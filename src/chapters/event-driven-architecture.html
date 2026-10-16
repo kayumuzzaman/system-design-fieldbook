@@ -1,0 +1,514 @@
+<!--meta
+{ "description": "Event-driven architecture for system design: events versus commands, notification and event-carried state transfer, designing and versioning event schemas, event sourcing with working TypeScript, CQRS and read models, living with eventual consistency, tracing event flows, and when an event-driven design helps or hurts.",
+  "lede": "The last two chapters covered the machinery for moving messages. This one is about what to say in them and how to build a system around them. “Event-driven” is used for at least four different ideas, from a service announcing that something changed to a database that stores nothing but events. They have different costs, and most trouble with event-driven systems comes from adopting a heavier one than the problem needed.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="events">Events, commands and queries</h2>
+<p>Services exchange three kinds of message, and the differences between them shape a system more than the choice of broker does.</p>
+<table>
+<thead><tr><th></th><th>Command</th><th>Event</th><th>Query</th></tr></thead>
+<tbody>
+<tr><th>Says</th><td>Do this</td><td>This happened</td><td>Tell me this</td></tr>
+<tr><th>Named as</th><td>An instruction: <code>ResizePhoto</code></td><td>A fact in the past tense: <code>PhotoUploaded</code></td><td>A question: <code>GetPhoto</code></td></tr>
+<tr><th>Addressed to</th><td>One specific receiver</td><td>Nobody in particular</td><td>One specific receiver</td></tr>
+<tr><th>Can be refused</th><td>Yes</td><td>No. It has already happened.</td><td>Yes</td></tr>
+<tr><th>The sender knows</th><td>Who will act and what they will do</td><td>Nothing about who is listening</td><td>Who holds the answer</td></tr>
+</tbody>
+</table>
+<p>The row that matters is the last one. A command couples the sender to the receiver: the upload service must know that a thumbnail service exists and what to ask of it. An event reverses the direction of knowledge. The upload service announces <code>PhotoUploaded</code> and knows nothing further. The thumbnail service knows that it cares about uploads. A sixth consumer can be added next year without the upload service changing or even being redeployed.</p>
+<p>An <dfn>event-driven architecture</dfn> is one in which services communicate mainly by publishing and reacting to events. The benefit is that kind of independence. The cost is that nobody is in charge of the overall flow, which later sections return to.</p>
+<p>A message can be sent through a broker and still be a command in disguise. If the upload service publishes <code>PhotoUploaded</code> but the event exists only so that one particular service will resize the photo, and the uploader breaks if that does not happen, the coupling is still there. It has only been hidden.</p>
+
+<h2 id="styles">Four things “event-driven” can mean</h2>
+<p>Martin Fowler observed in 2017 that people use the term for four distinct patterns. Telling them apart prevents most arguments about whether event-driven design is a good idea.</p>
+<table>
+<thead><tr><th>Pattern</th><th>The idea</th><th>Weight</th></tr></thead>
+<tbody>
+<tr><th>Event notification</th><td>Announce that something changed, with little detail. Interested services call back for more.</td><td>Light</td></tr>
+<tr><th>Event-carried state transfer</th><td>Put the changed data in the event, so that consumers keep their own copy and need not call back</td><td>Moderate</td></tr>
+<tr><th>Event sourcing</th><td>Store the events themselves as the system of record, and compute current state from them</td><td>Heavy</td></tr>
+<tr><th>CQRS</th><td>Use separate models, often separate stores, for changing data and for reading it</td><td>Moderate to heavy</td></tr>
+</tbody>
+</table>
+<p>The first two are about what crosses the boundary between services. The last two are about how one service stores and serves its own data. They can be combined freely or used alone.</p>
+
+<figure class="fig wide" id="fig-styles">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-labelledby="f361t f361d">
+<title id="f361t">A thin notification event compared with an event that carries state</title>
+<desc id="f361d">On the left, the photo service sends a small event containing only the type and photo ID, and the search indexer calls back with a GET request to fetch the details. It is small and never stale, but every consumer must call back, so the publisher must be up and takes the extra load. On the right, the event carries the caption, tags, owner and version, and the search indexer keeps its own copy with no call back. Consumers work even if the publisher is down, at the cost of larger events and copies that can lag.</desc>
+<text class="tb" x="10" y="18">Notification: “something changed”</text>
+<rect class="n sig" x="10" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="65" y="67.5">Photo service</text>
+<rect class="n" x="238" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="293" y="67.5">Search indexer</text>
+<path class="e async" d="M120 54H238"/>
+<text class="ts mid" x="179" y="46">1. event</text>
+<path class="e both" d="M238 76H120"/>
+<text class="ts mid" x="179" y="94">2. GET /photos/871</text>
+<rect class="n sunk" x="10" y="112" width="338" height="54" rx="4"/>
+<text class="ts" x="20" y="132">{ "type": "photo.updated",</text>
+<text class="ts" x="31" y="148">"photoId": 871 }</text>
+<text class="ts" x="10" y="192">Small and never stale. Every consumer must call back,</text>
+<text class="ts" x="10" y="208">so the publisher must be up and takes the extra load.</text>
+<path class="e none dash" d="M360 8V224"/>
+<text class="tb" x="380" y="18">State transfer: “here is what it is now”</text>
+<rect class="n sig" x="380" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="435" y="67.5">Photo service</text>
+<rect class="n" x="600" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="655" y="59">Search indexer</text>
+<text class="ts mid" x="655" y="76">keeps its own copy</text>
+<path class="e async" d="M490 63H600"/>
+<text class="ts mid" x="545" y="55">event</text>
+<rect class="n sunk" x="380" y="112" width="330" height="54" rx="4"/>
+<text class="ts" x="390" y="128">{ "type": "photo.updated", "photoId": 871,</text>
+<text class="ts" x="401" y="143">"caption": "Sunrise", "tags": ["sea"],</text>
+<text class="ts" x="401" y="158">"ownerId": 42, "version": 7 }</text>
+<text class="ts" x="380" y="192">No call back: consumers work even if the publisher is down.</text>
+<text class="ts" x="380" y="208">Larger events, and copies that can lag behind.</text>
+
+</svg>
+</div>
+<figcaption>The same change announced two ways. The choice decides whether consumers depend on the publisher being available.</figcaption>
+</figure>
+
+<p>A <b>notification</b> is small and cannot carry stale data, since the consumer fetches the current state. The cost is a call back from every consumer for every event, which adds load to the publisher and means consumers stop working when it is down. The independence the event bought is partly given back.</p>
+<p><b>State transfer</b> removes the call back. The search indexer needs nothing from the photo service at run time, because everything it needs arrived in events. This is how services become able to survive each other’s outages. In exchange, events are larger, data is duplicated across services, and each copy lags the source by however long delivery takes.</p>
+<p>A workable default: carry in the event the fields that consumers commonly need, along with a version number so that a consumer can tell old from new, and leave rarely needed detail to be fetched.</p>
+
+<h2 id="design">Designing events</h2>
+<p>An event is a public interface with an unusual property: it is stored. Events published last month may be read next year, by code that did not exist when they were written. That raises the stakes on getting their shape right.</p>
+
+<h3 id="envelope">The envelope</h3>
+<p>Every event needs the same handful of facts about itself, separate from its business content. The CloudEvents specification, a Cloud Native Computing Foundation standard, gives them common names so that tools and services from different teams agree.</p>
+<pre data-lang="js" data-title="An event in the CloudEvents format">
+{
+  "specversion": "1.0",
+  "id": "0199c2f4-7a10-7c3e-9d2b-5f1e8a4b6c70",     // unique: consumers deduplicate on this
+  "source": "/photo-service",                         // who published it
+  "type": "com.example.photo.uploaded.v1",            // what happened, with a version
+  "subject": "photos/871",                            // what it is about
+  "time": "2026-10-10T09:14:03.120Z",                 // when it happened, not when it was sent
+  "datacontenttype": "application/json",
+  "data": {
+    "photoId": 871,
+    "ownerId": 42,
+    "caption": "Sunrise",
+    "version": 7                                      // lets consumers ignore older updates
+  }
+}
+</pre>
+
+<h3 id="content">What to put inside</h3>
+<ul>
+  <li><b>Describe what happened in business terms.</b> <code>OrderCancelled</code> with a reason tells consumers something. <code>OrderRowUpdated</code> with a list of changed columns makes every consumer reverse-engineer your intent, and breaks them when your table changes.</li>
+  <li><b>Publish deliberately.</b> The events a service shares are a contract. Its internal tables are not. Exposing raw database changes as public events couples every consumer to your schema (<x-ref to="change-data-capture#outbox"></x-ref> returns to this).</li>
+  <li><b>Give each event a key.</b> Use the ID of the entity, so that a log keeps that entity’s events in order (<x-ref to="event-streaming#partitions"></x-ref>).</li>
+  <li><b>Include a version of the entity.</b> Delivery can duplicate and reorder. A consumer that stores the highest version it has applied can discard anything older (<x-ref to="idempotency-and-delivery#versions"></x-ref>).</li>
+  <li><b>Treat personal data with care.</b> A log is designed not to forget, which conflicts with a person’s right to have their data deleted. Keep personal data out of long-lived events where you can and refer to it by ID. Where you cannot, one technique is to encrypt each person’s data with their own key and delete the key when they ask to be forgotten.</li>
+</ul>
+
+<h3 id="versioning">Changing a schema without breaking consumers</h3>
+<p>Producers and consumers are deployed at different times by different teams. For a while, old and new versions of both are running, and old events remain in the log. A schema change is safe only if it is compatible in the direction that matters.</p>
+<table>
+<thead><tr><th>Compatibility</th><th>Meaning</th><th>Safe changes</th><th>Deploy first</th></tr></thead>
+<tbody>
+<tr><th>Backward</th><td>New consumers can read old events</td><td>Add an optional field with a default. Remove a field.</td><td>Consumers</td></tr>
+<tr><th>Forward</th><td>Old consumers can read new events</td><td>Add a field. Remove an optional field.</td><td>Producers</td></tr>
+<tr><th>Full</th><td>Both of the above</td><td>Add or remove optional fields only</td><td>Either</td></tr>
+</tbody>
+</table>
+<p>In practice: add optional fields, never change the meaning or type of an existing field, and never reuse a name. When a change cannot be made compatibly, publish a new event type, such as <code>photo.uploaded.v2</code>, alongside the old one, and retire the old one when its last consumer has moved.</p>
+<p>A <dfn>schema registry</dfn> enforces this mechanically. Producers register each event’s schema, written in a format such as Avro, Protocol Buffers or JSON Schema. The registry rejects a new version that breaks the configured compatibility rule, before any incompatible event can be published. Without one, the first notice of a broken schema is a consumer failing in production.</p>
+<div class="note production"><p><span class="label">In production.</span> Keep a catalog of events: what each means, who publishes it, its schema and who consumes it. The AsyncAPI format does for events what OpenAPI does for HTTP APIs. In an event-driven system the list of consumers is not visible in any code, and “who will break if I change this?” has no answer unless someone has written it down.</p></div>
+
+<h2 id="event-sourcing">Event sourcing</h2>
+<p>Most services store current state. A wallet row says the balance is 50. When money moves, the row is overwritten. How the balance came to be 50 is lost, unless a separate audit table records it, and then there are two records that can disagree.</p>
+<p><dfn>Event sourcing</dfn> stores the changes and nothing else. The wallet is a sequence of events: deposited 100, withdrew 20, withdrew 30. The balance is not stored. It is computed by applying the events in order. Accountants have worked this way for centuries: a ledger is never erased, and the balance is the sum of the entries.</p>
+
+<figure class="fig wide" id="fig-es">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 274" role="img" aria-labelledby="f362t f362d">
+<title id="f362t">Handling a command in an event-sourced wallet</title>
+<desc id="f362d">A command to withdraw 30 arrives. Step one loads the event stream for wallet 42, which holds Deposited 100 and Withdrawn 20, and replays it to find a balance of 80. Step two decides that 30 is allowed and produces the event Withdrawn 30. Step three appends that event, on the condition that the stream still has two events. The stream of three events is the only thing stored. Read models are computed from the events: the balance of 50 shown in the app, a statement of every movement, and fraud signals added a year later by replaying the events.</desc>
+<rect class="n sig" x="10" y="34" width="110" height="46" rx="6"/>
+<text class="tb mid" x="65" y="53">Command</text>
+<text class="ts mid" x="65" y="70">Withdraw 30</text>
+<g data-s="1">
+<rect class="n" x="160" y="24" width="150" height="66" rx="6"/>
+<text class="ts tb mid" x="235" y="44.5">1. Load and replay</text>
+<text class="ts mid" x="235" y="61.5">stream wallet-42</text>
+<text class="ts mid" x="235" y="78.5">gives balance 80</text>
+</g>
+<g data-s="2">
+<rect class="n" x="350" y="24" width="140" height="66" rx="6"/>
+<text class="ts tb mid" x="420" y="44.5">2. Decide</text>
+<text class="ts mid" x="420" y="61.5">30 ≤ 80: allowed</text>
+<text class="ts mid" x="420" y="78.5">so “Withdrawn 30”</text>
+</g>
+<g data-s="3">
+<rect class="n store" x="530" y="24" width="180" height="66" rx="6"/>
+<text class="ts tb mid" x="620" y="44.5">3. Append</text>
+<text class="ts mid" x="620" y="61.5">only if the stream still</text>
+<text class="ts mid" x="620" y="78.5">has 2 events</text>
+</g>
+<g data-s="1">
+<path class="e sig" d="M120 57H160"/>
+</g>
+<g data-s="2">
+<path class="e" d="M310 57H350"/>
+</g>
+<g data-s="3">
+<path class="e store" d="M490 57H530"/>
+</g>
+<text class="tb" x="10" y="128">Event stream for wallet-42: the only thing stored</text>
+<rect class="n" x="10" y="140" width="142" height="34" rx="3"/>
+<text class="ts mid" x="81" y="162">0: Deposited 100</text>
+<rect class="n" x="160" y="140" width="142" height="34" rx="3"/>
+<text class="ts mid" x="231" y="162">1: Withdrawn 20</text>
+<g data-s="3">
+<rect class="n store" x="310" y="140" width="142" height="34" rx="3"/>
+<text class="ts mid" x="381" y="162">2: Withdrawn 30</text>
+<path class="e store" d="M620 90C620 130 500 110 452 157"/>
+<text class="ts" x="480" y="150">new</text>
+</g>
+<g data-s="4">
+<text class="tb" x="10" y="208">Read models, each computed from the events</text>
+<rect class="n async" x="10" y="220" width="226" height="44" rx="6"/>
+<text class="ts tb mid" x="123" y="238">Balance: 50</text>
+<text class="ts mid" x="123" y="255">what the app shows</text>
+<rect class="n async" x="246" y="220" width="226" height="44" rx="6"/>
+<text class="ts tb mid" x="359" y="238">Statement</text>
+<text class="ts mid" x="359" y="255">every movement, in order</text>
+<rect class="n async" x="482" y="220" width="226" height="44" rx="6"/>
+<text class="ts tb mid" x="595" y="238">Fraud signals</text>
+<text class="ts mid" x="595" y="255">added a year later, built by replay</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="withdraw 30" data-state="Events in the stream: 2; Balance: 80">A command arrives: withdraw 30. The handler loads the wallet’s event stream and replays it. Deposited 100, withdrawn 20, so the balance is 80.</li>
+  <li data-msg="Withdrawn 30">It decides. 30 is not more than 80, so the withdrawal is allowed. The outcome is a new event, “Withdrawn 30”.</li>
+  <li data-msg="Withdrawn 30" data-state="Events in the stream: 3; Balance: 50">It appends the event, on condition that the stream still holds 2 events. If another command got in first, the append fails and the handler starts again from step 1.</li>
+  <li>Read models are computed from the events: the balance the app shows, the statement, and a fraud view that was added a year later and built by replaying the history.</li>
+</ol>
+<figcaption>The events are the record. Everything else, including the balance, is a view that can be thrown away and rebuilt.</figcaption>
+</figure>
+
+<p>The code has a characteristic shape. Two pure functions hold all the logic. <code>apply</code> computes state from events. <code>decide</code> checks a command against the current state and returns new events. Neither touches a database, which makes the business rules easy to test.</p>
+<pre data-lang="ts" data-title="An event-sourced wallet">
+// Events: facts, named in the past tense. Amounts are in cents.
+type WalletEvent =
+  | { type: "Deposited"; amount: number }
+  | { type: "Withdrawn"; amount: number }
+  | { type: "Frozen"; reason: string };
+
+interface WalletState { balance: number; frozen: boolean; }
+const initial: WalletState = { balance: 0, frozen: false };
+
+// State is computed from events and from nothing else.
+function apply(state: WalletState, event: WalletEvent): WalletState {
+  switch (event.type) {
+    case "Deposited": return { ...state, balance: state.balance + event.amount };
+    case "Withdrawn": return { ...state, balance: state.balance - event.amount };
+    case "Frozen":    return { ...state, frozen: true };
+  }
+}
+
+type Command =
+  | { type: "Deposit"; amount: number }
+  | { type: "Withdraw"; amount: number };
+
+// The rules live here: check the command against current state, and return
+// the events that follow. Nothing is saved and nothing is sent.
+function decide(state: WalletState, command: Command): WalletEvent[] {
+  if (state.frozen) throw new Error("wallet is frozen");
+  if (command.amount <= 0) throw new Error("amount must be positive");
+  switch (command.type) {
+    case "Deposit":
+      return [{ type: "Deposited", amount: command.amount }];
+    case "Withdraw":
+      if (command.amount > state.balance) throw new Error("insufficient funds");
+      return [{ type: "Withdrawn", amount: command.amount }];
+  }
+}
+
+class EventStore {
+  private streams = new Map<string, WalletEvent[]>();
+
+  read(streamId: string): WalletEvent[] {
+    return this.streams.get(streamId) ?? [];
+  }
+
+  // Append only if nobody else has appended since we read.
+  append(streamId: string, expectedVersion: number, events: WalletEvent[]): void {
+    const stream = this.read(streamId);
+    if (stream.length !== expectedVersion) throw new Error("concurrent update: reload and retry");
+    this.streams.set(streamId, [...stream, ...events]);
+  }
+}
+
+function handle(store: EventStore, walletId: string, command: Command): void {
+  const history = store.read(walletId);
+  const state = history.reduce(apply, initial);            // rebuild current state
+  store.append(walletId, history.length, decide(state, command));
+}
+
+const store = new EventStore();
+handle(store, "wallet-42", { type: "Deposit", amount: 10_000 });
+handle(store, "wallet-42", { type: "Withdraw", amount: 2_000 });
+handle(store, "wallet-42", { type: "Withdraw", amount: 3_000 });
+
+store.read("wallet-42").reduce(apply, initial).balance;     // 5000
+
+// A question nobody planned for, answered from the same events:
+const largestWithdrawal = Math.max(
+  ...store.read("wallet-42").filter((e) => e.type === "Withdrawn").map((e) => e.amount));   // 3000
+</pre>
+<p>The condition in <code>append</code> is the optimistic concurrency control of <x-ref to="transactions#optimistic"></x-ref>. If two withdrawals are handled at once, both read a stream of two events, and only one append of a third can succeed. The other reloads, sees the lower balance and is checked again. Without that condition, both could pass the balance check and overdraw the wallet.</p>
+
+<h3 id="es-gains">What it gives you</h3>
+<ul>
+  <li><b>A complete history for free.</b> The audit trail is the data itself, so it cannot drift from the truth.</li>
+  <li><b>Answers to questions asked later.</b> The last lines of the example compute something no table was designed for. New read models can be built at any time by replaying events from the start.</li>
+  <li><b>State at any past moment.</b> Replay up to a date to see what the balance was then, or to reproduce a bug exactly as it occurred.</li>
+  <li><b>Events to publish.</b> The service already has a reliable record of everything that happened, in order.</li>
+</ul>
+
+<h3 id="es-costs">What it costs</h3>
+<ul>
+  <li><b>Events are forever.</b> A table can be migrated. Stored events cannot be rewritten without undermining the point of them, so code must be able to read every version of every event ever written, usually by converting old versions to the current shape as they are loaded.</li>
+  <li><b>Reads need projections.</b> “All wallets with a balance over 1,000” cannot be answered by scanning event streams. You maintain read models, which brings eventual consistency inside a single service.</li>
+  <li><b>Long streams are slow to replay.</b> A wallet with a million events needs a <dfn>snapshot</dfn>: the state saved at some event number, so that loading replays only what came after.</li>
+  <li><b>Deleting is hard.</b> Removing a person’s data from an append-only history needs the techniques mentioned earlier.</li>
+  <li><b>It is unfamiliar.</b> Every engineer who joins has to learn a different way to think about data.</li>
+</ul>
+<p>Event sourcing earns its cost where history is the point: ledgers, payments, orders, anything audited, anything where “how did it get into this state?” is asked often. For a service that stores user preferences, it is a great deal of machinery for no benefit. It is a choice for one service at a time, never a style for a whole system. <x-ref to="hld-digital-wallet"></x-ref> builds a full design on it.</p>
+
+<h2 id="cqrs">CQRS and read models</h2>
+<p>The data shape that makes writes safe is rarely the one that makes reads fast. Writes want normalized data and enforced rules. Reads want exactly what one screen needs, already joined and sorted.</p>
+<p><dfn>Command query responsibility segregation</dfn>, or CQRS, accepts this and splits them. Commands go to a write model built for correctness. Changes flow out of it as events. Separate <dfn>read models</dfn>, also called projections or materialized views, are kept up to date from those events, each shaped for one kind of query and stored in whatever suits it.</p>
+
+<figure class="fig wide" id="fig-cqrs">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f363t f363d">
+<title id="f363t">Separate write and read models connected by events</title>
+<desc id="f363d">Commands go to a write model that enforces the rules in one consistent store. It emits events describing what changed. The events update three read models: a feed view precomputed per user, a full-text search index, and reports in a warehouse. Queries go straight to a read model. The read models trail the write model by a moment, so a command’s effect may not be visible to the very next query.</desc>
+<rect class="n sig" x="10" y="22" width="100" height="44" rx="6"/>
+<text class="tb mid" x="60" y="40">Commands</text>
+<text class="ts mid" x="60" y="57">change things</text>
+<rect class="n" x="160" y="14" width="150" height="60" rx="6"/>
+<text class="ts tb mid" x="235" y="31.5">Write model</text>
+<text class="ts mid" x="235" y="48.5">enforces the rules</text>
+<text class="ts mid" x="235" y="65.5">one consistent store</text>
+<g data-s="1">
+<path class="e sig" d="M110 44H160"/>
+</g>
+<rect class="n async" x="370" y="22" width="110" height="44" rx="6"/>
+<text class="tb mid" x="425" y="40">Events</text>
+<text class="ts mid" x="425" y="57">what changed</text>
+<g data-s="2">
+<path class="e async" d="M310 44H370"/>
+</g>
+<rect class="n store" x="250" y="120" width="150" height="46" rx="6"/>
+<text class="ts tb mid" x="325" y="139">Feed view</text>
+<text class="ts mid" x="325" y="156">precomputed per user</text>
+<g data-s="3">
+<path class="e async" d="M425 66C425 96 325 90 325 120"/>
+</g>
+<rect class="n store" x="410" y="120" width="150" height="46" rx="6"/>
+<text class="ts tb mid" x="485" y="139">Search index</text>
+<text class="ts mid" x="485" y="156">full-text</text>
+<g data-s="3">
+<path class="e async" d="M425 66C425 96 485 90 485 120"/>
+</g>
+<rect class="n store" x="570" y="120" width="140" height="46" rx="6"/>
+<text class="ts tb mid" x="640" y="139">Reports</text>
+<text class="ts mid" x="640" y="156">in a warehouse</text>
+<g data-s="3">
+<path class="e async" d="M425 66C425 96 640 90 640 120"/>
+</g>
+<rect class="n sig" x="10" y="121" width="100" height="44" rx="6"/>
+<text class="tb mid" x="60" y="139">Queries</text>
+<text class="ts mid" x="60" y="156">read things</text>
+<g data-s="4">
+<path class="e store" d="M110 143H250"/>
+<text class="ts mid" x="180" y="162">answered from a view</text>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="200">The write side is shaped for correctness, and each read side for one kind of question. The read models are updated</text>
+<text class="ts" x="10" y="216">from events, so they trail the write model by a moment. A command’s effect may not be visible to the very next query.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="command">A command asks to change something. It goes to the write model, which enforces the rules against one consistent store.</li>
+  <li data-msg="event">Every change that is accepted is published as an event.</li>
+  <li data-msg="event">Each read model consumes the events and updates a store of its own, shaped for one kind of question.</li>
+  <li data-msg="query">Queries are answered from a read model and never touch the write model.</li>
+  <li>The views are built from events, so they trail the write model by a moment. A user may not see the effect of a command at once.</li>
+</ol>
+<figcaption>One model for deciding, several for answering. The link between them is asynchronous, which is both the benefit and the cost.</figcaption>
+</figure>
+
+<p>You have already met mild forms of this. A read replica is a read model with the same shape as the write model (<x-ref to="replication#lag"></x-ref>). A search index kept in step with a database is a read model in a different store (<x-ref to="search-systems#sync"></x-ref>). A cache is a read model that can be discarded. Full CQRS only makes the idea explicit and uses events as the feed.</p>
+<p>The essential property of a read model is that it is <b>disposable</b>. It holds nothing that cannot be recomputed from the write side. If its design turns out wrong, build a new one beside it from the event history, switch over and delete the old one.</p>
+<p>CQRS and event sourcing are often mentioned together and are independent. A service can keep ordinary tables and still publish events to feed read models. A service can be event-sourced with a single simple read model. Use each only where it pays.</p>
+
+<h2 id="consistency">Living with eventual consistency</h2>
+<p>Every pattern in this chapter introduces a delay between a change and its visibility elsewhere. Usually it is milliseconds. Under load or after a failure it can be minutes. The design has to be correct at any length of delay.</p>
+<p><b>The user who cannot see their own change.</b> Ana renames an album, the page reloads from a read model that has not yet caught up, and the old name appears. This is the read-your-writes problem of <x-ref to="consistency-models#session"></x-ref>. Common answers:</p>
+<ul>
+  <li>Return the new state in the response to the command, and have the client display that.</li>
+  <li>Update the interface optimistically, without waiting.</li>
+  <li>Have the command return a version number, and have the read side wait briefly until it has reached that version.</li>
+  <li>Read that user’s own data from the write model for a short time after they change it.</li>
+</ul>
+<p><b>Duplicates and reordering.</b> Events are delivered at least once and, across partitions, in no particular order. Projections must be idempotent and should use entity versions to ignore stale updates.</p>
+<p><b>A projection that falls behind or goes wrong.</b> Monitor each projection’s lag as you would a consumer’s. Keep the ability to rebuild one from scratch, and rehearse it. A projection that cannot be rebuilt has quietly become a source of truth.</p>
+<p><b>Losing an event at the source.</b> A service that updates its database and then publishes can crash between the two, and every downstream view is then wrong with no error anywhere. Publish through a transactional outbox (<x-ref to="distributed-transactions#outbox"></x-ref>) or change data capture (<x-ref to="change-data-capture"></x-ref>), never as a second, separate write.</p>
+
+<h2 id="tracing">Following a flow nobody wrote down</h2>
+<p>In a system built on direct calls, the sequence of steps for placing an order can be read in the code of whichever service makes the calls. In an event-driven system the sequence exists only as the sum of every service’s subscriptions. This is the choreography of <x-ref to="distributed-transactions#coordination"></x-ref>, with the same weakness: no single place describes the process, and nothing notices if one step silently never happens.</p>
+<p>Two identifiers on every event make the flow recoverable after the fact.</p>
+
+<figure class="fig wide" id="fig-chain">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-labelledby="f364t f364d">
+<title id="f364t">A chain of events linked by correlation and causation identifiers</title>
+<desc id="f364d">An HTTP request with trace 4bf9 causes the event order placed with ID e1. That causes payment captured with ID e2, which causes shipment created with ID e3. Each event records the ID of what caused it, and all four carry the correlation ID 4bf9, so one search finds the whole flow.</desc>
+<text class="tb" x="10" y="18">Every event records which request started the flow and which event caused it</text>
+<g data-s="1">
+<rect class="n sig" x="10" y="36" width="160" height="64" rx="6"/>
+<text class="ts tb mid" x="90" y="55.5">HTTP request</text>
+<text class="ts mid" x="90" y="72.5">POST /orders</text>
+<text class="ts mid" x="90" y="89.5">trace 4bf9</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M170 68H188"/>
+<rect class="n" x="188" y="36" width="160" height="64" rx="6"/>
+<text class="ts tb mid" x="268" y="55.5">order.placed</text>
+<text class="ts mid" x="268" y="72.5">id e1</text>
+<text class="ts mid" x="268" y="89.5">caused by: request</text>
+</g>
+<g data-s="3">
+<path class="e async" d="M348 68H366"/>
+<rect class="n" x="366" y="36" width="160" height="64" rx="6"/>
+<text class="ts tb mid" x="446" y="55.5">payment.captured</text>
+<text class="ts mid" x="446" y="72.5">id e2</text>
+<text class="ts mid" x="446" y="89.5">caused by: e1</text>
+</g>
+<g data-s="4">
+<path class="e async" d="M526 68H544"/>
+<rect class="n" x="544" y="36" width="160" height="64" rx="6"/>
+<text class="ts tb mid" x="624" y="55.5">shipment.created</text>
+<text class="ts mid" x="624" y="72.5">id e3</text>
+<text class="ts mid" x="624" y="89.5">caused by: e2</text>
+</g>
+<g data-s="5">
+<path class="e none dash" d="M10 116v8h694v-8"/>
+<text class="ts mid" x="357" y="144">all four carry correlation ID 4bf9, so one search finds the whole flow</text>
+<text class="ts" x="10" y="174">The correlation ID answers “what else happened because of this request?”. The causation ID answers “why did this event</text>
+<text class="ts" x="10" y="190">happen?”, and lets you draw the chain in order even when the events were processed out of order.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li>An HTTP request arrives to place an order. It is given a trace ID, 4bf9.</li>
+  <li>Handling it produces the event <code>order.placed</code>, with an ID of its own, e1. The event records that the request caused it.</li>
+  <li>The payment service reacts to e1 and emits <code>payment.captured</code>, e2, which records e1 as its cause.</li>
+  <li>The shipping service reacts to e2 and emits <code>shipment.created</code>, e3.</li>
+  <li>All four carry the correlation ID 4bf9, so one search finds the whole flow. The causation IDs put it in order, even if the events were processed out of order.</li>
+</ol>
+<figcaption>The correlation ID groups everything that followed from one request. The causation ID links each event to its direct cause.</figcaption>
+</figure>
+
+<p>When a service handles an event and publishes another, it copies the correlation ID and sets the causation ID to the ID of the event it handled. With distributed tracing in place (<x-ref to="observability"></x-ref>), the trace context does the same job across both calls and messages.</p>
+<p>For a process with a defined beginning and end, where a missing step must be detected and compensated, such as fulfilling an order, events alone are the wrong tool. Use an orchestrator or workflow engine that owns the process and knows what should have happened by now (<x-ref to="scheduling-and-workflows#workflows"></x-ref>). Events suit open-ended reactions. Workflows suit processes that must complete.</p>
+
+<h2 id="when">When it helps and when it hurts</h2>
+<table>
+<thead><tr><th>Event-driven design fits when</th><th>It is a poor fit when</th></tr></thead>
+<tbody>
+<tr><td>Several independent services react to the same occurrences</td><td>One service needs an answer from another to continue</td></tr>
+<tr><td>New reactions are added often, by different teams</td><td>The process has strict steps that must all complete, in order</td></tr>
+<tr><td>Consumers must keep working when the producer is down</td><td>Users must see every change immediately everywhere</td></tr>
+<tr><td>The load is uneven and work can be deferred</td><td>The system is small and one team owns all of it</td></tr>
+<tr><td>History and audit are requirements</td><td>The data is simple and its history has no value</td></tr>
+</tbody>
+</table>
+<p>A small system does not need any of this. One service with one database and a jobs table is easier to build, reason about and debug. Event-driven design is a way of managing the cost of many teams and many services, and it has costs of its own that are only worth paying against that one.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> When you say “this service publishes an event”, add what kind: “a state-carrying event keyed by order ID, with a version, published through an outbox”. If you propose event sourcing or CQRS, say what it buys in this problem and name the cost: “event sourcing here because the wallet needs a full audit trail and reproducible balances, and the price is that reads come from projections that lag”. Proposing either as a default is a warning sign to an interviewer.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Commands dressed as events</th><td>The coupling remains, with less visibility</td><td>If one receiver must act, send a command or call it</td></tr>
+<tr><th>Publishing raw table changes as public events</th><td>Every consumer depends on your schema</td><td>Publish designed business events</td></tr>
+<tr><th>Updating the database and publishing as two steps</th><td>Lost or phantom events, and views that are wrong forever</td><td>Outbox or change data capture</td></tr>
+<tr><th>No schema rules</th><td>A producer change breaks consumers in production</td><td>Compatibility rules, enforced by a registry</td></tr>
+<tr><th>Thin events everywhere</th><td>A storm of call-backs, and consumers that fail with the producer</td><td>Carry the commonly needed state</td></tr>
+<tr><th>Event sourcing as a system-wide style</th><td>Heavy machinery on simple data</td><td>Apply it to the few services where history is the point</td></tr>
+<tr><th>Treating a read model as a source of truth</th><td>It cannot be rebuilt, and silently diverges</td><td>Everything in a read model must be derivable from the write side</td></tr>
+<tr><th>Assuming the read side is current</th><td>Users see their own changes disappear</td><td>Design the interface for the delay</td></tr>
+<tr><th>No correlation IDs</th><td>A failed flow cannot be reconstructed</td><td>Correlation and causation IDs on every event</td></tr>
+<tr><th>Choreographing a process that must complete</th><td>Steps go missing unnoticed</td><td>An orchestrator or workflow engine</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="message-queues"></x-ref> and <x-ref to="event-streaming"></x-ref>: the transport underneath.</li>
+  <li><x-ref to="distributed-transactions"></x-ref>: sagas, choreography against orchestration, and the outbox.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: consumers that tolerate duplicates and reordering.</li>
+  <li><x-ref to="consistency-models"></x-ref>: read-your-writes and other session guarantees.</li>
+  <li><x-ref to="change-data-capture"></x-ref>: turning database changes into events reliably.</li>
+  <li><x-ref to="domain-modeling"></x-ref>: aggregates and domain events inside one service.</li>
+  <li><x-ref to="monoliths-and-microservices"></x-ref>: where service boundaries, and so event boundaries, should fall.</li>
+  <li><x-ref to="hld-digital-wallet"></x-ref>: event sourcing and CQRS in a full design.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A command tells one receiver what to do. An event states what happened and leaves the reaction to whoever cares. Events move knowledge of the relationship from the sender to the receiver.</li>
+  <li>“Event-driven” covers four patterns of very different weight: notification, state transfer, event sourcing and CQRS.</li>
+  <li>Events that carry state let consumers work without calling back, at the price of duplicated data that lags.</li>
+  <li>Events are stored interfaces. Give them an envelope, a key and a version, and change schemas only compatibly.</li>
+  <li>Event sourcing stores changes as the record and derives state. It gives history and replay, and costs permanent schemas and projections.</li>
+  <li>CQRS separates the model that decides from the models that answer. Read models are disposable and lag behind.</li>
+  <li>Design the interface and every consumer for delay, duplicates and reordering.</li>
+  <li>Use events for open-ended reactions and a workflow for processes that must complete.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>The upload service publishes “GenerateThumbnails” to a topic. Is that an event? Why does the distinction matter?</summary><p>It is a command sent through a broker. It is an instruction, in the imperative, and it presumes a particular receiver doing a particular thing. The uploader still knows about thumbnails, so adding or removing reactions still means changing it. An event would be “PhotoUploaded”, with the thumbnail service deciding for itself that uploads need thumbnails.</p></details>
+<details><summary>A search indexer receives thin “photo.updated” events and calls the photo service for details. What happens to search during a photo service outage, and how would you change the events?</summary><p>The indexer cannot fetch details, so it stalls or fails for the whole outage, although search itself is healthy. Carrying the fields the indexer needs in the event, with a version number, removes the call back, and the indexer keeps working from events alone.</p></details>
+<details><summary>You need to add a required field to an event that five teams consume. What is the safe sequence?</summary><p>A new required field is not compatible in both directions. Add it as an optional field with a default, so that old consumers ignore it and new consumers cope with old events that lack it. Deploy producers to populate it. If it must be required with different semantics, publish a new event type alongside the old one and retire the old one after every consumer has migrated.</p></details>
+<details><summary>In the event-sourced wallet, two withdrawals of 60 arrive at the same moment against a balance of 100. What prevents an overdraft?</summary><p>Both handlers load the same stream and both decide the withdrawal is allowed. Each tries to append with the expected version it read. The store accepts the first and rejects the second, because the stream is now longer than expected. The second reloads, computes a balance of 40 and is refused for insufficient funds.</p></details>
+<details><summary>Name two things event sourcing makes easy and two it makes hard.</summary><p>Easy: a complete and trustworthy audit trail, and building new views or answering new questions from history, including state as of any past time. Hard: changing event schemas, since old events must stay readable forever, and queries across many entities, which need separately maintained read models. Deleting personal data is a third difficulty.</p></details>
+<details><summary>After saving a profile change, a user is shown their old profile. The system uses CQRS. What is happening, and what are two fixes?</summary><p>The page was read from a read model that had not yet processed the event for the change. Fixes: return the updated profile in the command’s response and display that, or have the read wait until the read model reaches the version the command returned. Reading that user’s own data from the write side for a short time also works.</p></details>
+<details><summary>An order sometimes ends up paid but never shipped, in a system where services react to each other’s events. Why is this hard to detect, and what design addresses it?</summary><p>With choreography no component knows the whole process, so nothing expects the shipment and nothing notices its absence. An orchestrator or workflow engine that owns the order process records each step and can time out, retry or compensate when a step does not happen. Correlation IDs at least allow the incomplete flow to be found afterward.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Fowler, <a href="https://martinfowler.com/articles/201701-event-driven.html">What do you mean by “Event-Driven”?</a>, February 2017. The four patterns.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/eaaDev/EventSourcing.html">Event Sourcing</a> and <a href="https://martinfowler.com/bliki/CQRS.html">CQRS</a>. The second includes a warning about using CQRS where it does not fit.</li>
+  <li>Cloud Native Computing Foundation, <a href="https://github.com/cloudevents/spec">CloudEvents specification</a>. Common attribute names for event envelopes.</li>
+  <li>Confluent, <a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html">Schema Evolution and Compatibility</a>. Backward, forward and full compatibility and which changes each allows.</li>
+  <li>AsyncAPI Initiative, <a href="https://www.asyncapi.com/">AsyncAPI</a>. A specification for documenting event-driven interfaces.</li>
+  <li>Microsoft, <a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing">Event Sourcing pattern</a> and <a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs">CQRS pattern</a>, Azure Architecture Center.</li>
+  <li>Martin Kleppmann, <a href="https://martin.kleppmann.com/2015/11/05/database-inside-out-at-oredev.html">Turning the database inside-out</a>, 2015. Read models as materialized views over a log.</li>
+  <li>Ben Stopford, <cite>Designing Event-Driven Systems</cite>, O’Reilly, 2018. Event-carried state transfer and event sourcing with a log.</li>
+</ol>
+</section>

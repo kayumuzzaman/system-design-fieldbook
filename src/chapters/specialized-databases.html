@@ -1,0 +1,469 @@
+<!--meta
+{ "description": "Specialized data stores and when to use them: time-series databases with compression and rollups, geospatial indexes such as geohash, R-trees and H3, graph databases, and vector databases with HNSW and IVF indexes, plus when an extension to your main database is enough.",
+  "lede": "Some kinds of data have a shape that general-purpose indexes handle badly: measurements arriving every second, points on a map, networks of relationships, lists of numbers that stand for meaning. Each has a family of stores built around it. This chapter explains what makes each shape awkward, the trick that handles it, and how to tell when you need a dedicated system.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">When the default stops fitting</h2>
+<p>The advice in <x-ref to="data-models#choosing"></x-ref> was to begin with a relational database and to move a workload out only when there is a reason. This chapter is about four of the most common reasons. In each case the difficulty is the same underneath. A B-tree orders data along one dimension and is superb at finding a value or a range along it. These workloads ask questions that do not reduce to one ordered dimension, or they arrive in volumes that reward a storage layout designed for nothing else.</p>
+<table>
+<thead><tr><th>Data</th><th>Typical question</th><th>Why a B-tree struggles</th><th>The specialized idea</th></tr></thead>
+<tbody>
+<tr><th>Time series</th><td>Average CPU per host, per minute, over the last day</td><td>Enormous append-only volume, read as aggregates over ranges</td><td>Partition by time, compress by column, pre-aggregate</td></tr>
+<tr><th>Geospatial</th><td>Restaurants within 2 km of me</td><td>Nearness involves two dimensions at once</td><td>Map two dimensions onto cells or nested boxes</td></tr>
+<tr><th>Graph</th><td>The shortest chain of connections between two people</td><td>An unknown number of joins</td><td>Store each node with direct links to its neighbors</td></tr>
+<tr><th>Vector</th><td>The ten items most similar in meaning to this one</td><td>Similarity across hundreds of dimensions, with no sort order at all</td><td>Approximate search through clusters or a graph of neighbors</td></tr>
+</tbody>
+</table>
+<p>For all four there is a middle path between “make do” and “run another database”: an extension that adds the specialized index to the database you already have. PostgreSQL has one for each. The chapter ends with how to choose.</p>
+
+<h2 id="time-series">Time-series data</h2>
+<p>A <dfn>time series</dfn> is a sequence of measurements of the same thing over time: CPU load on a server, temperature from a sensor, the price of a stock, requests per second to an endpoint. The workload has a very particular shape.</p>
+<ul>
+  <li><b>Writes are appends.</b> New points arrive constantly, nearly in time order, and old points are almost never changed.</li>
+  <li><b>Volume is large and steady.</b> Ten thousand servers reporting 200 metrics every 10 seconds produce 200,000 points per second, or 17 billion a day.</li>
+  <li><b>Recent data is read far more than old data</b>, and old data is read as summaries.</li>
+  <li><b>Queries are ranges and aggregates</b>: averages, maximums and percentiles over a window, grouped by time bucket and by some label such as host or region.</li>
+</ul>
+<p>A <dfn>time-series database</dfn> is built around that shape, with three techniques.</p>
+<p><b>Partitioning by time.</b> Data is divided into chunks covering a fixed period, such as a day. Writes go to the current chunk, whose indexes are small and in memory. A query for the last hour opens one chunk. Old data is removed by dropping whole chunks, which is instant. This is the table partitioning from <x-ref to="partitioning#table-partitioning"></x-ref>, automated.</p>
+<p><b>Compression by column.</b> Consecutive points in a series are very alike. Timestamps arrive at regular intervals, so the difference between successive differences is usually zero and can be stored in a single bit. Values change slowly, so each can be stored as its difference from the one before. Facebook’s Gorilla system, which introduced this scheme in 2015, reported an average of 1.37 bytes per point where the raw form takes 16. For the fleet above, that turns 276 GB a day into about 24 GB.</p>
+<p><b>Downsampling and retention.</b> Nobody needs ten-second resolution for last year. Older data is replaced by summaries at coarser intervals, and each level of detail has its own lifetime.</p>
+
+<figure class="fig wide" id="fig-rollup">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f251t f251d">
+<title id="f251t">Downsampling a time series into coarser tiers with longer retention</title>
+<desc id="f251d">Three tiers. Raw points every 10 seconds are kept for 7 days, at 8,640 points a day. A 5-minute rollup storing the minimum, maximum and average is kept for 90 days, at 288 points a day. A 1-hour rollup is kept for 2 years, at 24 points a day. Each tier is drawn as a line with progressively fewer points.</desc>
+<rect class="n sig" x="10" y="14" width="210" height="76" rx="6"/>
+<text class="tb mid" x="115" y="39.5">Raw</text>
+<text class="ts mid" x="115" y="56.5">every 10 seconds</text>
+<text class="ts mid" x="115" y="73.5">kept 7 days</text>
+<text class="ts mid" x="115" y="112">8,640 points a day</text>
+<path class="e" d="M220 52H250"/>
+<rect class="n store" x="250" y="14" width="210" height="76" rx="6"/>
+<text class="tb mid" x="355" y="39.5">5-minute rollup</text>
+<text class="ts mid" x="355" y="56.5">min, max, average</text>
+<text class="ts mid" x="355" y="73.5">kept 90 days</text>
+<text class="ts mid" x="355" y="112">288 points a day</text>
+<path class="e" d="M460 52H490"/>
+<rect class="n" x="490" y="14" width="210" height="76" rx="6"/>
+<text class="tb mid" x="595" y="39.5">1-hour rollup</text>
+<text class="ts mid" x="595" y="56.5">min, max, average</text>
+<text class="ts mid" x="595" y="73.5">kept 2 years</text>
+<text class="ts mid" x="595" y="112">24 points a day</text>
+<path class="line" style="stroke-width:1.5" d="M20.0 155.3 L22.4 161.1 L24.8 158.7 L27.2 162.1 L29.6 166.0 L32.0 161.5 L34.4 148.6 L36.8 143.1 L39.2 140.6 L41.6 149.9 L44.1 149.2 L46.5 154.0 L48.9 158.9 L51.3 163.2 L53.7 163.7 L56.1 149.6 L58.5 143.2 L60.9 139.8 L63.3 137.9 L65.7 148.9 L68.1 153.1 L70.5 149.3 L72.9 145.0 L75.3 139.9 L77.7 136.3 L80.1 150.1 L82.5 147.9 L84.9 145.3 L87.3 147.1 L89.7 154.7 L92.2 153.3 L94.6 160.2 L97.0 147.4 L99.4 141.2 L101.8 143.7 L104.2 150.2 L106.6 142.0 L109.0 143.7 L111.4 138.6 L113.8 136.2 L116.2 141.5 L118.6 146.7 L121.0 146.0 L123.4 149.0 L125.8 156.2 L128.2 157.6 L130.6 148.3 L133.0 158.1 L135.4 163.9 L137.8 155.8 L140.3 157.9 L142.7 154.0 L145.1 153.0 L147.5 154.9 L149.9 143.0 L152.3 151.9 L154.7 152.9 L157.1 157.7 L159.5 152.0 L161.9 155.6 L164.3 156.3 L166.7 148.8 L169.1 152.9 L171.5 150.6 L173.9 142.2 L176.3 153.3 L178.7 160.8 L181.1 161.9 L183.5 151.8 L185.9 148.8 L188.4 154.5 L190.8 156.1 L193.2 160.1 L195.6 156.9 L198.0 163.3 L200.4 154.0 L202.8 144.5 L205.2 137.6 L207.6 137.9 L210.0 133.5"/>
+<path class="line" style="stroke-width:1.5" d="M260.0 159.6 L268.3 160.0 L276.5 146.7 L284.8 142.5 L293.0 147.3 L301.3 139.5 L309.6 141.3 L317.8 138.4 L326.1 147.2 L334.3 154.5 L342.6 153.8 L350.9 159.6 L359.1 158.1 L367.4 145.6 L375.7 150.7 L383.9 160.3 L392.2 165.3 L400.4 165.8 L408.7 153.8 L417.0 155.0 L425.2 157.2 L433.5 162.4 L441.7 147.8 L450.0 150.2"/>
+<path class="line" style="stroke-width:1.5" d="M500.0 155.8 L527.1 162.3 L554.3 166.3 L581.4 166.4 L608.6 156.3 L635.7 160.8 L662.9 165.7 L690.0 159.6"/>
+<text class="ts" x="10" y="190">Each tier keeps less detail for longer. A dashboard for the last hour reads raw points, and one for the last year reads 8,760 hourly values</text>
+<text class="ts" x="10" y="206">per series instead of 3 million raw ones.</text>
+
+</svg>
+</div>
+<figcaption>Rollups trade detail for lifetime. Store the minimum and maximum along with the average, since an average alone hides the spikes you will later want to find.</figcaption>
+</figure>
+
+<pre data-lang="sql" data-title="A typical time-series query, here in TimescaleDB’s SQL">
+SELECT time_bucket('5 minutes', recorded_at) AS bucket,
+       device_id,
+       avg(temperature) AS avg_temp,
+       max(temperature) AS max_temp
+FROM readings
+WHERE recorded_at > now() - INTERVAL '6 hours'
+GROUP BY bucket, device_id
+ORDER BY bucket;
+</pre>
+
+<h3 id="cardinality">The cardinality trap</h3>
+<p>The most common way to break a time-series database has nothing to do with the number of points. Each distinct combination of labels is a separate series. A metric labeled by host and endpoint, with 1,000 hosts and 50 endpoints, is 50,000 series. Add a label for user ID, with a million users, and it becomes 50 billion possible series, each needing its own index entry and memory. This is called a <dfn>cardinality</dfn> explosion. Labels should describe a small, bounded set of values. Anything unbounded, such as user IDs, request IDs and full URLs, belongs in logs or traces (<x-ref to="observability"></x-ref>).</p>
+
+<h3 id="ts-options">Options</h3>
+<table>
+<thead><tr><th>System</th><th>Character</th></tr></thead>
+<tbody>
+<tr><th>Prometheus</th><td>The standard for infrastructure monitoring. Collects metrics by scraping them from services, stores them locally, and is built for alerting on recent data. Long-term storage is delegated to compatible systems such as Thanos, Mimir or VictoriaMetrics.</td></tr>
+<tr><th>TimescaleDB</th><td>A PostgreSQL extension, from the company now called TigerData. Time-series tables beside ordinary relational ones, with full SQL and joins.</td></tr>
+<tr><th>InfluxDB</th><td>A dedicated time-series database. Its current generation stores data as column files in object storage.</td></tr>
+<tr><th>ClickHouse</th><td>A general column-oriented analytics database that is widely used for metrics, logs and events at very large scale</td></tr>
+</tbody>
+</table>
+<p>A plain PostgreSQL table partitioned by month, with an index on series and time, is a perfectly good time-series store for modest volumes. Move on when write volume, storage cost or query speed over long ranges says so.</p>
+
+<h2 id="geospatial">Geospatial data</h2>
+<p>“Find drivers near me” and “which delivery zone contains this address?” are questions about position. The awkwardness is that nearness is two-dimensional. An index on latitude finds everything in a horizontal band around the world, and an index on longitude a vertical one. Neither narrows the search to a neighborhood, and a B-tree can only sort by one thing. Spatial indexes solve this in one of two ways.</p>
+
+<h3 id="cells">Dividing the map into cells</h3>
+<p>Lay a grid over the world and give each cell an identifier. A point’s cell ID is an ordinary value that a B-tree or a hash can index. Finding nearby things becomes: work out which cells the search area touches, fetch what is in them, and discard anything outside the exact radius.</p>
+
+<figure class="fig wide" id="fig-geo">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f252t f252d">
+<title id="f252t">A nearby search using a grid of cells</title>
+<desc id="f252d">A grid of cells with places scattered across it. The user is near the corner of one cell. A dashed circle around the user marks the search radius and extends into neighboring cells. The search fetches every place in the user’s cell and its eight neighbors, then keeps the ones whose true distance is within the radius.</desc>
+<rect class="n" x="20" y="14" width="56" height="56" rx="0"/>
+<rect class="n sunk" x="76" y="14" width="56" height="56" rx="0"/>
+<rect class="n sunk" x="132" y="14" width="56" height="56" rx="0"/>
+<rect class="n sunk" x="188" y="14" width="56" height="56" rx="0"/>
+<rect class="n" x="244" y="14" width="56" height="56" rx="0"/>
+<rect class="n" x="20" y="70" width="56" height="56" rx="0"/>
+<rect class="n sunk" x="76" y="70" width="56" height="56" rx="0"/>
+<rect class="n sig" x="132" y="70" width="56" height="56" rx="0"/>
+<rect class="n sunk" x="188" y="70" width="56" height="56" rx="0"/>
+<rect class="n" x="244" y="70" width="56" height="56" rx="0"/>
+<rect class="n" x="20" y="126" width="56" height="56" rx="0"/>
+<rect class="n sunk" x="76" y="126" width="56" height="56" rx="0"/>
+<rect class="n sunk" x="132" y="126" width="56" height="56" rx="0"/>
+<rect class="n sunk" x="188" y="126" width="56" height="56" rx="0"/>
+<rect class="n" x="244" y="126" width="56" height="56" rx="0"/>
+<rect class="n" x="20" y="182" width="56" height="56" rx="0"/>
+<rect class="n" x="76" y="182" width="56" height="56" rx="0"/>
+<rect class="n" x="132" y="182" width="56" height="56" rx="0"/>
+<rect class="n" x="188" y="182" width="56" height="56" rx="0"/>
+<rect class="n" x="244" y="182" width="56" height="56" rx="0"/>
+<circle cx="147" cy="145" r="3.5" fill="var(--ink-3)"/>
+<circle cx="275" cy="126" r="3.5" fill="var(--ink-3)"/>
+<circle cx="162" cy="151" r="3.5" fill="var(--ink-3)"/>
+<circle cx="74" cy="135" r="3.5" fill="var(--ink-3)"/>
+<circle cx="195" cy="192" r="3.5" fill="var(--ink-3)"/>
+<circle cx="50" cy="93" r="3.5" fill="var(--ink-3)"/>
+<circle cx="49" cy="196" r="3.5" fill="var(--ink-3)"/>
+<circle cx="213" cy="40" r="3.5" fill="var(--ink-3)"/>
+<circle cx="291" cy="227" r="3.5" fill="var(--ink-3)"/>
+<circle cx="202" cy="156" r="3.5" fill="var(--ink-3)"/>
+<circle cx="67" cy="35" r="3.5" fill="var(--ink-3)"/>
+<circle cx="168" cy="44" r="3.5" fill="var(--store)"/>
+<circle cx="76" cy="81" r="3.5" fill="var(--ink-3)"/>
+<circle cx="32" cy="126" r="3.5" fill="var(--ink-3)"/>
+<circle cx="144" cy="202" r="3.5" fill="var(--ink-3)"/>
+<circle cx="165" cy="161" r="3.5" fill="var(--ink-3)"/>
+<circle cx="160" cy="166" r="3.5" fill="var(--ink-3)"/>
+<circle cx="148" cy="88" r="3.5" fill="var(--store)"/>
+<circle cx="295" cy="233" r="3.5" fill="var(--ink-3)"/>
+<circle cx="253" cy="175" r="3.5" fill="var(--ink-3)"/>
+<circle cx="110" cy="78" r="3.5" fill="var(--ink-3)"/>
+<circle cx="103" cy="46" r="3.5" fill="var(--ink-3)"/>
+<circle cx="232" cy="113" r="3.5" fill="var(--ink-3)"/>
+<circle cx="254" cy="110" r="3.5" fill="var(--ink-3)"/>
+<circle cx="285" cy="203" r="3.5" fill="var(--ink-3)"/>
+<circle cx="24" cy="74" r="3.5" fill="var(--ink-3)"/>
+<circle cx="272" cy="127" r="3.5" fill="var(--ink-3)"/>
+<circle cx="291" cy="112" r="3.5" fill="var(--ink-3)"/>
+<circle cx="44" cy="159" r="3.5" fill="var(--ink-3)"/>
+<circle cx="236" cy="86" r="3.5" fill="var(--ink-3)"/>
+<circle cx="48" cy="99" r="3.5" fill="var(--ink-3)"/>
+<circle cx="286" cy="185" r="3.5" fill="var(--ink-3)"/>
+<circle cx="56" cy="82" r="3.5" fill="var(--ink-3)"/>
+<circle cx="51" cy="44" r="3.5" fill="var(--ink-3)"/>
+<circle cx="176" cy="86" r="48" fill="none" stroke="var(--fault)" stroke-width="1.5" stroke-dasharray="4 4"/>
+<circle cx="176" cy="86" r="6" class="fill-fault" stroke="var(--surface)" stroke-width="2"/>
+<text class="ts" x="330" y="34">The user (red dot) is near a corner of the blue cell.</text>
+<text class="ts" x="330" y="52">The search circle spills into the cells above and beside it.</text>
+<text class="ts" x="330" y="88">1. Find the user’s cell and its 8 neighbors.</text>
+<text class="ts" x="330" y="106">2. Fetch every place in those 9 cells. Each is</text>
+<text class="ts" x="346" y="124">one indexed prefix lookup.</text>
+<text class="ts" x="330" y="142">3. Compute the true distance to each and keep</text>
+<text class="ts" x="346" y="160">those inside the circle.</text>
+<text class="ts" x="330" y="196">Checking only the user’s own cell would miss</text>
+<text class="ts" x="330" y="214">nearby places just across a cell boundary.</text>
+
+</svg>
+</div>
+<figcaption>Searching by cell. The grid narrows millions of places to a few dozen candidates, and an exact distance calculation finishes the job.</figcaption>
+</figure>
+
+<p>The schemes differ in how cells are shaped and named.</p>
+<table>
+<thead><tr><th>Scheme</th><th>How it works</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Geohash</th><td>Repeatedly halves the world, alternating between longitude and latitude, and writes the choices as a short string. Each extra character makes the cell smaller: six characters is roughly 1.2 km by 0.6 km.</td><td>Cells sharing a prefix are nested, so a prefix lookup finds a region. Two points either side of a cell boundary can have very different strings, which is why neighbors must be searched.</td></tr>
+<tr><th>Quadtree</th><td>Splits a square into four whenever it holds too many points, and repeats</td><td>Adapts to density: small cells in a city center, large ones over the ocean</td></tr>
+<tr><th>S2</th><td>Google’s library. Projects the sphere onto a cube and numbers cells along a curve that keeps nearby cells close in number.</td><td>Handles the whole globe without distortion at the poles</td></tr>
+<tr><th>H3</th><td>Uber’s library. Covers the globe in hexagons at sixteen resolutions.</td><td>Every neighbor of a hexagon is the same distance away, which suits movement and demand analysis</td></tr>
+</tbody>
+</table>
+
+<h3 id="rtree">Nesting boxes</h3>
+<p>The other approach is the <dfn>R-tree</dfn>, which is to rectangles what a B-tree is to numbers. Nearby objects are grouped inside a bounding rectangle, nearby rectangles inside a larger one, and so on up to a root. A search descends only into rectangles that overlap the search area. R-trees handle shapes as well as points, so they answer “which zone contains this point?” and “which roads cross this area?”. PostGIS, the spatial extension to PostgreSQL, uses this structure.</p>
+<pre data-lang="sql" data-title="Places within 2 km, nearest first, with PostGIS">
+CREATE INDEX places_location_idx ON places USING gist (location);
+
+SELECT id, name,
+       ST_Distance(location, ST_MakePoint(151.2093, -33.8688)::geography) AS meters
+FROM places
+WHERE ST_DWithin(location, ST_MakePoint(151.2093, -33.8688)::geography, 2000)
+ORDER BY meters
+LIMIT 20;
+</pre>
+<p>Two details of that query catch people out. The point is written as longitude then latitude, the reverse of how coordinates are usually spoken. And the <code>geography</code> type computes distances over the curved surface of the Earth in meters. Treating latitude and longitude as flat coordinates gives errors that grow toward the poles.</p>
+<p>For static places such as shops, a spatial index in the main database is all most products need. Things that move are a different workload. A fleet of drivers reporting position every few seconds is write-heavy, the data is worthless after a minute, and it is usually kept in memory, in a store such as Redis with its geospatial commands or in a purpose-built grid. <x-ref to="hld-ride-hailing"></x-ref> designs such a system.</p>
+
+<h2 id="graph">Graph data</h2>
+<p><x-ref to="data-models#graph"></x-ref> introduced the graph model. The reason it needs its own storage is the cost of a hop. In a relational database, following a relationship is a join, which is an index lookup whose cost grows slowly with the size of the table. A <dfn>graph database</dfn> stores, with each node, direct references to its edges and neighbors. Following an edge is a pointer dereference whose cost does not depend on how large the whole graph is. For a query that follows five or six hops through a large network, the difference is between milliseconds and minutes.</p>
+<p>SQL can express traversals with recursive queries, and for hierarchies and shallow traversals that is often enough.</p>
+<pre data-lang="sql" data-title="Everyone below a manager in an organization, without a graph database">
+WITH RECURSIVE reports AS (
+  SELECT id, name, manager_id, 1 AS depth
+  FROM employees
+  WHERE manager_id = 42
+  UNION ALL
+  SELECT e.id, e.name, e.manager_id, r.depth + 1
+  FROM employees e JOIN reports r ON e.manager_id = r.id
+  WHERE r.depth < 10
+)
+SELECT * FROM reports;
+</pre>
+<p>A dedicated graph database earns its place when traversals are deep, varied and central to the product: fraud detection that looks for rings of accounts sharing devices and cards, recommendations from paths through purchases, permission systems where access is inherited through nested groups, and knowledge graphs. Three cautions apply.</p>
+<ul>
+  <li><b>Supernodes.</b> A node with millions of edges, such as a celebrity account, makes any traversal through it explode. Queries need limits and such nodes need special handling.</li>
+  <li><b>Scaling out is hard.</b> A graph has no natural partition key. However it is cut, some traversals cross machines, and each crossing is a network round trip.</li>
+  <li><b>It is rarely the system of record.</b> Most deployments keep the authoritative data in a relational database and maintain the graph as a derived copy for the queries that need it.</li>
+</ul>
+
+<h2 id="vector">Vector data</h2>
+<p><x-ref to="search-systems#vectors"></x-ref> introduced embeddings: lists of numbers produced by a machine learning model, arranged so that similar items lie close together. A <dfn>vector database</dfn>, or a vector index inside another database, answers one question: given a query vector, which stored vectors are nearest to it? That question underlies semantic search, recommendations, duplicate and near-duplicate detection, and the retrieval step that supplies language models with relevant documents (<x-ref to="retrieval-and-vector-search"></x-ref>).</p>
+<p>“Nearest” needs a definition. The common measures are cosine similarity, which compares direction and ignores length, the dot product, and straight-line distance. Use whichever the embedding model was trained with.</p>
+<p>The obvious method compares the query with every stored vector. It is exact, and for up to some tens of thousands of vectors it is fast enough and the right choice. Beyond that it is too slow, and ordinary indexes cannot help: in hundreds of dimensions there is no ordering that keeps neighbors together. The practical answer is <dfn>approximate nearest neighbor</dfn> search, which accepts missing a few of the true nearest in exchange for speed. The fraction of true neighbors that are found is the <dfn>recall</dfn>, and every such index is a dial between recall and speed.</p>
+
+<figure class="fig wide" id="fig-ann">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f253t f253d">
+<title id="f253t">Two approximate nearest neighbor indexes: clusters and a layered graph</title>
+<desc id="f253d">Left: vectors grouped into four clusters around centers. A query point lies between two clusters, and only the vectors in those two clusters are compared with it. Right: a graph in three layers. The top layer has few points connected by long hops, the middle layer more, and the bottom layer every vector. A search path starts at the top, moves toward the query, and descends layer by layer to the nearest vector.</desc>
+<text class="tl" x="10" y="18">Clusters (IVF)</text>
+<circle cx="80" cy="80" r="46" fill="none" stroke="var(--rule-2)" stroke-dasharray="3 4"/>
+<circle cx="82" cy="104" r="3" fill="var(--ink-3)"/>
+<circle cx="62" cy="99" r="3" fill="var(--ink-3)"/>
+<circle cx="76" cy="75" r="3" fill="var(--ink-3)"/>
+<circle cx="114" cy="83" r="3" fill="var(--ink-3)"/>
+<circle cx="79" cy="92" r="3" fill="var(--ink-3)"/>
+<circle cx="101" cy="79" r="3" fill="var(--ink-3)"/>
+<circle cx="91" cy="62" r="3" fill="var(--ink-3)"/>
+<circle cx="74" cy="73" r="3" fill="var(--ink-3)"/>
+<circle cx="57" cy="54" r="3" fill="var(--ink-3)"/>
+<circle cx="50" cy="76" r="3" fill="var(--ink-3)"/>
+<circle cx="77" cy="74" r="3" fill="var(--ink-3)"/>
+<circle cx="81" cy="55" r="3" fill="var(--ink-3)"/>
+<circle cx="78" cy="85" r="3" fill="var(--ink-3)"/>
+<circle cx="94" cy="64" r="3" fill="var(--ink-3)"/>
+<circle cx="200" cy="70" r="46" fill="var(--sig-tint)" stroke="var(--rule-2)" stroke-dasharray="3 4"/>
+<circle cx="193" cy="35" r="3" fill="var(--sig)"/>
+<circle cx="192" cy="34" r="3" fill="var(--sig)"/>
+<circle cx="174" cy="90" r="3" fill="var(--sig)"/>
+<circle cx="165" cy="83" r="3" fill="var(--sig)"/>
+<circle cx="205" cy="65" r="3" fill="var(--sig)"/>
+<circle cx="208" cy="79" r="3" fill="var(--sig)"/>
+<circle cx="219" cy="66" r="3" fill="var(--sig)"/>
+<circle cx="190" cy="59" r="3" fill="var(--sig)"/>
+<circle cx="182" cy="69" r="3" fill="var(--sig)"/>
+<circle cx="185" cy="90" r="3" fill="var(--sig)"/>
+<circle cx="168" cy="52" r="3" fill="var(--sig)"/>
+<circle cx="184" cy="36" r="3" fill="var(--sig)"/>
+<circle cx="225" cy="39" r="3" fill="var(--sig)"/>
+<circle cx="195" cy="61" r="3" fill="var(--sig)"/>
+<circle cx="140" cy="170" r="46" fill="none" stroke="var(--rule-2)" stroke-dasharray="3 4"/>
+<circle cx="165" cy="140" r="3" fill="var(--ink-3)"/>
+<circle cx="160" cy="156" r="3" fill="var(--ink-3)"/>
+<circle cx="137" cy="159" r="3" fill="var(--ink-3)"/>
+<circle cx="152" cy="148" r="3" fill="var(--ink-3)"/>
+<circle cx="139" cy="176" r="3" fill="var(--ink-3)"/>
+<circle cx="164" cy="138" r="3" fill="var(--ink-3)"/>
+<circle cx="168" cy="187" r="3" fill="var(--ink-3)"/>
+<circle cx="132" cy="175" r="3" fill="var(--ink-3)"/>
+<circle cx="131" cy="200" r="3" fill="var(--ink-3)"/>
+<circle cx="144" cy="166" r="3" fill="var(--ink-3)"/>
+<circle cx="136" cy="166" r="3" fill="var(--ink-3)"/>
+<circle cx="137" cy="154" r="3" fill="var(--ink-3)"/>
+<circle cx="169" cy="143" r="3" fill="var(--ink-3)"/>
+<circle cx="100" cy="169" r="3" fill="var(--ink-3)"/>
+<circle cx="270" cy="160" r="46" fill="var(--sig-tint)" stroke="var(--rule-2)" stroke-dasharray="3 4"/>
+<circle cx="268" cy="166" r="3" fill="var(--sig)"/>
+<circle cx="266" cy="157" r="3" fill="var(--sig)"/>
+<circle cx="276" cy="178" r="3" fill="var(--sig)"/>
+<circle cx="263" cy="154" r="3" fill="var(--sig)"/>
+<circle cx="304" cy="169" r="3" fill="var(--sig)"/>
+<circle cx="255" cy="195" r="3" fill="var(--sig)"/>
+<circle cx="284" cy="149" r="3" fill="var(--sig)"/>
+<circle cx="248" cy="166" r="3" fill="var(--sig)"/>
+<circle cx="254" cy="140" r="3" fill="var(--sig)"/>
+<circle cx="245" cy="150" r="3" fill="var(--sig)"/>
+<circle cx="291" cy="152" r="3" fill="var(--sig)"/>
+<circle cx="243" cy="173" r="3" fill="var(--sig)"/>
+<circle cx="271" cy="175" r="3" fill="var(--sig)"/>
+<circle cx="293" cy="157" r="3" fill="var(--sig)"/>
+<circle cx="236" cy="116" r="6" class="fill-fault" stroke="var(--surface)" stroke-width="2"/>
+<text class="ts" x="246" y="108">query</text>
+<text class="ts" x="10" y="236">Vectors are grouped around centers in advance.</text>
+<text class="ts" x="10" y="252">A query is compared only with vectors in the</text>
+<text class="ts" x="10" y="268">nearest few groups, shaded here.</text>
+<path class="e none dash" d="M360 8V282"/>
+<text class="tl" x="380" y="18">Layered graph (HNSW)</text>
+<line class="axis" x1="390" y1="44" x2="700" y2="44"/>
+<circle cx="400" cy="44" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="560" cy="44" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="680" cy="44" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<line class="axis" x1="390" y1="104" x2="700" y2="104"/>
+<circle cx="400" cy="104" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="470" cy="104" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="560" cy="104" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="620" cy="104" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="680" cy="104" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<line class="axis" x1="390" y1="170" x2="700" y2="170"/>
+<circle cx="400" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="435" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="470" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="515" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="560" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="590" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="620" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="650" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<circle cx="680" cy="170" r="5" fill="var(--ink-3)" stroke="var(--surface)" stroke-width="1.5"/>
+<path class="e sig" d="M400 44 L560 44 L560 104 L620 104 L620 170 L650 170"/>
+<circle cx="650" cy="170" r="6" class="fill-fault" stroke="var(--surface)" stroke-width="2"/>
+<text class="ts mid" x="650" y="192">nearest</text>
+<text class="ts" x="390" y="36">top layer: few points, long hops</text>
+<text class="ts" x="390" y="96">middle layer</text>
+<text class="ts" x="390" y="162">bottom layer: every vector, short hops</text>
+<text class="ts" x="380" y="236">Search starts at the top, moves to the neighbor closest to</text>
+<text class="ts" x="380" y="252">the query, and drops a layer when no neighbor is closer.</text>
+<text class="ts" x="380" y="268">A few dozen comparisons instead of millions.</text>
+
+</svg>
+</div>
+<figcaption>Two ways to avoid comparing against everything. Both find most of the true nearest neighbors, most of the time, at a small fraction of the cost.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Index</th><th>Idea</th><th>Strength</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>Exact scan</th><td>Compare with everything</td><td>Perfect recall, no index to build</td><td>Cost grows in step with the data</td></tr>
+<tr><th>IVF (inverted file)</th><td>Group vectors into clusters, and search only the clusters nearest the query</td><td>Compact. Fast to build.</td><td>Recall drops for queries near cluster boundaries unless more clusters are searched</td></tr>
+<tr><th>HNSW (hierarchical navigable small world)</th><td>A layered graph linking each vector to its near neighbors. Search hops greedily toward the query.</td><td>The best trade of recall for speed in most benchmarks. The usual default.</td><td>The graph is large and lives in memory. Slow to build.</td></tr>
+<tr><th>Quantization</th><td>Store each vector in compressed form: fewer bits per number, or a short code</td><td>Cuts memory by 4 to 30 times or more</td><td>Loses precision. Usually combined with a re-check of the top results against the full vectors.</td></tr>
+</tbody>
+</table>
+<p>Memory is the practical constraint, and the arithmetic is worth doing early. A vector of 1,536 numbers at 4 bytes each is about 6 KB. Ten million of them are 61 GB before any index is added. Storing each number in one byte reduces that to 15 GB, and one bit per number to under 2 GB, at a cost in accuracy.</p>
+<pre data-lang="sql" data-title="Vector search inside PostgreSQL with the pgvector extension">
+CREATE EXTENSION vector;
+
+CREATE TABLE photo_embeddings (
+  photo_id  BIGINT PRIMARY KEY REFERENCES photos (id),
+  embedding vector(1536) NOT NULL
+);
+
+CREATE INDEX ON photo_embeddings USING hnsw (embedding vector_cosine_ops);
+
+-- The 10 photos most similar to a query vector, among one user's photos
+SELECT p.id, p.caption
+FROM photo_embeddings e JOIN photos p ON p.id = e.photo_id
+WHERE p.owner_id = 42
+ORDER BY e.embedding <=> $1
+LIMIT 10;
+</pre>
+<p>That query hides the hardest problem in vector search, which is <dfn>filtering</dfn>. Real queries are rarely “the nearest vectors overall”. They are “the nearest among this user’s documents”, or “among products in stock under 50”. Filtering after the vector search can leave too few results, since the nearest ten may all belong to other users. Filtering before it may defeat the index. How well a system combines the two is one of the main differences between products, and something to test with your own data.</p>
+
+<h3 id="vector-options">Options</h3>
+<table>
+<thead><tr><th>Option</th><th>When it fits</th></tr></thead>
+<tbody>
+<tr><th>An extension to your database, such as pgvector</th><td>Up to millions of vectors. Filters, joins and transactions with the rest of your data, and nothing new to operate. The right place to start.</td></tr>
+<tr><th>Your search engine</th><td>You already run Elasticsearch or OpenSearch and want hybrid keyword and vector search in one query</td></tr>
+<tr><th>A dedicated vector database, such as Qdrant, Milvus, Weaviate or Pinecone</th><td>Hundreds of millions of vectors or more, high query rates, or advanced filtering and quantization</td></tr>
+<tr><th>Vectors in object storage</th><td>Very large, rarely queried collections where cost matters more than latency. Amazon S3 now offers this natively.</td></tr>
+</tbody>
+</table>
+<p>Embeddings are derived data. They are computed from the original text or image by a particular model, and if you change the model, every vector must be recomputed, because vectors from different models cannot be compared. Keep the source data and a record of which model produced each embedding.</p>
+
+<h2 id="others">Other specialized stores</h2>
+<p>For completeness, a few other families and where this book covers them.</p>
+<table>
+<thead><tr><th>Family</th><th>Built for</th><th>Covered in</th></tr></thead>
+<tbody>
+<tr><th>Search engines</th><td>Text relevance</td><td><x-ch to="search-systems"></x-ch></td></tr>
+<tr><th>Column-oriented warehouses</th><td>Analytical scans</td><td><x-ch to="data-models"></x-ch> and <x-ch to="batch-and-stream-processing"></x-ch></td></tr>
+<tr><th>Event logs</th><td>Ordered, replayable streams of events</td><td><x-ch to="event-streaming"></x-ch></td></tr>
+<tr><th>Coordination stores</th><td>Small, strongly consistent configuration and locks</td><td><x-ch to="membership-and-coordination"></x-ch></td></tr>
+<tr><th>Embedded databases</th><td>A database inside the application process, with no server: SQLite for transactions, DuckDB for analytics</td><td>Here. Often the right answer for single-machine tools, mobile apps and tests.</td></tr>
+<tr><th>Ledger databases</th><td>Append-only records with cryptographic proof that history was not altered</td><td><x-ch to="hld-payments"></x-ch></td></tr>
+</tbody>
+</table>
+
+<h2 id="choosing">Extension or dedicated system?</h2>
+<p>Each of the four workloads can be served by an extension to a database you already run, or by a separate system built for it.</p>
+<table>
+<thead><tr><th>Workload</th><th>Inside PostgreSQL</th><th>Signs you have outgrown it</th></tr></thead>
+<tbody>
+<tr><th>Time series</th><td>Partitioned tables, or TimescaleDB</td><td>Sustained ingestion beyond what one node writes. Storage cost dominated by history. Long-range queries too slow.</td></tr>
+<tr><th>Geospatial</th><td>PostGIS</td><td>Constantly moving objects at high update rates. Global scale with strict latency.</td></tr>
+<tr><th>Graph</th><td>Recursive queries, or the Apache AGE extension</td><td>Deep traversals in the request path. Graph algorithms over the whole data set.</td></tr>
+<tr><th>Vector</th><td>pgvector</td><td>Index no longer fits in memory. Vector queries slowing transactional ones. Recall or filtering needs you cannot meet.</td></tr>
+</tbody>
+</table>
+<p>The extension keeps the data in one place. It shares transactions, joins, backups, access control and operational knowledge with everything else, and there is nothing to synchronize. A dedicated system does its one job better and adds a system to run, a copy of the data to keep in step, and a new set of failure modes. The questions from <x-ref to="schema-design#denormalization"></x-ref> return: which copy is the truth, how the copy is kept current, and how it is rebuilt.</p>
+<p>The reasonable order is to start with the extension, measure, and move the one workload that has outgrown it. A specialized store adopted for a problem you do not yet have is cost without benefit.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Name the specialized structure when the question calls for it, with the reason: “nearby search needs a spatial index, so a geohash prefix or PostGIS”, “metrics are append-only and read as aggregates, so a time-series store with rollups”, “similarity over embeddings, so an HNSW index”. Then say where the source of truth is. Interviewers are checking that you know the default stops fitting, and that you know what replaces it.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Adopting a specialized database before trying an extension</b> to the one you have.</li>
+  <li><b>Unbounded labels</b> on time-series metrics.</li>
+  <li><b>Keeping only averages</b> in rollups, and losing every spike.</li>
+  <li><b>Separate indexes on latitude and longitude</b> for nearby searches.</li>
+  <li><b>Searching only the user’s own cell</b> and missing neighbors across the boundary.</li>
+  <li><b>Flat-plane distance on latitude and longitude</b>, and swapping their order.</li>
+  <li><b>A graph database for single-hop lookups.</b></li>
+  <li><b>An approximate vector index over a few thousand vectors</b>, where an exact scan is faster and perfectly accurate.</li>
+  <li><b>Not measuring recall</b>, so nobody knows what the approximate index is missing.</li>
+  <li><b>Mixing embeddings from different models</b> in one index.</li>
+  <li><b>Treating any of these stores as the source of truth</b> without a way to rebuild it.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="data-models"></x-ref>: the general models these stores specialize.</li>
+  <li><x-ref to="storage-engines"></x-ref>: column layout and compression, which time-series stores depend on.</li>
+  <li><x-ref to="search-systems"></x-ref>: hybrid keyword and vector search.</li>
+  <li><x-ref to="observability"></x-ref>: metrics, the largest use of time-series databases.</li>
+  <li><x-ref to="hld-ride-hailing"></x-ref> and <x-ref to="hld-metrics-and-logging"></x-ref>: designs centered on geospatial and time-series data.</li>
+  <li><x-ref to="retrieval-and-vector-search"></x-ref>: vector search in AI systems.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Specialized stores exist for workloads whose questions do not fit one ordered dimension, or whose volume rewards a dedicated layout.</li>
+  <li>Time-series stores partition by time, compress by column and downsample old data. Keep label cardinality bounded.</li>
+  <li>Geospatial indexes map two dimensions onto cells (geohash, S2, H3) or nested rectangles (R-trees). Search neighboring cells, then check exact distance.</li>
+  <li>Graph databases make each hop cheap by storing direct links. They pay off for deep, varied traversals.</li>
+  <li>Vector indexes find approximate nearest neighbors, trading recall for speed. HNSW is the usual default, memory is the constraint and filtering is the hard part.</li>
+  <li>Start with an extension to your main database. Move a workload to a dedicated system when measurements show it has outgrown the extension.</li>
+  <li>Specialized stores usually hold derived data. Keep the source of truth elsewhere and be able to rebuild.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A metrics system slows down and runs out of memory after a developer adds a <code>customer_id</code> label to a request counter. Why?</summary><p>Every distinct combination of label values is a separate time series with its own index entry and memory. A label with one value per customer multiplies the number of series by the number of customers. Remove the label and record per-customer detail in logs or traces instead.</p></details>
+<details><summary>Why does a rollup store the minimum and maximum as well as the average?</summary><p>An average over five minutes hides short spikes: one second at 100% CPU and the rest at 10% averages to a little over 10%. The maximum preserves the fact that the spike happened, which is usually what you are looking for later.</p></details>
+<details><summary>A nearby search looks up only the grid cell containing the user and sometimes misses a shop 50 meters away. What is wrong?</summary><p>The shop is in an adjacent cell, just across the boundary. The search must also fetch the neighboring cells that the search radius reaches, then filter the candidates by true distance.</p></details>
+<details><summary>Your product has 20,000 documents to search by embedding. Should you build an HNSW index?</summary><p>Probably not. Comparing a query against 20,000 vectors exactly takes a few milliseconds and returns perfect results. An approximate index adds build time, memory and a loss of recall to solve a speed problem you do not have.</p></details>
+<details><summary>A vector search for “the ten most similar documents this user can access” returns only two results, although the user can access thousands. What is the likely cause?</summary><p>The filter is applied after the vector search. The index returned its ten nearest overall, and only two of them belonged to this user. The filter needs to be applied during the search, or the search asked for many more candidates before filtering.</p></details>
+<details><summary>You switch to a newer embedding model. What has to happen to the existing vectors?</summary><p>All of them must be recomputed from the original content with the new model, and the index rebuilt. Vectors from different models live in unrelated spaces, so distances between them mean nothing.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Tuomas Pelkonen and others, <a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Gorilla: A Fast, Scalable, In-Memory Time Series Database</a>, VLDB 2015. The compression scheme and the 1.37 bytes per point.</li>
+  <li>Prometheus documentation, <a href="https://prometheus.io/docs/practices/naming/">Metric and label naming</a>. The warning about label cardinality.</li>
+  <li>TigerData, <a href="https://www.tigerdata.com/blog/timescale-becomes-tigerdata">Timescale becomes TigerData</a>, 2025, and the <a href="https://github.com/timescale/timescaledb">TimescaleDB repository</a>.</li>
+  <li><a href="https://postgis.net/documentation/">PostGIS documentation</a>. Spatial types, indexes and functions.</li>
+  <li>Uber, <a href="https://h3geo.org/docs/">H3 documentation</a>, and Google, <a href="https://s2geometry.io/">S2 Geometry</a>.</li>
+  <li>Antonin Guttman, <a href="https://dl.acm.org/doi/10.1145/602259.602266">R-trees: A Dynamic Index Structure for Spatial Searching</a>, SIGMOD 1984.</li>
+  <li>Yu. A. Malkov and D. A. Yashunin, <a href="https://arxiv.org/abs/1603.09320">Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs</a>, 2016.</li>
+  <li><a href="https://github.com/pgvector/pgvector">pgvector</a>. Index types, operators and limits.</li>
+  <li>Ian Robinson, Jim Webber and Emil Eifrem, <i>Graph Databases</i> (O’Reilly). Free from Neo4j.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html">Working with S3 Vectors and vector buckets</a>.</li>
+</ol>
+</section>

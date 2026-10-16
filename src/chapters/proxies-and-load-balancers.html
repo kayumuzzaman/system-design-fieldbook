@@ -1,0 +1,522 @@
+<!--meta
+{ "description": "Forward and reverse proxies, layer 4 and layer 7 load balancing, balancing algorithms compared by simulation, health checks, connection draining, session affinity, making the load balancer itself highly available, and what an API gateway adds.",
+  "lede": "Almost every request in a large system passes through a program whose only job is to pass it on. These intermediaries decide which server does the work, hide failures from clients, and let you change what is behind them without anyone noticing. This chapter explains how they work, how they fail, and the details that cause most of the trouble in practice.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="proxies">Programs that stand in the middle</h2>
+<p>A <dfn>proxy</dfn> is a program that receives a request and makes a request of its own on behalf of whoever sent the first one. It is a client to one side and a server to the other. Which side it works for gives the two kinds their names.</p>
+
+<figure class="fig wide" id="fig-forward-reverse">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 176" role="img" aria-labelledby="f131t f131d">
+<title id="f131t">A forward proxy compared with a reverse proxy</title>
+<desc id="f131d">On the left, a forward proxy sits inside the clients’ network. Clients send requests to it and it contacts outside sites for them, so a site sees only the proxy. On the right, a reverse proxy sits inside the servers’ network. Outside clients connect to it and it passes requests to servers behind it, so a client sees only the proxy.</desc>
+<text class="tl" x="10" y="20">Forward proxy: acts for the clients</text>
+<rect class="grp" x="10" y="48" width="226" height="84" rx="8"/><text class="ts" x="18" y="43">the clients’ network</text>
+<rect class="n" x="22" y="68" width="80" height="44" rx="6"/><text class="tb mid" x="62" y="95">Clients</text>
+<rect class="n sig" x="144" y="68" width="80" height="44" rx="6"/><text class="tb mid" x="184" y="95">Proxy</text>
+<rect class="n" x="268" y="68" width="80" height="44" rx="6"/><text class="tb mid" x="308" y="95">Any site</text>
+<path class="e sig" d="M102 90H144"/><path class="e sig" d="M224 90H268"/>
+<text class="ts" x="10" y="160">The site sees the proxy’s address, not the client’s.</text>
+<path class="e none dash" d="M364 8V168"/>
+<text class="tl" x="380" y="20">Reverse proxy: acts for the servers</text>
+<rect class="n" x="380" y="68" width="84" height="44" rx="6"/><text class="tb mid" x="422" y="95">Any client</text>
+<rect class="grp" x="492" y="48" width="218" height="84" rx="8"/><text class="ts" x="500" y="43">the servers’ network</text>
+<rect class="n sig" x="504" y="68" width="80" height="44" rx="6"/><text class="tb mid" x="544" y="95">Proxy</text>
+<rect class="n" x="622" y="58" width="76" height="28" rx="5"/><text class="ts mid" x="660" y="77">Server 1</text>
+<rect class="n" x="622" y="94" width="76" height="28" rx="5"/><text class="ts mid" x="660" y="113">Server 2</text>
+<path class="e sig" d="M464 90H504"/><path class="e sig" d="M584 84 622 73"/><path class="e sig" d="M584 96 622 107"/>
+<text class="ts" x="380" y="160">The client sees the proxy’s address, not the servers’.</text>
+</svg>
+</div>
+<figcaption>The same mechanism pointed in opposite directions. A forward proxy is configured by the people who run the clients. A reverse proxy is configured by the people who run the servers.</figcaption>
+</figure>
+
+<p>A <dfn>forward proxy</dfn> sits with the clients and makes outbound requests for them. Companies use one to filter and log what leaves their network. In system design it appears as an <dfn>egress proxy</dfn>: all outbound calls from your services pass through one place that enforces a list of allowed destinations. That gives you a single, auditable exit and a stable source address to give to partners who restrict access by IP.</p>
+<p>A <dfn>reverse proxy</dfn> sits with the servers and accepts inbound requests for them. Clients believe they are talking to the application. This is the kind that matters for most of this book, because it is a natural place to put everything that should happen to every request:</p>
+<ul>
+  <li><b>Load balancing</b>: choosing which of many servers handles each request.</li>
+  <li><b>TLS termination</b>: holding the certificates and doing the encryption (<x-ref to="http-and-tls#termination"></x-ref>).</li>
+  <li><b>Routing</b>: sending <code>/api</code> to one service and <code>/images</code> to another.</li>
+  <li><b>Caching and compression</b> of responses.</li>
+  <li><b>Protection</b>: limiting request rates and sizes, and keeping malformed traffic away from the application.</li>
+  <li><b>Hiding the layout</b>: servers can be added, moved or replaced, and the address clients use never changes.</li>
+</ul>
+<p>The names in this chapter (reverse proxy, load balancer, API gateway, ingress controller, service mesh sidecar) describe roles, and one piece of software often plays several. NGINX, HAProxy and Envoy can each act as any of them. Learn the roles and the vocabulary will stop being confusing.</p>
+
+<h2 id="why">What a load balancer is for</h2>
+<p><x-ref to="scalability"></x-ref> scaled the photo app by running many identical servers. A <dfn>load balancer</dfn> is what makes many servers look like one. It does four jobs, and spreading load is only the first.</p>
+<ol>
+  <li><b>Spread work</b> so that no server is overloaded while others are idle.</li>
+  <li><b>Hide failures</b> by noticing dead or sick servers and sending work elsewhere.</li>
+  <li><b>Allow change</b> by taking servers out of rotation gracefully, so deployments and scaling events do not drop requests.</li>
+  <li><b>Provide one stable address</b> in front of a set of servers that changes constantly.</li>
+</ol>
+<p>The second and third jobs are where designs succeed or fail. A balancer that distributes load perfectly and handles failure badly will cause outages. One that distributes load crudely and handles failure well will not.</p>
+
+<h2 id="l4-l7">Layer 4 and layer 7</h2>
+<p>Load balancers are classified by the layer of the network stack at which they make decisions (the layers are in <x-ref to="ip-and-routing#layers"></x-ref>). The two that matter are layer 4, the transport layer, and layer 7, the application layer.</p>
+
+<figure class="fig wide" id="fig-l4-l7">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f132t f132d">
+<title id="f132t">How a layer 4 balancer and a layer 7 balancer treat the same traffic</title>
+<desc id="f132d">A layer 4 balancer reads only addresses and ports, picks a server when a connection opens and passes every byte of that connection to the same server without looking inside. A layer 7 balancer ends the client’s connection and its TLS, reads each HTTP request, and sends each one to a server chosen by its content, for example image requests to one service and API requests to another, over separate connections of its own.</desc>
+<text class="tl" x="10" y="20">Layer 4: passes connections along</text>
+<rect class="n" x="10" y="36" width="90" height="50" rx="6"/><text class="tb mid" x="55" y="66">Client</text>
+<rect class="n sig" x="270" y="36" width="180" height="50" rx="6"/><text class="tb mid" x="360" y="57">Layer 4 balancer</text><text class="ts mid" x="360" y="74">reads addresses and ports</text>
+<rect class="n" x="620" y="36" width="90" height="50" rx="6"/><text class="tb mid" x="665" y="66">Server</text>
+<path class="e store" d="M100 61H270"/><text class="ts mid" x="185" y="52">one TCP connection</text>
+<path class="e store" d="M450 61H620"/><text class="ts mid" x="535" y="52">the same bytes, unread</text>
+<text class="tl" x="10" y="134">Layer 7: reads requests and makes its own</text>
+<rect class="n" x="10" y="156" width="90" height="50" rx="6"/><text class="tb mid" x="55" y="186">Client</text>
+<rect class="n sig" x="270" y="156" width="180" height="50" rx="6"/><text class="tb mid" x="360" y="177">Layer 7 balancer</text><text class="ts mid" x="360" y="194">reads every HTTP request</text>
+<rect class="n" x="620" y="146" width="90" height="30" rx="5"/><text class="ts mid" x="665" y="166">Image service</text>
+<rect class="n" x="620" y="188" width="90" height="30" rx="5"/><text class="ts mid" x="665" y="208">API service</text>
+<path class="e store" d="M100 181H270"/><text class="ts mid" x="185" y="172">connection and TLS end here</text>
+<path class="e sig" d="M450 174 620 162"/><text class="ts mid" x="535" y="156">/img/…</text>
+<path class="e sig" d="M450 190 620 202"/><text class="ts mid" x="535" y="216">/api/…</text>
+</svg>
+</div>
+<figcaption>A layer 4 balancer chooses once per connection and cannot see what is inside. A layer 7 balancer is a full participant in HTTP, so it can choose per request and by content.</figcaption>
+</figure>
+
+<p>A <dfn>layer 4 load balancer</dfn> works with TCP connections and UDP packets. When a connection arrives it picks a server, and from then on it forwards that connection’s packets to the same server. It never interprets the bytes. That makes it fast and cheap per connection, and it works for any protocol: HTTP, database traffic, game traffic, anything.</p>
+<p>A <dfn>layer 7 load balancer</dfn> is a reverse proxy that understands the application protocol, almost always HTTP. It accepts the client’s connection, completes the TLS handshake, reads each request, and then makes its own request to a server over a separate connection. Because it sees requests, it can route by host name, path, header or cookie, retry a failed request on another server, add headers, and record a metric for every request.</p>
+<table>
+<thead><tr><th></th><th>Layer 4</th><th>Layer 7</th></tr></thead>
+<tbody>
+<tr><th>Unit it balances</th><td>Connections or packets</td><td>Individual requests</td></tr>
+<tr><th>What it can see</th><td>IP addresses, ports, protocol</td><td>URL, method, headers, cookies, body</td></tr>
+<tr><th>Routing by content</th><td>No</td><td>Yes</td></tr>
+<tr><th>TLS</th><td>Usually passed through untouched</td><td>Terminated here</td></tr>
+<tr><th>Cost per unit of traffic</th><td>Very low</td><td>Higher: parsing, encryption, two connections</td></tr>
+<tr><th>Protocols</th><td>Anything over TCP or UDP</td><td>HTTP, gRPC, WebSocket</td></tr>
+<tr><th>Retries, rewriting, per-request metrics</th><td>No</td><td>Yes</td></tr>
+<tr><th>Examples</th><td>AWS Network Load Balancer, IPVS, Maglev, Katran</td><td>AWS Application Load Balancer, NGINX, HAProxy, Envoy</td></tr>
+</tbody>
+</table>
+<p>The weakness of layer 4 is that it balances connections, and connections are not equal. Modern clients keep connections open and reuse them. One connection may carry a single request, and another may carry ten thousand. With HTTP/2 and gRPC, a calling service typically opens one connection and sends everything over it, so a layer 4 balancer sends all of that caller’s traffic to one server. The <a href="#http2">section on HTTP/2</a> below returns to this.</p>
+<p>The rule of thumb: use layer 7 for HTTP traffic unless you have a reason not to, because per-request balancing, routing and retries are worth the cost. Use layer 4 for other protocols, for extreme volume, or as a first tier in front of the layer 7 proxies themselves.</p>
+
+<h2 id="algorithms">Choosing a server</h2>
+<p>Given a request and a list of healthy servers, which one gets it? The common algorithms differ in how much they know about the servers’ current state.</p>
+<table>
+<thead><tr><th>Algorithm</th><th>How it chooses</th><th>Good at</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>Round robin</th><td>Each server in turn</td><td>Simple, even counts, no state to share</td><td>Ignores how busy servers are and how expensive requests are</td></tr>
+<tr><th>Weighted round robin</th><td>In turn, in proportion to assigned weights</td><td>Servers of different sizes, and shifting a small share of traffic to a new version</td><td>Weights are set by hand and go stale</td></tr>
+<tr><th>Random</th><td>Any server, by chance</td><td>Nothing to coordinate</td><td>Uneven in the short run</td></tr>
+<tr><th>Least connections</th><td>The server with the fewest requests in progress</td><td>Requests of very different cost, and long-lived connections</td><td>Needs an accurate count, and can flood a new or broken server</td></tr>
+<tr><th>Two random choices</th><td>Pick two at random, send to the less busy</td><td>Nearly as good as least connections, with far less coordination</td><td>Slightly worse than a perfect global view</td></tr>
+<tr><th>Hashing</th><td>Hash a key such as the user ID or URL to pick a server</td><td>Sending the same key to the same server, which keeps caches warm</td><td>Popular keys overload their server</td></tr>
+<tr><th>Latency-aware</th><td>Favor servers that have been answering fastest</td><td>Servers that differ in speed, or that sit in different regions</td><td>Can oscillate, and a server that fails fast looks attractive</td></tr>
+</tbody>
+</table>
+<p>How much do they differ? I simulated 20 servers at 80% utilization, with requests arriving at random and service times that vary. The setup is the same as the queueing model in <x-ref to="latency-and-throughput#saturation"></x-ref>.</p>
+
+<figure class="fig wide" id="fig-algorithms">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f133t f133d">
+<title id="f133t">Response time under four load balancing algorithms, from a simulation</title>
+<desc id="f133d">A bar chart of average and 99th percentile response time, in multiples of the average service time, for 20 servers at 80 percent utilization. Random: average 5.0, 99th percentile 23.2. Round robin: 2.8 and 12.7. Two random choices: 2.1 and 7.8. Least connections: 1.2 and 5.2.</desc>
+<line class="grid" x1="190" y1="34" x2="190" y2="244"/>
+<text class="ts mid" x="190" y="260">0</text>
+<line class="grid" x1="288" y1="34" x2="288" y2="244"/>
+<text class="ts mid" x="288" y="260">5</text>
+<line class="grid" x1="386" y1="34" x2="386" y2="244"/>
+<text class="ts mid" x="386" y="260">10</text>
+<line class="grid" x1="484" y1="34" x2="484" y2="244"/>
+<text class="ts mid" x="484" y="260">15</text>
+<line class="grid" x1="582" y1="34" x2="582" y2="244"/>
+<text class="ts mid" x="582" y="260">20</text>
+<line class="grid" x1="680" y1="34" x2="680" y2="244"/>
+<text class="ts mid" x="680" y="260">25</text>
+<rect class="bar" x="190" y="10" width="12" height="12" rx="2"/>
+<text class="ts" x="208" y="21">average</text>
+<rect class="bar async" x="280" y="10" width="12" height="12" rx="2"/>
+<text class="ts" x="298" y="21">99th percentile (the slowest 1 in 100)</text>
+<text class="tb end" x="178" y="58">Random</text>
+<text class="ts end" x="178" y="75">ignores load</text>
+<path class="bar" d="M190 44h94.0a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-94.0z"/>
+<text class="ts" x="295" y="56">5.0</text>
+<path class="bar async" d="M190 62h450.7a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-450.7z"/>
+<text class="ts" x="652" y="74">23.2</text>
+<text class="tb end" x="178" y="108">Round robin</text>
+<text class="ts end" x="178" y="125">takes turns</text>
+<path class="bar" d="M190 94h50.5a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-50.5z"/>
+<text class="ts" x="251" y="106">2.8</text>
+<path class="bar async" d="M190 112h244.9a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-244.9z"/>
+<text class="ts" x="446" y="124">12.7</text>
+<text class="tb end" x="178" y="158">Two random choices</text>
+<text class="ts end" x="178" y="175">less busy of two</text>
+<path class="bar" d="M190 144h36.2a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-36.2z"/>
+<text class="ts" x="237" y="156">2.1</text>
+<path class="bar async" d="M190 162h148.9a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-148.9z"/>
+<text class="ts" x="350" y="174">7.8</text>
+<text class="tb end" x="178" y="208">Least connections</text>
+<text class="ts end" x="178" y="225">least busy of all</text>
+<path class="bar" d="M190 194h18.7a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-18.7z"/>
+<text class="ts" x="220" y="206">1.2</text>
+<path class="bar async" d="M190 212h97.9a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-97.9z"/>
+<text class="ts" x="299" y="224">5.2</text>
+<line class="axis" x1="190" y1="34" x2="190" y2="244"/>
+<text class="ts" x="190" y="280">Response time, in multiples of the average time a request takes to serve</text>
+
+<rect class="hit" x="6" y="40" width="708" height="42" data-tip="Random|average: 5.0 times the service time|99th percentile: 23.2 times"/>
+<rect class="hit" x="6" y="90" width="708" height="42" data-tip="Round robin|average: 2.8 times the service time|99th percentile: 12.7 times"/>
+<rect class="hit" x="6" y="140" width="708" height="42" data-tip="Two random choices|average: 2.1 times the service time|99th percentile: 7.8 times"/>
+<rect class="hit" x="6" y="190" width="708" height="42" data-tip="Least connections|average: 1.2 times the service time|99th percentile: 5.2 times"/>
+</svg>
+</div>
+<figcaption>My own simulation: 20 servers at 80% utilization, 600,000 requests, random arrivals, exponentially distributed service times, and a single balancer with perfect knowledge. A value of 1.0 would mean no waiting at all. Real systems will differ in the numbers and agree on the order.</figcaption>
+</figure>
+
+<p>Three lessons come out of this.</p>
+<ul>
+  <li><b>Knowing anything about load helps a great deal.</b> Random assignment leaves some servers with queues while others sit idle. Its 99th percentile is more than four times that of least connections, on the same hardware and the same traffic.</li>
+  <li><b>Two random choices get most of the benefit.</b> Checking two servers and taking the less busy cuts the tail to a third of the random value. Checking all twenty does better still, by a smaller step.</li>
+  <li><b>Round robin is better than random</b>, because taking turns spaces out the arrivals at each server. It still cannot react to a server that is slow or to a request that is expensive.</li>
+</ul>
+<aside class="sn"><b>Why two choices are used in practice</b>Least connections looks best in a simulation with one balancer that knows everything. Real systems have many balancers, each with a partial and slightly stale view. If all of them send to the server that looked emptiest a moment ago, they overload it together. Choosing between two random candidates avoids that herd, which is why Envoy’s least-request policy and NGINX’s <code>random two</code> work this way.</aside>
+
+<h3 id="hashing">Hashing, and why it needs to be consistent</h3>
+<p>Sometimes the goal is not even load but repeatability: the same user or the same URL should reach the same server, because that server has the relevant data cached in memory. Hashing a key and taking the remainder after dividing by the number of servers achieves this, until the number of servers changes. Then almost every key maps to a different server and every cache goes cold at once.</p>
+<p><dfn>Consistent hashing</dfn> is a family of schemes in which adding or removing one server out of <i>n</i> moves only about 1/<i>n</i> of the keys. Layer 4 balancers also rely on it so that every balancer in a fleet independently sends a given connection to the same server. Google’s Maglev is the best-known design. The technique matters even more for data storage, and <x-ref to="partitioning"></x-ref> explains it in full.</p>
+
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Least connections has a dangerous failure mode. A server that is broken and returns errors instantly finishes its requests faster than healthy servers, so it always has the fewest in progress, and the balancer sends it more and more traffic. One bad server can absorb most requests this way. The defense is to judge servers by errors as well as by load, which is the subject of the next section.</p></div>
+
+<h2 id="health">Health checks</h2>
+<p>A balancer can only hide failures it knows about. There are two ways it finds out.</p>
+<p><b>Active checks.</b> The balancer sends each server a probe on a timer, usually an HTTP request to a path such as <code>/healthz</code>, and expects a <code>200</code> within a time limit. Several consecutive failures mark the server unhealthy, and several successes bring it back. The thresholds prevent one lost packet from removing a server.</p>
+<p><b>Passive checks.</b> The balancer watches real traffic. A server that returns too many errors or timeouts is ejected for a while, then cautiously tried again. Envoy calls this <dfn>outlier detection</dfn>.</p>
+<p>Use both. Active checks find a dead server even when there is no traffic, and detect it slowly: the time to notice is the interval multiplied by the failure threshold. With the Application Load Balancer’s defaults of a 30-second interval and 2 failures, a server can be dead for up to a minute while still receiving requests. Passive checks react within a few requests, and they catch a server that answers its health probe correctly while failing real work.</p>
+
+<h3 id="health-design">What the health endpoint should check</h3>
+<p>This looks like a detail and is one of the more consequential decisions in the chapter. It helps to separate two questions that are often merged.</p>
+<ul>
+  <li><b>Liveness</b>: is this process broken in a way that only a restart will fix? The response to failure is to kill and replace it.</li>
+  <li><b>Readiness</b>: should this instance receive traffic right now? It may be starting up, warming a cache, or shutting down. The response is to stop routing to it and leave it alone.</li>
+</ul>
+<p>The tempting design is a <dfn>deep health check</dfn> that tests everything the server depends on: the database, the cache, other services. Consider what happens when the database has a 30-second problem. Every server’s check fails at the same moment. The balancer now sees no healthy servers, and what could have been 30 seconds of slow requests becomes a full outage, followed by a rush as every server returns at once.</p>
+<p>A sounder rule is that a health check should report on the instance and nothing shared. Check that the process is up, has loaded its configuration, and can do its own work. A failure of a shared dependency is not something removing one server can fix, so handle it in the request path with timeouts and fallbacks (<x-ref to="resilience-patterns"></x-ref>).</p>
+<p>Balancers defend against this pattern by <dfn>failing open</dfn>: when all or most servers look unhealthy, they conclude that the health information is more likely wrong than the whole fleet, and send traffic anyway. AWS load balancers route to all targets when none pass their checks. Envoy does the same when fewer than half are healthy, by default, and calls it panic mode. Know which behavior your balancer has, because it decides what a bad health check does to you.</p>
+<div class="note production"><p><span class="label">In production.</span> Health checks create load of their own. With 10 balancer nodes checking 500 servers every 5 seconds, each server answers 2 probes a second, and the fleet answers 1,000. Keep the endpoint cheap, and never make it do work that scales with data size.</p></div>
+
+<h2 id="draining">Removing a server without dropping requests</h2>
+<p>Servers leave rotation constantly: for every deployment, every scale-in and every hardware replacement. If a server is killed while it holds requests in progress, those requests fail. <dfn>Connection draining</dfn> is the procedure that avoids this, and it requires the balancer and the application to cooperate.</p>
+
+<figure class="fig wide" id="fig-drain">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 206" role="img" aria-labelledby="f134t f134d">
+<title id="f134t">The steps of draining a server before stopping it</title>
+<desc id="f134d">Five steps in order. The server is marked as draining and starts failing its readiness check. The balancer stops sending it new requests. Requests already in progress are allowed to finish, up to a time limit. Idle connections are closed. The process exits. Below, two bars show that new requests stop arriving at the second step while requests in progress continue until the fourth.</desc>
+<g data-s="1">
+<rect class="n sig" x="10" y="14" width="124" height="56" rx="6"/>
+<text class="tb mid" x="72" y="38">1. Mark draining</text>
+<text class="ts mid" x="72" y="55">readiness now fails</text>
+</g>
+<g data-s="2">
+<rect class="n" x="154" y="14" width="124" height="56" rx="6"/>
+<text class="tb mid" x="216" y="38">2. No new work</text>
+<text class="ts mid" x="216" y="55">balancer skips it</text>
+</g>
+<g data-s="3">
+<rect class="n" x="298" y="14" width="124" height="56" rx="6"/>
+<text class="tb mid" x="360" y="38">3. Finish</text>
+<text class="ts mid" x="360" y="55">up to a time limit</text>
+</g>
+<g data-s="4">
+<rect class="n" x="442" y="14" width="124" height="56" rx="6"/>
+<text class="tb mid" x="504" y="38">4. Close</text>
+<text class="ts mid" x="504" y="55">idle connections</text>
+</g>
+<g data-s="5">
+<rect class="n store" x="586" y="14" width="124" height="56" rx="6"/>
+<text class="tb mid" x="648" y="38">5. Exit</text>
+<text class="ts mid" x="648" y="55">safe to stop</text>
+</g>
+<g data-s="2">
+<path class="e" d="M134 42H154"/>
+</g>
+<g data-s="3">
+<path class="e" d="M278 42H298"/>
+</g>
+<g data-s="4">
+<path class="e" d="M422 42H442"/>
+</g>
+<g data-s="5">
+<path class="e" d="M566 42H586"/>
+</g>
+<g data-s="1">
+<text class="ts" x="10" y="104">New requests arriving at this server</text>
+<rect class="bar" x="10" y="112" width="206" height="10" rx="4"/>
+<text class="ts" x="10" y="148">Requests in progress on this server</text>
+<rect class="bar async" x="10" y="156" width="494" height="10" rx="4"/>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="194">Stopping the process at step 1 would cut off every request in the second bar.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>The server is told to stop. It marks itself as draining and starts failing its readiness check, while it carries on serving.</li>
+  <li>The load balancer sees the failed check and stops sending this server new requests.</li>
+  <li>Requests already in progress are allowed to finish, up to a time limit.</li>
+  <li>Idle connections are closed, so that their clients reconnect to another server.</li>
+  <li>Only now does the process exit. Stopping it at step 1 would have cut off every request that was still in progress.</li>
+</ol>
+<figcaption>Draining separates two things that end at different times: the arrival of new work, and the completion of work already accepted.</figcaption>
+</figure>
+
+<p>On the application side, this means handling the termination signal properly. Most platforms send <code>SIGTERM</code>, wait for a grace period, and then kill the process outright.</p>
+<pre data-lang="ts" data-title="Graceful shutdown for a Node HTTP server">
+import { createServer } from "node:http";
+
+let draining = false;
+
+const server = createServer((req, res) => {
+  if (req.url === "/ready") { res.writeHead(draining ? 503 : 200).end(); return; }
+  if (draining) res.setHeader("Connection", "close");   // ask the caller to open a new connection elsewhere
+  handle(req, res);
+});
+server.listen(8080);
+
+process.on("SIGTERM", () => {
+  draining = true;                              // step 1: readiness fails from now on
+
+  setTimeout(() => {                            // step 2: give the balancer time to notice
+    server.close(() => process.exit(0));        // steps 3 and 5: stop accepting, exit when requests finish
+    server.closeIdleConnections();              // step 4
+  }, 15_000);
+
+  setTimeout(() => process.exit(1), 45_000).unref();   // hard limit, shorter than the platform's grace period
+});
+</pre>
+<p>The wait before closing is the part people leave out. In any system where routing information spreads asynchronously, and Kubernetes is the usual example, the instruction to stop a server and the instruction to stop routing to it travel separately. For a short time after the signal arrives, balancers that have not yet heard the news still send requests. A server that stops listening at once refuses them. Continuing to serve for a few seconds while failing readiness closes that gap.</p>
+<p>The balancer has its own setting for the same process. AWS calls it the deregistration delay, 300 seconds by default, which is how long a deregistered target is allowed to finish existing work. The opposite problem exists on the way in: a server that has just started has cold caches and an empty connection pool, and under least connections it looks like the emptiest server in the fleet. <dfn>Slow start</dfn> ramps a new server’s share of traffic up over a period instead of giving it a full share at once.</p>
+
+<h2 id="affinity">Session affinity</h2>
+<p><dfn>Session affinity</dfn>, or sticky sessions, means sending all of one user’s requests to the same server. A layer 7 balancer does it by setting a cookie that names the server. A layer 4 balancer does it by hashing the client’s IP address.</p>
+<p>The usual reason is a server that keeps session data in its own memory, and that reason is a design flaw being accommodated, as <x-ref to="scalability#stateless"></x-ref> argued. Affinity has real costs:</p>
+<ul>
+  <li><b>Uneven load.</b> Users differ enormously in activity, and the balancer can no longer move the heavy ones.</li>
+  <li><b>Failure loses the session.</b> When the server dies, its users are logged out or lose their work.</li>
+  <li><b>Scaling is slow to take effect.</b> New servers receive only new users. Existing users stay where they were.</li>
+  <li><b>IP hashing is unreliable.</b> Thousands of users behind one corporate NAT share an address, and a phone changes address as it moves between networks.</li>
+</ul>
+<p>Prefer to keep session state in a shared store or in a signed token, so that any server can handle any request. Affinity is legitimate when it is an optimization and not a requirement for correctness. Routing a user to the server that has their data cached is fine if a different server would produce the same answer more slowly. A WebSocket is sticky by nature for the life of its connection (<x-ref to="realtime-communication#scaling"></x-ref>), which is a property of the connection and needs no feature.</p>
+
+<h2 id="ha">Who balances the balancer?</h2>
+<p>Putting one load balancer in front of twenty servers removes twenty single points of failure and adds one. The balancer has to be redundant too, and since it is the thing clients connect to, the methods differ from those used for the servers behind it.</p>
+<ul>
+  <li><b>An active and a standby sharing an address.</b> Two balancers share a <dfn>virtual IP address</dfn>. One holds it and serves traffic, and the other watches. If the active one stops responding, the standby claims the address and traffic follows within a second or two. This is simple and wastes half the capacity.</li>
+  <li><b>Many active balancers behind the routers.</b> Several balancers announce the same address to the network, and routers spread packets across them. This is equal-cost multipath routing (ECMP), the same idea as anycast in <x-ref to="ip-and-routing#anycast"></x-ref>. Since the router may send different packets of one connection to different balancers after a change, the balancers use consistent hashing so that all of them pick the same server for a given connection.</li>
+  <li><b>DNS.</b> Publish several addresses, one per balancer or per region, and remove the unhealthy ones. DNS is slow to react because of caching (<x-ref to="dns#caching"></x-ref>), so it is the outermost layer and never the only one.</li>
+</ul>
+<p>Large systems stack these, with a cheap, fast layer 4 tier spreading connections across a larger layer 7 tier that does the expensive per-request work.</p>
+
+<figure class="fig wide" id="fig-tiers">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 266" role="img" aria-labelledby="f135t f135d">
+<title id="f135t">Two tiers of load balancing in a large system</title>
+<desc id="f135d">Clients reach routers, which spread packets across several layer 4 balancers using equal-cost multipath routing. Each layer 4 balancer forwards connections to any of several layer 7 proxies, which terminate TLS and route each request to instances of the appropriate service.</desc>
+<rect class="n" x="10" y="92" width="80" height="60" rx="6"/><text class="tb mid" x="50" y="127">Clients</text>
+<rect class="n" x="130" y="92" width="90" height="60" rx="6"/><text class="tb mid" x="175" y="118">Routers</text><text class="ts mid" x="175" y="135">ECMP</text>
+<path class="e sig" d="M90 122H130"/>
+<rect class="n sig" x="270" y="24" width="110" height="44" rx="6"/><text class="tb mid" x="325" y="43">L4 balancer</text><text class="ts mid" x="325" y="59">hashes the flow</text>
+<rect class="n sig" x="270" y="100" width="110" height="44" rx="6"/><text class="tb mid" x="325" y="119">L4 balancer</text><text class="ts mid" x="325" y="135">hashes the flow</text>
+<rect class="n sig" x="270" y="176" width="110" height="44" rx="6"/><text class="tb mid" x="325" y="195">L4 balancer</text><text class="ts mid" x="325" y="211">hashes the flow</text>
+<path class="e sig" d="M220 110 270 50"/><path class="e sig" d="M220 122H270"/><path class="e sig" d="M220 134 270 194"/>
+<rect class="n sig" x="430" y="24" width="110" height="44" rx="6"/><text class="tb mid" x="485" y="43">L7 proxy</text><text class="ts mid" x="485" y="59">TLS, routing</text>
+<rect class="n sig" x="430" y="100" width="110" height="44" rx="6"/><text class="tb mid" x="485" y="119">L7 proxy</text><text class="ts mid" x="485" y="135">TLS, routing</text>
+<rect class="n sig" x="430" y="176" width="110" height="44" rx="6"/><text class="tb mid" x="485" y="195">L7 proxy</text><text class="ts mid" x="485" y="211">TLS, routing</text>
+<path class="e sig" d="M380 46H430"/><path class="e sig" d="M380 122H430"/><path class="e sig" d="M380 198H430"/>
+<path class="e sig" d="M380 54 430 112"/><path class="e sig" d="M380 114 430 56"/><path class="e sig" d="M380 130 430 188"/><path class="e sig" d="M380 190 430 132"/>
+<rect class="n" x="590" y="24" width="120" height="44" rx="6"/><text class="tb mid" x="650" y="51">Photo service</text>
+<rect class="n" x="590" y="100" width="120" height="44" rx="6"/><text class="tb mid" x="650" y="127">Feed service</text>
+<rect class="n" x="590" y="176" width="120" height="44" rx="6"/><text class="tb mid" x="650" y="203">Login service</text>
+<path class="e sig" d="M540 46H590"/><path class="e sig" d="M540 122H590"/><path class="e sig" d="M540 198H590"/>
+<path class="e sig" d="M540 54 590 112"/><path class="e sig" d="M540 114 590 56"/><path class="e sig" d="M540 130 590 188"/><path class="e sig" d="M540 190 590 132"/>
+<text class="ts mid" x="175" y="244">one address,</text><text class="ts mid" x="175" y="259">many paths</text>
+<text class="ts mid" x="325" y="244">chooses per connection,</text><text class="ts mid" x="325" y="259">very cheaply</text>
+<text class="ts mid" x="485" y="244">chooses per request,</text><text class="ts mid" x="485" y="259">understands HTTP</text>
+<text class="ts mid" x="650" y="244">many instances</text><text class="ts mid" x="650" y="259">of each service</text>
+</svg>
+</div>
+<figcaption>Every tier has several members, and the tier in front of it routes around any that fail. No single machine on the path is essential.</figcaption>
+</figure>
+
+<p>If you use a cloud provider’s load balancer, this structure exists and is operated for you. A managed balancer is a fleet of nodes across several availability zones behind one DNS name. What remains your responsibility is registering targets in more than one zone and understanding the defaults. One worth knowing: AWS Network Load Balancer nodes send traffic only to targets in their own zone unless cross-zone balancing is turned on, so zones with unequal numbers of servers receive unequal load per server.</p>
+
+<h2 id="details">Details that cause incidents</h2>
+<p>Most real trouble with load balancers comes from a handful of specifics that are rarely mentioned in an overview.</p>
+
+<h3 id="client-ip">The client’s address disappears</h3>
+<p>Behind a proxy, every connection the application receives comes from the proxy. Rate limiting, audit logs and location lookups all need the real client address. A layer 7 proxy passes it along in a header:</p>
+<pre data-lang="http" data-title="A request after passing through two proxies">
+GET /api/photos HTTP/1.1
+Host: api.example.com
+X-Forwarded-For: 203.0.113.7, 198.51.100.20
+X-Forwarded-Proto: https
+</pre>
+<p>Each proxy appends the address it received the request from, so the list reads from the original client on the left to the most recent proxy on the right. The trap is that the client controls the starting value. Anyone can send a request that already contains <code>X-Forwarded-For: 1.2.3.4</code>, and your proxy will append to it. Code that trusts the leftmost entry can be told any address at all.</p>
+<p>The correct reading is from the right. Count back past the proxies you operate, and the entry your own outermost proxy added is the one you can trust. Everything to its left is a claim. For layer 4 balancers, which cannot add headers, the equivalent is either preserving the original source address in the packets or the <dfn>PROXY protocol</dfn>, a short preamble sent at the start of each connection that the server must be configured to expect.</p>
+
+<h3 id="timeouts">Timeouts that disagree</h3>
+<p>A balancer keeps idle connections to its servers open for reuse, and both ends have a timer for closing them. If the server’s timer is shorter, there is a moment when the server has decided to close a connection and the balancer, not yet aware, sends a request on it. The request fails, and the client receives a <code>502 Bad Gateway</code> that appears in no application log, because the application never saw the request.</p>
+<p>These failures are rare, random and unrelated to load, which makes them hard to diagnose. The rule that prevents them is that the side that receives requests should keep idle connections open longer than the side that sends them. Node’s HTTP server closes idle connections after 5 seconds by default, and an Application Load Balancer holds them for 60, so this pairing produces the problem unless it is changed:</p>
+<pre data-lang="ts">
+server.keepAliveTimeout = 65_000;   // longer than the balancer's 60-second idle timeout
+</pre>
+<p>The same reasoning applies to every hop. Request timeouts should get shorter as you go deeper into the system, so that the outer layers do not give up and retry while the inner ones are still working.</p>
+
+<h3 id="http2">HTTP/2, gRPC and one very busy server</h3>
+<p>HTTP/2 sends many requests concurrently over a single long-lived connection (<x-ref to="http-and-tls#versions"></x-ref>), and gRPC is built on it. Put a layer 4 balancer between two services using gRPC and it will balance the connections, of which there may be one per calling instance, held for hours. Requests go wherever those few connections happened to land. New servers added during a traffic spike receive nothing.</p>
+<p>There are three fixes: balance at layer 7 with a proxy that understands HTTP/2 and distributes individual requests; have the client hold connections to every server and balance for itself; or set a maximum connection age on the servers so that connections are regularly closed and re-established. The first two are the real answers. The third is a partial remedy that is simple to apply.</p>
+
+<h3 id="retries">Retries multiply load</h3>
+<p>A layer 7 balancer can retry a failed request on another server, which hides individual failures well. Two limits are essential. Retry only requests that are safe to repeat (<x-ref to="api-styles#idempotency-keys"></x-ref>). And cap retries as a share of total traffic, because when a whole service is overloaded, retrying every failure doubles the load on it at the worst possible moment.</p>
+
+<h3 id="ports">Running out of ports</h3>
+<p>A proxy opens connections to its servers from its own address, and each connection needs a distinct source port. Between one proxy address and one server address and port there are roughly 64,000 available. A proxy that opens a new connection for every request, to a small number of servers, can run out. Connections then fail even though every machine has spare CPU and memory. Reusing connections, as the configuration below does with <code>keepalive</code>, is the first fix, and adding addresses is the second.</p>
+
+<pre data-lang="text" data-title="A reverse proxy with load balancing in NGINX (certificate lines omitted)">
+upstream photo_api {
+    least_conn;
+    server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.13:8080 backup;
+    keepalive 64;                       # idle connections kept open to the servers
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name api.example.com;
+
+    location /api/ {
+        proxy_pass http://photo_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";                 # needed for connection reuse
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 30s;
+        proxy_next_upstream error timeout http_503;     # retry these on another server
+    }
+}
+</pre>
+<p>Most of this chapter is visible in those twenty lines: the algorithm, passive health checks through <code>max_fails</code>, a standby server, connection reuse, forwarding headers, timeouts and limited retries.</p>
+
+<h2 id="client-side">Balancing without a box in the middle</h2>
+<p>Inside a data center, a dedicated balancer between every pair of services adds a network hop, a cost and a component that can fail. The alternative is <dfn>client-side load balancing</dfn>. The calling service obtains the list of healthy instances from a registry and chooses among them itself, using the same algorithms as above. gRPC clients can work this way.</p>
+<p>The cost is that every client, in every language you use, needs this logic. A <dfn>service mesh</dfn> removes that cost by putting the logic in a small proxy that runs alongside each service instance, or once per machine, and handles its network calls. Applications make plain requests, and the mesh proxies do the balancing, retries, encryption and metrics. <x-ref to="service-communication"></x-ref> examines when that is worth its considerable complexity.</p>
+
+<h2 id="api-gateway">API gateways</h2>
+<p>An <dfn>API gateway</dfn> is a reverse proxy placed at the outer boundary of a system that takes on work specific to APIs. It became common with microservices, for a simple reason: if twenty services each implement authentication, rate limiting and request logging, they will do it in twenty slightly different ways. A gateway does these things once, in front of all of them.</p>
+<table>
+<thead><tr><th>Concern</th><th>What the gateway does</th><th>More in</th></tr></thead>
+<tbody>
+<tr><th>Authentication</th><td>Validates tokens or API keys and rejects anonymous traffic before it reaches a service</td><td><x-ch to="oauth-and-sso"></x-ch></td></tr>
+<tr><th>Rate limiting and quotas</th><td>Limits requests per client, per key or per plan</td><td><x-ch to="hld-rate-limiter"></x-ch></td></tr>
+<tr><th>Routing</th><td>Maps public paths and versions to internal services</td><td><x-ch to="api-styles"></x-ch></td></tr>
+<tr><th>Validation and limits</th><td>Rejects oversized or malformed requests early</td><td><x-ch to="threats-and-defenses"></x-ch></td></tr>
+<tr><th>Translation</th><td>Accepts REST from outside and calls gRPC inside, for example</td><td><x-ch to="api-styles"></x-ch></td></tr>
+<tr><th>Observability</th><td>Emits uniform logs, metrics and trace IDs for every call</td><td><x-ch to="observability"></x-ch></td></tr>
+</tbody>
+</table>
+<p>A gateway can also <dfn>aggregate</dfn>: accept one request from a client and call several services to build the response, saving a mobile app several round trips. When a separate gateway of this kind is built for each kind of client, with one for the mobile app and one for the web app, the pattern is called a <dfn>back end for a front end</dfn> (BFF). Each one is shaped to what its client needs and is usually owned by the team that builds that client.</p>
+<p>Gateways attract two problems. The first is that logic accumulates in them. A rule added to the gateway is easier than a change to a service, and a gateway that started as a router ends up knowing about discounts and user types, at which point every team must change it to ship anything. Keep it to concerns that apply to all traffic, and keep business rules in services. The second is that it is on the path of every request, so it needs the redundancy described earlier, and its own latency is added to everything.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Draw a load balancer wherever there is more than one instance of something, and say what kind: “a layer 7 load balancer here, terminating TLS and routing by path”. Mention health checks and that the balancer itself is redundant. If you add an API gateway, name the two or three things it does in your design. A box labeled “gateway” with no stated purpose invites questions you may not want.</p></div>
+
+<h3 id="roles">Telling the roles apart</h3>
+<table>
+<thead><tr><th>Role</th><th>Where it sits</th><th>Main purpose</th></tr></thead>
+<tbody>
+<tr><th>Reverse proxy</th><td>In front of servers</td><td>The general mechanism. Everything below is a specialization.</td></tr>
+<tr><th>Load balancer</th><td>In front of a group of identical servers</td><td>Spread load and hide failures</td></tr>
+<tr><th>API gateway</th><td>At the edge of the system, facing external clients</td><td>Apply policy to API traffic: who may call what, and how often</td></tr>
+<tr><th>Ingress or gateway controller</th><td>At the edge of a Kubernetes cluster</td><td>Configure a reverse proxy from cluster resources</td></tr>
+<tr><th>Service mesh proxy</th><td>Beside every service instance</td><td>Balance, secure and observe calls between services</td></tr>
+<tr><th>CDN</th><td>Close to users, around the world</td><td>Cache and protect, as covered in <x-ch to="cdn-and-edge"></x-ch></td></tr>
+</tbody>
+</table>
+
+<h2 id="landscape">What people run, as of October 2026</h2>
+<ul>
+  <li><b>Open-source proxies.</b> NGINX and HAProxy are the long-established choices, configured with files. Envoy was designed to be reconfigured continuously through an API with no restarts, and is the foundation of most service meshes and many gateways. Traefik and Caddy aim at simpler setups with automatic certificates.</li>
+  <li><b>Managed cloud balancers.</b> Every major provider offers layer 4 and layer 7 balancers as services. For most teams this is the right default, since the redundancy and scaling of the balancer become someone else’s job.</li>
+  <li><b>Large-scale layer 4.</b> Google’s Maglev and Meta’s Katran are software balancers on ordinary servers that use ECMP and consistent hashing as described above. Katran is open source.</li>
+  <li><b>Kubernetes.</b> The original Ingress API is frozen and the Gateway API is its successor, with richer routing and a cleaner split between the people who run the infrastructure and those who define routes. The community Ingress NGINX controller, for years the most widely used, was retired in March 2026 and receives no further fixes. New clusters should start with a Gateway API implementation.</li>
+  <li><b>Gateways for AI traffic.</b> A recent category of API gateway sits in front of language model providers and applies the usual ideas with different units: limits counted in tokens instead of requests, routing between providers, and fallback when one is unavailable. <x-ref to="llm-application-architecture"></x-ref> covers this.</li>
+</ul>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>A single load balancer.</b> The component added to remove single points of failure becomes one.</li>
+  <li><b>Deep health checks.</b> A shared dependency blinks and every server is removed at once.</li>
+  <li><b>No draining.</b> Every deployment produces a burst of failed requests that is written off as normal.</li>
+  <li><b>Trusting the leftmost <code>X-Forwarded-For</code> entry.</b> Clients choose their own IP address, which defeats rate limits and corrupts audit logs.</li>
+  <li><b>Server idle timeout shorter than the balancer’s.</b> Occasional unexplained 502 errors.</li>
+  <li><b>Layer 4 balancing for gRPC.</b> One server takes most of the traffic and scaling out has no effect.</li>
+  <li><b>Sticky sessions to work around server-side state.</b> Uneven load, sessions lost on failure and slow scaling.</li>
+  <li><b>Unlimited retries at the balancer.</b> An overloaded service receives double the traffic.</li>
+  <li><b>Business logic in the gateway.</b> Every team is blocked on one shared component.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="scalability"></x-ref>: horizontal scaling only works because a balancer makes many servers look like one.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: health checks and failover are how redundancy turns into availability.</li>
+  <li><x-ref to="http-and-tls"></x-ref>: TLS termination and HTTP versions determine what a balancer can see.</li>
+  <li><x-ref to="partitioning"></x-ref>: consistent hashing in full.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: timeouts, retry budgets, circuit breakers and load shedding.</li>
+  <li><x-ref to="deployment-strategies"></x-ref>: weighted routing is the mechanism behind canary and blue-green releases.</li>
+  <li><x-ref to="containers-and-orchestration"></x-ref>: Services, readiness probes and the Gateway API in Kubernetes.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A reverse proxy accepts requests on behalf of servers. Load balancers, API gateways and mesh proxies are all reverse proxies with a particular job.</li>
+  <li>Layer 4 balances connections without reading them. Layer 7 terminates TLS and balances individual requests, and can route, retry and measure them.</li>
+  <li>Any algorithm that uses load information beats one that does not. Choosing the less busy of two random servers is robust and close to the best.</li>
+  <li>Combine active and passive health checks. Make the health endpoint report on the instance itself and not on shared dependencies.</li>
+  <li>Drain before stopping: fail readiness, keep serving briefly, finish requests in progress, then exit.</li>
+  <li>The balancer must be redundant: a standby with a shared address, many nodes behind ECMP, or a managed service that does this for you.</li>
+  <li>Read <code>X-Forwarded-For</code> from the right, and keep server idle timeouts longer than the balancer’s.</li>
+  <li>An API gateway centralizes authentication, rate limiting and routing. Keep business logic out of it.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Two services communicate with gRPC through a layer 4 load balancer. You double the number of servers and the load on the original ones barely changes. Why?</summary><p>gRPC uses long-lived HTTP/2 connections, and a layer 4 balancer chooses a server only when a connection is opened. The existing connections stay on the original servers and carry all the requests. Balance at layer 7, balance in the client, or limit connection age so that connections are re-established.</p></details>
+<details><summary>Your health endpoint queries the database. The database becomes slow for a minute. What happens, and what would be better?</summary><p>Every server’s health check times out at the same time, so the balancer sees no healthy servers. Depending on the balancer it either rejects all traffic or fails open and sends it everywhere. Either way the health check added nothing, since removing servers cannot fix a shared database. The endpoint should check only the instance itself, and database trouble should be handled in the request path with timeouts and fallbacks.</p></details>
+<details><summary>Why can “least connections” make an outage worse when one server starts returning errors immediately?</summary><p>A server that fails instantly completes its requests faster than healthy servers, so it always has the fewest in progress and the algorithm keeps choosing it. It draws in a growing share of traffic and fails all of it. Passive health checks that eject servers with high error rates prevent this.</p></details>
+<details><summary>A request arrives with the header <code>X-Forwarded-For: 10.9.9.9, 203.0.113.7, 198.51.100.20</code>, and you operate two proxies in front of the application. Which address is the client’s?</summary><p>Count from the right. The application received the connection from your inner proxy. The rightmost entry, 198.51.100.20, was appended by that inner proxy and is the address of your outer proxy. The entry before it, 203.0.113.7, was appended by your outer proxy and is the address that actually connected to you, so it is the one to use. The leftmost entry was supplied by the client and may be invented.</p></details>
+<details><summary>Users occasionally receive a 502 error, about once in several thousand requests, with nothing in the application logs. What do you check first?</summary><p>Idle connection timeouts. If the application closes idle keep-alive connections sooner than the balancer does, the balancer will sometimes send a request on a connection the server is in the middle of closing. Set the server’s keep-alive timeout longer than the balancer’s idle timeout.</p></details>
+<details><summary>What does an API gateway add that a plain load balancer does not, and what should it not contain?</summary><p>It applies policy that is specific to APIs and common to all services: authentication, rate limits and quotas per client, request validation, version routing and uniform logging. It should not contain business rules, because then every product change requires changing a component that all teams share.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>D. E. Eisenbud and others, <a href="https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/">Maglev: A Fast and Reliable Software Network Load Balancer</a>, NSDI 2016. ECMP, consistent hashing and connection tracking in a layer 4 fleet.</li>
+  <li>Michael Mitzenmacher, <a href="https://www.eecs.harvard.edu/~michaelm/postscripts/mythesis.pdf">The Power of Two Choices in Randomized Load Balancing</a>, PhD thesis, 1996. The analysis behind “two random choices”.</li>
+  <li>Envoy documentation, <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers">Supported load balancers</a>, <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/panic_threshold">Panic threshold</a> and <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier">Outlier detection</a>.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html">Target groups for Application Load Balancers</a> and <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html">Health checks</a>. Algorithms, the 300-second deregistration delay, default check intervals and fail-open behavior. Checked October 2026.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html">Network Load Balancers</a>. Idle timeouts and the cross-zone default.</li>
+  <li>NGINX documentation, <a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html">ngx_http_upstream_module</a>. The directives used in the configuration example.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Forwarded-For">X-Forwarded-For</a>. Includes the security guidance on which entry to trust.</li>
+  <li>HAProxy Technologies, <a href="https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt">The PROXY protocol</a>.</li>
+  <li>Kubernetes, <a href="https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/">Ingress NGINX Retirement: What You Need to Know</a>, November 2025, and the <a href="https://gateway-api.sigs.k8s.io/">Gateway API</a> documentation.</li>
+  <li>David Yanacek, <a href="https://builder.aws.com/content/3Ev53O39izHCtWLzp4XU6t8PC1O/implementing-health-checks">Implementing health checks</a>, Amazon Builders’ Library. Shallow and deep checks, and failing open.</li>
+  <li>Sam Newman, <a href="https://samnewman.io/patterns/architectural/bff/">Backends For Frontends</a>.</li>
+</ol>
+</section>

@@ -1,0 +1,771 @@
+<!--meta
+{ "description": "A news feed designed with the method of chapter 76: requirements and estimates for 300 million daily users, the API with cursors, the post, graph and feed stores, fan-out on write against fan-out on read measured on a simulated network of 100,000 accounts, the celebrity problem and a fan-out worker pool under a two-million-follower post, ranking with a cheap first pass, failures, growth and what Twitter and Facebook have published.",
+  "lede": "A news feed shows each user the recent posts of everyone they follow. Either the system copies every post into the feed of every follower when it is written, or it gathers the posts from every followed account when the feed is read. Which is cheaper depends on how often feeds are read, and the answer breaks for the few accounts with millions of followers.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the home feed of a social network. Users follow other users and publish short posts, with images. When a user opens the app, they see the posts of the accounts they follow, the most interesting first, and can scroll back through older ones.</p></div>
+<p>A <dfn>news feed</dfn> is the list of recent posts from the accounts a user follows, assembled for that user each time they look. The difficulty is that every feed is different and every post belongs to many feeds. One post must reach thousands or millions of readers, and one feed draws on hundreds of authors. Somewhere, the system pays for every follow, either when a post is written or when a feed is read. The design is the choice of where, and the few accounts with enormous audiences make each simple choice fail. The method of <x-ref to="hld-method"></x-ref> takes these in order.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<p>The questions that change this design are the read and post rates, how fast a post must reach followers, whether the feed is ranked, and how large the largest accounts are. With the answers written down:</p>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>Publish a post: text and up to four images</th><td>In scope</td></tr>
+<tr><th>Follow and unfollow an account</th><td>In scope</td></tr>
+<tr><th>Read the home feed: posts of followed accounts, ranked, in pages, scrolling back about three days</th><td>In scope</td></tr>
+<tr><th>An author sees their own new post in their feed at once</th><td>In scope</td></tr>
+<tr><th>Likes and comments, posts from accounts not followed, ads, search, notifications, messages</th><td>Out of scope. Notifications and messages have chapters of their own: <x-ref to="hld-notifications"></x-ref> and <x-ref to="hld-chat"></x-ref></td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>300 million daily active users. Each opens the feed 10 times a day and posts once every five days, so 60 million posts a day. Authors have 200 followers on average, and the largest have more than 100 million. The busiest hour runs at twice the average</td></tr>
+<tr><th>Latency</th><td>99% of feed pages served within 200 ms, measured at the server. Publishing answers within 500 ms</td></tr>
+<tr><th>Delivery</th><td>99% of posts appear in followers’ feeds within 5 seconds</td></tr>
+<tr><th>Availability</th><td>99.95% for reading the feed, 99.9% for publishing</td></tr>
+<tr><th>Durability</th><td>An acknowledged post is never lost. Feeds themselves can be rebuilt</td></tr>
+<tr><th>Consistency</th><td>Followers see a post eventually; the author sees it at once (<x-ref to="consistency-models#session"></x-ref>)</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">posts        60 million a day ÷ 86,400 ≈ 694 a second            peak × 2 ≈ 1,400
+feed reads   300 million × 10 = 3 billion a day ≈ 34,700 a second   peak ≈ 69,000
+ratio        3 billion ÷ 60 million = 50 feed reads for every post
+fan-out      60 million × 200 followers = 12 billion feed entries a day ≈ 139,000 a second
+feed lists   300 million × 800 ids × 16 bytes ≈ 3.8 TB, in three copies ≈ 11.5 TB of memory
+post text    60 million × 1 KB = 60 GB a day ≈ 22 TB a year, before images</div>
+<p>The 16 bytes of a feed entry hold a post id and its author’s id; the 1 KB of a post holds its text and metadata. Both are assumptions. The arithmetic is that of <x-ref to="estimation#method"></x-ref>, and each line decides something.</p>
+<table>
+<thead><tr><th>The number</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><th>50 feed reads for every post</th><td>Work done when a post is written is paid once; work done when a feed is read is paid 50 times. Step 6a measures what follows</td></tr>
+<tr><th>139,000 feed entries a second</th><td>Copying posts into feeds is the system’s largest write load. It runs off the publishing path, in workers fed by a queue</td></tr>
+<tr><th>11.5 TB for the feed lists</th><td>Feeds are kept in memory, partitioned by reader over a cluster, and only for active users</td></tr>
+<tr><th>Accounts with 100 million followers</th><td>One post from such an account is 100 million writes. Step 6b is about them</td></tr>
+<tr><th>22 TB of posts a year</th><td>A partitioned store, but an ordinary one. Images go to object storage and a CDN (<x-ref to="object-and-file-storage"></x-ref>)</td></tr>
+</tbody>
+</table>
+
+<div class="widget wide" data-widget="feed81">
+<h4>Feed traffic, fan-out work and the feed cache</h4>
+<p>Recomputes step 2, and compares the work of copying posts ahead with gathering them on demand.</p>
+<div class="controls">
+  <label>Daily active users<input type="number" name="users" value="300000000" min="1" max="3000000000" step="1000000"></label>
+  <label>Feed opens per user a day<input type="number" name="opens" value="10" min="0" max="1000" step="1"></label>
+  <label>Posts per user a day<input type="number" name="posting" value="0.2" min="0.001" max="100" step="0.01"></label>
+  <label>Follows per user<input type="number" name="follows" value="200" min="1" max="100000" step="1"></label>
+  <label>Ids kept per feed<input type="number" name="kept" value="800" min="1" max="100000" step="10"></label>
+  <label>Bytes per feed entry<input type="number" name="entry" value="16" min="1" max="10000" step="1"></label>
+  <label>Peak factor<input type="number" name="peak" value="2" min="1" max="20" step="0.5"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 150" role="img" aria-label="Two stacked bars of operations a second at peak, for fan-out on write and fan-out on read, each split into writes and list reads."><text x="10" y="16" class="ts">Operations a second at peak</text><text x="118" y="53" class="ts end">Fan-out on write</text><rect x="128" y="36" width="8" height="24" rx="2" class="bar async"></rect><rect x="136" y="36" width="2" height="24" rx="2" class="bar"></rect><text x="146" y="53" class="ts tb">347 thousand /s</text><text x="118" y="99" class="ts end">Fan-out on read</text><rect x="128" y="82" width="0.5" height="24" rx="2" class="bar async"></rect><rect x="128" y="82" width="400" height="24" rx="2" class="bar"></rect><text x="536" y="99" class="ts tb">13.9 million /s</text><text x="10" y="138" class="ts">Purple: feed entries or posts written. Blue: lists read. One copy, before any cache.</text></svg>
+<dl class="results">
+  <div><dt>Posts</dt><dd data-out="posts">694 /s, peak 1,389 /s</dd></div>
+  <div><dt>Feed reads</dt><dd data-out="reads">34.7 thousand /s, peak 69.4 thousand /s</dd></div>
+  <div><dt>Feed reads per post</dt><dd data-out="ratio">50</dd></div>
+  <div><dt>Fan-out on write, operations a second at peak</dt><dd data-out="push">278 thousand writes + 69.4 thousand reads</dd></div>
+  <div><dt>Fan-out on read, operations a second at peak</dt><dd data-out="pull">1,389 writes + 13.9 million reads</dd></div>
+  <div><dt>Feed lists in memory</dt><dd data-out="memory">3.84 TB, 11.5 TB in 3 copies</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Feeds are opened 50 times for every post written, so at peak fan-out on write does 347 thousand operations a second and fan-out on read 13.9 million. Fan-out on read does 40 times as much. The lists of 800 ids need 3.84 TB of memory, 11.5 TB in three copies.</p>
+</div>
+<p>The calculator counts one operation for each feed entry written and each list read, which is rough but shows the shape. With the defaults, copying ahead needs 40 times fewer operations than gathering on demand. Set the feed opens below the posts, as in a system that is mostly written and rarely read, and the comparison turns around.</p>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Publish a post">
+POST /v1/posts
+Authorization: Bearer …
+Idempotency-Key: 3f1c9a7e-52b4-4d0e-9c61-8a2f7b6e0d13
+Content-Type: application/json
+
+{ "text": "First day at the new job", "media": ["m_7Qe2"] }
+
+HTTP/1.1 201 Created
+{ "id": "1840271936512409183", "createdAt": "2026-10-13T08:12:31Z" }
+</pre>
+<pre data-lang="http" data-title="Read the feed, follow, unfollow">
+GET /v1/feed?limit=20            → 200 OK
+  { "posts": [ { "id": "1840271936512409183", "author": { … }, "text": "…" }, … ],
+    "next": "c2Vzc2lvbj03ZjJhO29mZnNldD0yMA" }
+GET /v1/feed?cursor=c2Vzc2lvbj03ZjJhO29mZnNldD0yMA&limit=20   → 200 OK, the next 20
+GET /v1/users/41/posts?before=1840271936512409183  → 200 OK, a profile, older than a post id
+
+PUT    /v1/following/41          → 204 No Content
+DELETE /v1/following/41          → 204 No Content
+</pre>
+<ul>
+  <li><b>Retries.</b> The idempotency key makes a retried publish return the first post instead of a second one (<x-ref to="api-styles#idempotency-keys"></x-ref>). Follow and unfollow are <code>PUT</code> and <code>DELETE</code>, which can be repeated safely as they are.</li>
+  <li><b>Pages.</b> The feed is paged by an opaque cursor, never by an offset, because new posts arrive between pages (<x-ref to="api-styles#pagination"></x-ref>). For a ranked feed the cursor points into an order saved for the session; step 6c explains why.</li>
+  <li><b>Images</b> are uploaded first, straight to object storage with a presigned URL, and the post refers to them by id (<x-ref to="object-and-file-storage#presigned"></x-ref>).</li>
+  <li><b>Errors.</b> 400 for an empty or oversized post, 404 for following an account that does not exist, 429 for a client over its rate limit (<x-ref to="hld-rate-limiter"></x-ref>).</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A post: author, text, media ids, time</th><td>Post id, time-ordered</td><td>A key-value or wide-column store, partitioned by post id, three copies</td><td>Read by id, in batches of 20. A time-ordered id (<x-ref to="unique-ids#snowflake"></x-ref>) makes “newer” and “larger id” the same, so lists of ids sort themselves</td></tr>
+<tr><th>An author’s timeline: their post ids, newest first</th><td>Author, then post id</td><td>A wide-column table, one partition per author</td><td>A profile page reads one partition in order (<x-ref to="data-models#wide-column"></x-ref>)</td></tr>
+<tr><th>Who follows whom</th><td>Two tables: followers by account, and accounts followed by user</td><td>A partitioned key-value store</td><td>Every query is one hop: “followers of X”, “who does Y follow”. A graph database is not needed (<x-ref to="specialized-databases#graph"></x-ref>)</td></tr>
+<tr><th>A feed: up to 800 entries of post id and author id</th><td>Reader</td><td>An in-memory store of lists, partitioned by reader, three copies</td><td>One read per page. It is a cache: it can be rebuilt from the timelines</td></tr>
+<tr><th>Big accounts’ recent post ids</th><td>Account</td><td>The same in-memory store, with extra copies</td><td>Read by many feeds at once (step 6b)</td></tr>
+<tr><th>Posts and authors for display</th><td>Post id, author id</td><td>A cache cluster</td><td>Filling in a page of ids is a multi-get</td></tr>
+<tr><th>A ranked order for a session</th><td>Reader and session</td><td>The in-memory store, expiring after 30 minutes</td><td>Later pages come from the same order (step 6c)</td></tr>
+</tbody>
+</table>
+<p>The feed list holds ids, not posts. A post is stored once and its id copied; an edit or a delete then changes one record, and the feed service filters out ids whose posts are gone when it fills in a page.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 392" role="img" aria-labelledby="f811t f811d">
+<title id="f811t">The design of the news feed</title>
+<desc id="f811d">Apps reach two services through a load balancer. The post service stores a new post in the post store and publishes a post-created event to a queue. In a band of work done later, fan-out workers take events from the queue, read the author’s followers from the graph store in pages, and add the post id to each follower’s list in the feed cache. The feed service answers a feed request by reading the reader’s list from the feed cache, the recent posts of any of the largest accounts the reader follows from the timeline cache, and the posts and authors from the post cache, and it asks the ranking service, drawn below, to order the candidates.</desc>
+<text class="ts" x="356" y="16">Later, after the reply</text>
+<rect class="n async" x="356" y="24" width="150" height="46" rx="6"/>
+<text class="tb mid" x="431" y="43">Queue</text>
+<text class="ts mid" x="431" y="60">post created</text>
+<rect class="n async" x="540" y="24" width="170" height="46" rx="6"/>
+<text class="tb mid" x="625" y="43">Fan-out workers</text>
+<text class="ts mid" x="625" y="60">followers in pages of 1,000</text>
+<path class="e async" d="M506 47H540"/>
+<rect class="n" x="10" y="160" width="88" height="56" rx="6"/>
+<text class="tb mid" x="54" y="184">Apps</text>
+<text class="ts mid" x="54" y="201">post, read</text>
+<rect class="n" x="122" y="104" width="74" height="238" rx="6"/>
+<text class="tb mid" x="159" y="219">Load</text>
+<text class="ts mid" x="159" y="236">balancer</text>
+<path class="e sig" d="M98 188H122"/>
+<rect class="n sig" x="220" y="104" width="112" height="46" rx="6"/>
+<text class="tb mid" x="276" y="131.5">Post service</text>
+<rect class="n store" x="356" y="104" width="150" height="46" rx="6"/>
+<text class="tb mid" x="431" y="123">Post store</text>
+<text class="ts mid" x="431" y="140">posts by id</text>
+<rect class="n store" x="540" y="104" width="170" height="46" rx="6"/>
+<text class="tb mid" x="625" y="123">Graph store</text>
+<text class="ts mid" x="625" y="140">who follows whom</text>
+<path class="e sig" d="M196 127H220"/>
+<path class="e sig" d="M332 127H356"/>
+<path class="e async" d="M276 104V47H356"/>
+<text class="ts" x="282" y="64">event</text>
+<path class="e async" d="M625 70V104"/>
+<text class="ts" x="632" y="92">followers</text>
+<path class="e async" d="M540 60H523V207H506"/>
+<text class="ts" x="531" y="168">add the post id to each</text>
+<text class="ts" x="531" y="182">follower’s list</text>
+<rect class="n sig" x="220" y="184" width="112" height="158" rx="6"/>
+<text class="tb mid" x="276" y="267.5">Feed service</text>
+<rect class="n store" x="356" y="184" width="150" height="46" rx="6"/>
+<text class="tb mid" x="431" y="203">Feed cache</text>
+<text class="ts mid" x="431" y="220">800 ids per reader</text>
+<rect class="n store" x="356" y="240" width="150" height="46" rx="6"/>
+<text class="tb mid" x="431" y="259">Timeline cache</text>
+<text class="ts mid" x="431" y="276">big accounts’ posts</text>
+<rect class="n store" x="356" y="296" width="150" height="46" rx="6"/>
+<text class="tb mid" x="431" y="315">Post cache</text>
+<text class="ts mid" x="431" y="332">posts and authors</text>
+<path class="e sig" d="M196 263H220"/>
+<path class="e sig" d="M332 207H356"/>
+<path class="e sig" d="M332 263H356"/>
+<path class="e sig" d="M332 319H356"/>
+<rect class="n sig" x="540" y="252" width="170" height="46" rx="6"/>
+<text class="tb mid" x="625" y="271">Ranking</text>
+<text class="ts mid" x="625" y="288">scores the candidates</text>
+<path class="e sig" d="M276 342V370H625V298"/>
+<text class="ts mid" x="450" y="364">rank the candidates</text>
+<text class="ts" x="540" y="222">Solid: the request path.</text>
+<text class="ts" x="540" y="238">Dashed: later.</text>
+</svg>
+</div>
+<figcaption>A post is stored once and its id is then copied, after the reply, into the lists of its readers. A feed request reads one list, merges a few big accounts, ranks the candidates and fills in the posts.</figcaption>
+</figure>
+
+<p>Publishing and reading are separate services, scaled for different loads. Everything that depends on followers runs in the dashed band, after the author has their answer: publishing a post never waits for its 200 or 100 million followers. The queue between them absorbs bursts, such as a sports final, when posts arrive several times faster than usual (<x-ref to="message-queues#backpressure"></x-ref>).</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 560" role="img" aria-labelledby="f812t f812d">
+<title id="f812t">Publishing a post, and reading the feed</title>
+<desc id="f812d">Two sequences. Publishing: the app sends the post with an idempotency key; the post service stores it under a new time-ordered id, adds it to the author’s own timeline and feed so the author sees it at once, publishes an event and answers. Later a fan-out worker takes the event, reads the author’s followers a page at a time from the graph store, and adds the id to each follower’s list in the feed cache. Reading: the app asks the feed service for a page; the service reads the reader’s list of ids, the recent ids of the big accounts the reader follows, merges them, has the ranking service order them, saves the order for the session, fetches the first 20 posts and returns them with a cursor.</desc>
+<text class="tb" x="10" y="16">Publishing a post</text>
+<g data-scene="publish">
+<text class="tb mid" x="44" y="40">App</text>
+<line class="axis" x1="44" y1="48" x2="44" y2="318"/>
+<text class="tb mid" x="150" y="40">Post service</text>
+<line class="axis" x1="150" y1="48" x2="150" y2="318"/>
+<text class="tb mid" x="262" y="40">Post store</text>
+<line class="axis" x1="262" y1="48" x2="262" y2="318"/>
+<text class="tb mid" x="362" y="40">Queue</text>
+<line class="axis" x1="362" y1="48" x2="362" y2="318"/>
+<text class="tb mid" x="466" y="40">Fan-out worker</text>
+<line class="axis" x1="466" y1="48" x2="466" y2="318"/>
+<text class="tb mid" x="572" y="40">Graph store</text>
+<line class="axis" x1="572" y1="48" x2="572" y2="318"/>
+<text class="tb mid" x="672" y="40">Feed cache</text>
+<line class="axis" x1="672" y1="48" x2="672" y2="318"/>
+<g data-s="1">
+<path class="e sig" d="M45 72H149"/>
+<text class="ts mid" x="97.0" y="66">1. POST /v1/posts</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M151 99H261"/>
+<text class="ts mid" x="206.0" y="93">2. insert 9183</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M151 126H671"/>
+<text class="ts mid" x="411.0" y="120">3. add 9183 to Ana’s lists</text>
+</g>
+<g data-s="4">
+<path class="e async" d="M151 153H361"/>
+<text class="ts mid" x="256.0" y="147">4. post created</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M149 180H45"/>
+<text class="ts mid" x="97.0" y="174">5. 201 Created</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M363 207H465"/>
+<text class="ts mid" x="414.0" y="201">6. event: 9183 by Ana</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M467 234H571"/>
+<text class="ts mid" x="519.0" y="228">7. followers of Ana, page 1</text>
+</g>
+<g data-s="8">
+<path class="e async" d="M467 261H671"/>
+<text class="ts mid" x="569.0" y="255">8. add 9183 to 1,000 lists</text>
+</g>
+<g data-s="9" data-packet="none">
+<rect class="n async" x="263.1" y="274" width="194.9" height="22" rx="4"/>
+<text class="ts mid" x="360.55" y="289">9. pages 2 and 3 the same way</text>
+</g>
+</g>
+<path class="e none dash" d="M10 330H710"/>
+<text class="tb" x="10" y="350">Reading the feed</text>
+<g data-scene="read">
+<text class="tb mid" x="44" y="372">App</text>
+<line class="axis" x1="44" y1="380" x2="44" y2="546"/>
+<text class="tb mid" x="170" y="372">Feed service</text>
+<line class="axis" x1="170" y1="380" x2="170" y2="546"/>
+<text class="tb mid" x="290" y="372">Feed cache</text>
+<line class="axis" x1="290" y1="380" x2="290" y2="546"/>
+<text class="tb mid" x="410" y="372">Timeline cache</text>
+<line class="axis" x1="410" y1="380" x2="410" y2="546"/>
+<text class="tb mid" x="530" y="372">Ranking</text>
+<line class="axis" x1="530" y1="380" x2="530" y2="546"/>
+<text class="tb mid" x="650" y="372">Post cache</text>
+<line class="axis" x1="650" y1="380" x2="650" y2="546"/>
+<g data-s="1">
+<path class="e sig" d="M45 400H169"/>
+<text class="ts mid" x="107.0" y="394">1. GET /v1/feed</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M171 422H289"/>
+<text class="ts mid" x="230.0" y="416">2. Ben’s list</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M171 444H409"/>
+<text class="ts mid" x="290.0" y="438">3. recent ids of 3 big accounts</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M171 466H529"/>
+<text class="ts mid" x="350.0" y="460">4. score 830 candidates</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M529 488H171"/>
+<text class="ts mid" x="350.0" y="482">5. ids in ranked order</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M171 510H649"/>
+<text class="ts mid" x="410.0" y="504">6. get 20 posts and authors</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M169 532H45"/>
+<text class="ts mid" x="107.0" y="526">7. 20 posts, cursor</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="publish" data-label="Publish">
+  <li data-msg="POST" data-state="Post store: nothing; Ana’s own feed: without it; Followers’ feeds with the post: 0 of 2,400">Ana’s app sends the new post, with an idempotency key so that a retry cannot publish it twice.</li>
+  <li data-msg="9183" data-state="Post store: 9183; Ana’s own feed: without it; Followers’ feeds with the post: 0 of 2,400">The post service stores the post under a new time-ordered id, so a larger id means a newer post.</li>
+  <li data-msg="add 9183" data-state="Post store: 9183; Ana’s own feed: has it; Followers’ feeds with the post: 0 of 2,400">It adds the id to Ana’s own timeline and feed at once, so that Ana sees her post on her next refresh.</li>
+  <li data-msg="event" data-state="Post store: 9183; Ana’s own feed: has it; Followers’ feeds with the post: 0 of 2,400">It publishes an event saying the post exists. Copying it to followers is left to later work.</li>
+  <li data-msg="201" data-state="Post store: 9183; Ana’s own feed: has it; Followers’ feeds with the post: 0 of 2,400">Ana’s app gets its answer. Nothing has been sent to her 2,400 followers yet.</li>
+  <li data-msg="9183" data-state="Post store: 9183; Ana’s own feed: has it; Followers’ feeds with the post: 0 of 2,400">A fan-out worker takes the event. Ana has 2,400 followers, under the threshold, so her post is fanned out.</li>
+  <li data-msg="page 1" data-state="Post store: 9183; Ana’s own feed: has it; Followers’ feeds with the post: 0 of 2,400">It reads her followers a page of 1,000 at a time, so that no single read is huge.</li>
+  <li data-msg="1,000 adds" data-state="Post store: 9183; Ana’s own feed: has it; Followers’ feeds with the post: 1,000 of 2,400">It adds the id to those 1,000 lists in one pipelined batch. Each list keeps its newest 800 ids.</li>
+  <li data-msg="none" data-state="Post store: 9183; Ana’s own feed: has it; Followers’ feeds with the post: 2,400 of 2,400">Two more pages finish the job, within the 5 seconds the requirements allow.</li>
+</ol>
+<ol class="steps" data-scene="read" data-label="Read">
+  <li data-msg="GET" data-state="Candidates: none; Page: none">Ben opens the app. His app asks for the first page of his feed.</li>
+  <li data-msg="get" data-state="Candidates: 800 ids; Page: none">The feed service reads Ben’s list of up to 800 post ids, one read from one partition.</li>
+  <li data-msg="get 3" data-state="Candidates: 830 ids; Page: none">Ben follows three accounts too large to fan out. Their recent ids are read and merged in.</li>
+  <li data-msg="score" data-state="Candidates: 830 ids; Page: none">The ranking service scores the candidates for Ben, using features such as age and how often he interacts with each author.</li>
+  <li data-msg="ranked" data-state="Candidates: 830 ranked, saved; Page: none">The ranked order comes back. The feed service saves it for this session, so later pages come from the same order.</li>
+  <li data-msg="get 20" data-state="Candidates: 830 ranked, saved; Page: 20 posts">It fetches the text, media links and authors of the first 20, in one multi-get.</li>
+  <li data-msg="200" data-state="Candidates: 830 ranked, saved; Page: 20 posts, cursor 20">Ben gets 20 posts and a cursor that points into the saved order.</li>
+</ol>
+<figcaption>Publishing touches one store and a queue before it answers; followers get the post in the background. Reading a feed reads one list and a few big accounts, never the whole graph.</figcaption>
+</figure>
+
+<p>Two choices in the flows are deliberate. The post service adds the post to the author’s own lists before it answers, which gives the author read-your-writes while followers wait for the workers. And the feed service reads the graph only in the form of a few big accounts’ timelines; the work of following 200 accounts was done earlier, by the workers.</p>
+
+<h2 id="fanout">Step 6a: Fan-out on write or on read</h2>
+<p>There are two ways to assemble a feed. <dfn>Fan-out on write</dfn> copies the id of each new post into a stored feed list for every follower when the post is published, so reading a feed is one list. <dfn>Fan-out on read</dfn> stores each post only in its author’s timeline and builds a feed when it is requested, by merging the timelines of every account the reader follows. Both give the same feed. The chapter’s code implements both, and a hybrid of the two, over the same follow graph; in a test on 3,000 accounts, all of them returned the same two pages for 6,000 reads after 30,000 posts.</p>
+<p>Both rest on one operation: merging lists of ids, each already sorted newest first, into one. A heap holding the head of each list gives the next newest id in a few steps, however many lists there are.</p>
+<pre data-lang="ts" data-title="Merging timelines, newest first, from a cursor">
+// Merges several newest-first lists into one, taking `limit` ids. Each list is a Capped plus a position.
+function merge(lists: Capped[], limit: number, before: number, work: Work): number[] {
+  type Head = { list: Capped; i: number };
+  const heap = new MinHeap<Head>((a, b) => a.list.at(a.i) > b.list.at(b.i));
+  for (const list of lists) {
+    work.timelinesRead++;
+    const i = list.start(before);
+    if (i >= 0) heap.push({ list, i });
+  }
+  const out: number[] = [];
+  while (out.length < limit && heap.size > 0) {
+    const h = heap.pop() as Head;
+    out.push(h.list.at(h.i));
+    work.entriesScanned++;
+    if (h.i > 0) heap.push({ list: h.list, i: h.i - 1 });
+  }
+  return out;
+}
+</pre>
+<p>To compare the costs, the simulation builds a network of 100,000 accounts with 6,002,235 follows, in which popularity is skewed as it is on real networks. The average account has 60 followers, the median 16 and the largest 20,493, and the 100 most followed accounts hold 16.6% of all follows. Fan-out on write costs 62.0 list inserts per post on average (the author’s timeline, the author’s own feed and 60 followers) and one list per feed read. Fan-out on read costs one insert per post and 61.0 lists per read, and a reader at the 99th percentile merges 282.</p>
+<p>The two numbers add up to about 63 under every strategy, and that is no accident. Each follow is paid for once: either by a write into the follower’s list each time the author posts, or by a read of the author’s timeline each time the follower opens the feed. A strategy only chooses which side pays. That makes the choice a matter of rates. Silberstein and colleagues showed in 2010 that the cheapest plan decides for each pair of reader and author: copy ahead when the reader reads more often than the author posts, after weighting by the costs of a write and a read. Step 2 found 50 feed reads for every post, so for nearly every pair, copying ahead wins.</p>
+
+<figure class="fig wide" id="fig-who-pays">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 353" role="img" aria-labelledby="f813t f813d">
+<title id="f813t">Who pays for each follow</title>
+<desc id="f813d">Horizontal stacked bars, one for each celebrity threshold, of the cache operations caused by one post and the 50 feed reads that come with it, on a simulated network of 100,000 accounts. The write part is the inserts per post; the read part is 50 times the lists read per feed request. none (all push): 62.0 written plus 50 read, 112 in all; 10,000 or more: 56.5 written plus 325 read, 382 in all; 5,000 or more: 51.2 written plus 591 read, 642 in all; 2,000 or more: 44.3 written plus 935 read, 980 in all; 1,000 or more: 39.0 written plus 1201 read, 1,240 in all; 500 or more: 33.8 written plus 1463 read, 1,496 in all; 200 or more: 26.8 written plus 1813 read, 1,840 in all; 100 or more: 21.3 written plus 2084 read, 2,105 in all; all (all pull): 1.0 written plus 3051 read, 3,052 in all.</desc>
+<text class="tb" x="10" y="18">Cache operations for one post and the 50 feed reads that follow it</text>
+<text class="ts" x="10" y="36">Accounts exempt from fan-out, by followers</text>
+<line class="grid" x1="150.0" y1="44" x2="150.0" y2="287"/>
+<text class="ts mid" x="150.0" y="303">0</text>
+<line class="grid" x1="267.5" y1="44" x2="267.5" y2="287"/>
+<text class="ts mid" x="267.5" y="303">800</text>
+<line class="grid" x1="385.0" y1="44" x2="385.0" y2="287"/>
+<text class="ts mid" x="385.0" y="303">1,600</text>
+<line class="grid" x1="502.5" y1="44" x2="502.5" y2="287"/>
+<text class="ts mid" x="502.5" y="303">2,400</text>
+<line class="grid" x1="620.0" y1="44" x2="620.0" y2="287"/>
+<text class="ts mid" x="620.0" y="303">3,200</text>
+<text class="ts end" x="140" y="63">none (all push)</text>
+<rect class="bar async" x="150" y="50" width="9.1" height="17" rx="2"/>
+<rect class="bar" x="159.1" y="50" width="7.3" height="17" rx="2"/>
+<text class="ts tb" x="174.5" y="63">112</text>
+<text class="ts end" x="140" y="90">10,000 or more</text>
+<rect class="bar async" x="150" y="77" width="8.3" height="17" rx="2"/>
+<rect class="bar" x="158.3" y="77" width="47.7" height="17" rx="2"/>
+<text class="ts tb" x="214.1" y="90">382</text>
+<text class="ts end" x="140" y="117">5,000 or more</text>
+<rect class="bar async" x="150" y="104" width="7.5" height="17" rx="2"/>
+<rect class="bar" x="157.5" y="104" width="86.8" height="17" rx="2"/>
+<text class="ts tb" x="252.4" y="117">642</text>
+<text class="ts end" x="140" y="144">2,000 or more</text>
+<rect class="bar async" x="150" y="131" width="6.5" height="17" rx="2"/>
+<rect class="bar" x="156.5" y="131" width="137.4" height="17" rx="2"/>
+<text class="ts tb" x="301.9" y="144">980</text>
+<text class="ts end" x="140" y="171">1,000 or more</text>
+<rect class="bar async" x="150" y="158" width="5.7" height="17" rx="2"/>
+<rect class="bar" x="155.7" y="158" width="176.3" height="17" rx="2"/>
+<text class="ts tb" x="340.1" y="171">1,240</text>
+<text class="ts end" x="140" y="198">500 or more</text>
+<rect class="bar async" x="150" y="185" width="5.0" height="17" rx="2"/>
+<rect class="bar" x="155.0" y="185" width="214.8" height="17" rx="2"/>
+<text class="ts tb" x="377.8" y="198">1,496</text>
+<text class="ts end" x="140" y="225">200 or more</text>
+<rect class="bar async" x="150" y="212" width="3.9" height="17" rx="2"/>
+<rect class="bar" x="153.9" y="212" width="266.3" height="17" rx="2"/>
+<text class="ts tb" x="428.3" y="225">1,840</text>
+<text class="ts end" x="140" y="252">100 or more</text>
+<rect class="bar async" x="150" y="239" width="3.1" height="17" rx="2"/>
+<rect class="bar" x="153.1" y="239" width="306.1" height="17" rx="2"/>
+<text class="ts tb" x="467.2" y="252">2,105</text>
+<text class="ts end" x="140" y="279">all (all pull)</text>
+<rect class="bar async" x="150" y="266" width="0.1" height="17" rx="2"/>
+<rect class="bar" x="150.1" y="266" width="448.1" height="17" rx="2"/>
+<text class="ts tb" x="606.3" y="279">3,052</text>
+<line class="axis" x1="150" y1="44" x2="150" y2="287"/>
+<text class="ts" x="150" y="327">Purple: feed entries written by fan-out. Blue: lists read, 50 reads for each post.</text>
+<text class="ts" x="150" y="343">Simulated network of 100,000 accounts, code/81-hld-news-feed.</text>
+<rect class="hit" x="10" y="46" width="700" height="25" data-tip="No account exempt|0 accounts exempt, holding 0.0% of follows|written: 62.0 entries per post, at most 20,495 for one post|read: 1.0 lists per feed request (99th percentile 1)|112 operations for a post and its 50 reads"/>
+<rect class="hit" x="10" y="73" width="700" height="25" data-tip="Accounts with 10,000 or more followers exempt|39 accounts exempt, holding 9.2% of follows|written: 56.5 entries per post, at most 9,848 for one post|read: 6.5 lists per feed request (99th percentile 23)|382 operations for a post and its 50 reads"/>
+<rect class="hit" x="10" y="100" width="700" height="25" data-tip="Accounts with 5,000 or more followers exempt|116 accounts exempt, holding 18.0% of follows|written: 51.2 entries per post, at most 4,974 for one post|read: 11.8 lists per feed request (99th percentile 46)|642 operations for a post and its 50 reads"/>
+<rect class="hit" x="10" y="127" width="700" height="25" data-tip="Accounts with 2,000 or more followers exempt|341 accounts exempt, holding 29.5% of follows|written: 44.3 entries per post, at most 1,997 for one post|read: 18.7 lists per feed request (99th percentile 78)|980 operations for a post and its 50 reads"/>
+<rect class="hit" x="10" y="154" width="700" height="25" data-tip="Accounts with 1,000 or more followers exempt|723 accounts exempt, holding 38.3% of follows|written: 39.0 entries per post, at most 1,000 for one post|read: 24.0 lists per feed request (99th percentile 103)|1,240 operations for a post and its 50 reads"/>
+<rect class="hit" x="10" y="181" width="700" height="25" data-tip="Accounts with 500 or more followers exempt|1,478 accounts exempt, holding 47.0% of follows|written: 33.8 entries per post, at most 501 for one post|read: 29.3 lists per feed request (99th percentile 129)|1,496 operations for a post and its 50 reads"/>
+<rect class="hit" x="10" y="208" width="700" height="25" data-tip="Accounts with 200 or more followers exempt|3,766 accounts exempt, holding 58.7% of follows|written: 26.8 entries per post, at most 201 for one post|read: 36.3 lists per feed request (99th percentile 162)|1,840 operations for a post and its 50 reads"/>
+<rect class="hit" x="10" y="235" width="700" height="25" data-tip="Accounts with 100 or more followers exempt|7,652 accounts exempt, holding 67.6% of follows|written: 21.3 entries per post, at most 101 for one post|read: 41.7 lists per feed request (99th percentile 189)|2,105 operations for a post and its 50 reads"/>
+<rect class="hit" x="10" y="262" width="700" height="25" data-tip="Every account exempt|100,000 accounts exempt, holding 100.0% of follows|written: 1.0 entries per post, at most 1 for one post|read: 61.0 lists per feed request (99th percentile 282)|3,052 operations for a post and its 50 reads"/>
+</svg>
+</div>
+<figcaption>Every account exempted from fan-out moves its followers’ cost from the write side to the read side, where it is paid 50 times. Pure fan-out on write does the least work in total.</figcaption>
+</figure>
+
+<p>With 50 reads for each post, pure fan-out on write costs 112 operations for a post and its reads, and pure fan-out on read 3,052, 27 times as many. Any account exempted from fan-out moves its followers’ share to the expensive side. So the starting design is fan-out on write for everyone, and the question becomes which accounts it cannot serve.</p>
+
+<h2 id="celebrity">Step 6b: The celebrity problem</h2>
+<p>The <dfn>celebrity problem</dfn> is the cost and delay of fanning out a post from an account with millions of followers: one post becomes millions of writes, all due at once. It is the hot spot of <x-ref to="partitioning#hot-keys"></x-ref> in a new form. At the 139,000 entries a second of step 2, a post to 100 million followers is 12 minutes of the whole fleet’s work, and the 5-second delivery target is gone for everyone queued behind it.</p>
+<p>The answer is the hybrid in the code below. Accounts above a follower threshold are not fanned out. Their posts go only to their own timeline, and each feed read merges in the timelines of the few such accounts the reader follows.</p>
+<pre data-lang="ts" data-title="The hybrid: fan out most accounts, merge the largest at read time">
+// The hybrid: accounts with at least `threshold` followers are not fanned out.
+// Their posts stay on their own timeline, and readers merge in the few such accounts they follow.
+export class HybridFeed implements FeedStrategy {
+  readonly name: string;
+  readonly work: Work = newWork();
+  private readonly graph: Graph;
+  private readonly threshold: number;
+  private readonly feeds: Capped[];
+  private readonly timelines: Capped[];
+
+  constructor(graph: Graph, cap: number, threshold: number) {
+    this.graph = graph;
+    this.threshold = threshold;
+    this.name = `hybrid, threshold ${threshold}`;
+    this.feeds = Array.from({ length: graph.users }, () => new Capped(cap));
+    this.timelines = Array.from({ length: graph.users }, () => new Capped(cap));
+  }
+  isCelebrity(user: number): boolean {
+    return followerCount(this.graph, user) >= this.threshold;
+  }
+  publish(post: Post): void {
+    const g = this.graph, a = post.author;
+    (this.timelines[a] as Capped).add(post.id);
+    this.work.inserts++;
+    if (this.isCelebrity(a)) return;                       // read-time merge instead
+    this.insert(a, post.id);
+    for (let k = g.followerStart[a] as number; k < (g.followerStart[a + 1] as number); k++) {
+      this.insert(g.followers[k] as number, post.id);
+    }
+  }
+  private insert(user: number, id: number): void {
+    (this.feeds[user] as Capped).add(id);
+    this.work.inserts++;
+  }
+  read(user: number, limit: number, before = Infinity): number[] {
+    const g = this.graph;
+    const lists = [this.feeds[user] as Capped];
+    if (this.isCelebrity(user)) lists.push(this.timelines[user] as Capped);
+    for (let k = g.followeeStart[user] as number; k < (g.followeeStart[user + 1] as number); k++) {
+      const v = g.followees[k] as number;
+      if (this.isCelebrity(v)) lists.push(this.timelines[v] as Capped);
+    }
+    return merge(lists, limit, before, this.work);
+  }
+}
+</pre>
+<p>On the simulated network, the threshold trades the largest single fan-out against the lists each read must merge.</p>
+<table>
+<thead><tr><th>Exempt above</th><th>Accounts exempt</th><th>Their share of follows</th><th>Most inserts for one post</th><th>Lists per read, average and 99th percentile</th></tr></thead>
+<tbody>
+<tr><th>No one</th><td>0</td><td>0%</td><td>20,495</td><td>1.0 and 1</td></tr>
+<tr><th>10,000 followers</th><td>39</td><td>9.2%</td><td>9,848</td><td>6.5 and 23</td></tr>
+<tr><th>1,000 followers</th><td>723</td><td>38.3%</td><td>1,000</td><td>24.0 and 103</td></tr>
+<tr><th>Everyone</th><td>100,000</td><td>100%</td><td>1</td><td>61.0 and 282</td></tr>
+</tbody>
+</table>
+<p>The threshold should be as high as delivery allows, because every exemption adds reads. The second simulation finds where delivery breaks. Sixteen fan-out workers each write 5,000 feed entries a second, 80,000 in all. Ordinary posts arrive at 500 a second with audiences drawn from the network, which uses 37.5% of that capacity. Ten seconds in, an account with 2 million followers posts. Four ways of running the workers were measured over the minute that follows.</p>
+
+<figure class="fig wide" id="fig-celebrity">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 316" role="img" aria-labelledby="f814t f814d">
+<title id="f814t">How long ordinary posts wait when a celebrity posts</title>
+<desc id="f814d">A line chart of the longest time any ordinary post published in each second took to reach all its followers, over the first 60 seconds, with 16 fan-out workers. At second 10 an account with 2,000,000 followers posts. batches, one queue: before the post at most 0.2 s, in the minute after at most 25.0 s. one job per post: before the post at most 2.6 s, in the minute after at most 3.6 s. batches, small posts first: before the post at most 0.2 s, in the minute after at most 0.4 s. With no fan-out for that account, the curve matches small posts first.</desc>
+<text class="tb" x="10" y="18">Slowest delivery among the ordinary posts published in each second</text>
+<line class="grid" x1="60" y1="250.0" x2="560" y2="250.0"/>
+<text class="ts end" x="52" y="254.0">0 s</text>
+<line class="grid" x1="60" y1="215.0" x2="560" y2="215.0"/>
+<text class="ts end" x="52" y="219.0">5 s</text>
+<line class="grid" x1="60" y1="180.0" x2="560" y2="180.0"/>
+<text class="ts end" x="52" y="184.0">10 s</text>
+<line class="grid" x1="60" y1="145.0" x2="560" y2="145.0"/>
+<text class="ts end" x="52" y="149.0">15 s</text>
+<line class="grid" x1="60" y1="110.0" x2="560" y2="110.0"/>
+<text class="ts end" x="52" y="114.0">20 s</text>
+<line class="grid" x1="60" y1="75.0" x2="560" y2="75.0"/>
+<text class="ts end" x="52" y="79.0">25 s</text>
+<line class="grid" x1="60" y1="40.0" x2="560" y2="40.0"/>
+<text class="ts end" x="52" y="44.0">30 s</text>
+<line class="axis" x1="60" y1="250" x2="560" y2="250"/>
+<text class="ts mid" x="60.0" y="268">0 s</text>
+<text class="ts mid" x="143.3" y="268">10 s</text>
+<text class="ts mid" x="226.7" y="268">20 s</text>
+<text class="ts mid" x="310.0" y="268">30 s</text>
+<text class="ts mid" x="393.3" y="268">40 s</text>
+<text class="ts mid" x="476.7" y="268">50 s</text>
+<text class="ts mid" x="560.0" y="268">60 s</text>
+<text class="ts" x="60" y="290">Time a post was published. 16 workers at 5,000 entries a second, 500 ordinary posts a second. code/81-hld-news-feed.</text>
+<path class="e none dash" d="M143.3 34V250"/>
+<text class="ts" x="149.3" y="42">2 million followers post</text>
+<path class="line" style="stroke:var(--fault);" d="M64.2 248.6 L72.5 248.6 L80.8 248.6 L89.2 248.6 L97.5 248.6 L105.8 248.6 L114.2 248.6 L122.5 248.6 L130.8 248.5 L139.2 248.5 L147.5 74.9 L155.8 79.2 L164.2 82.0 L172.5 87.7 L180.8 92.3 L189.2 96.0 L197.5 100.9 L205.8 105.0 L214.2 107.3 L222.5 111.6 L230.8 116.2 L239.2 121.2 L247.5 123.9 L255.8 130.0 L264.2 134.0 L272.5 139.8 L280.8 143.5 L289.2 149.1 L297.5 154.0 L305.8 156.9 L314.2 161.5 L322.5 165.1 L330.8 169.3 L339.2 174.5 L347.5 178.2 L355.8 182.9 L364.2 186.6 L372.5 190.6 L380.8 195.0 L389.2 199.7 L397.5 203.2 L405.8 207.2 L414.2 213.0 L422.5 217.7 L430.8 221.8 L439.2 227.0 L447.5 230.8 L455.8 235.9 L464.2 240.2 L472.5 243.4 L480.8 248.6 L489.2 248.6 L497.5 248.6 L505.8 248.6 L514.2 248.6 L522.5 248.6 L530.8 248.6 L539.2 248.5 L547.5 248.6 L555.8 248.6"/>
+<path class="line" style="stroke:var(--ink-3);stroke-dasharray:5 4;" d="M64.2 246.2 L72.5 242.4 L80.8 246.5 L89.2 239.0 L97.5 245.0 L105.8 242.4 L114.2 240.2 L122.5 239.4 L130.8 231.6 L139.2 242.3 L147.5 247.2 L155.8 245.0 L164.2 246.9 L172.5 245.8 L180.8 234.1 L189.2 244.6 L197.5 241.4 L205.8 230.4 L214.2 235.7 L222.5 240.1 L230.8 245.3 L239.2 224.8 L247.5 245.8 L255.8 244.1 L264.2 247.5 L272.5 237.7 L280.8 248.9 L289.2 248.4 L297.5 226.9 L305.8 236.6 L314.2 230.4 L322.5 242.2 L330.8 248.3 L339.2 238.1 L347.5 241.0 L355.8 238.5 L364.2 234.3 L372.5 246.5 L380.8 244.1 L389.2 243.0 L397.5 244.6 L405.8 245.9 L414.2 240.2 L422.5 247.8 L430.8 246.3 L439.2 239.8 L447.5 247.9 L455.8 229.6 L464.2 240.4 L472.5 237.7 L480.8 246.4 L489.2 242.5 L497.5 238.1 L505.8 243.1 L514.2 248.6 L522.5 247.3 L530.8 240.6 L539.2 229.6 L547.5 244.9 L555.8 242.6"/>
+<path class="line" style="stroke:var(--store);" d="M64.2 248.6 L72.5 248.6 L80.8 248.6 L89.2 248.6 L97.5 248.6 L105.8 248.6 L114.2 248.6 L122.5 248.6 L130.8 248.5 L139.2 248.5 L147.5 248.2 L155.8 247.6 L164.2 247.9 L172.5 247.8 L180.8 248.4 L189.2 247.5 L197.5 248.1 L205.8 247.5 L214.2 247.8 L222.5 247.4 L230.8 247.8 L239.2 247.2 L247.5 246.9 L255.8 248.3 L264.2 248.2 L272.5 247.7 L280.8 248.7 L289.2 248.5 L297.5 247.3 L305.8 248.1 L314.2 247.3 L322.5 247.8 L330.8 248.4 L339.2 247.6 L347.5 248.3 L355.8 247.9 L364.2 246.9 L372.5 248.3 L380.8 248.1 L389.2 247.9 L397.5 248.0 L405.8 248.1 L414.2 248.1 L422.5 248.3 L430.8 248.3 L439.2 247.4 L447.5 248.0 L455.8 248.0 L464.2 247.7 L472.5 247.5 L480.8 248.6 L489.2 248.6 L497.5 248.6 L505.8 248.6 L514.2 248.6 L522.5 248.6 L530.8 248.6 L539.2 248.5 L547.5 248.6 L555.8 248.6"/>
+<text class="ts" x="193.0" y="78.5">batches, one queue</text>
+<text class="ts" x="568.0" y="218.5">one job per post</text>
+<text class="ts" x="568.0" y="251.2">batches, small posts first</text>
+<rect class="hit" x="60" y="40" width="8.33333" height="210" data-tip="posts published at 0 to 1 s|batches, one queue: 0.20 s|one job per post: 0.54 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="68.3333" y="40" width="8.33333" height="210" data-tip="posts published at 1 to 2 s|batches, one queue: 0.20 s|one job per post: 1.08 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="76.6667" y="40" width="8.33333" height="210" data-tip="posts published at 2 to 3 s|batches, one queue: 0.20 s|one job per post: 0.51 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="85" y="40" width="8.33333" height="210" data-tip="posts published at 3 to 4 s|batches, one queue: 0.20 s|one job per post: 1.56 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="93.3333" y="40" width="8.33333" height="210" data-tip="posts published at 4 to 5 s|batches, one queue: 0.20 s|one job per post: 0.71 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="101.667" y="40" width="8.33333" height="210" data-tip="posts published at 5 to 6 s|batches, one queue: 0.20 s|one job per post: 1.08 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="110" y="40" width="8.33333" height="210" data-tip="posts published at 6 to 7 s|batches, one queue: 0.20 s|one job per post: 1.40 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="118.333" y="40" width="8.33333" height="210" data-tip="posts published at 7 to 8 s|batches, one queue: 0.20 s|one job per post: 1.51 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="126.667" y="40" width="8.33333" height="210" data-tip="posts published at 8 to 9 s|batches, one queue: 0.22 s|one job per post: 2.63 s|batches, small posts first: 0.22 s|no fan-out for the big account: 0.22 s"/>
+<rect class="hit" x="135" y="40" width="8.33333" height="210" data-tip="posts published at 9 to 10 s|batches, one queue: 0.21 s|one job per post: 1.10 s|batches, small posts first: 0.21 s|no fan-out for the big account: 0.21 s"/>
+<rect class="hit" x="143.333" y="40" width="8.33333" height="210" data-tip="posts published at 10 to 11 s|batches, one queue: 25.02 s|one job per post: 0.40 s|batches, small posts first: 0.26 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="151.667" y="40" width="8.33333" height="210" data-tip="posts published at 11 to 12 s|batches, one queue: 24.40 s|one job per post: 0.72 s|batches, small posts first: 0.35 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="160" y="40" width="8.33333" height="210" data-tip="posts published at 12 to 13 s|batches, one queue: 24.00 s|one job per post: 0.44 s|batches, small posts first: 0.30 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="168.333" y="40" width="8.33333" height="210" data-tip="posts published at 13 to 14 s|batches, one queue: 23.18 s|one job per post: 0.59 s|batches, small posts first: 0.32 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="176.667" y="40" width="8.33333" height="210" data-tip="posts published at 14 to 15 s|batches, one queue: 22.52 s|one job per post: 2.27 s|batches, small posts first: 0.23 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="185" y="40" width="8.33333" height="210" data-tip="posts published at 15 to 16 s|batches, one queue: 22.01 s|one job per post: 0.77 s|batches, small posts first: 0.35 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="193.333" y="40" width="8.33333" height="210" data-tip="posts published at 16 to 17 s|batches, one queue: 21.30 s|one job per post: 1.23 s|batches, small posts first: 0.28 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="201.667" y="40" width="8.33333" height="210" data-tip="posts published at 17 to 18 s|batches, one queue: 20.72 s|one job per post: 2.79 s|batches, small posts first: 0.36 s|no fan-out for the big account: 0.25 s"/>
+<rect class="hit" x="210" y="40" width="8.33333" height="210" data-tip="posts published at 18 to 19 s|batches, one queue: 20.39 s|one job per post: 2.04 s|batches, small posts first: 0.32 s|no fan-out for the big account: 0.22 s"/>
+<rect class="hit" x="218.333" y="40" width="8.33333" height="210" data-tip="posts published at 19 to 20 s|batches, one queue: 19.77 s|one job per post: 1.41 s|batches, small posts first: 0.37 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="226.667" y="40" width="8.33333" height="210" data-tip="posts published at 20 to 21 s|batches, one queue: 19.12 s|one job per post: 0.67 s|batches, small posts first: 0.32 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="235" y="40" width="8.33333" height="210" data-tip="posts published at 21 to 22 s|batches, one queue: 18.40 s|one job per post: 3.60 s|batches, small posts first: 0.40 s|no fan-out for the big account: 0.38 s"/>
+<rect class="hit" x="243.333" y="40" width="8.33333" height="210" data-tip="posts published at 22 to 23 s|batches, one queue: 18.01 s|one job per post: 0.61 s|batches, small posts first: 0.44 s|no fan-out for the big account: 0.36 s"/>
+<rect class="hit" x="251.667" y="40" width="8.33333" height="210" data-tip="posts published at 23 to 24 s|batches, one queue: 17.14 s|one job per post: 0.85 s|batches, small posts first: 0.24 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="260" y="40" width="8.33333" height="210" data-tip="posts published at 24 to 25 s|batches, one queue: 16.57 s|one job per post: 0.35 s|batches, small posts first: 0.26 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="268.333" y="40" width="8.33333" height="210" data-tip="posts published at 25 to 26 s|batches, one queue: 15.74 s|one job per post: 1.76 s|batches, small posts first: 0.33 s|no fan-out for the big account: 0.22 s"/>
+<rect class="hit" x="276.667" y="40" width="8.33333" height="210" data-tip="posts published at 26 to 27 s|batches, one queue: 15.21 s|one job per post: 0.16 s|batches, small posts first: 0.19 s|no fan-out for the big account: 0.16 s"/>
+<rect class="hit" x="285" y="40" width="8.33333" height="210" data-tip="posts published at 27 to 28 s|batches, one queue: 14.42 s|one job per post: 0.22 s|batches, small posts first: 0.21 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="293.333" y="40" width="8.33333" height="210" data-tip="posts published at 28 to 29 s|batches, one queue: 13.71 s|one job per post: 3.30 s|batches, small posts first: 0.38 s|no fan-out for the big account: 0.31 s"/>
+<rect class="hit" x="301.667" y="40" width="8.33333" height="210" data-tip="posts published at 29 to 30 s|batches, one queue: 13.30 s|one job per post: 1.92 s|batches, small posts first: 0.27 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="310" y="40" width="8.33333" height="210" data-tip="posts published at 30 to 31 s|batches, one queue: 12.64 s|one job per post: 2.79 s|batches, small posts first: 0.38 s|no fan-out for the big account: 0.22 s"/>
+<rect class="hit" x="318.333" y="40" width="8.33333" height="210" data-tip="posts published at 31 to 32 s|batches, one queue: 12.12 s|one job per post: 1.12 s|batches, small posts first: 0.32 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="326.667" y="40" width="8.33333" height="210" data-tip="posts published at 32 to 33 s|batches, one queue: 11.52 s|one job per post: 0.24 s|batches, small posts first: 0.23 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="335" y="40" width="8.33333" height="210" data-tip="posts published at 33 to 34 s|batches, one queue: 10.78 s|one job per post: 1.70 s|batches, small posts first: 0.35 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="343.333" y="40" width="8.33333" height="210" data-tip="posts published at 34 to 35 s|batches, one queue: 10.26 s|one job per post: 1.28 s|batches, small posts first: 0.24 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="351.667" y="40" width="8.33333" height="210" data-tip="posts published at 35 to 36 s|batches, one queue: 9.58 s|one job per post: 1.65 s|batches, small posts first: 0.30 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="360" y="40" width="8.33333" height="210" data-tip="posts published at 36 to 37 s|batches, one queue: 9.05 s|one job per post: 2.25 s|batches, small posts first: 0.45 s|no fan-out for the big account: 0.36 s"/>
+<rect class="hit" x="368.333" y="40" width="8.33333" height="210" data-tip="posts published at 37 to 38 s|batches, one queue: 8.49 s|one job per post: 0.49 s|batches, small posts first: 0.25 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="376.667" y="40" width="8.33333" height="210" data-tip="posts published at 38 to 39 s|batches, one queue: 7.86 s|one job per post: 0.85 s|batches, small posts first: 0.27 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="385" y="40" width="8.33333" height="210" data-tip="posts published at 39 to 40 s|batches, one queue: 7.19 s|one job per post: 1.00 s|batches, small posts first: 0.31 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="393.333" y="40" width="8.33333" height="210" data-tip="posts published at 40 to 41 s|batches, one queue: 6.68 s|one job per post: 0.77 s|batches, small posts first: 0.28 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="401.667" y="40" width="8.33333" height="210" data-tip="posts published at 41 to 42 s|batches, one queue: 6.11 s|one job per post: 0.59 s|batches, small posts first: 0.27 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="410" y="40" width="8.33333" height="210" data-tip="posts published at 42 to 43 s|batches, one queue: 5.28 s|one job per post: 1.40 s|batches, small posts first: 0.27 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="418.333" y="40" width="8.33333" height="210" data-tip="posts published at 43 to 44 s|batches, one queue: 4.61 s|one job per post: 0.32 s|batches, small posts first: 0.24 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="426.667" y="40" width="8.33333" height="210" data-tip="posts published at 44 to 45 s|batches, one queue: 4.03 s|one job per post: 0.53 s|batches, small posts first: 0.24 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="435" y="40" width="8.33333" height="210" data-tip="posts published at 45 to 46 s|batches, one queue: 3.28 s|one job per post: 1.46 s|batches, small posts first: 0.37 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="443.333" y="40" width="8.33333" height="210" data-tip="posts published at 46 to 47 s|batches, one queue: 2.74 s|one job per post: 0.30 s|batches, small posts first: 0.28 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="451.667" y="40" width="8.33333" height="210" data-tip="posts published at 47 to 48 s|batches, one queue: 2.01 s|one job per post: 2.92 s|batches, small posts first: 0.29 s|no fan-out for the big account: 0.27 s"/>
+<rect class="hit" x="460" y="40" width="8.33333" height="210" data-tip="posts published at 48 to 49 s|batches, one queue: 1.40 s|one job per post: 1.37 s|batches, small posts first: 0.32 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="468.333" y="40" width="8.33333" height="210" data-tip="posts published at 49 to 50 s|batches, one queue: 0.94 s|one job per post: 1.76 s|batches, small posts first: 0.36 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="476.667" y="40" width="8.33333" height="210" data-tip="posts published at 50 to 51 s|batches, one queue: 0.20 s|one job per post: 0.52 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="485" y="40" width="8.33333" height="210" data-tip="posts published at 51 to 52 s|batches, one queue: 0.20 s|one job per post: 1.08 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="493.333" y="40" width="8.33333" height="210" data-tip="posts published at 52 to 53 s|batches, one queue: 0.20 s|one job per post: 1.70 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="501.667" y="40" width="8.33333" height="210" data-tip="posts published at 53 to 54 s|batches, one queue: 0.20 s|one job per post: 0.98 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="510" y="40" width="8.33333" height="210" data-tip="posts published at 54 to 55 s|batches, one queue: 0.20 s|one job per post: 0.20 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="518.333" y="40" width="8.33333" height="210" data-tip="posts published at 55 to 56 s|batches, one queue: 0.20 s|one job per post: 0.39 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="526.667" y="40" width="8.33333" height="210" data-tip="posts published at 56 to 57 s|batches, one queue: 0.20 s|one job per post: 1.34 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="535" y="40" width="8.33333" height="210" data-tip="posts published at 57 to 58 s|batches, one queue: 0.22 s|one job per post: 2.92 s|batches, small posts first: 0.22 s|no fan-out for the big account: 0.22 s"/>
+<rect class="hit" x="543.333" y="40" width="8.33333" height="210" data-tip="posts published at 58 to 59 s|batches, one queue: 0.20 s|one job per post: 0.73 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+<rect class="hit" x="551.667" y="40" width="8.33333" height="210" data-tip="posts published at 59 to 60 s|batches, one queue: 0.20 s|one job per post: 1.05 s|batches, small posts first: 0.20 s|no fan-out for the big account: 0.20 s"/>
+</svg>
+</div>
+<figcaption>With one queue, the celebrity’s 2,000 batches hold up every post behind them for up to 25 seconds. Serving small posts first keeps them under half a second, measured.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Workers take</th><th>Ordinary posts in the next minute: 99th percentile, slowest</th><th>The big post reaches half its followers, all of them</th></tr></thead>
+<tbody>
+<tr><th>One job per post</th><td>0.15 s, 3.59 s</td><td>200 s, 400 s</td></tr>
+<tr><th>Batches of 1,000 followers, one queue</th><td>24.6 s, 25.0 s</td><td>12.6 s, 25.2 s</td></tr>
+<tr><th>Batches, small posts first</th><td>0.21 s, 0.44 s</td><td>20.1 s, 40.2 s</td></tr>
+<tr><th>No fan-out for the big account</th><td>0.18 s, 0.38 s</td><td>At once, merged when feeds are read</td></tr>
+</tbody>
+</table>
+<p>One job per post leaves the big post on one worker for 400 seconds, and even an ordinary account with 20,000 followers takes 4 seconds. Batches spread a post over all workers, but with one queue the big post’s 2,000 batches stand in front of every ordinary post: those published right after it took 25 seconds to deliver, and the backlog took 40 seconds to clear. A second queue for posts with more than 100 batches, served only when the first is empty, keeps ordinary posts under half a second and lets the big post use the spare capacity. That spare capacity sets the threshold: 80,000 minus 30,000 is 50,000 entries a second, so an account with more than 250,000 followers cannot be delivered in 5 seconds even with every worker on it. At the scale of step 2, with workers sized for twice the peak of 278,000 entries a second, the same rule puts the threshold near 1.4 million followers, an estimate.</p>
+<p>Exempting an account moves its load, it does not remove it. Its timeline is read by every feed request of its followers: if 30% of users follow it, 20,000 reads a second at peak land on one list. That list is copied to many nodes of the cache, and each feed server keeps it in memory for a second or two, as <x-ref to="caching#other-failures"></x-ref> describes for a hot key.</p>
+
+<h2 id="ranking">Step 6c: Ranking</h2>
+<p>A feed in time order is simple and predictable, and the API above serves it with an id cursor. A ranked feed puts the posts the reader is most likely to care about first. It runs in stages. <dfn>Candidate generation</dfn> collects the posts that might be shown: here, the 800 ids of the reader’s list and the recent posts of the big accounts they follow. Each candidate then gets a score from features such as its age, how often the reader interacts with its author, and how much engagement it is drawing. Facebook has described its score as a weighted sum of predicted probabilities that the reader will like, comment on or share the post.</p>
+<p>The full model is the expensive part, so it should not score more candidates than it must. The simulation gave 1,000 readers 800 candidates each, spread over 72 hours, and a full model whose score halves every 12 hours of age. It then let the full model score only some candidates, chosen either by age or by a cheap model whose scores correlate with the full model’s at 0.82, and counted how much of the best page of 20 was found.</p>
+
+<figure class="fig wide" id="fig-funnel">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f815t f815d">
+<title id="f815t">How many candidates the full model must score</title>
+<desc id="f815d">A line chart of the share of the best page of 20 posts that is found when the full ranking model scores only some of the 800 candidates, on a log scale from 20 to 800. Choosing them by age, newest first: 20 scored 15%, 30 scored 22%, 50 scored 34%, 75 scored 47%, 100 scored 58%, 150 scored 75%, 200 scored 85%, 300 scored 96%, 400 scored 99%, 600 scored 100%, 800 scored 100%. Choosing them with a cheap model first: 20 scored 42%, 30 scored 53%, 50 scored 67%, 75 scored 79%, 100 scored 86%, 150 scored 93%, 200 scored 97%, 300 scored 99%, 400 scored 100%, 600 scored 100%, 800 scored 100%.</desc>
+<text class="tb" x="10" y="18">Share of the best page found, of 800 candidates, averaged over 1,000 readers</text>
+<line class="grid" x1="70" y1="240.0" x2="560" y2="240.0"/>
+<text class="ts end" x="62" y="244.0">0%</text>
+<line class="grid" x1="70" y1="200.0" x2="560" y2="200.0"/>
+<text class="ts end" x="62" y="204.0">20%</text>
+<line class="grid" x1="70" y1="160.0" x2="560" y2="160.0"/>
+<text class="ts end" x="62" y="164.0">40%</text>
+<line class="grid" x1="70" y1="120.0" x2="560" y2="120.0"/>
+<text class="ts end" x="62" y="124.0">60%</text>
+<line class="grid" x1="70" y1="80.0" x2="560" y2="80.0"/>
+<text class="ts end" x="62" y="84.0">80%</text>
+<line class="grid" x1="70" y1="40.0" x2="560" y2="40.0"/>
+<text class="ts end" x="62" y="44.0">100%</text>
+<line class="axis" x1="70" y1="240" x2="560" y2="240"/>
+<line class="axis" x1="70.0" y1="240" x2="70.0" y2="245"/>
+<text class="ts mid" x="70.0" y="258">20</text>
+<line class="axis" x1="191.7" y1="240" x2="191.7" y2="245"/>
+<text class="ts mid" x="191.7" y="258">50</text>
+<line class="axis" x1="283.8" y1="240" x2="283.8" y2="245"/>
+<text class="ts mid" x="283.8" y="258">100</text>
+<line class="axis" x1="375.9" y1="240" x2="375.9" y2="245"/>
+<text class="ts mid" x="375.9" y="258">200</text>
+<line class="axis" x1="467.9" y1="240" x2="467.9" y2="245"/>
+<text class="ts mid" x="467.9" y="258">400</text>
+<line class="axis" x1="560.0" y1="240" x2="560.0" y2="245"/>
+<text class="ts mid" x="560.0" y="258">800</text>
+<text class="ts" x="70" y="280">Candidates the full model scores (log scale). Cheap model correlation 0.82. code/81-hld-news-feed.</text>
+<path class="line" style="stroke:var(--sig)" d="M70.0 156.2 L123.9 134.2 L191.7 105.2 L245.6 81.9 L283.8 68.6 L337.6 53.6 L375.9 46.7 L429.7 41.5 L467.9 40.2 L521.8 40.0 L560.0 40.0"/>
+<circle class="dot" style="fill:var(--sig)" cx="70.0" cy="156.2" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="123.9" cy="134.2" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="191.7" cy="105.2" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="245.6" cy="81.9" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="283.8" cy="68.6" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="337.6" cy="53.6" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="375.9" cy="46.7" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="429.7" cy="41.5" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="467.9" cy="40.2" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="521.8" cy="40.0" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="560.0" cy="40.0" r="3.5"/>
+<path class="line" style="stroke:var(--ink-3)" d="M70.0 209.7 L123.9 196.0 L191.7 171.9 L245.6 145.1 L283.8 123.3 L337.6 90.6 L375.9 69.6 L429.7 48.4 L467.9 42.1 L521.8 40.1 L560.0 40.0"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="70.0" cy="209.7" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="123.9" cy="196.0" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="191.7" cy="171.9" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="245.6" cy="145.1" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="283.8" cy="123.3" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="337.6" cy="90.6" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="375.9" cy="69.6" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="429.7" cy="48.4" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="467.9" cy="42.1" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="521.8" cy="40.1" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="560.0" cy="40.0" r="3.5"/>
+<text class="ts end" x="185.7" y="91.2">cheap model first</text>
+<text class="ts" x="293.8" y="139.3">newest first</text>
+<rect class="hit" x="60" y="40" width="36.9293" height="200" data-tip="full model scores 20 candidates|cheap model first: 41.9% of the best page|newest first: 15.2% of the best page"/>
+<rect class="hit" x="96.9293" y="40" width="60.8562" height="200" data-tip="full model scores 30 candidates|cheap model first: 52.9% of the best page|newest first: 22.0% of the best page"/>
+<rect class="hit" x="157.786" y="40" width="60.8562" height="200" data-tip="full model scores 50 candidates|cheap model first: 67.4% of the best page|newest first: 34.1% of the best page"/>
+<rect class="hit" x="218.642" y="40" width="46.0359" height="200" data-tip="full model scores 75 candidates|cheap model first: 79.1% of the best page|newest first: 47.4% of the best page"/>
+<rect class="hit" x="264.678" y="40" width="46.0359" height="200" data-tip="full model scores 100 candidates|cheap model first: 85.7% of the best page|newest first: 58.4% of the best page"/>
+<rect class="hit" x="310.714" y="40" width="46.0359" height="200" data-tip="full model scores 150 candidates|cheap model first: 93.2% of the best page|newest first: 74.7% of the best page"/>
+<rect class="hit" x="356.75" y="40" width="46.0359" height="200" data-tip="full model scores 200 candidates|cheap model first: 96.7% of the best page|newest first: 85.2% of the best page"/>
+<rect class="hit" x="402.786" y="40" width="46.0359" height="200" data-tip="full model scores 300 candidates|cheap model first: 99.3% of the best page|newest first: 95.8% of the best page"/>
+<rect class="hit" x="448.821" y="40" width="46.0359" height="200" data-tip="full model scores 400 candidates|cheap model first: 99.9% of the best page|newest first: 98.9% of the best page"/>
+<rect class="hit" x="494.857" y="40" width="46.0359" height="200" data-tip="full model scores 600 candidates|cheap model first: 100.0% of the best page|newest first: 100.0% of the best page"/>
+<rect class="hit" x="540.893" y="40" width="29.1066" height="200" data-tip="full model scores 800 candidates|cheap model first: 100.0% of the best page|newest first: 100.0% of the best page"/>
+</svg>
+</div>
+<figcaption>A cheap first pass that picks 200 candidates for the full model finds 97% of the best page, measured; picking the newest 200 finds 85%.</figcaption>
+</figure>
+
+<p>Scoring the newest 100 finds 58% of the best page, because a strong post from yesterday loses to weak posts from this morning. A cheap first pass that picks 100 finds 86%, and 200 finds 97%. That is the shape of every production ranking system: a cheap stage over many candidates, an expensive one over a few hundred.</p>
+<p>Ranking changes paging. A post’s rank changes as it ages and draws engagement, so ranking again for page 2 shows some posts twice and skips others. The test measured it: re-ranking for page 2 half an hour after page 1 repeated 4.05 of page 1’s posts on average, and 3.06 older posts that had climbed above position 20 were never shown at all. Serving page 2 from the order saved with page 1 repeated none. So the feed service saves the ranked list for the session, the cursor is a position in it, and new posts wait for the next refresh. A chronological feed has the same problem with offsets: in the test, four new posts made page 2 by offset repeat four posts, and page 2 by id cursor repeated none.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A feed cache node is lost</th><td>A slower first page for the readers on it</td><td>Another copy serves them. If all copies are lost, the list is rebuilt once by fan-out on read from the timelines</td></tr>
+<tr><th>Fan-out workers fall behind</th><td>New posts appear late; feeds still load</td><td>The queue holds the backlog. Small posts go first, more workers are added, and delivery lag is an alert</td></tr>
+<tr><th>An event is delivered twice</th><td>Nothing</td><td>Adding an id that a list already holds changes nothing, because the list is a set ordered by id (<x-ref to="idempotency-and-delivery#consumers"></x-ref>)</td></tr>
+<tr><th>The ranking service is down or slow</th><td>A feed in time order</td><td>After a 50 ms timeout, the feed service returns the merged candidates newest first (<x-ref to="resilience-patterns"></x-ref>)</td></tr>
+<tr><th>The graph store is slow</th><td>Late delivery, not slow feeds</td><td>Only the workers read followers; feed reads do not touch it</td></tr>
+<tr><th>A post is deleted, or an account unfollowed</th><td>The post disappears from feeds</td><td>The feed service filters ids whose posts are gone and authors no longer followed; lists clean up as they roll over</td></tr>
+<tr><th>A celebrity’s timeline is hot</th><td>Nothing</td><td>Extra copies and short in-process caching, step 6b</td></tr>
+</tbody>
+</table>
+<p>At ten times the load, feed lists need 115 TB of memory in three copies. The answer is to keep lists in memory only for active users, as Twitter described, and to build a returning user’s feed once on read. Fan-out reaches 1.4 million entries a second, more workers on more partitions of the same queue. At a hundred times, one region cannot hold it: users are split into regional cells, each with its own workers and feed cache, and posts are copied between regions so that each fans out to its local followers (<x-ref to="multi-region"></x-ref>). The hybrid, the merge and the ranking stages do not change.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Twitter, 2012.</b> In a QCon talk, Raffi Krikorian described home timelines kept in a Redis cluster, at most 800 entries each, in three copies, with 300,000 timeline reads a second against 6,000 writes. Fan-out aimed to deliver within 5 seconds, and a tweet could take up to 5 minutes to reach Lady Gaga’s 31 million followers. The largest accounts were no longer fanned out and were merged in when timelines were read, and only active users were kept in memory (as summarized by High Scalability, July 2013).</li>
+  <li><b>Twitter’s ranked timeline, 2023.</b> When Twitter published its recommendation code in March 2023, it said that each request picks the best 1,500 posts from hundreds of millions, half on average from accounts the reader follows, ranks them with a neural network of about 48 million parameters that predicts ten kinds of engagement, and that the pipeline runs about 5 billion times a day in under 1.5 seconds on average.</li>
+  <li><b>Facebook, 2021.</b> Meta’s engineers described more than 1,000 posts available to each user each day on average, a lightweight pass that selects about 500, a main pass that scores each with a weighted sum of predicted engagement, and a final pass that adjusts the order for context.</li>
+  <li><b>The per-pair rule.</b> Silberstein, Terrace, Cooper and Ramakrishnan (SIGMOD 2010) proved that the cheapest plan chooses copy-ahead or gather-on-read separately for each pair of reader and author, from the ratio of the reader’s request rate to the author’s posting rate.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“Show posts from accounts I do not follow”</th><td>More candidate sources, such as posts liked by similar users, merged before ranking. The ranking stages grow</td><td>Fan-out of followed accounts</td></tr>
+<tr><th>“Unfollowing must remove posts at once”</th><td>The feed service checks each candidate’s author against the reader’s follow set, cached per session</td><td>The feed lists, which clean up as they roll over</td></tr>
+<tr><th>“Private accounts and close-friends posts”</th><td>Fan-out writes only to allowed readers, and reads check the audience again</td><td>The stores</td></tr>
+<tr><th>“Show like counts on every post”</th><td>Counts live in a counter service, read in the multi-get that fills a page, and are batched on write</td><td>The feed lists, which hold ids only</td></tr>
+<tr><th>“Users on every continent”</th><td>Regional cells with their own feed caches; posts replicated between regions before fan-out</td><td>The API</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Spend 5 minutes on requirements and say the read-to-post ratio aloud, 3 on estimates, 5 on the API and data model, and 10 on the drawing and the two flows. Give the deep dives about 15 minutes: fan-out on write against fan-out on read with the ratio as the argument, then the celebrity threshold and how the workers are protected from one big post. Mention ranking stages and session-saved order if time allows, and keep the last 5 minutes for failures.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Fan-out on read for everyone</th><td>Every feed read merges dozens to hundreds of lists, 27 times the work at 50 reads a post</td><td>Fan-out on write, with exemptions</td></tr>
+<tr><th>Fan-out on write for everyone</th><td>One post from the largest account is millions of writes and minutes of delay</td><td>Exempt accounts above a threshold, merged at read time</td></tr>
+<tr><th>A low celebrity threshold, “to be safe”</th><td>Each exemption moves its followers’ cost to reads, paid 50 times</td><td>The highest threshold that still meets the delivery target</td></tr>
+<tr><th>One queue for all fan-out work</th><td>A big post delays every post behind it, by 25 seconds in the simulation</td><td>Batches, with big posts in a second queue</td></tr>
+<tr><th>Copying whole posts into feed lists</th><td>An edit or a delete must touch millions of lists, and the lists are about 60 times larger</td><td>Copy ids; fill in posts from a cache</td></tr>
+<tr><th>Paging by offset, or ranking again for every page</th><td>Posts repeat and others are never shown</td><td>An id cursor, or a cursor into an order saved for the session</td></tr>
+<tr><th>Keeping feeds for every registered user</th><td>Memory for people who never read them</td><td>Keep active users’ feeds; rebuild the others on return</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="hld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="partitioning"></x-ref>: hot keys, of which the celebrity problem is one.</li>
+  <li><x-ref to="message-queues"></x-ref>: the queue between publishing and fan-out, and backpressure.</li>
+  <li><x-ref to="caching"></x-ref>: the feed, timeline and post caches.</li>
+  <li><x-ref to="api-styles"></x-ref>: cursors and idempotency keys.</li>
+  <li><x-ref to="unique-ids"></x-ref>: time-ordered ids that make lists sort themselves.</li>
+  <li><x-ref to="hld-notifications"></x-ref>: the same fan-out, delivered to devices instead of lists.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Every follow is paid for once: by a write when the author posts, or by a read when the follower opens the feed.</li>
+  <li>With 50 feed reads per post, copying ids ahead into each follower’s list is the cheaper default, 27 times cheaper in the simulation.</li>
+  <li>Accounts too large to fan out within the delivery target are merged in at read time. Set the threshold from the workers’ spare capacity, as high as possible.</li>
+  <li>Fan out in batches, and keep big posts in a queue of their own, or one celebrity delays everyone.</li>
+  <li>Feed lists hold ids, are capped, live in memory for active users only, and can be rebuilt.</li>
+  <li>Rank in stages: a cheap model over all candidates, the full model over a few hundred.</li>
+  <li>Page a ranked feed from an order saved for the session; page a chronological one by id cursor.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why do inserts per post and lists per read add up to about the same number under every strategy?</summary><p>Each follow is paid for once. If the author is fanned out, the follow costs one insert per post; if not, one list read per feed request. A strategy only decides which side pays for each follow.</p></details>
+<details><summary>Feeds are read 50 times for every post. Which is cheaper, fan-out on write or on read, and by roughly how much in the simulation?</summary><p>Fan-out on write: 112 operations for a post and its 50 reads, against 3,052 for fan-out on read, 27 times as many. A write is paid once, a read 50 times.</p></details>
+<details><summary>Why not exempt every account with more than 1,000 followers, to be safe?</summary><p>Each exemption moves that account’s followers to the read side. On the simulated network, a threshold of 1,000 makes the average feed read merge 24 lists instead of 1, and the 99th percentile 103.</p></details>
+<details><summary>How would you choose the celebrity threshold?</summary><p>From the delivery target and the workers’ spare capacity: an account whose fan-out cannot finish within the target even with all spare capacity should be exempt. With 50,000 spare entries a second and 5 seconds, that is 250,000 followers.</p></details>
+<details><summary>A post from an account with 2 million followers enters the same queue as everyone else, split into batches. What happens to ordinary posts?</summary><p>They wait behind the 2,000 batches. In the simulation, ordinary posts published in the next minute took up to 25 seconds to deliver, against under half a second when big posts had their own queue served after small ones.</p></details>
+<details><summary>Why save the ranked order for the session instead of ranking again for each page?</summary><p>Scores change between pages, so ranking again shows some posts twice and skips others. In the test, re-ranking half an hour later repeated about 4 posts and skipped about 3; the saved order repeated none.</p></details>
+<details><summary>A feed cache partition loses all its copies. What do its readers see, and how does the system recover?</summary><p>A slower first page. The feed service rebuilds each reader’s list once by fan-out on read, merging the timelines of everyone they follow, and stores it again. No post is lost, because the lists only hold ids of posts stored elsewhere.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Adam Silberstein, Jeff Terrace, Brian F. Cooper and Raghu Ramakrishnan, <a href="https://sns.cs.princeton.edu/assets/papers/2010-sigmod-silberstein.pdf">“Feeding Frenzy: Selectively Materializing Users’ Event Feeds”</a>, SIGMOD 2010. The per-pair rule for copying ahead or gathering on read.</li>
+  <li>Raffi Krikorian, <a href="https://www.infoq.com/presentations/Twitter-Timeline-Scalability/">“Timelines at Scale”</a>, QCon San Francisco 2012, published by InfoQ, April 2013. The talk behind the Twitter figures.</li>
+  <li>High Scalability, <a href="http://highscalability.com/blog/2013/7/8/the-architecture-twitter-uses-to-deal-with-150m-active-users.html">“The Architecture Twitter Uses to Deal with 150M Active Users, 300K QPS, a 22 MB/S Firehose, and Send Tweets in Under 5 Seconds”</a>, July 2013. A written summary of the talk, checked October 2026.</li>
+  <li>Twitter Engineering, <a href="https://blog.x.com/engineering/en_us/topics/open-source/2023/twitter-recommendation-algorithm">“Twitter’s Recommendation Algorithm”</a>, March 2023. Candidate sources, the 1,500 candidates and the ranking model.</li>
+  <li>Akos Lada, Meihong Wang and Tak Yan, <a href="https://engineering.fb.com/2021/01/26/core-infra/news-feed-ranking/">“How machine learning powers Facebook’s News Feed ranking algorithm”</a>, Engineering at Meta, January 2021. The passes of ranking and the weighted score.</li>
+</ol>
+</section>

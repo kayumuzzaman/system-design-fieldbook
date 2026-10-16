@@ -1,0 +1,414 @@
+<!--meta
+{ "description": "Availability and reliability in system design: counting nines, MTBF and MTTR, availability in series and in parallel, single points of failure, redundancy and failover, failure domains, SLIs, SLOs, SLAs and error budgets, RTO and RPO, and lessons from the AWS and Cloudflare outages of 2025.",
+  "lede": "Every component fails eventually. The question a design has to answer is what the user sees when it does. This chapter gives you the arithmetic of uptime, the patterns that keep a system answering through failures, and the vocabulary for agreeing how good is good enough.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="words">Five words that are often confused</h2>
+<p>People use “reliable”, “available” and “durable” as if they meant the same thing. They measure different properties, a system can have one without the others, and design reviews go wrong when two people mean different ones.</p>
+<table>
+<thead><tr><th>Term</th><th>The question it answers</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>Availability</th><td>What fraction of the time, or of requests, does the system respond correctly?</td><td>The API answered 99.95% of requests successfully this month.</td></tr>
+<tr><th>Reliability</th><td>How long does it run correctly before something goes wrong?</td><td>The service runs for about 60 days between incidents.</td></tr>
+<tr><th>Durability</th><td>Once data is stored, how likely is it to still be there later?</td><td>No object has been lost in ten years.</td></tr>
+<tr><th>Fault tolerance</th><td>Does the system keep working when a part of it fails?</td><td>A database server died and no request failed.</td></tr>
+<tr><th>Resilience</th><td>How well does it absorb trouble and return to normal?</td><td>Under a traffic spike it slowed, shed some load and recovered without help.</td></tr>
+</tbody>
+</table>
+<p>Availability and durability are the two most often mixed up, and the difference matters. A storage service can be unreachable for an hour, which is an availability failure, and have every byte intact when it returns. Another can answer every request instantly and have silently lost a file last Tuesday. Users forgive the first within a day. They may never forgive the second.</p>
+<p>It also helps to separate three words for things going wrong. A <dfn>fault</dfn> is a defect in one component: a disk that dies, a bug, a mistyped configuration value. An <dfn>error</dfn> is the incorrect internal state that the fault produces. A <dfn>failure</dfn> is what happens when that error reaches the user and the system as a whole stops doing its job. Faults cannot be prevented. The purpose of this chapter is to stop faults from becoming failures.</p>
+
+<h2 id="nines">Counting nines</h2>
+<p>Availability is written as a percentage, and since the interesting values are all close to 100, people count the nines. “Three nines” is 99.9%. The percentages look nearly identical. The downtime they permit does not.</p>
+<table>
+<thead><tr><th>Availability</th><th>Called</th><th>Downtime per year</th><th>Per month</th><th>Per day</th></tr></thead>
+<tbody>
+<tr><td class="r">90%</td><td>one nine</td><td class="r">36.5 days</td><td class="r">3 days</td><td class="r">2.4 hours</td></tr>
+<tr><td class="r">99%</td><td>two nines</td><td class="r">3.65 days</td><td class="r">7.3 hours</td><td class="r">14.4 minutes</td></tr>
+<tr><td class="r">99.9%</td><td>three nines</td><td class="r">8.8 hours</td><td class="r">43.8 minutes</td><td class="r">86 seconds</td></tr>
+<tr><td class="r">99.95%</td><td>three and a half</td><td class="r">4.4 hours</td><td class="r">21.9 minutes</td><td class="r">43 seconds</td></tr>
+<tr><td class="r">99.99%</td><td>four nines</td><td class="r">52.6 minutes</td><td class="r">4.4 minutes</td><td class="r">8.6 seconds</td></tr>
+<tr><td class="r">99.999%</td><td>five nines</td><td class="r">5.3 minutes</td><td class="r">26 seconds</td><td class="r">0.9 seconds</td></tr>
+</tbody>
+</table>
+<p>Each added nine cuts the allowed downtime by ten. Read the table for what it implies about people as well as machines. At three nines you can afford one bad hour-long incident in a quarter, and a person can be paged, wake up, diagnose and fix it. At four nines the whole year’s allowance is under an hour, so a single incident handled by a human uses most of it. At five nines the allowance is five minutes a year, which is less time than it takes to open a laptop. Recovery at that level has to be automatic, and so does detection.</p>
+
+<h3 id="measuring">What exactly is being measured</h3>
+<p>The percentage hides choices, and two teams quoting “99.9%” may mean different things.</p>
+<ul>
+  <li><b>Time or requests?</b> Time-based availability is minutes up divided by total minutes. Request-based availability is successful requests divided by total requests. The second is usually better: an outage at four in the morning that affects twelve users and one at the evening peak that affects a million count the same by the clock and very differently by requests.</li>
+  <li><b>What counts as success?</b> A response that takes 30 seconds is not a success to the person waiting. Mature definitions include a latency bound: “answered correctly within one second”.</li>
+  <li><b>Measured from where?</b> The server’s own count misses every request that never reached it. Measure at the load balancer or from outside.</li>
+  <li><b>Does planned maintenance count?</b> Many contracts exclude it. Users do not.</li>
+  <li><b>All of it or part of it?</b> When search works and checkout does not, is the site up? Availability is more useful stated per feature than for “the site”.</li>
+</ul>
+
+<h2 id="mtbf-mttr">Two ways to be more available</h2>
+<p>Availability can be computed from two averages. <dfn>Mean time between failures</dfn> (MTBF) is how long the system runs between incidents. <dfn>Mean time to recovery</dfn> (MTTR) is how long an incident lasts.</p>
+<div class="formula">availability = MTBF ÷ (MTBF + MTTR)</div>
+<p>A service that fails once every 30 days and takes an hour to restore is available 720 ÷ 721 of the time, or 99.86%. There are two ways to improve that figure. You can make failures rarer: to reach 99.986% by this route, the service would have to run 300 days between incidents. Or you can make recovery faster: cutting the hour to six minutes gets the same result.</p>
+<p>The second route is almost always cheaper. Preventing failures means finding every bug and anticipating every hardware fault. Recovering quickly means detecting a problem within seconds, having a tested way to roll back or fail over, and removing the steps that need a person to make a decision at three in the morning. Much of what follows is about shortening recovery.</p>
+
+<h2 id="combining">How availability combines</h2>
+<p>A system is built from components, each with its own availability. How they are connected decides the availability of the whole, and there are only two arrangements.</p>
+
+<figure class="fig" id="fig-series-parallel">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f61t f61d">
+<title id="f61t">Availability in series and in parallel</title>
+<desc id="f61d">Left: three components in series, each 99.9 percent available, give 99.7 percent overall, about 26 hours of downtime a year. Right: two servers in parallel, each 99 percent available, give 99.99 percent overall, about 53 minutes a year, provided they fail independently.</desc>
+<text class="tl" x="10" y="22">In series: every one must work</text>
+<rect class="n" x="14" y="62" width="96" height="50" rx="6"/><text class="tb mid" x="62" y="84">Load balancer</text><text class="ts mid" x="62" y="101">99.9%</text>
+<rect class="n" x="134" y="62" width="96" height="50" rx="6"/><text class="tb mid" x="182" y="84">App server</text><text class="ts mid" x="182" y="101">99.9%</text>
+<rect class="n store" x="254" y="62" width="96" height="50" rx="6"/><text class="tb mid" x="302" y="84">Database</text><text class="ts mid" x="302" y="101">99.9%</text>
+<path class="e sig" d="M110 87H134"/><path class="e store" d="M230 87H254"/>
+<text x="14" y="148">0.999 × 0.999 × 0.999 = <tspan class="tb">99.7%</tspan></text>
+<text class="ts" x="14" y="168">About 26 hours down per year.</text>
+<text class="ts" x="14" y="185">Worse than any single component.</text>
+<path class="e none dash" d="M376 10V212"/>
+<text class="tl" x="400" y="22">In parallel: one must work</text>
+<circle class="n" cx="420" cy="87" r="7"/>
+<rect class="n" x="490" y="40" width="110" height="40" rx="6"/><text class="tb mid" x="545" y="58">Server A</text><text class="ts mid" x="545" y="73">99%</text>
+<rect class="n" x="490" y="94" width="110" height="40" rx="6"/><text class="tb mid" x="545" y="112">Server B</text><text class="ts mid" x="545" y="127">99%</text>
+<circle class="n" cx="670" cy="87" r="7"/>
+<path class="e sig" d="M426 83 490 62"/><path class="e sig" d="M426 91 490 112"/>
+<path class="e sig" d="M600 62 664 84"/><path class="e sig" d="M600 112 664 90"/>
+<text x="400" y="168">1 − (0.01 × 0.01) = <tspan class="tb">99.99%</tspan></text>
+<text class="ts" x="400" y="188">About 53 minutes down per year,</text>
+<text class="ts" x="400" y="205">if the two fail independently.</text>
+</svg>
+</div>
+<figcaption>The two ways components combine. A chain is weaker than its weakest link, and a redundant pair is stronger than either member.</figcaption>
+</figure>
+
+<p><b>In series</b>, a request needs every component, so the availabilities multiply and the result is always lower than the lowest of them. This is the arithmetic that makes long dependency chains dangerous. A request that passes through 30 services, each at a respectable 99.99%, succeeds only 99.7% of the time, which is 26 hours of failure a year. Nobody chose that number. It emerged from the shape of the system.</p>
+<p><b>In parallel</b>, a request needs only one of several components that do the same job, so the system fails only when all of them fail together. The chance of that is the product of their individual failure rates. Two mediocre servers at 99% make a 99.99% pair. This is <dfn>redundancy</dfn>, and it is the central technique of the chapter.</p>
+
+<div class="widget" data-widget="nines">
+<h4>Availability calculator</h4>
+<p>Build a chain of identical components, then add redundant copies of each one.</p>
+<div class="controls">
+  <label>Availability of one component
+    <select name="component"><option value="99">99%</option><option value="99.5">99.5%</option><option value="99.9" selected>99.9%</option><option value="99.95">99.95%</option><option value="99.99">99.99%</option><option value="99.999">99.999%</option></select>
+  </label>
+  <label>Components in series <output data-out="series">5</output><input type="range" name="series" min="1" max="30" value="5" step="1"></label>
+  <label>Redundant copies of each <output data-out="copies">1</output><input type="range" name="copies" min="1" max="4" value="1" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Availability of the system</dt><dd data-out="system">99.501%</dd></div>
+  <div><dt>Downtime per year</dt><dd data-out="year">43.7 hours</dd></div>
+  <div><dt>Per month</dt><dd data-out="month">3.65 hours</dd></div>
+  <div><dt>Per day</dt><dd data-out="day">7.19 min</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Every dependency in the chain multiplies in. 5 components at 99.9% each are worse than any one of them alone.</p>
+</div>
+
+<h3 id="correlated">The catch: failures are rarely independent</h3>
+<p>The parallel formula has an assumption buried in it. Multiplying two failure rates is valid only if the two failures have nothing to do with each other. In real systems they often do, and that is why measured availability falls short of the arithmetic.</p>
+<p>Two servers that run the same code have the same bugs, and the request that crashes one will crash the other. Two servers in the same building lose power together. Two replicas configured by the same automation receive the same bad configuration within the same minute. Two services that look separate may share a database, a DNS provider or a login system. These are <dfn>correlated failures</dfn>, and they are the main subject of the incident reports later in this chapter.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Believing a number produced by multiplication. “Three replicas at 99.9% gives nine nines” assumes every failure is an independent hardware fault. The failures that take down real systems are a bad deployment, an expired certificate or a full disk, and those arrive on all three replicas at once. Redundancy protects you from the faults that are independent. Different defenses are needed for the ones that are shared.</p></div>
+
+<h2 id="spof">Single points of failure</h2>
+<p>A <dfn>single point of failure</dfn> (SPOF) is any component whose loss stops the whole system. In terms of the last section, it is a part with nothing in parallel. Removing them is the first job in designing for availability.</p>
+
+<figure class="fig wide" id="fig-spof">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f62t f62d">
+<title id="f62t">Removing single points of failure</title>
+<desc id="f62d">Left: one load balancer, one application server and one database in a chain, each a single point of failure. Right: an active and a standby load balancer, four application servers spread over two zones, and a primary database in one zone replicating to a standby in the other.</desc>
+<text class="tl" x="10" y="22">Before: three single points of failure</text>
+<rect class="n fault" x="14" y="92" width="84" height="46" rx="6"/><text class="tb mid" x="56" y="112">Load</text><text class="tb mid" x="56" y="128">balancer</text>
+<rect class="n fault" x="122" y="92" width="76" height="46" rx="6"/><text class="tb mid" x="160" y="120">App</text>
+<rect class="n fault" x="222" y="92" width="84" height="46" rx="6"/><text class="tb mid" x="264" y="120">Database</text>
+<path class="e sig" d="M98 115H122"/><path class="e store" d="M198 115H222"/>
+<text class="ts" x="14" y="166">Lose any one box and the</text>
+<text class="ts" x="14" y="182">whole service is down.</text>
+<path class="e none dash" d="M330 10V224"/>
+<text class="tl" x="352" y="22">After: every role has a spare in another zone</text>
+<rect class="n ghost" x="352" y="36" width="358" height="86" rx="8"/><text class="ts" x="362" y="52">Zone A</text>
+<rect class="n ghost" x="352" y="132" width="358" height="86" rx="8"/><text class="ts" x="362" y="148">Zone B</text>
+<rect class="n sig" x="364" y="64" width="112" height="40" rx="6"/><text class="tb mid" x="420" y="81">Load balancer</text><text class="ts mid" x="420" y="96">active</text>
+<rect class="n" x="364" y="160" width="112" height="40" rx="6"/><text class="tb mid" x="420" y="177">Load balancer</text><text class="ts mid" x="420" y="192">standby</text>
+<rect class="n" x="516" y="46" width="60" height="30" rx="5"/><text class="mid" x="546" y="66">App</text>
+<rect class="n" x="516" y="84" width="60" height="30" rx="5"/><text class="mid" x="546" y="104">App</text>
+<rect class="n" x="516" y="142" width="60" height="30" rx="5"/><text class="mid" x="546" y="162">App</text>
+<rect class="n" x="516" y="180" width="60" height="30" rx="5"/><text class="mid" x="546" y="200">App</text>
+<rect class="n store" x="614" y="60" width="88" height="44" rx="6"/><text class="tb mid" x="658" y="79">Database</text><text class="ts mid" x="658" y="95">primary</text>
+<rect class="n store" x="614" y="156" width="88" height="44" rx="6"/><text class="tb mid" x="658" y="175">Database</text><text class="ts mid" x="658" y="191">standby</text>
+<path class="e sig" d="M476 76 516 62"/><path class="e sig" d="M476 86 516 98"/><path class="e sig" d="M476 94 516 152"/><path class="e sig" d="M476 100 516 190"/>
+<path class="e store" d="M576 62 614 74"/><path class="e store" d="M576 98 614 90"/>
+<path class="e store" d="M658 104V156"/><text class="ts end" x="650" y="148">copies data</text>
+</svg>
+</div>
+<figcaption>The same three roles before and after. Each role now survives the loss of one machine, and the loss of one whole zone.</figcaption>
+</figure>
+
+<p>To find them, go through the architecture diagram box by box and arrow by arrow and ask the same question of each: <i>if this disappeared right now, what would users see?</i> Wherever the answer is “everything stops”, you have found one.</p>
+<p>The obvious ones are servers. The ones that cause real outages are usually not drawn on the diagram at all:</p>
+<ul>
+  <li><b>DNS.</b> One provider, or records that only one system can update.</li>
+  <li><b>Certificates and credentials.</b> One certificate that everything presents, one API key that expires for every service at once.</li>
+  <li><b>Configuration and deployment systems.</b> A single source that can push a bad value to every server in seconds.</li>
+  <li><b>Shared services.</b> The login service, the feature-flag service, the secrets store. Fifty “independent” services that each call the same one at startup are a single system.</li>
+  <li><b>A region or a provider.</b> Everything in one data center, or one cloud account.</li>
+  <li><b>A person.</b> The one engineer who knows how the billing job works, and is on a flight.</li>
+</ul>
+<p>Not every single point of failure must be removed. Each removal costs money and adds complexity, and the complexity brings failure modes of its own. The requirement is that each one is known, and that leaving it in place is a decision someone made.</p>
+
+<h2 id="redundancy">Redundancy and failover</h2>
+<p>Redundancy means having more than one of something. <dfn>Failover</dfn> is the act of switching to the spare when the active one fails. There are two basic arrangements.</p>
+<table>
+<thead><tr><th></th><th>Active-passive</th><th>Active-active</th></tr></thead>
+<tbody>
+<tr><th>How it works</th><td>One instance serves traffic. A standby waits and takes over on failure.</td><td>All instances serve traffic all the time. When one fails, the others absorb its share.</td></tr>
+<tr><th>Capacity used in normal operation</th><td>Half or less. The standby is idle.</td><td>All of it, with enough headroom left to lose one.</td></tr>
+<tr><th>Recovery time</th><td>Seconds to minutes: detect the failure, promote the standby, redirect traffic.</td><td>Close to zero: stop sending traffic to the failed instance.</td></tr>
+<tr><th>Main difficulty</th><td>The switch itself, and making sure the standby really works.</td><td>Every instance must be able to handle any request, which is hard when they hold data.</td></tr>
+<tr><th>Typical use</th><td>Databases with one primary. Load balancer pairs.</td><td>Stateless application servers. Multi-region read traffic.</td></tr>
+</tbody>
+</table>
+<p>A passive standby can be kept at different levels of readiness. A <b>cold</b> standby is switched off and must be started and loaded with data. A <b>warm</b> standby is running and receiving data, and needs a short time to take full load. A <b>hot</b> standby is fully synchronized and can take over at once. Warmer standbys recover faster and cost more to run.</p>
+<aside class="sn"><b>N+1</b>Capacity planning for active-active uses a simple notation. If N servers are needed to carry the peak, run N+1 so that one can fail, or N+2 so that one can fail while another is being upgraded. Spread over three zones, surviving the loss of a whole zone means each zone carries at most two-thirds of what it could, so about 50% extra capacity overall.</aside>
+
+<h3 id="failover">Why failover is harder than it looks</h3>
+<p>Failover has four steps, and each can go wrong.</p>
+<ol>
+  <li><b>Detect.</b> Something must notice the failure. This is done with <dfn>health checks</dfn>, where a monitor calls the component, or <dfn>heartbeats</dfn>, where the component reports in at intervals. The difficulty is that from the outside a dead server and a slow one look the same for a while. Check too eagerly and a brief pause triggers a needless failover. Check too patiently and users wait.</li>
+  <li><b>Decide.</b> Something must conclude that the active instance is really gone. If that conclusion is wrong, because the network between them failed and both are still running, each side may believe it is in charge. This is <dfn>split brain</dfn>, and with a database it means two primaries accepting conflicting writes.</li>
+  <li><b>Switch.</b> The standby is promoted and traffic is redirected, by changing a DNS record, moving an IP address or updating the load balancer. Clients holding old connections or cached addresses keep trying the dead instance for a while.</li>
+  <li><b>Fence.</b> The old instance must be prevented from acting if it comes back, since it does not know it was replaced.</li>
+</ol>
+<p>The rigorous answers to steps 2 and 4 come from consensus algorithms, covered in <x-ref to="consensus"></x-ref>. Two practical points belong here. First, a standby that has never taken production traffic is an untested claim, so exercise the failover on purpose and regularly. Second, if data is copied to the standby with a delay, the most recent writes are lost when you switch. That loss has a name, and it comes up again later in the chapter.</p>
+<div class="note production"><p><span class="label">In production.</span> Health checks decide which servers receive traffic, which makes them powerful and dangerous. A check that is too shallow, such as “is the port open?”, keeps sending users to a server that returns errors. A check that is too deep, such as “can you reach the database?”, marks every server unhealthy at once when the database has a brief problem, and the load balancer then has nowhere to send anything. A common safeguard is for the load balancer to ignore health checks when they would remove most of the fleet, on the reasoning that a half-working server is better than none.</p></div>
+
+<h2 id="failure-domains">Failure domains</h2>
+<p>Redundancy works only if the copies do not fail together. A <dfn>failure domain</dfn> is a group of things that share a fate: one event takes all of them out. Two servers in the same rack share a power supply and a network switch, so placing your two replicas there protects against a dead server and not against a dead switch. The art is to place copies in different failure domains, at whichever level your availability target requires.</p>
+
+<figure class="fig" id="fig-domains">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f63t f63d">
+<title id="f63t">Failure domains nest inside one another</title>
+<desc id="f63d">A region contains two availability zones. Each zone contains racks, each rack contains hosts, and each host runs processes. A failure at any level takes out everything inside it.</desc>
+<rect class="n ghost" x="8" y="8" width="704" height="210" rx="10"/><text class="tb" x="20" y="28">Region</text><text class="ts" x="72" y="28">a geographic area</text>
+<rect class="n ghost" x="20" y="40" width="336" height="168" rx="8"/><text class="tb" x="32" y="60">Availability zone A</text><text class="ts" x="158" y="60">separate power and network</text>
+<rect class="n ghost" x="366" y="40" width="336" height="168" rx="8"/><text class="tb" x="378" y="60">Availability zone B</text>
+<rect class="n sunk" x="32" y="72" width="152" height="126" rx="6"/><text class="tb" x="42" y="90">Rack</text>
+<rect class="n sunk" x="194" y="72" width="152" height="126" rx="6"/><text class="tb" x="204" y="90">Rack</text>
+<rect class="n" x="42" y="100" width="132" height="88" rx="5"/><text class="tb" x="52" y="118">Host</text>
+<rect class="n" x="204" y="100" width="132" height="88" rx="5"/><text class="tb" x="214" y="118">Host</text>
+<rect class="n sig" x="52" y="128" width="112" height="24" rx="4"/><text class="ts mid" x="108" y="144">Process</text>
+<rect class="n sig" x="52" y="156" width="112" height="24" rx="4"/><text class="ts mid" x="108" y="172">Process</text>
+<rect class="n sig" x="214" y="128" width="112" height="24" rx="4"/><text class="ts mid" x="270" y="144">Process</text>
+<rect class="n sig" x="214" y="156" width="112" height="24" rx="4"/><text class="ts mid" x="270" y="172">Process</text>
+<rect class="n sunk" x="378" y="72" width="152" height="126" rx="6"/><text class="tb" x="388" y="90">Rack</text>
+<rect class="n sunk" x="540" y="72" width="152" height="126" rx="6"/><text class="tb" x="550" y="90">Rack</text>
+<text class="ts mid" x="454" y="140">the same structure,</text><text class="ts mid" x="454" y="156">in different buildings</text>
+</svg>
+</div>
+<figcaption>Failure domains nest. A fault at any level removes everything drawn inside it, so copies must sit in different boxes at the level you need to survive.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Domain</th><th>What takes it out</th><th>How often, roughly</th><th>Defense</th></tr></thead>
+<tbody>
+<tr><th>Process</th><td>A crash, a memory leak, a bad request</td><td>Constantly, at scale</td><td>Several processes, automatic restart</td></tr>
+<tr><th>Host</th><td>Hardware failure, kernel fault, maintenance reboot</td><td>Routinely</td><td>Several hosts behind a load balancer</td></tr>
+<tr><th>Rack</th><td>A switch or power unit</td><td>Occasionally</td><td>Spread instances across racks</td></tr>
+<tr><th>Availability zone</th><td>Power, cooling or network failure in a data center, fire, flood</td><td>Rarely</td><td>Run in two or three zones</td></tr>
+<tr><th>Region</th><td>A regional control-plane fault, a natural disaster</td><td>Very rarely, with very large effect</td><td>A second region</td></tr>
+<tr><th>Provider or software version</th><td>A global configuration push, a bug in a shared system</td><td>Rarely</td><td>Staged rollouts. A second provider for the few things that justify it.</td></tr>
+</tbody>
+</table>
+<p>Cloud providers price and promise along these lines. Amazon’s compute service agreement, for example, commits to 99.5% for a single virtual machine and to 99.99% for machines deployed across two or more availability zones in a region. The difference between those two numbers is the value of one extra failure domain, stated in a contract. For storage, Amazon describes its standard object storage class as designed for 99.999999999% durability and 99.99% availability over a year: eleven nines for not losing your data, four for being able to reach it. That pair of figures is the clearest illustration of how different the two properties are.</p>
+<p>Each level outward costs more than the last. Running in several zones of one region is routine and nearly free in engineering terms, because the zones are close enough for data to be copied between them synchronously. A second region is far enough away that it is not, which forces the hard choices about consistency described in <x-ref to="multi-region"></x-ref>.</p>
+
+<h2 id="slo">SLIs, SLOs and SLAs</h2>
+<p>“As available as possible” is not a target. Every nine costs more than the one before, and beyond some point users cannot tell the difference, because their own phone, Wi-Fi and internet provider fail more often than your service does. Three terms, made standard by Google’s site reliability engineering practice, turn “how available should it be?” into something a team can manage.</p>
+<table>
+<thead><tr><th>Term</th><th>What it is</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>SLI, service level indicator</th><td>A measurement of one aspect of the service, as a ratio of good events to all events</td><td>The proportion of feed requests answered successfully in under 300 ms</td></tr>
+<tr><th>SLO, service level objective</th><td>The target value for an indicator over a period. An internal goal.</td><td>99.9% of feed requests, over a rolling 30 days</td></tr>
+<tr><th>SLA, service level agreement</th><td>A contract with customers that states what happens if a level is missed</td><td>Below 99.5% in a calendar month, the customer receives a 10% credit</td></tr>
+</tbody>
+</table>
+<p>The order matters. You measure indicators, you set objectives on them, and you promise customers something looser than your objective so that you find out about a problem before you owe anyone money. An SLO without an SLI behind it cannot be checked. An SLA tighter than your SLO is a promise you are not trying to keep.</p>
+
+<h3 id="error-budget">Error budgets</h3>
+<p>An objective of 99.9% says something easy to miss: 0.1% of requests are <em>allowed</em> to fail. That allowance is the <dfn>error budget</dfn>. Over 30 days at 99.9%, it is 43 minutes of full outage, or one failed request in every thousand.</p>
+
+<figure class="fig" id="fig-budget">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 132" role="img" aria-labelledby="f64t f64d">
+<title id="f64t">An error budget partly spent</title>
+<desc id="f64d">A 30-day error budget of 43.2 minutes at a 99.9 percent objective. An incident on day 4 used 12 minutes and a bad deployment on day 15 used 9 minutes, leaving 22.2 minutes.</desc>
+<text class="tb" x="20" y="24">Error budget for 30 days at 99.9%: 43.2 minutes</text>
+<rect data-tip="Incident on day 4|12 minutes|28% of the 43.2-minute budget" class="bar fault" x="20" y="44" width="187" height="28"/>
+<rect data-tip="Bad deployment on day 15|9 minutes|21% of the budget" class="bar fault" x="209" y="44" width="140" height="28"/>
+<rect data-tip="Still available|22.2 minutes|51% of the budget" x="351" y="44" width="349" height="28" style="fill:var(--sunk);stroke:var(--rule-2)"/>
+<text class="tb" x="20" y="92">12 min</text>
+<text class="ts" x="20" y="108">incident on day 4</text>
+<text class="tb" x="209" y="92">9 min</text>
+<text class="ts" x="209" y="108">bad deploy on day 15</text>
+<text class="tb" x="351" y="92">22.2 min left</text>
+<text class="ts" x="351" y="108">available for risk in the rest of the period</text>
+</svg>
+</div>
+<figcaption>An error budget, illustrated. Unreliability is treated as a quantity that can be spent, and what remains governs how much risk the team takes next.</figcaption>
+</figure>
+
+<p>The budget changes the conversation between the people who want to ship features and the people who want stability. While budget remains, the team may spend it: deploy more often, run experiments, do risky migrations. When it is used up, the agreement is that releases slow down and effort goes to reliability until the service is back within its objective. Neither side has to argue from opinion, because the number decides.</p>
+<p>The budget also tells you when a service is <em>too</em> reliable. If the objective is 99.9% and the service has delivered 99.999% for a year, either the objective is wrong or the team has been more cautious than the business needed, and could have moved faster.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> When asked for the availability target, do not answer “five nines” by reflex. Tie it to the product: “for a payment API I’d aim for 99.99%, because failed payments lose money directly; for the recommendations panel 99.9% is plenty, and it should fail silently and leave the page usable.” Then show you know what the number costs: “four nines is under an hour a year, so failover has to be automatic and we need at least two zones.”</p></div>
+
+<h2 id="rto-rpo">Recovery objectives: RTO and RPO</h2>
+<p>Availability targets describe ordinary operation. For a disaster, such as losing a database or a whole data center, two more numbers define what recovery must achieve.</p>
+
+<figure class="fig" id="fig-rto-rpo">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 158" role="img" aria-labelledby="f65t f65d">
+<title id="f65t">RPO and RTO on a timeline</title>
+<desc id="f65d">A timeline with three moments: the last copy of the data that survived, the failure, and the moment service is restored. The gap between the last surviving copy and the failure is the data lost, bounded by the recovery point objective. The gap between the failure and restoration is the downtime, bounded by the recovery time objective.</desc>
+<path class="e" d="M20 78H704"/>
+<text class="ts end" x="704" y="96">time</text>
+<line class="axis" x1="170" x2="170" y1="62" y2="94" style="stroke:var(--store);stroke-width:2"/>
+<line class="x" x1="352" y1="68" x2="368" y2="88"/><line class="x" x1="368" y1="68" x2="352" y2="88"/>
+<line class="axis" x1="580" x2="580" y1="62" y2="94" style="stroke:var(--sig);stroke-width:2"/>
+<text class="tb mid" x="170" y="118">Last surviving copy</text><text class="ts mid" x="170" y="134">backup or replicated write</text>
+<text class="tb mid" x="360" y="118">Failure</text>
+<text class="tb mid" x="580" y="118">Service restored</text>
+<path class="e store both" d="M174 44H346"/>
+<text class="tb mid" x="260" y="22">Data lost</text><text class="ts mid" x="260" y="37">RPO is the most you accept</text>
+<path class="e sig both" d="M374 44H576"/>
+<text class="tb mid" x="475" y="22">Downtime</text><text class="ts mid" x="475" y="37">RTO is the longest you accept</text>
+</svg>
+</div>
+<figcaption>The two recovery objectives. RPO looks backward from the failure and is measured in lost data. RTO looks forward and is measured in lost time.</figcaption>
+</figure>
+
+<ul>
+  <li><dfn>Recovery point objective</dfn> (RPO) is how much recent data you can afford to lose, expressed as time. An RPO of five minutes means that after recovery, at most the last five minutes of writes are gone. It is determined by how often data is copied elsewhere.</li>
+  <li><dfn>Recovery time objective</dfn> (RTO) is how long the service may be down. It is determined by how quickly you can detect the problem, bring up a replacement and redirect traffic.</li>
+</ul>
+<p>They are independent. Nightly backups with a spare server already running give a poor RPO, up to 24 hours of lost data, and a good RTO. Continuous replication to a machine that takes two hours to bring into service gives the opposite. Both numbers come from the business, by asking what an hour of downtime costs and what an hour of lost orders costs, and they are often different for different data in the same system.</p>
+<p>Four broad strategies cover the range. The recovery figures are orders of magnitude and depend heavily on how well the plan has been automated and rehearsed.</p>
+<table>
+<thead><tr><th>Strategy</th><th>What is kept ready</th><th>Data loss</th><th>Downtime</th><th>Relative cost</th></tr></thead>
+<tbody>
+<tr><th>Backup and restore</th><td>Backups stored in another location. Nothing running.</td><td>Hours</td><td>Hours or more</td><td>Lowest</td></tr>
+<tr><th>Pilot light</th><td>Data continuously replicated. Servers defined and switched off.</td><td>Minutes</td><td>Tens of minutes</td><td>Low</td></tr>
+<tr><th>Warm standby</th><td>A complete copy of the system running at reduced size.</td><td>Seconds to minutes</td><td>Minutes</td><td>Medium</td></tr>
+<tr><th>Active-active across sites</th><td>Full capacity serving traffic in two or more places.</td><td>Near zero</td><td>Near zero</td><td>Highest, often double</td></tr>
+</tbody>
+</table>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Counting backups that have never been restored. A backup is a file whose usefulness is unknown until someone restores it. Backups are found to be empty, corrupt, missing a table, or encrypted with a key that was stored only on the machine that died. Restore from backup on a schedule, to a fresh environment, and time it. The time it takes is your real RTO. <x-ref to="disaster-recovery"></x-ref> covers how.</p></div>
+
+<h2 id="design-for-failure">Designing for failure</h2>
+<p>Redundancy removes single points of failure. A second group of techniques deals with what the surviving parts do while something is failing, and their common aim is to keep a local problem local. Each is developed in <x-ref to="resilience-patterns"></x-ref>. In brief:</p>
+<table>
+<thead><tr><th>Technique</th><th>What it does</th><th>What it prevents</th></tr></thead>
+<tbody>
+<tr><th>Timeouts</th><td>Give up on a call after a set time</td><td>One slow dependency holding every thread, as Little’s law in <x-ref to="latency-and-throughput">Chapter 4</x-ref> predicts</td></tr>
+<tr><th>Retries with backoff and jitter</th><td>Try again after a growing, randomized delay</td><td>A brief fault becoming a user-visible error, without all clients retrying in step</td></tr>
+<tr><th>Circuit breaker</th><td>Stop calling a dependency that keeps failing, and test it now and then</td><td>Wasted work and added load on something that is already down</td></tr>
+<tr><th>Bulkheads</th><td>Give each dependency its own limited pool of resources</td><td>One failing dependency exhausting resources that others need</td></tr>
+<tr><th>Load shedding and rate limiting</th><td>Reject excess requests quickly</td><td>Overload that makes every request slow</td></tr>
+<tr><th>Graceful degradation</th><td>Serve a reduced result when a part is missing</td><td>A failure in an optional feature taking down the essential ones</td></tr>
+<tr><th>Idempotent operations</th><td>Make repeating a request harmless</td><td>Duplicates caused by all the retrying above</td></tr>
+</tbody>
+</table>
+<p>The last row is easy to pass over and it holds the rest together. Nearly every availability technique works by trying something again, somewhere else, or later. That is safe only if doing a thing twice has the same effect as doing it once. <x-ref to="idempotency-and-delivery"></x-ref> is devoted to it.</p>
+
+<h2 id="outages">Two outages, read closely</h2>
+<p>Published incident reports are the best teaching material in this field, because they show the gap between how a system was designed to fail and how it did. Two from late 2025 illustrate most of this chapter.</p>
+
+<h3 id="aws-2025">AWS, northern Virginia, 19 to 20 October 2025</h3>
+<p>Amazon’s DynamoDB database service manages the DNS records for its own endpoints with automation. Two parts of that automation interacted through a race condition that had been present and unnoticed: one applied an outdated plan over a newer one, and a clean-up step then deleted it. The service’s regional endpoint was left with no DNS records. Clients, including other AWS services, could not find DynamoDB although its servers were running.</p>
+<p>Engineers restored the records in under three hours. The disruption lasted about fourteen and a half hours, because recovery set off further failures. The EC2 subsystem that tracks the physical servers hosting customers’ machines depended on DynamoDB. When it tried to catch up on everything at once, it entered what Amazon called congestive collapse, and new machines could not be launched. A backlog of network configuration then delayed connectivity for those that did launch. Network load balancers ran health checks against machines whose networking was not ready, judged them unhealthy and removed capacity that was fine.</p>
+<p>What it shows:</p>
+<ul>
+  <li><b>Hidden dependencies make separate things fail together.</b> Many services that looked independent shared a reliance on one database service in one region.</li>
+  <li><b>The fault was in a control plane, in automation.</b> The data servers were healthy. The system that manages them was not.</li>
+  <li><b>Recovery is a load of its own.</b> A system coming back has a backlog, cold caches and every client retrying. It needs to be brought up gradually, with limits.</li>
+  <li><b>Health checks amplified the problem.</b> Among the changes Amazon announced was a limit on how much capacity a load balancer may remove at once on the strength of health checks.</li>
+</ul>
+
+<h3 id="cloudflare-2025">Cloudflare, 18 November 2025</h3>
+<p>A change to database permissions caused a query to return duplicate rows. That query builds a configuration file used by Cloudflare’s bot-detection system, and the file roughly doubled in size. It was distributed to servers across the network. The proxy software that reads it had a fixed limit of 200 entries, chosen with ample room above the 60 or so in normal use. The doubled file exceeded the limit and the proxy failed, returning 5xx errors for sites behind Cloudflare from 11:20 UTC. The team first suspected a very large attack. Traffic was largely restored by 14:30 and everything was normal at 17:06.</p>
+<p>What it shows:</p>
+<ul>
+  <li><b>Configuration is code.</b> It was generated automatically, shipped everywhere within minutes and able to crash the software that read it. It needs the same staged rollout and validation that code gets.</li>
+  <li><b>The copies were not independent.</b> Thousands of servers in hundreds of cities are the most redundant arrangement imaginable against hardware faults. All of them read the same file.</li>
+  <li><b>What happens at a limit is a design decision.</b> Exceeding the limit crashed the process. Rejecting the new file and keeping the last good one would have turned an outage into a log message.</li>
+  <li><b>Diagnosis takes most of the time.</b> The early belief that it was an attack is a reminder that MTTR is mostly the time needed to understand what is happening.</li>
+</ul>
+<p>Neither incident began with broken hardware. Both began with a change, made by automation, that reached every copy at once. Google’s site reliability engineering book puts the share of outages caused by changes to a live system at roughly 70%. Redundancy defends against things breaking. Against changes, the defenses are different: make them gradually, check them before they spread, and keep a fast way to undo them. That is the subject of <x-ref to="deployment-strategies"></x-ref>.</p>
+
+<h2 id="practice">Practicing failure</h2>
+<p>A failover path that has never run is a guess. The only way to know that a system survives the loss of a server, a zone or a dependency is to take one away and watch.</p>
+<ul>
+  <li><b>Chaos engineering</b> does this deliberately in production, starting small. Netflix made the practice well known with a tool that terminates servers at random during working hours, on the reasoning that a failure that will certainly happen is better met on a Tuesday afternoon than at a weekend.</li>
+  <li><b>Game days</b> are scheduled exercises in which a team simulates an incident, such as a region becoming unreachable, and works through the response using the real tools and runbooks.</li>
+  <li><b>Restore drills</b> rebuild a database from backup into a clean environment and measure how long it takes.</li>
+  <li><b>Failover tests</b> switch the primary to the standby on purpose. Some teams do this routinely, so that failover is an ordinary operation.</li>
+</ul>
+<p>After a real incident, a <dfn>postmortem</dfn> records what happened, why, and what will change. The useful ones are blameless: they assume people acted reasonably on what they knew, and they look for the conditions that made the mistake possible. The two reports summarized above are public examples of the form.</p>
+
+<h2 id="how-many">How many nines to aim for</h2>
+<p>More availability is not always better, because each step up costs more than the last and the money and attention come from somewhere. A workable way to choose:</p>
+<ol>
+  <li><b>Start from the cost of failure.</b> What does an hour of downtime cost in lost revenue, penalties, safety or trust? For an internal reporting tool the answer is “someone waits”. For a payment system it is a large number.</li>
+  <li><b>Set targets per feature.</b> Checkout, login and data integrity deserve more than recommendations, avatars and search suggestions. Design the lesser features to fail without taking the important ones with them.</li>
+  <li><b>Respect your dependencies.</b> A service that needs three others at 99.9% each cannot credibly promise more than about 99.7%, unless it can keep working without them.</li>
+  <li><b>Check what the target implies.</b> Use the nines table. If the target leaves five minutes a year, are detection, failover and rollback all automatic? If not, the target is a wish.</li>
+  <li><b>Revisit it with data.</b> After some months, compare the objective with what was delivered and with what users complained about.</li>
+</ol>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>Distributed systems.</b> Failover raises the question of who is in charge when machines cannot reach each other. The answers are in <x-ref to="consensus"></x-ref> and <x-ref to="consistency-models"></x-ref>, where availability turns out to trade directly against consistency.</li>
+  <li><b>Data storage.</b> Durability is achieved by <x-ref to="replication">replication</x-ref> and by the erasure coding described in <x-ref to="object-and-file-storage"></x-ref>.</li>
+  <li><b>Operations.</b> SLOs drive alerting: page a person when the error budget is being spent too fast, and for little else. See <x-ref to="observability"></x-ref>.</li>
+  <li><b>Reliability engineering.</b> MTBF, redundancy and failure-mode analysis were developed for aircraft, power plants and telephone networks long before software. The mathematics is shared.</li>
+  <li><b>Law and contracts.</b> An SLA is a legal document. Its exclusions, measurement method and remedies matter as much as the headline percentage.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Availability is the share of requests answered correctly. Durability is whether stored data survives. They are different properties with different defenses.</li>
+  <li>Each nine cuts allowed downtime tenfold. At four nines and above, detection and recovery must be automatic.</li>
+  <li>Availability rises by failing less often or by recovering faster. Faster recovery is usually the cheaper route.</li>
+  <li>Components in series multiply their availability down. Redundant components multiply their failure rates down, provided they fail independently.</li>
+  <li>Find every single point of failure, including DNS, certificates, configuration systems and shared services, and place copies in different failure domains.</li>
+  <li>Measure an indicator, set an objective on it, and use the error budget to decide how much risk to take.</li>
+  <li>RPO bounds the data you can lose and RTO bounds the time you can be down. A backup counts only after it has been restored.</li>
+  <li>Most large outages begin with a change that reaches every copy at once. Roll changes out gradually and keep a fast undo.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A request passes through a load balancer, an application server and a database, each 99.95% available, with no redundancy. What is the availability of the whole, and roughly how much downtime is that per year?</summary><p>0.9995 × 0.9995 × 0.9995 is about 99.85%. That is roughly 13 hours a year, three times the downtime of any one component.</p></details>
+<details><summary>You run two application servers in the same rack and calculate 99.99% from two at 99%. Why is the real figure likely to be lower?</summary><p>The calculation assumes the two fail independently. They share a rack, so a switch or power fault removes both. They also run the same code and receive the same deployments and configuration, so a bad release affects both at once.</p></details>
+<details><summary>A service has an SLO of 99.9% over 30 days and has had 40 minutes of full outage in the first two weeks. What should the team do?</summary><p>The budget is about 43 minutes and almost all of it is spent. Under an error-budget policy the team should pause risky changes and put effort into reliability, starting with whatever caused the 40 minutes, until the rolling window recovers.</p></details>
+<details><summary>A database is backed up every night at 02:00 and takes four hours to restore. It fails at 17:00. What are the data loss and the downtime, and which objective does each relate to?</summary><p>Fifteen hours of writes are lost, everything since 02:00, which is measured against the RPO. The service is down for at least the four hours of restoration plus the time to notice and start, which is measured against the RTO.</p></details>
+<details><summary>Thousands of servers in hundreds of locations all failed within minutes of each other. What does that tell you about the cause?</summary><p>That it was not hardware, since independent faults do not coincide like that. Something shared reached all of them: a configuration file, a software release, a certificate or a common dependency. Geographic redundancy gives no protection against a shared input.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Betsy Beyer, Chris Jones, Jennifer Petoff and Niall Richard Murphy (editors), <a href="https://sre.google/sre-book/table-of-contents/"><i>Site Reliability Engineering</i></a> (O’Reilly). Chapters 1, 3 and 4 cover the 70% figure, error budgets and service level objectives.</li>
+  <li>Amazon Web Services, <a href="https://aws.amazon.com/message/101925/">“Summary of the Amazon DynamoDB Service Disruption in the Northern Virginia (US-EAST-1) Region”</a>, October 2025.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/18-november-2025-outage/">“Cloudflare outage on November 18, 2025”</a>.</li>
+  <li>Amazon Web Services, <a href="https://aws.amazon.com/compute/sla/">Amazon Compute Service Level Agreement</a>. The 99.5% instance-level and 99.99% region-level commitments, checked October 2026.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html">Data protection in Amazon S3</a>. Design targets for durability and availability, checked October 2026.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html">Disaster recovery options in the cloud</a>. The four recovery strategies.</li>
+  <li>Netflix Technology Blog, <a href="https://netflixtechblog.com/the-netflix-simian-army-16e57fbab116">“The Netflix Simian Army”</a>, 2011. The origin of Chaos Monkey.</li>
+  <li>Richard Cook, <a href="https://how.complexsystems.fail/">“How Complex Systems Fail”</a>. Eighteen short observations that apply to every incident report you will read.</li>
+</ol>
+</section>

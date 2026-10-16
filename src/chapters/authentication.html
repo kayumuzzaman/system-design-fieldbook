@@ -1,0 +1,774 @@
+<!--meta
+{ "description": "Authentication explained for system design: storing passwords with salted memory-hard hashes, server-side sessions and cookies, JSON Web Tokens and refresh token rotation, multi-factor authentication, real-time phishing, passkeys and WebAuthn, account recovery and credential stuffing.",
+  "lede": "Before a system can decide what a caller may do, it has to know who the caller is. Authentication is how it finds out, and how it keeps knowing for the rest of a visit without asking again on every request. This chapter covers the ways a person can prove an identity, what the server must store to check the proof, how that proof is carried from one request to the next, and where each design breaks.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Who is calling?</h2>
+<p>Ana opens the photo app and sees her own private albums. Ben, on the same server a millisecond later, sees his. Every request arrives as bytes on a connection, and nothing in those bytes is Ana or Ben until the system has a reason to believe it.</p>
+<p>Two questions are asked of every request, in this order, and they are easy to blur.</p>
+<ul>
+  <li><dfn>Authentication</dfn> establishes who the caller is, by checking something only that caller should be able to present. It answers “who are you, and how do I know?”.</li>
+  <li>Authorization decides whether that caller may do the thing requested. It answers “are you allowed?”, and it is the subject of <x-ref to="authorization"></x-ref>.</li>
+</ul>
+<p>The two fail differently. An authentication failure lets a stranger act as Ana. An authorization failure lets Ana, correctly identified, read Ben’s photos. HTTP has a status code for each: <code>401</code> means “I do not know who you are”, and <code>403</code> means “I know who you are, and the answer is no”.</p>
+<p>The thing a caller presents is a <dfn>credential</dfn>: a password, a key, a token, or anything else whose possession is accepted as evidence of an identity. Credentials come in three kinds, usually called <dfn>authentication factors</dfn>: something you know, something you have, and something you are.</p>
+<table>
+<thead><tr><th>Factor</th><th>Examples</th><th>How it fails</th></tr></thead>
+<tbody>
+<tr><th>Something you know</th><td>A password, a PIN</td><td>Guessed, reused on another site that leaks it, or typed into a fake page</td></tr>
+<tr><th>Something you have</th><td>A phone, a security key, a private key stored on a device</td><td>Lost, stolen, or copied if the secret can leave the device</td></tr>
+<tr><th>Something you are</th><td>A fingerprint, a face</td><td>Cannot be changed once copied, so it is used to unlock a device, not sent to a server</td></tr>
+</tbody>
+</table>
+<p>Authentication has two parts that are designed separately. The first is the <em>sign-in</em>: a caller proves an identity once. The second is everything after it: the server must recognize the same caller on the next thousand requests without repeating the proof. This chapter starts with passwords, because nearly every system still has them and the rules for storing them are precise. Then sessions and tokens, which carry the result of a sign-in. Then second factors and passkeys, the credentials that are replacing passwords. Letting one system rely on another’s sign-in, and authenticating programs instead of people, are the subject of <x-ref to="oauth-and-sso"></x-ref>.</p>
+
+<h2 id="passwords">Storing passwords</h2>
+<p>If a server can check a password, it holds something derived from that password, and servers get broken into. The design goal is that a copy of the users table should be worth as little as possible to whoever takes it. Here are three ways of storing a password, and what each reveals when the table leaks.</p>
+
+<figure class="fig wide" id="fig-hash">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f511t f511d">
+<title id="f511t">What a stolen users table reveals under three ways of storing passwords</title>
+<desc id="f511d">Three versions of the same two rows. As plain text, both rows show sunset123. As a fast unsalted hash, both rows hold the same value, so equal passwords are visible and one guess is tested against every row at billions a second. As a salted, slow hash, each row has its own salt and a different result, so every guess is made separately for each user and each guess is expensive.</desc>
+<text class="tb" x="10" y="18">Plain text</text>
+<rect class="n sunk" x="10" y="30" width="52" height="24" rx="0"/>
+<text class="ts tb" x="17" y="46">user</text>
+<rect class="n sunk" x="62" y="30" width="168" height="24" rx="0"/>
+<text class="ts tb" x="69" y="46">password column</text>
+<rect class="n" x="10" y="54" width="52" height="24" rx="0"/>
+<text class="ts" x="17" y="70">ana</text>
+<rect class="n fault" x="62" y="54" width="168" height="24" rx="0"/>
+<text class="ts" x="69" y="70">sunset123</text>
+<rect class="n" x="10" y="78" width="52" height="24" rx="0"/>
+<text class="ts" x="17" y="94">ben</text>
+<rect class="n fault" x="62" y="78" width="168" height="24" rx="0"/>
+<text class="ts" x="69" y="94">sunset123</text>
+<text class="ts" x="10" y="126">Every password is readable the</text>
+<text class="ts" x="10" y="142">moment the table leaks.</text>
+<text class="tb" x="250" y="18">Fast hash, no salt</text>
+<rect class="n sunk" x="250" y="30" width="52" height="24" rx="0"/>
+<text class="ts tb" x="257" y="46">user</text>
+<rect class="n sunk" x="302" y="30" width="168" height="24" rx="0"/>
+<text class="ts tb" x="309" y="46">password column</text>
+<rect class="n" x="250" y="54" width="52" height="24" rx="0"/>
+<text class="ts" x="257" y="70">ana</text>
+<rect class="n fault" x="302" y="54" width="168" height="24" rx="0"/>
+<text class="ts" x="309" y="70">5e2a91c0…</text>
+<rect class="n" x="250" y="78" width="52" height="24" rx="0"/>
+<text class="ts" x="257" y="94">ben</text>
+<rect class="n fault" x="302" y="78" width="168" height="24" rx="0"/>
+<text class="ts" x="309" y="94">5e2a91c0…</text>
+<text class="ts" x="250" y="126">Equal passwords look equal. One</text>
+<text class="ts" x="250" y="142">guess is tested against every row,</text>
+<text class="ts" x="250" y="158">billions of times a second.</text>
+<text class="tb" x="490" y="18">Salted, slow hash</text>
+<rect class="n sunk" x="490" y="30" width="52" height="24" rx="0"/>
+<text class="ts tb" x="497" y="46">user</text>
+<rect class="n sunk" x="542" y="30" width="168" height="24" rx="0"/>
+<text class="ts tb" x="549" y="46">password column</text>
+<rect class="n" x="490" y="54" width="52" height="24" rx="0"/>
+<text class="ts" x="497" y="70">ana</text>
+<rect class="n store" x="542" y="54" width="168" height="24" rx="0"/>
+<text class="ts" x="549" y="70">$argon2id$…$k3Jx$9fQe…</text>
+<rect class="n" x="490" y="78" width="52" height="24" rx="0"/>
+<text class="ts" x="497" y="94">ben</text>
+<rect class="n store" x="542" y="78" width="168" height="24" rx="0"/>
+<text class="ts" x="549" y="94">$argon2id$…$Pq0v$c71B…</text>
+<text class="ts" x="490" y="126">A different salt in each row. Every</text>
+<text class="ts" x="490" y="142">guess is made per user, and each</text>
+<text class="ts" x="490" y="158">one costs memory and time.</text>
+<text class="ts" x="10" y="196">The salt is not a secret. It is stored in the same field, and its job is to make every row a separate problem.</text>
+</svg>
+</div>
+<figcaption>The same leak, three outcomes. Only the third leaves users time to change their passwords before those passwords are found.</figcaption>
+</figure>
+
+<p><b>Plain text</b> exposes every account at once, here and on every other site where those users chose the same password. <b>Encrypting</b> the column is little better, because the application must hold the key, and whoever took the table has usually been able to take the key too. A password should not be recoverable by anyone, including you.</p>
+<p>So passwords are <em>hashed</em>: passed through a one-way function, with only the result stored. To check a sign-in the server hashes what was typed and compares. <x-ref to="cryptography-in-practice"></x-ref> covers hash functions in general. For passwords, an ordinary fast hash such as SHA-256 is the wrong tool, for the two reasons visible in <x-fig to="fig-hash"></x-fig>.</p>
+<ol>
+  <li><b>Equal passwords give equal hashes.</b> An attacker can hash a list of common passwords once and look every row up in it. The fix is a <dfn>salt</dfn>: a random value, different for every password and stored beside the hash, that is mixed in before hashing so that the same password produces a different result in every row.</li>
+  <li><b>Fast hashes are fast for the attacker too.</b> SHA-256 was designed to process gigabytes a second. One high-end graphics card can try on the order of ten billion guesses a second against a salted SHA-256 hash. Every eight-letter lowercase password, all 209 billion of them, is covered in about twenty seconds.</li>
+</ol>
+<p>The fix for the second is a <dfn>password hashing function</dfn>: a hash built to be deliberately expensive, with a cost you can set. The good ones are also <dfn>memory-hard</dfn>, meaning that each guess needs a large block of memory as well as time. That matters because an attacker’s advantage comes from running thousands of guesses in parallel on graphics cards or custom chips, and memory is the resource that is hardest to multiply cheaply.</p>
+<table>
+<thead><tr><th>Function</th><th>Memory-hard</th><th>Minimum settings recommended by OWASP</th><th>Use it when</th></tr></thead>
+<tbody>
+<tr><th>Argon2id</th><td>Yes</td><td>19 MiB of memory, 2 passes, 1 thread</td><td>You can choose freely. It won the Password Hashing Competition in 2015</td></tr>
+<tr><th>scrypt</th><td>Yes</td><td>N = 2<sup>17</sup>, r = 8, p = 1</td><td>Argon2id is not available on your platform</td></tr>
+<tr><th>bcrypt</th><td>No</td><td>Work factor 10 or more</td><td>A system already uses it. It ignores input past 72 bytes</td></tr>
+<tr><th>PBKDF2</th><td>No</td><td>600,000 rounds with HMAC-SHA-256</td><td>A rule requires a FIPS-validated algorithm</td></tr>
+</tbody>
+</table>
+<p>Tune the cost by measuring on your own servers. A few hundred milliseconds is invisible to a person signing in and multiplies the attacker’s work by millions. Your servers pay the same cost on every sign-in, so the sign-in endpoint needs rate limiting, or it becomes an easy way to exhaust them.</p>
+<p>The code below uses scrypt because it ships with every version of Node.js. Argon2id is preferable where you have it: current Node.js releases include it as <code>crypto.argon2</code>, Node.js 22 does not, and maintained libraries exist for every major language.</p>
+
+<pre data-lang="ts" data-title="Hashing and verifying a password">
+import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
+
+// Cost settings travel with the hash, so they can be raised later.
+const CURRENT = { n: 2 ** 17, r: 8, p: 1, keyLength: 32 };
+
+function derive(password: string, salt: Buffer, c: typeof CURRENT): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const options = { N: c.n, r: c.r, p: c.p, maxmem: 256 * 1024 * 1024 };
+    scrypt(password.normalize("NFKC"), salt, c.keyLength, options, (err, key) => (err ? reject(err) : resolve(key)));
+  });
+}
+
+export async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16); // unique for every password, stored beside the hash
+  const key = await derive(password, salt, CURRENT);
+  return `scrypt$n=${CURRENT.n},r=${CURRENT.r},p=${CURRENT.p}$${salt.toString("base64url")}$${key.toString("base64url")}`;
+}
+
+export async function verifyPassword(password: string, stored: string): Promise<{ ok: boolean; rehash: boolean }> {
+  const [scheme, params, saltText, keyText] = stored.split("$");
+  if (scheme !== "scrypt") return { ok: false, rehash: false };
+  const found = Object.fromEntries(params.split(",").map((kv) => kv.split("=")));
+  const expected = Buffer.from(keyText, "base64url");
+  const cost = { n: Number(found.n), r: Number(found.r), p: Number(found.p), keyLength: expected.length };
+  const actual = await derive(password, Buffer.from(saltText, "base64url"), cost);
+  const ok = timingSafeEqual(actual, expected); // compares every byte, however early they differ
+  return { ok, rehash: ok && (cost.n < CURRENT.n || cost.r < CURRENT.r) };
+}
+</pre>
+<p>Three details in that code are worth copying.</p>
+<ul>
+  <li><b>The settings travel with the hash.</b> The stored string names the algorithm, its cost, the salt and the result. That is what makes it possible to raise the cost next year: <code>verifyPassword</code> reports when a hash was made with weaker settings, and the caller stores a fresh one while it still has the password in hand. There is no other moment when you can.</li>
+  <li><b>The comparison takes the same time</b> whether the first byte differs or the last, so response times reveal nothing about how close a guess was.</li>
+  <li><b>The work is asynchronous.</b> Half a second of hashing on the thread that serves requests would stall everything else on it.</li>
+</ul>
+<aside class="sn"><b>Pepper</b>A pepper is a secret key, the same for every user, mixed into the hash and kept outside the database, in a secrets manager or a hardware module. A thief with only the table then cannot test a single guess. It is an extra layer, not a substitute for a slow hash, and it has to be rotated like any other key.</aside>
+
+<h3 id="guessing">How long a stolen hash lasts</h3>
+<p>The strength of a password is measured in <em>bits</em>: a password chosen at random from 2<sup>n</sup> equally likely possibilities has n bits, and an attacker finds it after trying half of them on average. The calculator starts with a hash that takes 250 ms, an attacker with a thousand times the speed of one of your cores, and a password of 40 bits.</p>
+
+<div class="widget" data-widget="guessing">
+<h4>How long a stolen password hash resists guessing</h4>
+<p>The average time to find one password from its hash, with a slow hash and with a fast one.</p>
+<div class="controls">
+  <label>Time for one hash on your server, ms<input type="number" name="hashms" value="250" min="1" max="5000" step="1"></label>
+  <label>Attacker’s speed, as a multiple of one of your cores<input type="number" name="rig" value="1000" min="1" max="1000000" step="1"></label>
+  <label>Password strength, in bits<input type="number" name="bits" value="40" min="1" max="128" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 276" role="img" aria-label="For four example passwords and your own setting, the average time to find the password: a hollow dot for a fast hash and a filled dot for your slow hash, on a logarithmic time scale from under a second to a billion years."><text x="143.1" y="245" class="ts mid">1 second</text><text x="234.8" y="245" class="ts mid">1 hour</text><text x="336.4" y="245" class="ts mid">1 yr</text><text x="413.8" y="245" class="ts mid">1,000 yr</text><text x="491.1" y="245" class="ts mid">1 million yr</text><text x="568.4" y="245" class="ts mid">1 billion yr</text><line x1="40" x2="620" y1="230" y2="230" class="axis"></line><circle cx="46" cy="12" r="4.5" class="hollow"></circle><text x="56" y="16" class="ts">a fast hash, 10 billion guesses a second</text><circle cx="316" cy="12" r="5" class="fill-ink"></circle><text x="326" y="16" class="ts">your hash, 4,000 a second: the time at the right</text><line x1="143.1" x2="143.1" y1="53" y2="65" class="grid"></line><line x1="234.8" x2="234.8" y1="53" y2="65" class="grid"></line><line x1="336.4" x2="336.4" y1="53" y2="65" class="grid"></line><line x1="413.8" x2="413.8" y1="53" y2="65" class="grid"></line><line x1="491.1" x2="491.1" y1="53" y2="65" class="grid"></line><line x1="568.4" x2="568.4" y1="53" y2="65" class="grid"></line><text x="40" y="46" class="ts">One of the 10,000 most common passwords (13.3 bits)</text><text x="620" y="46" class="ts end">1.25 s</text><line x1="40" x2="145.6" y1="59" y2="59" class="axis"></line><circle cx="40" cy="59" r="4.5" class="hollow"></circle><circle cx="145.6" cy="59" r="5" class="fill-ink"></circle><line x1="143.1" x2="143.1" y1="91" y2="103" class="grid"></line><line x1="234.8" x2="234.8" y1="91" y2="103" class="grid"></line><line x1="336.4" x2="336.4" y1="91" y2="103" class="grid"></line><line x1="413.8" x2="413.8" y1="91" y2="103" class="grid"></line><line x1="491.1" x2="491.1" y1="91" y2="103" class="grid"></line><line x1="568.4" x2="568.4" y1="91" y2="103" class="grid"></line><text x="40" y="84" class="ts">8 random lowercase letters (37.6 bits)</text><text x="620" y="84" class="ts end">302 days</text><line x1="169.4" x2="334.3" y1="97" y2="97" class="axis"></line><circle cx="169.4" cy="97" r="4.5" class="hollow"></circle><circle cx="334.3" cy="97" r="5" class="fill-ink"></circle><line x1="143.1" x2="143.1" y1="129" y2="141" class="grid"></line><line x1="234.8" x2="234.8" y1="129" y2="141" class="grid"></line><line x1="336.4" x2="336.4" y1="129" y2="141" class="grid"></line><line x1="413.8" x2="413.8" y1="129" y2="141" class="grid"></line><line x1="491.1" x2="491.1" y1="129" y2="141" class="grid"></line><line x1="568.4" x2="568.4" y1="129" y2="141" class="grid"></line><text x="40" y="122" class="ts">4 random words from a list of 7,776 (51.7 bits)</text><text x="620" y="122" class="ts end">14,500 years</text><line x1="278.8" x2="443.7" y1="135" y2="135" class="axis"></line><circle cx="278.8" cy="135" r="4.5" class="hollow"></circle><circle cx="443.7" cy="135" r="5" class="fill-ink"></circle><line x1="143.1" x2="143.1" y1="167" y2="179" class="grid"></line><line x1="234.8" x2="234.8" y1="167" y2="179" class="grid"></line><line x1="336.4" x2="336.4" y1="167" y2="179" class="grid"></line><line x1="413.8" x2="413.8" y1="167" y2="179" class="grid"></line><line x1="491.1" x2="491.1" y1="167" y2="179" class="grid"></line><line x1="568.4" x2="568.4" y1="167" y2="179" class="grid"></line><text x="40" y="160" class="ts">15 random letters and digits (89.3 bits)</text><text x="620" y="160" class="ts end">off the scale: more than a quadrillion years</text><line x1="570.6" x2="620" y1="173" y2="173" class="axis"></line><circle cx="570.6" cy="173" r="4.5" class="hollow"></circle><circle cx="620" cy="173" r="5" class="fill-ink"></circle><line x1="143.1" x2="143.1" y1="205" y2="217" class="grid"></line><line x1="234.8" x2="234.8" y1="205" y2="217" class="grid"></line><line x1="336.4" x2="336.4" y1="205" y2="217" class="grid"></line><line x1="413.8" x2="413.8" y1="205" y2="217" class="grid"></line><line x1="491.1" x2="491.1" y1="205" y2="217" class="grid"></line><line x1="568.4" x2="568.4" y1="205" y2="217" class="grid"></line><text x="40" y="198" class="tb">Your setting (40 bits)</text><text x="620" y="198" class="tb end">4.36 years</text><line x1="188" x2="352.9" y1="211" y2="211" class="axis"></line><circle cx="188" cy="211" r="4.5" class="hollow"></circle><circle cx="352.9" cy="211" r="5.5" class="dot"></circle><text x="330" y="268" class="ts mid">Average time to find the password. Each step to the right is a thousand times longer, or more.</text></svg>
+<dl class="results">
+  <div><dt>Attacker’s guesses per second</dt><dd data-out="gps">4,000</dd></div>
+  <div><dt>Average time to find it</dt><dd data-out="avg">4.36 years</dd></div>
+  <div><dt>Sign-ins one core can check per second</dt><dd data-out="signins">4</dd></div>
+  <div><dt>With a fast hash instead</dt><dd data-out="fast">55 s</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">One hash takes 250 ms on your server, so one core can check 4 sign-ins a second. An attacker with 1,000 times that speed makes 4,000 guesses a second against each stolen hash, and finds a password of 40 bits in 4.36 years on average. Behind a fast hash the same password would last 55 s. The slow hash multiplies every password’s lifetime by 2.5 million. It cannot save a password that is on a list of common ones.</p>
+</div>
+
+<p>The slow hash moves every password the same distance to the right, a factor of 2.5 million at these settings, which is the difference between seconds and years for a middling password. It does almost nothing for a password that is on a list: the ten thousand most common ones fall in about a second either way. People do not choose passwords at random, so the rules below matter as much as the hash.</p>
+
+<h3 id="password-rules">Rules that help and rules that do not</h3>
+<p>For years, sites demanded an uppercase letter, a digit and a symbol, and a new password every ninety days. The results were <code>Password1!</code> and then <code>Password2!</code>. The United States standards body NIST reversed that advice, and the 2025 edition of its digital identity guidelines forbids both demands outright.</p>
+<table>
+<thead><tr><th>Do</th><th>Do not</th></tr></thead>
+<tbody>
+<tr><td>Require length: at least 15 characters when the password is the only factor, at least 8 when a second factor is also required</td><td>Require mixtures of character types</td></tr>
+<tr><td>Accept long passwords, at least 64 characters, including spaces and any Unicode character</td><td>Force a change on a schedule. Force one only when there is evidence of compromise</td></tr>
+<tr><td>Reject passwords found on a blocklist of common and breached ones</td><td>Offer password hints or security questions</td></tr>
+<tr><td>Let password managers fill the field, and allow paste</td><td>Truncate the password, silently or otherwise</td></tr>
+<tr><td>Limit failed attempts for each account</td><td>Store anything from which the password can be recovered</td></tr>
+</tbody>
+</table>
+<p>Checking a password against a public list of breached ones seems to require sending it to somebody. It does not. The widely used Pwned Passwords service is queried with only the first five characters of the password’s SHA-1 hash. It returns every breached hash that starts with those characters, hundreds of them, and the comparison is finished locally.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Writing passwords to a log. It happens indirectly: a request logger that records every body, or an error report that includes the form. Exclude credential fields by name, at the logger, and test that the exclusion works. The same applies to tokens and session identifiers.</p></div>
+<p>None of this addresses the larger problem: people reuse passwords, and other sites leak them. In <dfn>credential stuffing</dfn>, an attacker takes name and password pairs leaked from one site and tries them against another, automatically and by the million. The defenses come later in this chapter: a second factor, and credentials that cannot be reused at all.</p>
+
+<h2 id="sessions">Sessions and cookies</h2>
+<p>HTTP has no memory. Once Ana has proved who she is, the server needs a way to recognize her next request without asking for the password again. The oldest answer is still the right default for a website.</p>
+<p>A <dfn>session</dfn> is a record on the server that says “the holder of this identifier signed in as this user, at this time”. The identifier is a long random string. The browser receives it in a cookie and returns it with every request.</p>
+
+<figure class="fig wide" id="fig-session">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f512t f512d">
+<title id="f512t">A server-side session from sign-in to sign-out</title>
+<desc id="f512d">A sequence between a browser, the app server and a session store. The browser posts a name and password. The server checks the hash, creates session 9f2c for Ana in the store and returns it in a cookie. The next request carries the cookie, the server looks the session up and returns Ana’s feed. On sign-out the server deletes the session.</desc>
+<text class="tb mid" x="110" y="20">Ana’s browser</text>
+<line class="axis" x1="110" y1="28" x2="110" y2="262"/>
+<text class="tb mid" x="360" y="20">App server</text>
+<line class="axis" x1="360" y1="28" x2="360" y2="262"/>
+<text class="tb mid" x="610" y="20">Session store</text>
+<line class="axis" x1="610" y1="28" x2="610" y2="262"/>
+<g data-s="1">
+<path class="e sig" d="M111 54H359"/>
+<text class="ts mid" x="235.0" y="48">1. POST /login: name, password</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n " x="368" y="68" width="176.6" height="22" rx="4"/>
+<text class="ts mid" x="456.3" y="83">2. check the password hash</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M361 110H609"/>
+<text class="ts mid" x="485.0" y="104">3. create 9f2c… for Ana</text>
+</g>
+<g data-s="4">
+<path class="e" d="M359 138H111"/>
+<text class="ts mid" x="235.0" y="132">4. Set-Cookie: __Host-sid=9f2c…</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M111 166H359"/>
+<text class="ts mid" x="235.0" y="160">5. GET /feed, with the cookie</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M361 194H609"/>
+<text class="ts mid" x="485.0" y="188">6. who is 9f2c…?</text>
+</g>
+<g data-s="7">
+<path class="e" d="M359 222H111"/>
+<text class="ts mid" x="235.0" y="216">7. 200: Ana’s feed</text>
+</g>
+<g data-s="8">
+<path class="e fault" d="M361 250H609"/>
+<text class="ts mid" x="485.0" y="244">8. sign-out: delete 9f2c…</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Session store: empty; The browser holds: no cookie">Ana submits her name and password. The connection is encrypted, so only the server can read them.</li>
+  <li data-msg="none">The server finds Ana’s record and verifies the password against the stored hash.</li>
+  <li data-state="Session store: 9f2c… is Ana, 30 minutes left; The browser holds: no cookie">It creates a session: a long random identifier, kept on the server with the user it belongs to and the time it expires.</li>
+  <li data-state="Session store: 9f2c… is Ana, 30 minutes left; The browser holds: the cookie 9f2c…">The identifier travels back in a cookie that page scripts cannot read and that is sent only over HTTPS.</li>
+  <li>Every later request carries the cookie without the page doing anything.</li>
+  <li data-msg="who is 9f2c…?">The server looks the identifier up. One lookup on every request is what this design costs.</li>
+  <li>The store says the session is Ana’s and still valid, so the request is served as Ana.</li>
+  <li data-state="Session store: empty; The browser holds: a cookie that no longer works">When Ana signs out, the session is deleted. Any copy of the cookie, on any device, now refers to nothing.</li>
+</ol>
+<figcaption>A session keeps the facts on the server and gives the browser only a random reference to them. That is what makes it easy to end.</figcaption>
+</figure>
+
+<p>The identifier means nothing by itself. It is a reference to facts the server holds, and the server can change those facts at any moment. Signing out deletes the record. So does “sign out everywhere”, a password change, or an administrator disabling the account.</p>
+<p>The cost is a lookup on every request, which is why sessions are kept in a fast shared store that any server can reach (<x-ref to="scalability#stateless"></x-ref>). A session record is small: the user, when it was created and last used, and often the device it came from, so that users can review where they are signed in.</p>
+
+<h3 id="cookies">Getting the cookie right</h3>
+<p>The session identifier is a credential. Anyone who obtains it is Ana until it expires, without needing her password or her second factor. Its protection is mostly a matter of the attributes set when the cookie is issued.</p>
+<pre data-lang="http" data-title="The response to a successful sign-in">
+HTTP/1.1 303 See Other
+Location: /feed
+Set-Cookie: __Host-sid=9f2c4e81b7d05a36c1e84f7a2b9d6035; Path=/; Secure; HttpOnly; SameSite=Lax
+Cache-Control: no-store
+</pre>
+<table>
+<thead><tr><th>Attribute</th><th>Effect</th><th>What it defends against</th></tr></thead>
+<tbody>
+<tr><th><code>HttpOnly</code></th><td>Page scripts cannot read the cookie</td><td>A script injected into your page stealing the session (<x-ref to="threats-and-defenses"></x-ref>)</td></tr>
+<tr><th><code>Secure</code></th><td>Sent only over HTTPS</td><td>Anyone on the network path reading it</td></tr>
+<tr><th><code>SameSite=Lax</code></th><td>Not sent on requests that another site makes in the background or by submitting a form. Still sent when the user follows a link to your site</td><td>Another site causing actions in the user’s name, known as cross-site request forgery</td></tr>
+<tr><th><code>__Host-</code> prefix</th><td>Browsers accept the cookie only if it is <code>Secure</code>, has <code>Path=/</code> and names no domain</td><td>A subdomain, or a page served over plain HTTP, planting or overwriting it</td></tr>
+</tbody>
+</table>
+<p>The cookie above has no <code>Max-Age</code>, so it lasts until the browser closes. Add one to keep users signed in longer. The real expiry is enforced on the server either way, along with three more rules.</p>
+<ul>
+  <li><b>Generate at least 128 bits from a cryptographic random generator.</b> An identifier that can be predicted or counted through is no credential at all.</li>
+  <li><b>Issue a new identifier at sign-in.</b> In <dfn>session fixation</dfn>, an attacker obtains an identifier before signing in, tricks the victim’s browser into using it, and waits for the victim to sign in. If signing in keeps the old identifier, the attacker now holds a signed-in session. Issuing a fresh one at every change of privilege closes this.</li>
+  <li><b>Expire sessions twice.</b> An idle timeout ends a session that has not been used for a while. An absolute timeout ends it however active it is. NIST suggests at most 30 days for low-risk services and, for services that need a second factor, at most 24 hours overall and an hour of inactivity. A bank will choose minutes. A photo app will choose weeks and ask again before anything sensitive.</li>
+</ul>
+<aside class="sn"><b>Stolen cookies</b>Malware on a user’s computer can copy session cookies from the browser, and the thief then skips the password and the second factor entirely. Chrome 146 on Windows began shipping Device Bound Session Credentials in 2026: the browser holds a key in the machine’s security chip and must prove possession of it to renew a short-lived cookie, so a copied cookie soon stops working elsewhere.</aside>
+
+<h2 id="tokens">Tokens that carry their own proof</h2>
+<p>A session makes every request depend on one store. That is a small price for a website and a larger one in a system of forty services, where each service would have to ask the store who the caller is. The alternative is to hand the caller a statement that any service can verify without asking anyone.</p>
+<p>A <dfn>JSON Web Token</dfn>, or JWT, is a small signed document. It states who it is about, who issued it, who it is meant for and when it expires, and it carries a signature that proves the issuer wrote it and nothing has been changed since. Each statement inside it is called a <dfn>claim</dfn>.</p>
+
+<figure class="fig wide" id="fig-jwt">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f513t f513d">
+<title id="f513t">The three parts of a JSON Web Token and what a verifier checks</title>
+<desc id="f513d">A token drawn as three boxes separated by dots. The header names the algorithm ES256 and a key. The payload holds the claims: issuer, subject user-871, audience photos-api, expiry and scope. The signature is computed over the header and payload with the issuer’s private key. The first two parts are only encoded and can be read by anyone. A verifier checks the algorithm, then the signature, then issuer and audience, then expiry.</desc>
+<rect class="n" x="10" y="30" width="170" height="96" rx="6"/>
+<text class="tb" x="20" y="22">Header</text>
+<text class="ts" x="20" y="52">{ "alg": "ES256",</text>
+<text class="ts" x="31" y="68">"kid": "2026-10" }</text>
+<text class="ts" x="20" y="104">which algorithm, which key</text>
+<text class="tl" x="190" y="84">.</text>
+<rect class="n sig" x="206" y="30" width="290" height="96" rx="6"/>
+<text class="tb" x="216" y="22">Payload: the claims</text>
+<text class="ts" x="216" y="50">{ "iss": "https://id.photos.example",</text>
+<text class="ts" x="227" y="66">"sub": "user-871", "aud": "photos-api",</text>
+<text class="ts" x="227" y="82">"exp": 1800000900, "scope": "photos:read" }</text>
+<text class="ts" x="216" y="112">who issued it, about whom, for whom, until when</text>
+<text class="tl" x="506" y="84">.</text>
+<rect class="n store" x="522" y="30" width="188" height="96" rx="6"/>
+<text class="tb" x="532" y="22">Signature</text>
+<text class="ts" x="532" y="52">sign( header + "." + payload )</text>
+<text class="ts" x="532" y="68">with the issuer’s private key</text>
+<text class="ts" x="532" y="104">proves nothing was altered</text>
+<path class="e none" d="M10 136v6H496v-6"/>
+<text class="ts mid" x="253" y="158">only encoded, not encrypted: anyone holding the token can read this</text>
+<text class="tb" x="10" y="188">A verifier checks, in this order:</text>
+<text class="ts" x="10" y="206">1. the algorithm is one it has chosen to accept</text>
+<text class="ts" x="10" y="222">3. the issuer and audience are the ones it expects</text>
+<text class="ts" x="330" y="206">2. the signature is valid for a key of this issuer</text>
+<text class="ts" x="330" y="222">4. the token has not expired</text>
+</svg>
+</div>
+<figcaption>A signed token is a statement anyone can read and nobody but the issuer can change. Never put a secret in the payload.</figcaption>
+</figure>
+
+<p>Two properties follow from the structure, and both surprise people.</p>
+<ul>
+  <li><b>The contents are readable by anyone.</b> The first two parts are only encoded so that they survive being put in a header. Paste a token into any decoder and the claims appear. A token protects integrity, not secrecy.</li>
+  <li><b>A token is a <dfn>bearer token</dfn></b>: whoever holds it can use it, exactly like cash. Nothing in it ties it to the device it was issued to.</li>
+</ul>
+<p>The signature can be made in two ways. With a shared-secret algorithm such as HS256, the same key signs and verifies, so every service able to check a token is also able to forge one. With a public-key algorithm such as ES256, the issuer signs with a private key that never leaves it, and services verify with the matching public key, which the issuer publishes. Across more than one service, use a public-key algorithm. <x-ref to="cryptography-in-practice"></x-ref> explains both kinds of signature.</p>
+<p>The verifier below is complete. It uses HS256 because that needs nothing beyond the standard library. In production use a maintained library, and read this as a description of what that library must be told to do.</p>
+
+<pre data-lang="ts" data-title="Issuing and verifying a signed token">
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+export type Claims = { iss: string; sub: string; aud: string; exp: number; iat: number; [name: string]: unknown };
+
+const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+const sign = (input: string, key: Buffer) => createHmac("sha256", key).update(input).digest();
+
+export function issue(claims: Claims, key: Buffer): string {
+  const input = `${encode({ alg: "HS256", typ: "JWT" })}.${encode(claims)}`;
+  return `${input}.${sign(input, key).toString("base64url")}`;
+}
+
+export function verify(token: string, key: Buffer, expect: { iss: string; aud: string }, now = Date.now() / 1000): Claims {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("malformed token");
+  const header = JSON.parse(Buffer.from(parts[0], "base64url").toString());
+  // 1. The verifier chooses the algorithm. The token does not get a say.
+  if (header.alg !== "HS256") throw new Error("unexpected algorithm");
+  // 2. Check the signature before trusting a single claim.
+  const given = Buffer.from(parts[2], "base64url");
+  const wanted = sign(`${parts[0]}.${parts[1]}`, key);
+  if (given.length !== wanted.length || !timingSafeEqual(given, wanted)) throw new Error("bad signature");
+  // 3. Only now read the claims, and check each one that limits the token.
+  const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString()) as Claims;
+  if (claims.iss !== expect.iss) throw new Error("wrong issuer");
+  if (claims.aud !== expect.aud) throw new Error("meant for another service");
+  if (typeof claims.exp !== "number" || claims.exp <= now) throw new Error("expired");
+  return claims;
+}
+</pre>
+<p>The order of the checks is the point. The token is supplied by the caller, so every byte of it is untrusted until the signature has been verified with a key and an algorithm that the <em>verifier</em> chose. Most well-known token vulnerabilities violate that sentence.</p>
+<table>
+<thead><tr><th>Mistake</th><th>What an attacker does</th><th>Defense</th></tr></thead>
+<tbody>
+<tr><th>Trusting the header’s algorithm</th><td>Sends a token whose header says <code>"alg": "none"</code> and has no signature, or says HS256 and is signed with the public key as if it were a shared secret</td><td>Accept only the algorithms you configured</td></tr>
+<tr><th>Not checking the audience</th><td>Takes a valid token issued for one service and presents it to another</td><td>Every service checks that <code>aud</code> names itself</td></tr>
+<tr><th>Long lifetimes</th><td>Uses a stolen token for days</td><td>Minutes, plus a refresh token</td></tr>
+<tr><th>Reading claims before verifying</th><td>Forges whatever the code reads first</td><td>Verify, then parse</td></tr>
+</tbody>
+</table>
+
+<h3 id="revocation">The price: a token cannot be taken back</h3>
+<p>The property that makes a signed token useful is that nobody needs to be asked. The same property means nobody can be told. If Ana signs out, or her phone is stolen, every token already issued remains valid until it expires, at every service, and there is no record to delete.</p>
+<p>The standard answer is to split the credential in two.</p>
+<ul>
+  <li>An <dfn>access token</dfn> is the short-lived token that is sent to APIs. Lifetimes from five minutes to an hour are common, and this chapter uses fifteen minutes. The lifetime bounds how long a stolen one is useful.</li>
+  <li>A <dfn>refresh token</dfn> is a long-lived credential whose only use is to obtain new access tokens. It is sent to one place, the server that issued it, and that server keeps a record of it. Revoking it is an ordinary delete.</li>
+</ul>
+<p>Signing out now means deleting the refresh token. The access token outlives it by minutes. Where even that is too long, services can consult a small list of revoked token identifiers, which is a session store again in a reduced form.</p>
+<p>A refresh token is the most valuable thing a client holds, so it gets one more protection. With <dfn>refresh token rotation</dfn>, every use of a refresh token returns a new one and retires the old. A retired token that turns up again is evidence of theft.</p>
+
+<figure class="fig wide" id="fig-refresh">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 264" role="img" aria-labelledby="f514t f514d">
+<title id="f514t">Refresh token rotation and what happens when a stolen token is reused</title>
+<desc id="f514d">A sequence between a thief, the app, the sign-in service that issues tokens, and the API. The app calls the API with access token A1 until it expires, then sends refresh token R1 to the sign-in service and receives A2 and R2. Later a thief presents the old R1. The service sees a refresh token used twice and revokes every token descended from it.</desc>
+<text class="tb mid" x="70" y="20">Thief</text>
+<line class="axis" x1="70" y1="28" x2="70" y2="236"/>
+<text class="tb mid" x="250" y="20">The app</text>
+<line class="axis" x1="250" y1="28" x2="250" y2="236"/>
+<text class="tb mid" x="470" y="20">Sign-in service</text>
+<line class="axis" x1="470" y1="28" x2="470" y2="236"/>
+<text class="tb mid" x="660" y="20">API</text>
+<line class="axis" x1="660" y1="28" x2="660" y2="236"/>
+<g data-s="1">
+<path class="e sig" d="M251 54H659"/>
+<text class="ts mid" x="455.0" y="48">1. GET /photos with A1</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M659 82H251"/>
+<text class="ts mid" x="455.0" y="76">2. 401: token expired</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M251 110H469"/>
+<text class="ts mid" x="360.0" y="104">3. refresh with R1</text>
+</g>
+<g data-s="4">
+<path class="e" d="M469 138H251"/>
+<text class="ts mid" x="360.0" y="132">4. new A2 and new R2</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M251 166H659"/>
+<text class="ts mid" x="455.0" y="160">5. GET /photos with A2</text>
+</g>
+<g data-s="6">
+<path class="e fault" d="M71 194H469"/>
+<text class="ts mid" x="270.0" y="188">6. refresh with R1, stolen earlier</text>
+</g>
+<g data-s="7" data-packet="none">
+<rect class="n fault" x="478" y="208" width="194.9" height="22" rx="4"/>
+<text class="ts mid" x="575.45" y="223">7. revoke every token from R1</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Refresh token that works: R1; Already used: none">The app calls the API with a short-lived access token, A1. The API checks the signature and expiry itself and asks nobody.</li>
+  <li>Fifteen minutes later A1 has expired, and the API refuses it.</li>
+  <li>The app presents its refresh token. This is the only place a refresh token is ever sent.</li>
+  <li data-state="Refresh token that works: R2; Already used: R1">The server replies with a new access token and a new refresh token, and marks R1 as used. Each refresh token works once.</li>
+  <li>The app carries on with A2. The user noticed nothing.</li>
+  <li data-msg="R1, a second time">Now suppose R1 had been copied by malware. The thief presents it, and the server sees a refresh token arrive for the second time.</li>
+  <li data-msg="none" data-state="Refresh token that works: none; Already used: R1, R2 revoked">The server cannot tell which caller is the thief, so it revokes every token descended from R1. Both must sign in again, and only the real user can.</li>
+</ol>
+<figcaption>Rotation turns a stolen refresh token from a silent, lasting compromise into one that announces itself the first time both copies are used.</figcaption>
+</figure>
+
+<p>Rotation does not prevent theft. It bounds it: the first time both copies are used, the session ends for both. Current security practice for OAuth, the protocol in <x-ref to="oauth-and-sso"></x-ref>, requires that refresh tokens issued to browser and mobile apps either rotate like this or be bound to a key held by the client, so that a copied token is useless without the key.</p>
+
+<h3 id="session-or-token">Session or token?</h3>
+<table>
+<thead><tr><th></th><th>Server-side session</th><th>Signed token</th></tr></thead>
+<tbody>
+<tr><th>What the client holds</th><td>A random reference</td><td>The claims themselves, signed</td></tr>
+<tr><th>Cost of checking</th><td>A lookup in a shared store</td><td>A signature check, no network call</td></tr>
+<tr><th>Ending it early</th><td>Immediate: delete the record</td><td>Only by waiting for expiry, or by adding a lookup</td></tr>
+<tr><th>Changing a user’s permissions</th><td>Takes effect on the next request</td><td>Takes effect when the token is next renewed</td></tr>
+<tr><th>Size on each request</th><td>Tens of bytes</td><td>Hundreds of bytes to a few kilobytes</td></tr>
+<tr><th>Fits best</th><td>A website and its own backend</td><td>Calls between services, mobile apps, third-party APIs</td></tr>
+</tbody>
+</table>
+<p>The two are routinely combined: a session cookie between the browser and one backend, and signed tokens from that backend onward. <x-ref to="oauth-and-sso#browser"></x-ref> explains why that arrangement is the recommended one for web applications.</p>
+
+<h2 id="mfa">A second factor</h2>
+<p>A password alone fails in three common ways: it is guessed, it is reused on a site that leaks it, or it is typed into a fake page. <dfn>Multi-factor authentication</dfn>, or MFA, requires evidence of two different kinds, usually a password and something the user has, so that a stolen password is no longer enough on its own.</p>
+<p>Any second factor defeats credential stuffing. The factors differ sharply in what else they stop.</p>
+<table>
+<thead><tr><th>Second factor</th><th>How it works</th><th>Weakness</th><th>Stops real-time phishing</th></tr></thead>
+<tbody>
+<tr><th>Code by text message</th><td>The server sends a code to the user’s phone number</td><td>Phone numbers can be transferred to an attacker’s SIM card, and messages can be intercepted. NIST classes it as restricted</td><td>No</td></tr>
+<tr><th>Code from an app</th><td>The phone and the server share a secret and each derive a code from it and the time</td><td>The user can be persuaded to type the code into a fake page</td><td>No</td></tr>
+<tr><th>Push approval</th><td>The user taps “approve” on a phone</td><td>A user flooded with prompts eventually approves one</td><td>No, unless the prompt requires typing a number shown on the sign-in page</td></tr>
+<tr><th>Security key or passkey</th><td>A device signs a challenge with a key that is bound to the real site</td><td>Loss of the device, and whatever recovery replaces it</td><td>Yes</td></tr>
+</tbody>
+</table>
+<p>The app-generated code is simple, and it shows exactly where the weakness lies. A <dfn>time-based one-time password</dfn>, or TOTP, is a short code computed from a shared secret and the current time, so that it changes every thirty seconds. The secret is exchanged once, as the QR code the user scans during setup.</p>
+
+<pre data-lang="ts" data-title="A time-based one-time password, and the check on the server">
+import { createHmac } from "node:crypto";
+
+// RFC 6238: a counter derived from the clock, fed to the HOTP function of RFC 4226.
+export function totp(secret: Buffer, atSeconds = Date.now() / 1000, step = 30, digits = 6): string {
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(atSeconds / step)));
+  const mac = createHmac("sha1", secret).update(counter).digest();
+  const offset = mac[mac.length - 1] & 0x0f; // the last nibble picks four bytes
+  const number = mac.readUInt32BE(offset) & 0x7fffffff;
+  return String(number % 10 ** digits).padStart(digits, "0");
+}
+
+// Accept the current step and one on either side, to allow for clock drift,
+// and never accept the same step twice.
+export function checkTotp(secret: Buffer, code: string, lastUsedStep: number, atSeconds = Date.now() / 1000): number | null {
+  const current = Math.floor(atSeconds / 30);
+  for (const step of [current, current - 1, current + 1]) {
+    if (step > lastUsedStep && totp(secret, step * 30) === code) return step;
+  }
+  return null;
+}
+</pre>
+<p>Three consequences follow from those few lines.</p>
+<ul>
+  <li><b>The server must store the secret in a recoverable form</b>, because it has to compute the same code. Unlike a password it cannot be hashed. Encrypt it, with a key kept outside the database.</li>
+  <li><b>A six-digit code is one guess in a million</b>, and three in a million once neighboring time steps are accepted. Without a strict limit on attempts, a script finds it in minutes.</li>
+  <li><b>The code is the same wherever it is typed.</b> Nothing in it knows which site it was meant for.</li>
+</ul>
+<p>That last point is what attackers now exploit at scale. A phishing page no longer stores a password for later. It relays everything to the real site while the victim is still typing.</p>
+
+<figure class="fig wide" id="fig-phish">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 306" role="img" aria-labelledby="f516t f516d">
+<title id="f516t">A real-time phishing attack against a one-time code and against a passkey</title>
+<desc id="f516d">Two sequences between Ana, a fake site and the real site. In the first, Ana types her name, password and six-digit code into the fake site, which passes them to the real site within seconds and receives a session as Ana. In the second, Ana’s account uses a passkey. Her browser finds no passkey for the fake domain, nothing is signed, and the attacker has nothing to forward.</desc>
+<text class="tb" x="10" y="16">A one-time code</text>
+<g data-scene="code">
+<text class="tb mid" x="110" y="36">Ana</text>
+<line class="axis" x1="110" y1="44" x2="110" y2="140"/>
+<text class="tb mid" x="380" y="36">Fake site: photos-example.co</text>
+<line class="axis" x1="380" y1="44" x2="380" y2="140"/>
+<text class="tb mid" x="620" y="36">Real site: photos.example</text>
+<line class="axis" x1="620" y1="44" x2="620" y2="140"/>
+<g data-s="1">
+<path class="e sig" d="M111 70H379"/>
+<text class="ts mid" x="245.0" y="64">1. name, password, code 492 113</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M381 98H619"/>
+<text class="ts mid" x="500.0" y="92">2. the same three, seconds later</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M619 126H381"/>
+<text class="ts mid" x="500.0" y="120">3. session cookie for Ana</text>
+</g>
+</g>
+<path class="e none dash" d="M10 156H710"/>
+<text class="tb" x="10" y="176">A passkey</text>
+<g data-scene="passkey">
+<text class="tb mid" x="110" y="196">Ana</text>
+<line class="axis" x1="110" y1="204" x2="110" y2="300"/>
+<text class="tb mid" x="380" y="196">Fake site: photos-example.co</text>
+<line class="axis" x1="380" y1="204" x2="380" y2="300"/>
+<text class="tb mid" x="620" y="196">Real site: photos.example</text>
+<line class="axis" x1="620" y1="204" x2="620" y2="300"/>
+<g data-s="1">
+<path class="e fault" d="M379 230H111"/>
+<text class="ts mid" x="245.0" y="224">1. sign this challenge</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n store" x="118" y="244" width="231.5" height="22" rx="4"/>
+<text class="ts mid" x="233.75" y="259">2. no passkey for photos-example.co</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M381 286H538.4"/>
+<path class="x" d="M539.4 279l14 14M553.4 279l-14 14"/>
+<text class="ts mid" x="459.2" y="280">3. nothing to forward</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="code" data-label="A one-time code">
+  <li data-state="The attacker holds: Ana’s password and a code that is still valid">A link leads Ana to a copy of the sign-in page on a look-alike domain. She types her name, her password and the six-digit code from her phone.</li>
+  <li data-msg="name, password, 492 113">The fake site passes all three to the real one at once, while the code still has seconds to live.</li>
+  <li data-msg="session cookie" data-state="The attacker holds: a signed-in session as Ana">The real site sees a correct password and a correct code, and issues a session. To the attacker.</li>
+</ol>
+<ol class="steps" data-scene="passkey" data-label="A passkey">
+  <li data-state="The attacker holds: nothing">The same link, but Ana’s account now uses a passkey. The fake site relays a challenge from the real site and asks her browser to sign it.</li>
+  <li data-msg="none">Her browser looks for a passkey registered for the site it is showing. There is none: Ana’s passkey belongs to photos.example, and she is offered nothing to approve or type.</li>
+  <li data-msg="none" data-state="The attacker holds: nothing">The attacker has nothing to pass on. A signature would also name the origin it was made for, so the real site would reject one made anywhere else.</li>
+</ol>
+<figcaption>A code is phishable because a person can be persuaded to type it anywhere. A passkey is not, because the browser decides where it may be used and the person is never asked.</figcaption>
+</figure>
+
+<p>A credential is called <dfn>phishing-resistant</dfn> when what it produces is bound to the site it was registered with, so that nothing a user can be tricked into doing on another site yields anything usable. Codes and push approvals are not, however they are delivered. Passkeys and security keys are. NIST’s current guidelines require services at the second assurance level to offer at least one phishing-resistant option.</p>
+<div class="note production"><p><span class="label">In production.</span> In September 2022 an attacker who had bought a contractor’s password sent push prompts to the contractor’s phone for more than an hour, then posed as IT support in a message and asked for one to be approved. One was, and the attacker was inside Uber’s internal network. The lesson drawn across the industry was number matching: the user must type into the phone a number displayed on the sign-in page, which cannot be done absent-mindedly or for somebody else’s sign-in.</p></div>
+<p>Two more decisions come with any second factor. <b>Recovery codes</b> are single-use codes issued at setup for the day the phone is lost. Store them hashed, like passwords. <dfn>Step-up authentication</dfn> means asking for a factor again, or for a stronger one, immediately before a sensitive action such as changing the email address or deleting everything, even though the session is otherwise valid.</p>
+
+<h2 id="passkeys">Passkeys</h2>
+<p>Every credential so far is a secret that both sides know, or that travels to the server to be checked. A <dfn>passkey</dfn> is a credential built on a key pair: the user’s device creates a private key that never leaves it and gives the server the matching public key. Signing in means signing a fresh challenge. There is nothing on the server worth stealing and nothing a user can be tricked into typing.</p>
+<p>The browser interface that makes this work is <dfn>WebAuthn</dfn>, a W3C standard whose third edition became a Recommendation in August 2026. In its terms the site is the <dfn>relying party</dfn> and the thing holding the key is the authenticator: a phone, a laptop’s security chip, a password manager or a hardware security key.</p>
+
+<figure class="fig wide" id="fig-webauthn">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 388" role="img" aria-labelledby="f517t f517d">
+<title id="f517t">Registering a passkey and signing in with it</title>
+<desc id="f517d">Two sequences between an authenticator, the browser and the photo app’s server. To register, the server sends a challenge, the browser asks the authenticator to create a key for photos.example, Ana unlocks the device, and the public key is returned and stored. To sign in, the server sends a fresh challenge, the authenticator signs it together with the origin after Ana unlocks the device, and the server verifies the signature with the stored public key.</desc>
+<text class="tb" x="10" y="16">Registering, once</text>
+<g data-scene="register">
+<text class="tb mid" x="110" y="36">Authenticator</text>
+<line class="axis" x1="110" y1="44" x2="110" y2="168"/>
+<text class="tb mid" x="360" y="36">Browser</text>
+<line class="axis" x1="360" y1="44" x2="360" y2="168"/>
+<text class="tb mid" x="610" y="36">Photo app server</text>
+<line class="axis" x1="610" y1="44" x2="610" y2="168"/>
+<g data-s="1">
+<path class="e" d="M609 70H361"/>
+<text class="ts mid" x="485.0" y="64">1. challenge, for photos.example</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M359 98H111"/>
+<text class="ts mid" x="235.0" y="92">2. create a key for photos.example</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n store" x="118" y="112" width="225.4" height="22" rx="4"/>
+<text class="ts mid" x="230.7" y="127">3. Ana unlocks, a key pair is made</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M111 154H609"/>
+<text class="ts mid" x="360.0" y="148">4. public key and credential ID</text>
+</g>
+</g>
+<path class="e none dash" d="M10 184H710"/>
+<text class="tb" x="10" y="204">Signing in, every time</text>
+<g data-scene="signin">
+<text class="tb mid" x="110" y="224">Authenticator</text>
+<line class="axis" x1="110" y1="232" x2="110" y2="382"/>
+<text class="tb mid" x="360" y="224">Browser</text>
+<line class="axis" x1="360" y1="232" x2="360" y2="382"/>
+<text class="tb mid" x="610" y="224">Photo app server</text>
+<line class="axis" x1="610" y1="232" x2="610" y2="382"/>
+<g data-s="1">
+<path class="e" d="M609 258H361"/>
+<text class="ts mid" x="485.0" y="252">1. a fresh challenge</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M359 286H111"/>
+<text class="ts mid" x="235.0" y="280">2. sign for photos.example</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n store" x="118" y="300" width="194.9" height="22" rx="4"/>
+<text class="ts mid" x="215.45" y="315">3. Ana unlocks, the key signs</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M111 342H609"/>
+<text class="ts mid" x="360.0" y="336">4. signature over challenge and origin</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n " x="407.1" y="356" width="194.9" height="22" rx="4"/>
+<text class="ts mid" x="504.55" y="371">5. verify with the public key</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="register" data-label="Registering">
+  <li data-msg="challenge" data-state="Private key: does not exist yet; The server stores: nothing for Ana">Ana chooses to add a passkey. The server sends a random challenge and names the site the key is for.</li>
+  <li data-msg="create key">The browser passes the request on, and adds the origin of the page it is showing.</li>
+  <li data-msg="none" data-state="Private key: on Ana’s device; The server stores: nothing for Ana">Ana unlocks the device with a fingerprint, her face or a PIN. That check never leaves the device. The authenticator creates a new key pair for this one site.</li>
+  <li data-msg="public key" data-state="Private key: on Ana’s device; The server stores: Ana’s public key">Only the public key travels. The server stores it with Ana’s account. A copy of that table cannot produce a signature.</li>
+</ol>
+<ol class="steps" data-scene="signin" data-label="Signing in">
+  <li data-msg="challenge 5c1e…" data-state="Private key: on Ana’s device; The server stores: Ana’s public key">To sign in, the server sends a challenge it has never used before.</li>
+  <li data-msg="sign">The browser asks the authenticator for a signature and states the origin. A page on any other domain would be asking for a different key.</li>
+  <li data-msg="none">Ana unlocks the device again. The private key signs the challenge together with the origin.</li>
+  <li data-msg="signature">The signature goes back. Nothing in it can be used a second time, because the next sign-in will use a different challenge.</li>
+  <li data-msg="none">The server checks the signature with the stored public key, and checks that the challenge is the one it issued and the origin is its own.</li>
+</ol>
+<figcaption>A passkey replaces a secret both sides know with a key pair. The server keeps the half that is safe to lose.</figcaption>
+</figure>
+
+<p>Three properties do the work, and each removes an attack described earlier.</p>
+<table>
+<thead><tr><th>Property</th><th>What it means</th><th>Attack it ends</th></tr></thead>
+<tbody>
+<tr><th>No shared secret</th><td>The server stores only a public key</td><td>A leaked users table yields nothing to guess or reuse. Credential stuffing has nothing to stuff</td></tr>
+<tr><th>Bound to the site</th><td>The browser offers a passkey only to the site it was created for, and the signature covers the site’s origin</td><td>Phishing, including the real-time relay</td></tr>
+<tr><th>Unlocked locally</th><td>The fingerprint, face or PIN is checked by the device and never sent</td><td>A stolen device is not a stolen account, and no biometric data reaches the server</td></tr>
+</tbody>
+</table>
+<p>In the page, each ceremony is one call to the browser: <code>navigator.credentials.create</code> to register and <code>navigator.credentials.get</code> to sign in. The guarantees are enforced by what the server checks when a signature comes back:</p>
+<ol>
+  <li>the challenge is the one this server issued, and has not been used before;</li>
+  <li>the origin recorded by the browser is the server’s own;</li>
+  <li>the site identifier that the authenticator signed for matches;</li>
+  <li>the authenticator reports that a person was present and unlocked it;</li>
+  <li>the signature verifies with the public key stored for this account.</li>
+</ol>
+<p>A check written to that list was run against a response from a real browser with a simulated authenticator. It accepted the response and rejected each of four variations: another challenge, another origin, another site identifier, and a signature with one bit changed. Use a maintained WebAuthn library, which also handles registration and the other key types.</p>
+
+<h3 id="passkey-kinds">Synced and device-bound</h3>
+<p>Passkeys come in two kinds, and the difference is a trade between convenience and assurance.</p>
+<table>
+<thead><tr><th></th><th>Synced passkey</th><th>Device-bound passkey</th></tr></thead>
+<tbody>
+<tr><th>Where the private key lives</th><td>In a password manager or platform account, encrypted and copied to the user’s other devices</td><td>In one hardware security key or one device’s security chip, and it cannot be exported</td></tr>
+<tr><th>Losing a device</th><td>The passkey is still on the others</td><td>The passkey is gone. A second key, registered in advance, is essential</td></tr>
+<tr><th>Fits</th><td>Consumer products</td><td>Administrators, and anywhere the highest assurance is required</td></tr>
+</tbody>
+</table>
+<p>NIST’s guidelines accept synced passkeys at the second assurance level and require a key that cannot be exported at the third. The server can tell the two apart from flags in the authenticator’s response.</p>
+<p>In October 2025 the FIDO Alliance, drawing on figures from Amazon, Google, Microsoft, PayPal, Target and TikTok, reported that sign-ins with a passkey succeeded 93% of the time, took 73% less time than other methods, and cut sign-in help desk incidents by as much as 81%. The source is an industry body that promotes passkeys, and the figures are from large consumer services.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Adding passkeys and leaving a weak way around them. If the account can still be entered with a password and a text message, or reset through its email inbox, it is exactly as strong as that path. Strengthen the fallback, and let users remove the password entirely.</p></div>
+
+<h2 id="account">Recovery, guessing and abuse</h2>
+<p>Attackers rarely break the cryptography. They reset the password, or guess it from a list, or ask support nicely.</p>
+<h3 id="recovery">Account recovery is authentication</h3>
+<p>A “forgot password” link is a second way to sign in, and it deserves the same care as the first.</p>
+<ul>
+  <li>The reset link contains a random token of at least 128 bits. Store only its hash, let it work once, and expire it within the hour.</li>
+  <li>Completing a reset ends every existing session and notifies the user.</li>
+  <li>A reset never bypasses the second factor. Control of the mailbox should get an attacker no further than a password would.</li>
+  <li>Support staff are the same path with a human in it. Give them a procedure that they cannot be talked around.</li>
+</ul>
+<h3 id="enumeration">Do not confirm who has an account</h3>
+<p><dfn>Account enumeration</dfn> is learning which names or email addresses have accounts, from differences in how a system responds. “No such user” on one attempt and “wrong password” on another turns the sign-in form into a lookup service, and the list it produces feeds every other attack. Answer identically in both cases: “name or password is incorrect” at sign-in, and “if an account exists for that address, we have sent a link” on reset. The timing has to match as well, so hash a dummy password when the user does not exist.</p>
+<h3 id="guess-limits">Limit guessing without locking users out</h3>
+<p>Guessing against the live system is far slower than guessing against a stolen table, and it is still worth an attacker’s time if nothing pushes back. NIST requires that failed attempts on an account be limited, to no more than a hundred in a row. The obvious mechanism, locking the account after five failures, hands attackers a way to lock out any user they choose. Better tools exist:</p>
+<ul>
+  <li>Delays that grow with each failure, applied per account and per source address (<x-ref to="resilience-patterns#rate-limiting"></x-ref>).</li>
+  <li>A second factor when a sign-in comes from a device not seen before.</li>
+  <li>Detection of the pattern itself: one address trying one password against each of a thousand accounts looks nothing like a user who has forgotten theirs.</li>
+</ul>
+<p>Record every sign-in, failure, reset, new device and change of factor. Show the user part of that record (“signed in from a new device”) and alert on the whole (<x-ref to="observability#alerting"></x-ref>): a sudden rise in failed sign-ins is often the first evidence of an attack.</p>
+
+<h2 id="design">Choosing for a real system</h2>
+<p>For the people who use the photo app, the decisions come out like this. None of them is exotic, and that is the intent.</p>
+<table>
+<thead><tr><th>Decision</th><th>Choice</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Signing in</th><td>A passkey where one is registered. Otherwise a password of 15 characters or more, checked against breached lists, plus a second factor</td><td>Phishing resistance for those who accept it, and a floor for everyone else</td></tr>
+<tr><th>In a browser</th><td>A server-side session in a <code>__Host-</code> cookie, idle for at most two weeks, replaced at sign-in</td><td>Instant sign-out, nothing readable by page scripts</td></tr>
+<tr><th>In the mobile app</th><td>A 15-minute access token and a rotating refresh token, held in the phone’s secure storage</td><td>No cookie jar, long-lived installs, theft that reveals itself</td></tr>
+<tr><th>Recovery</th><td>A single-use link, the second factor still required, every session ended afterward</td><td>The reset path is a sign-in path</td></tr>
+</tbody>
+</table>
+<div class="note production"><p><span class="label">In production.</span> Authentication is the clearest case in this book for not building it yourself. The flows are standardized, the failure modes are subtle, and the attackers are practiced. Use an identity provider, or the authentication library that your framework’s maintainers support. You still choose the lifetimes, the cookie attributes, the fallback paths and what each service verifies, and those choices are where systems built on excellent libraries still fail.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Passwords hashed with a fast function, or unsalted</th><td>A leaked table gives up most passwords within hours</td><td>Argon2id or scrypt with a salt for each password, and the cost stored with the hash</td></tr>
+<tr><th>Composition rules and forced rotation</th><td>Predictable passwords, written down</td><td>Length, a breached-password check, and no scheduled changes</td></tr>
+<tr><th>Session cookie without <code>HttpOnly</code>, <code>Secure</code> or <code>SameSite</code></th><td>Stolen by an injected script, read on the network, or used by another site</td><td>All three, and the <code>__Host-</code> prefix</td></tr>
+<tr><th>Keeping the same session identifier across sign-in</th><td>Session fixation</td><td>A new identifier at every change of privilege</td></tr>
+<tr><th>Letting a token choose its own algorithm, or skipping the audience check</th><td>Forged tokens, and tokens for one service accepted at another</td><td>An allow-list fixed by the verifier, then issuer, audience and expiry</td></tr>
+<tr><th>Access tokens that live for days</th><td>A stolen token cannot be stopped</td><td>Minutes, with a rotating refresh token</td></tr>
+<tr><th>Treating a text-message code as phishing protection</th><td>Real-time phishing relays it</td><td>Passkeys or security keys for accounts that matter</td></tr>
+<tr><th>A reset path weaker than the sign-in</th><td>Attackers use the reset path</td><td>Design recovery as carefully as sign-in</td></tr>
+<tr><th>Different answers for “no such user” and “wrong password”</th><td>The form reveals who has an account</td><td>One answer, and matching timing</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="http-and-tls"></x-ref>: the encrypted channel that every credential in this chapter depends on, and the headers that carry them.</li>
+  <li><x-ref to="scalability"></x-ref>: why session state must live outside the application servers.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: the rate limiters that protect the sign-in endpoint.</li>
+  <li><x-ref to="oauth-and-sso"></x-ref>: relying on another system’s sign-in, and authenticating programs.</li>
+  <li><x-ref to="authorization"></x-ref>: what the caller may do, once you know who it is.</li>
+  <li><x-ref to="cryptography-in-practice"></x-ref>: the hashes, signatures and keys used here, and how to manage them.</li>
+  <li><x-ref to="threats-and-defenses"></x-ref>: script injection, request forgery and the other attacks that target sessions.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Authentication establishes who the caller is. Authorization, a separate step, decides what that caller may do.</li>
+  <li>Store passwords only as salted hashes from a slow, memory-hard function, with the settings kept beside the hash so that they can be raised later.</li>
+  <li>Prefer long passwords and a breached-password check to composition rules and scheduled changes.</li>
+  <li>A session is a random reference to facts held on the server. It costs a lookup on every request and can be ended at once.</li>
+  <li>A signed token carries its own facts. It needs no lookup and cannot be taken back, so it is kept short-lived and paired with a refresh token that rotates.</li>
+  <li>Verify a token’s signature with an algorithm and key you chose before reading any claim, then check issuer, audience and expiry.</li>
+  <li>Any second factor stops reused passwords. Only credentials bound to the site, such as passkeys, stop real-time phishing.</li>
+  <li>A passkey leaves only a public key on the server, so there is nothing there to steal, guess or reuse.</li>
+  <li>An account is as strong as its weakest way in, and that is usually recovery.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Your password hash takes 250 ms. An attacker with a thousand times the speed of one of your cores steals the table. How long does a randomly chosen 40-bit password last on average, and what is the limit of this protection?</summary><p>The attacker makes 4,000 guesses a second. Half of 2<sup>40</sup> is about 550 billion guesses, which takes a little over four years. Behind a fast hash at ten billion guesses a second it would last under a minute. The limit is that people do not choose at random: a password on a list of common ones falls in seconds whatever the hash.</p></details>
+<details><summary>A user reports a stolen laptop. With server-side sessions, and with 15-minute access tokens plus refresh tokens, what does “sign out everywhere” do in each case?</summary><p>With sessions, the server deletes every session record for the user, and the stolen cookie refers to nothing from the next request. With tokens, the server deletes the user’s refresh tokens. An access token already on the laptop keeps working until it expires, at most fifteen minutes, unless services also check a list of revoked tokens.</p></details>
+<details><summary>A token verifier reads the <code>alg</code> field from the token’s header and uses whatever algorithm it names. Describe an attack.</summary><p>The attacker writes any claims they like, sets the header to <code>"alg": "none"</code> and omits the signature, and a verifier that honors the header accepts it. A second form targets services that verify with a public key: the attacker sets the algorithm to HS256 and signs with the public key, which is not secret, used as the shared secret. The fix is the same for both: the verifier decides which algorithms are acceptable.</p></details>
+<details><summary>A refresh token is used once by the real app and then presented again by someone else. What should the server do, and why not simply refuse the second use?</summary><p>It should revoke every token descended from that refresh token, so that the newer one stops working too. A second use proves the token was copied, but the server cannot tell whether the thief used it first or second. If the thief was first, the thief now holds the newest valid token, and refusing only the old one would leave the thief signed in and lock out the owner.</p></details>
+<details><summary>An account is protected by a password and a six-digit code from an authenticator app. Explain how a phishing page can still take over the session, and why the same page fails against a passkey.</summary><p>The page relays what the victim types to the real site immediately. The code is valid for the current thirty seconds wherever it is entered, so the real site accepts it and gives the attacker a session. A passkey is offered by the browser only to the site it was registered for, so on the look-alike domain there is nothing to use, and a signature includes the origin, so one made for another origin would be rejected.</p></details>
+<details><summary>A service adds passkeys but keeps “reset by email link” exactly as it was. What has it gained?</summary><p>Less than it appears. Sign-in itself is now protected from phishing and password reuse, but anyone who controls a user’s mailbox can still reset the account and get in. The account is as strong as its weakest path, so recovery has to require a second factor, end existing sessions and notify the user.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>NIST, <a href="https://pages.nist.gov/800-63-4/sp800-63b.html">Special Publication 800-63B-4: Digital Identity Guidelines, Authentication and Authenticator Management</a>, July 2025. Password rules, assurance levels, rate limits, session timeouts and phishing resistance.</li>
+  <li>OWASP, <a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html">Password Storage Cheat Sheet</a>. The minimum settings quoted for Argon2id, scrypt, bcrypt and PBKDF2.</li>
+  <li>OWASP, <a href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html">Session Management Cheat Sheet</a>.</li>
+  <li>Alex Biryukov, Daniel Dinu, Dmitry Khovratovich and Simon Josefsson, <a href="https://www.rfc-editor.org/rfc/rfc9106">RFC 9106: Argon2 Memory-Hard Function for Password Hashing and Proof-of-Work Applications</a>, 2021.</li>
+  <li>Troy Hunt, <a href="https://www.troyhunt.com/ive-just-launched-pwned-passwords-version-2/">I’ve Just Launched “Pwned Passwords” V2 With Half a Billion Passwords for Download</a>, February 2018. How a password can be checked against a breach list without revealing it.</li>
+  <li>Michael Jones, John Bradley and Nat Sakimura, <a href="https://www.rfc-editor.org/rfc/rfc7519">RFC 7519: JSON Web Token</a>, 2015, and Yaron Sheffer, Dick Hardt and Michael Jones, <a href="https://www.rfc-editor.org/rfc/rfc8725">RFC 8725: JSON Web Token Best Current Practices</a>, 2020.</li>
+  <li>Torsten Lodderstedt, John Bradley, Andrey Labunets and Daniel Fett, <a href="https://datatracker.ietf.org/doc/html/rfc9700">RFC 9700: Best Current Practice for OAuth 2.0 Security</a>, January 2025. The rule on refresh token rotation.</li>
+  <li>David M’Raihi and others, <a href="https://www.rfc-editor.org/rfc/rfc6238">RFC 6238: TOTP: Time-Based One-Time Password Algorithm</a>, 2011. The test values the code in this chapter was checked against.</li>
+  <li>FIDO Alliance, <a href="https://fidoalliance.org/webauthn-level-3-is-now-a-w3c-recommendation/">WebAuthn Level 3 is now a W3C Recommendation</a>, August 2026, and the Passkey Index, October 2025, as reported by <a href="https://www.mobileidworld.com/fido-alliance-reports-3-billion-passkeys-in-use-shows-93-authentication-success-rate/">Mobile ID World</a>.</li>
+  <li>TechCrunch, <a href="https://techcrunch.com/2022/09/19/how-to-fix-another-uber-breach">How to fix another Uber breach</a>, September 2022.</li>
+  <li>Help Net Security, <a href="https://helpnetsecurity.com/2026/04/10/google-chrome-device-bound-session-credentials">To counter cookie theft, Chrome ships device-bound session credentials</a>, April 2026.</li>
+</ol>
+</section>

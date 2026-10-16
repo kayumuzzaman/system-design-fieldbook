@@ -1,0 +1,949 @@
+<!--meta
+{ "description": "Behavioral design patterns in TypeScript with tested code: strategy, observer, state, command with undo and redo, chain of responsibility, template method and iterator, with the function forms TypeScript allows, how strategy differs from state, and short notes on mediator, memento, visitor and interpreter.",
+  "lede": "The creational patterns decided how objects are made, and the structural patterns how they are fitted together. The behavioral patterns are about what happens next: who decides, who is told, who is allowed to say no, and in what order things run. This chapter builds the seven that turn up most often in real code and in design interviews, each from a problem in the photo app, and says plainly which of them TypeScript reduces to a function.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">Who decides, and who is told</h2>
+<p>Structure answers the question “what is connected to what?”. It does not answer “when a photo is added, what else happens, and who is responsible for making it happen?”. That is a question about behavior, and the catalog introduced in <x-ref to="creational-patterns#why"></x-ref> has eleven patterns for it. Seven are in everyday use.</p>
+<table>
+<thead><tr><th>Pattern</th><th>Problem</th><th>In one sentence</th><th>Often enough in TypeScript</th></tr></thead>
+<tbody>
+<tr><th>Strategy</th><td>One step of a job can be done in several ways</td><td>Pass the step in as an object</td><td>A function</td></tr>
+<tr><th>Observer</th><td>Several things must react when something happens</td><td>Let them subscribe, and announce the event</td><td>An event emitter</td></tr>
+<tr><th>State</th><td>What an object may do depends on the state it is in</td><td>Give each state its own object, and swap them</td><td>A table of transitions, when states are simple</td></tr>
+<tr><th>Command</th><td>An action must be kept, queued, repeated or undone</td><td>Turn the action into an object</td><td>A plain data record and a function that runs it</td></tr>
+<tr><th>Chain of responsibility</th><td>Several handlers might deal with a request</td><td>Pass it along a line until one does</td><td>Middleware functions</td></tr>
+<tr><th>Template method</th><td>An algorithm has fixed steps with a few that vary</td><td>Fix the order in a base class, fill in steps in subclasses</td><td>A function that takes the steps as arguments</td></tr>
+<tr><th>Iterator</th><td>A collection should be walked without exposing its storage</td><td>Hand out one item at a time on request</td><td>Built into the language</td></tr>
+</tbody>
+</table>
+<p>The cautions from the creational chapter apply here with more force, because behavior is where indirection hurts most. A reader can see structure in a diagram. To see behavior they have to follow calls, and every pattern in this chapter makes at least one call harder to follow in exchange for making one kind of change easier.</p>
+
+<h2 id="strategy">Strategy</h2>
+<p>An upload from a phone fails often: the train enters a tunnel, the wifi drops. The uploader retries. How long it should wait between attempts is a separate question with several reasonable answers, and the answer will change more often than the retry loop does (<x-ref to="resilience-patterns#retries"></x-ref>).</p>
+<p>A <dfn>strategy</dfn> is one of several interchangeable ways of doing a step, written behind a common interface so that the code which needs the step done can be given any of them.</p>
+<pre data-lang="ts" data-title="A retry loop that is given its waiting policy">
+// The job that varies: how long to wait before retry number `attempt` (counted from 1), in milliseconds.
+
+// The classic form: an interface, and a class for each way of doing the job.
+export interface BackoffPolicy {
+  delay(attempt: number): number;
+}
+export class FixedBackoff implements BackoffPolicy {
+  private readonly ms: number;
+  constructor(ms: number) {
+    this.ms = ms;
+  }
+  delay(): number {
+    return this.ms;
+  }
+}
+
+// The TypeScript form: a strategy with one method is a function.
+export type Backoff = (attempt: number) => number;
+
+export const fixed = (ms: number): Backoff => () => ms;
+export const exponential = (base: number, cap: number): Backoff => (attempt) => Math.min(cap, base * 2 ** (attempt - 1));
+export const jittered = (inner: Backoff, random: () => number = Math.random): Backoff => (attempt) =>
+  Math.round(inner(attempt) * random());
+
+// The context: it retries, and has no opinion about how long to wait.
+export class Uploader {
+  private readonly backoff: Backoff;
+  private readonly sleep: (ms: number) => Promise<void>;
+
+  constructor(backoff: Backoff, sleep: (ms: number) => Promise<void>) {
+    this.backoff = backoff;
+    this.sleep = sleep;
+  }
+
+  async upload(send: () => Promise<void>, maxAttempts = 4): Promise<number> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await send();
+        return attempt;
+      } catch (error) {
+        if (attempt === maxAttempts) throw error;
+        await this.sleep(this.backoff(attempt));
+      }
+    }
+  }
+}
+</pre>
+<p>The same <code>Uploader</code>, given three different strategies and an upload that fails three times, waited as follows in a test.</p>
+<table>
+<thead><tr><th>Strategy passed in</th><th>Waits before attempts 2, 3 and 4</th></tr></thead>
+<tbody>
+<tr><th><code>fixed(200)</code></th><td>200, 200, 200 ms</td></tr>
+<tr><th><code>exponential(100, 5000)</code></th><td>100, 200, 400 ms</td></tr>
+<tr><th><code>jittered(exponential(100, 5000))</code>, with the random number fixed at 0.5 for the test</th><td>50, 100, 200 ms</td></tr>
+</tbody>
+</table>
+<p>Three things in the listing are worth noticing.</p>
+<ul>
+  <li><b>The class form and the function form are the same pattern.</b> An interface with one method and a function type say the same thing. The function form needs no class for each variant, and a variant with settings is a function that returns a function.</li>
+  <li><b>Strategies compose.</b> <code>jittered</code> takes a strategy and returns a strategy. That is a decorator for functions (<x-ref to="structural-patterns#decorator"></x-ref>).</li>
+  <li><b>The clock is passed in too.</b> <code>sleep</code> is a second strategy, there so that the test can record the waits instead of waiting. <x-ref to="errors-and-testing"></x-ref> returns to this.</li>
+</ul>
+<p>You already use the pattern whenever you pass a comparison function to <code>sort</code>. It is the open/closed principle in its smallest form (<x-ref to="solid-principles#ocp"></x-ref>): a new way of waiting is a new function, and the retry loop is not edited.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> A strategy interface whose implementations need different inputs. If one pricing strategy needs the user’s country and another needs their purchase history, the shared method ends up taking everything any of them might want. That is a sign the variants are not doing the same job, and a strategy is the wrong tool.</p></div>
+
+<h2 id="observer">Observer</h2>
+<p>When a photo is added to a shared album, the activity feed gets an entry, the search index learns about it, and the other members get a push message. If <code>Album.add</code> calls all three, then <code>Album</code> depends on all three, cannot be tested without them, and must be edited whenever a fourth reaction is wanted.</p>
+<p>An <dfn>observer</dfn> is an object that has registered to be told when something happens to another object. The object being watched, called the <dfn>subject</dfn>, keeps a list of observers and calls each one when it has news. It knows them only as functions to call.</p>
+<pre data-lang="ts" data-title="A typed event emitter, and an album that announces its changes">
+type Listener<T> = (payload: T) => void;
+
+// A small typed subject. Events is a map from event name to the data that comes with it.
+export class Emitter<Events extends Record<string, unknown>> {
+  private readonly listeners: { [K in keyof Events]?: Set<Listener<Events[K]>> } = {};
+
+  // Subscribing returns the function that unsubscribes.
+  on<K extends keyof Events>(event: K, listener: Listener<Events[K]>): () => void {
+    const set = (this.listeners[event] ??= new Set());
+    set.add(listener);
+    return () => set.delete(listener);
+  }
+
+  // Every listener is told, even if an earlier one throws. The errors are returned to the caller.
+  emit<K extends keyof Events>(event: K, payload: Events[K]): unknown[] {
+    const errors: unknown[] = [];
+    for (const listener of [...(this.listeners[event] ?? [])]) {
+      try {
+        listener(payload);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    return errors;
+  }
+
+  count<K extends keyof Events>(event: K): number {
+    return this.listeners[event]?.size ?? 0;
+  }
+}
+
+export type AlbumEvents = {
+  photoAdded: { album: string; photo: string };
+  shared: { album: string; with: string };
+};
+
+// The subject. It announces what happened and knows nothing about who is listening.
+export class Album {
+  readonly events = new Emitter<AlbumEvents>();
+  readonly name: string;
+  private readonly photos: string[] = [];
+
+  constructor(name: string) {
+    this.name = name;
+  }
+
+  add(photo: string): void {
+    this.photos.push(photo);
+    this.events.emit("photoAdded", { album: this.name, photo });
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-observer">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f612t f612d">
+<title id="f612t">An album announcing a new photo to three listeners</title>
+<desc id="f612d">A sequence between calling code, an album, and three listeners: the activity feed, the push sender and the search index. The caller adds a photo. The album announces photoAdded to the feed, then to the push sender, which throws an error. The emitter catches the error and goes on to tell the search index. Then add returns to the caller.</desc>
+<text class="tb mid" x="60" y="20">Caller</text>
+<line class="axis" x1="60" y1="28" x2="60" y2="206"/>
+<text class="tb mid" x="200" y="20">Album</text>
+<line class="axis" x1="200" y1="28" x2="200" y2="206"/>
+<text class="tb mid" x="350" y="20">Feed</text>
+<line class="axis" x1="350" y1="28" x2="350" y2="206"/>
+<text class="tb mid" x="500" y="20">Push sender</text>
+<line class="axis" x1="500" y1="28" x2="500" y2="206"/>
+<text class="tb mid" x="650" y="20">Search index</text>
+<line class="axis" x1="650" y1="28" x2="650" y2="206"/>
+<g data-s="1">
+<path class="e sig" d="M61 54H199"/>
+<text class="ts mid" x="130.0" y="48">1. add(p1)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M201 82H349"/>
+<text class="ts mid" x="275.0" y="76">2. photoAdded</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M201 110H499"/>
+<text class="ts mid" x="350.0" y="104">3. photoAdded</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M499 138H201"/>
+<text class="ts mid" x="350.0" y="132">4. Error: push service down</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M201 166H649"/>
+<text class="ts mid" x="425.0" y="160">5. photoAdded</text>
+</g>
+<g data-s="6">
+<path class="e uses" d="M199 194H61"/>
+<text class="ts mid" x="130.0" y="188">6. done</text>
+</g>
+<text class="ts" x="10" y="236">The Album class depends on none of the three. Each of them subscribed with album.events.on("photoAdded", …).</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Listeners told: none">Calling code adds a photo. The album stores it and then announces what happened to whoever has subscribed.</li>
+  <li data-state="Listeners told: feed">The first subscriber, the activity feed, is called with the event’s data. The album does not know what it will do with it.</li>
+  <li data-state="Listeners told: feed, push">The second subscriber is called in turn. Listeners run one after another, in the order they subscribed.</li>
+  <li data-msg="Error">The push listener throws. This emitter catches the error and keeps it, because one listener failing is no reason to skip the others.</li>
+  <li data-state="Listeners told: feed, push (failed), search index">The third subscriber is still told. With an emitter that does not catch, it would have been skipped.</li>
+  <li>add returns. The album’s code names no feed, no push service and no search index.</li>
+</ol>
+<figcaption>The subject knows that listeners may exist and nothing else about them. A fourth reaction to a new photo is one more subscription, and no change to <code>Album</code>.</figcaption>
+</figure>
+
+<p>The type parameter does useful work. Subscribing to <code>"photoAdded"</code> gives the listener a payload with <code>album</code> and <code>photo</code>, checked by the compiler, and a misspelled event name is a compile error.</p>
+<p>The pattern is simple to write and has four well-known ways of going wrong. The test for this chapter exercised the first two.</p>
+<ul>
+  <li><b>A listener that throws.</b> This emitter caught the error and still told the remaining listeners. Node.js’s built-in <code>EventEmitter</code> behaves differently: given the same three listeners, it told the first, the second threw, the third was never called, and the error surfaced in the code that emitted. The browser’s <code>EventTarget</code> told all the others and reported the error separately. Know which behavior you have.</li>
+  <li><b>A listener that is never removed.</b> The subject holds a reference to every listener, and so to everything the listener holds. A screen that subscribes when it opens and does not unsubscribe when it closes can never be freed, and keeps reacting to events after it is gone. Returning the unsubscribe function from <code>on</code>, as here, makes the cleanup hard to forget.</li>
+  <li><b>Listeners run inside the subject’s call.</b> <code>emit</code> is an ordinary loop. A slow listener makes <code>album.add</code> slow, and a listener that changes the album during the loop can cause a second event to be delivered in the middle of the first.</li>
+  <li><b>Order that matters.</b> Listeners run in the order they subscribed. Code that relies on that order has a dependency that appears nowhere in the types.</li>
+</ul>
+<p>The same idea at the scale of a system is publish and subscribe: the subject and its observers are separate services and a broker carries the events between them (<x-ref to="message-queues#models"></x-ref>, <x-ref to="event-driven-architecture#events"></x-ref>). The benefit is the same and so is the cost. Nothing at the point where the event is raised says what will happen as a result.</p>
+
+<h2 id="state">State</h2>
+<p><x-ref to="uml-diagrams#state"></x-ref> drew the life of an upload as six states and implemented it as a table: for each state, which events it accepts and where they lead. That is the right implementation while a state is only a name. It strains when states acquire behavior of their own: an uploading state that tracks progress and can pause, a failed state that holds the reason and decides whether a retry makes sense. Then every method of the class turns into a <code>switch</code> over the state.</p>
+<p>The <dfn>state pattern</dfn> gives each state its own class, which implements what every event means in that state. The main object holds a reference to the current state object, forwards every event to it, and replaces it when the state changes.</p>
+<pre data-lang="ts" data-title="The upload from the UML chapter, with a class for each state">
+import type { UploadEvent, UploadState as StateName } from "./table.ts";
+
+// One method for each event. Each returns the state the upload is in afterward.
+export type UploadState = { readonly name: StateName } & Record<UploadEvent, (upload: Upload) => UploadState>;
+
+// The default answer to every event is no. A state overrides only the events it accepts.
+abstract class Refusing implements UploadState {
+  abstract readonly name: StateName;
+  start(_: Upload): UploadState { return this.refuse("start"); }
+  received(_: Upload): UploadState { return this.refuse("received"); }
+  processed(_: Upload): UploadState { return this.refuse("processed"); }
+  error(_: Upload): UploadState { return this.refuse("error"); }
+  retry(_: Upload): UploadState { return this.refuse("retry"); }
+  cancel(_: Upload): UploadState { return this.refuse("cancel"); }
+  private refuse(event: UploadEvent): never {
+    throw new Error(`an upload that is ${this.name} cannot ${event}`);
+  }
+}
+
+class Pending extends Refusing {
+  readonly name = "pending";
+  override start(upload: Upload): UploadState { return new Uploading(upload); }
+  override cancel(): UploadState { return new Canceled(); }
+}
+class Uploading extends Refusing {
+  readonly name = "uploading";
+  constructor(upload: Upload) {
+    super();
+    upload.countAttempt(); // the action on the way in
+  }
+  override received(): UploadState { return new Processing(); }
+  override error(): UploadState { return new Failed(); }
+  override cancel(): UploadState { return new Canceled(); }
+}
+class Processing extends Refusing {
+  readonly name = "processing";
+  override processed(): UploadState { return new Ready(); }
+  override error(): UploadState { return new Failed(); }
+}
+class Failed extends Refusing {
+  readonly name = "failed";
+  override retry(upload: Upload): UploadState {
+    if (upload.attempts >= Upload.maxAttempts) throw new Error("no attempts left"); // the guard
+    return new Uploading(upload);
+  }
+  override cancel(): UploadState { return new Canceled(); }
+}
+class Ready extends Refusing { readonly name = "ready"; }
+class Canceled extends Refusing { readonly name = "canceled"; }
+
+// The context. It holds the current state object and passes every event to it.
+export class Upload {
+  static readonly maxAttempts = 3;
+  readonly id: string;
+  private current: UploadState = new Pending();
+  private tries = 0;
+
+  constructor(id: string) {
+    this.id = id;
+  }
+  get state(): StateName { return this.current.name; }
+  get attempts(): number { return this.tries; }
+  countAttempt(): void { this.tries += 1; }
+
+  handle(event: UploadEvent): void {
+    this.current = this.current[event](this);
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-state">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f613t f613d">
+<title id="f613t">An upload holding one state object at a time</title>
+<desc id="f613d">On the left, an Upload object with a field named current. On the right, six state objects laid out as the state diagram: Pending leads to Uploading on start, Uploading to Processing on received, Processing to Ready on processed. Uploading and Processing lead to Failed on error, and Failed leads back to Uploading on retry. Pending, Uploading and Failed lead to Canceled on cancel. As the events start, error, retry, received and processed arrive, the current field points in turn at Uploading, Failed, Uploading again, Processing and Ready.</desc>
+<path class="e" d="M247 42H298"/>
+<text class="ts mid" x="273" y="36">start</text>
+<path class="e" d="M397 42H456"/>
+<text class="ts mid" x="427" y="36">received</text>
+<path class="e" d="M555 42H616"/>
+<text class="ts mid" x="586" y="36">processed</text>
+<path class="e" d="M198 61V168"/>
+<text class="ts " x="204" y="120">cancel</text>
+<path class="e" d="M312 61L238 168"/>
+<text class="ts " x="284" y="124">cancel</text>
+<path class="e" d="M398 188H248"/>
+<text class="ts mid" x="323" y="182">cancel</text>
+<path class="e" d="M356 61L420 168"/>
+<text class="ts end" x="380" y="124">error</text>
+<path class="e" d="M452 168L388 61"/>
+<text class="ts " x="428" y="108">retry</text>
+<path class="e" d="M506 61L476 168"/>
+<text class="ts " x="498" y="120">error</text>
+<rect class="n" x="150" y="24" width="96" height="36" rx="5"/>
+<text class="ts tb mid" x="198.0" y="46">Pending</text>
+<rect class="n" x="300" y="24" width="96" height="36" rx="5"/>
+<text class="ts tb mid" x="348.0" y="46">Uploading</text>
+<rect class="n" x="458" y="24" width="96" height="36" rx="5"/>
+<text class="ts tb mid" x="506.0" y="46">Processing</text>
+<rect class="n" x="618" y="24" width="96" height="36" rx="5"/>
+<text class="ts tb mid" x="666.0" y="46">Ready</text>
+<rect class="n" x="150" y="170" width="96" height="36" rx="5"/>
+<text class="ts tb mid" x="198.0" y="192">Canceled</text>
+<rect class="n" x="400" y="170" width="96" height="36" rx="5"/>
+<text class="ts tb mid" x="448.0" y="192">Failed</text>
+<rect class="n sig" x="10" y="84" width="104" height="56" rx="5"/>
+<text class="tb mid" x="62" y="106">Upload</text>
+<text class="ts mid" x="62" y="126">current →</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n store" x="300" y="24" width="96" height="36" rx="5" style="fill-opacity:.3;stroke-width:2.5"/>
+<path class="e store" d="M115 106L298 58" style="stroke-dasharray:3 3"/>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n store" x="400" y="170" width="96" height="36" rx="5" style="fill-opacity:.3;stroke-width:2.5"/>
+<path class="e store" d="M115 124L398 188" style="stroke-dasharray:3 3"/>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n store" x="300" y="24" width="96" height="36" rx="5" style="fill-opacity:.3;stroke-width:2.5"/>
+<path class="e store" d="M115 106L298 58" style="stroke-dasharray:3 3"/>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n store" x="458" y="24" width="96" height="36" rx="5" style="fill-opacity:.3;stroke-width:2.5"/>
+<path class="e store" d="M115 106L456 58" style="stroke-dasharray:3 3"/>
+</g>
+<g class="hide" data-s="5">
+<rect class="n store" x="618" y="24" width="96" height="36" rx="5" style="fill-opacity:.3;stroke-width:2.5"/>
+<path class="e store" d="M115 106L616 58" style="stroke-dasharray:3 3"/>
+</g>
+<text class="ts" x="10" y="240">Every state object answers every event. Most answers are “an upload that is … cannot …”.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="start" data-state="current: Uploading; attempts: 1">The upload begins as Pending. The event start arrives, Upload calls current.start(), and Pending returns a new Uploading object. Creating it counts one attempt.</li>
+  <li data-msg="error" data-state="current: Failed; attempts: 1">The network drops. Upload calls current.error(), and the answer comes from Uploading, which knows that an error leads to Failed.</li>
+  <li data-msg="retry" data-state="current: Uploading; attempts: 2">The user retries. Failed checks the guard, finds attempts remaining and returns a fresh Uploading, which counts a second attempt.</li>
+  <li data-msg="received" data-state="current: Processing; attempts: 2">All the bytes arrive. Uploading returns Processing.</li>
+  <li data-msg="processed" data-state="current: Ready; attempts: 2">Thumbnails are made, and Processing returns Ready. Ready overrides nothing, so from here every event is refused.</li>
+</ol>
+<figcaption><code>Upload.handle</code> is one line: ask the current state, keep what it returns. The rules of each state live in that state’s class and nowhere else.</figcaption>
+</figure>
+
+<p>The two implementations ought to behave identically, and that is a claim a test can check. Every possible sequence of one to five events, 9,330 of them, was run against both. The resulting state, the attempt count and the wording of every refusal matched in all of them.</p>
+<table>
+<thead><tr><th></th><th>Table of transitions</th><th>State objects</th></tr></thead>
+<tbody>
+<tr><th>Seeing the whole machine</th><td>One screen. It reads like the diagram</td><td>Spread over one class for each state</td></tr>
+<tr><th>Adding an event</th><td>One entry in each row that accepts it</td><td>One method in the base, overridden where accepted</td></tr>
+<tr><th>Behavior inside a state</th><td>Has nowhere to live. Ends up as conditions in the main class</td><td>Lives in that state’s class, with its own data</td></tr>
+<tr><th>Good when</th><td>States are labels and the rules are about which moves are legal</td><td>States do work, hold data or differ in many methods</td></tr>
+</tbody>
+</table>
+<p>The class diagram of this pattern is almost the one for strategy, which causes regular confusion.</p>
+
+<figure class="fig wide" id="fig-family">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f611t f611d">
+<title id="f611t">Strategy and state have the same structure and different intent</title>
+<desc id="f611d">Two class diagrams side by side. On the left, strategy: Uploader holds a Backoff, an interface with one operation, delay. Three implementations, fixed, exponential and jittered, implement it. The calling code picks one and passes it in, and it stays for the life of the Uploader. On the right, state: Upload holds an UploadState, an interface with one operation for each event. Pending, Uploading and Failed, three of the six states, implement it. Each operation returns the next state, so the object that Upload holds is replaced from inside as events arrive.</desc>
+<text class="tb" x="10" y="18">Strategy: chosen from outside, then kept</text>
+<text class="tb" x="380" y="18">State: replaced from inside, as events arrive</text>
+<rect class="n" x="10" y="48" width="120" height="54" rx="4"/>
+<text class="tb mid" x="70" y="67">Uploader</text>
+<line class="sep" x1="10" y1="76" x2="130" y2="76"/>
+<text class="ts" x="18" y="92">+ upload(send)</text>
+<rect class="n sig" x="200" y="34" width="140" height="68" rx="4"/>
+<text class="ts mid" x="270" y="50">«interface»</text>
+<text class="tb mid" x="270" y="67">Backoff</text>
+<line class="sep sig" x1="200" y1="76" x2="340" y2="76"/>
+<text class="ts" x="208" y="92">+ delay(attempt)</text>
+<path class="e has" d="M130 75 L200 74.8"/>
+<text class="ts mid" x="165" y="67.9">backoff</text>
+<rect class="n" x="10" y="150" width="102" height="28" rx="4"/>
+<text class="tb mid" x="61" y="169">fixed</text>
+<path class="e implements" d="M61 150 L235 102"/>
+<rect class="n" x="124" y="150" width="102" height="28" rx="4"/>
+<text class="tb mid" x="175" y="169">exponential</text>
+<path class="e implements" d="M175 150 L270 102"/>
+<rect class="n" x="238" y="150" width="102" height="28" rx="4"/>
+<text class="tb mid" x="289" y="169">jittered</text>
+<path class="e implements" d="M289 150 L305 102"/>
+<text class="ts" x="10" y="206">The Uploader never changes which one it holds.</text>
+<text class="ts" x="10" y="222">Its caller made that choice once.</text>
+<rect class="n" x="380" y="48" width="110" height="54" rx="4"/>
+<text class="tb mid" x="435" y="67">Upload</text>
+<line class="sep" x1="380" y1="76" x2="490" y2="76"/>
+<text class="ts" x="388" y="92">+ handle(event)</text>
+<rect class="n store" x="560" y="34" width="150" height="68" rx="4"/>
+<text class="ts mid" x="635" y="50">«interface»</text>
+<text class="tb mid" x="635" y="67">UploadState</text>
+<line class="sep store" x1="560" y1="76" x2="710" y2="76"/>
+<text class="ts" x="568" y="92">+ start(), error(), …</text>
+<path class="e has" d="M490 75 L560 74.8"/>
+<text class="ts mid" x="525" y="67.9">current</text>
+<rect class="n" x="380" y="150" width="102" height="28" rx="4"/>
+<text class="tb mid" x="431" y="169">Pending</text>
+<path class="e implements" d="M431 150 L590 102"/>
+<rect class="n" x="494" y="150" width="102" height="28" rx="4"/>
+<text class="tb mid" x="545" y="169">Uploading</text>
+<path class="e implements" d="M545 150 L635 102"/>
+<rect class="n" x="608" y="150" width="102" height="28" rx="4"/>
+<text class="tb mid" x="659" y="169">Failed</text>
+<path class="e implements" d="M659 150 L680 102"/>
+<text class="ts" x="380" y="206">Each method returns the next state, and Upload</text>
+<text class="ts" x="380" y="222">holds whatever came back. Nobody outside chooses.</text>
+<path class="e none dash" d="M362 8V230"/>
+</svg>
+</div>
+<figcaption>The class diagrams are nearly the same. Strategy answers “which way of doing this?” and the caller decides. State answers “what is allowed now?” and the object decides for itself.</figcaption>
+</figure>
+
+<p>Low-level design interviews lean on this pattern heavily, because so many of the standard exercises are machines with modes: a vending machine that is idle, holding money or dispensing, an elevator that is moving or stopped with its doors open (<x-ref to="lld-vending-machine"></x-ref>, <x-ref to="lld-elevator"></x-ref>).</p>
+
+<h2 id="command">Command</h2>
+<p>The photo editor lets a user crop, rotate and add filters, and take any of it back. A button handler that changes the picture directly leaves nothing behind to undo. The action happened and is gone.</p>
+<p>A <dfn>command</dfn> is a request turned into an object. The object holds everything needed to carry the request out, and because it is an object it can be stored in a list, sent somewhere else, run later, run again or reversed.</p>
+<pre data-lang="ts" data-title="Commands that can be undone, and the history that runs them">
+export interface Command {
+  readonly label: string;
+  run(): void;
+  undo(): void;
+}
+
+export class Crop implements Command {
+  readonly label: string;
+  private readonly picture: Picture;
+  private readonly width: number;
+  private readonly height: number;
+  private before: { width: number; height: number } | null = null;
+
+  constructor(picture: Picture, width: number, height: number) {
+    this.picture = picture;
+    this.width = width;
+    this.height = height;
+    this.label = `crop to ${width}x${height}`;
+  }
+  // Cropping cannot be reversed by arithmetic, so the command remembers what it replaced.
+  run(): void {
+    this.before = { width: this.picture.width, height: this.picture.height };
+    this.picture.width = this.width;
+    this.picture.height = this.height;
+  }
+  undo(): void {
+    if (!this.before) throw new Error("undo before run");
+    this.picture.width = this.before.width;
+    this.picture.height = this.before.height;
+  }
+}
+
+// …Rotate and AddFilter have the same shape, and reverse themselves by arithmetic…
+
+// The invoker. It runs commands without knowing what any of them does.
+export class History {
+  private readonly done: Command[] = [];
+  private readonly undone: Command[] = [];
+
+  run(command: Command): void {
+    command.run();
+    this.done.push(command);
+    this.undone.length = 0; // a new action ends the possibility of redo
+  }
+  undo(): boolean {
+    const command = this.done.pop();
+    if (!command) return false;
+    command.undo();
+    this.undone.push(command);
+    return true;
+  }
+  redo(): boolean {
+    const command = this.undone.pop();
+    if (!command) return false;
+    command.run();
+    this.done.push(command);
+    return true;
+  }
+  get labels(): string[] { return this.done.map((command) => command.label); }
+  get redoable(): string[] { return this.undone.map((command) => command.label); }
+}
+</pre>
+
+<figure class="fig wide" id="fig-command">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f614t f614d">
+<title id="f614t">Undo and redo as two stacks of command objects</title>
+<desc id="f614d">Two stacks, one of commands that have been done and one of commands that have been undone. Three commands are run and pile up on the done stack: crop, rotate 90, filter warm. Undo moves filter warm to the undone stack, and a second undo moves rotate 90. Redo moves rotate 90 back. Then a new command, filter grain, is run: it goes on the done stack and the undone stack is emptied.</desc>
+<text class="tb mid" x="250" y="18">Done</text>
+<text class="tb mid" x="530" y="18">Undone, available to redo</text>
+<path class="e none" d="M170 204H330M450 204H610"/>
+<text class="ts mid" x="250" y="222">undo() takes from the top</text>
+<text class="ts mid" x="530" y="222">redo() takes from the top</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n sig" x="170" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="189">crop to 3000x3000</text>
+<path class="e sig" d="M40 185H166"/>
+<text class="ts mid" x="100" y="178">run(command)</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n " x="170" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="189">crop to 3000x3000</text>
+<rect class="n sig" x="170" y="136" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="155">rotate 90</text>
+<path class="e sig" d="M40 151H166"/>
+<text class="ts mid" x="100" y="144">run(command)</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n " x="170" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="189">crop to 3000x3000</text>
+<rect class="n " x="170" y="136" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="155">rotate 90</text>
+<rect class="n sig" x="170" y="102" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="121">filter warm</text>
+<path class="e sig" d="M40 117H166"/>
+<text class="ts mid" x="100" y="110">run(command)</text>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n " x="170" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="189">crop to 3000x3000</text>
+<rect class="n " x="170" y="136" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="155">rotate 90</text>
+<rect class="n async" x="450" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="530" y="189">filter warm</text>
+<path class="e async" d="M332 117C380 117 400 185 446 185"/>
+<text class="ts mid" x="390" y="107">undo()</text>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<rect class="n " x="170" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="189">crop to 3000x3000</text>
+<rect class="n " x="450" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="530" y="189">filter warm</text>
+<rect class="n async" x="450" y="136" width="160" height="30" rx="4"/>
+<text class="ts mid" x="530" y="155">rotate 90</text>
+<path class="e async" d="M332 151C380 151 400 151 446 151"/>
+<text class="ts mid" x="390" y="141">undo()</text>
+</g>
+<g class="hide" data-s="6" data-e="6">
+<rect class="n " x="170" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="189">crop to 3000x3000</text>
+<rect class="n sig" x="170" y="136" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="155">rotate 90</text>
+<rect class="n " x="450" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="530" y="189">filter warm</text>
+<path class="e sig" d="M448 151C400 151 380 151 334 151"/>
+<text class="ts mid" x="390" y="141">redo()</text>
+</g>
+<g class="hide" data-s="7">
+<rect class="n " x="170" y="170" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="189">crop to 3000x3000</text>
+<rect class="n " x="170" y="136" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="155">rotate 90</text>
+<rect class="n sig" x="170" y="102" width="160" height="30" rx="4"/>
+<text class="ts mid" x="250" y="121">filter grain</text>
+<path class="e sig" d="M40 117H166"/>
+<text class="ts mid" x="100" y="110">run(command)</text>
+<text class="ts mid" x="530" y="120">emptied by the new command</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="run crop" data-state="Picture: 3000×3000, rotation 0, no filters">The user crops. The editor builds a Crop command, the history runs it and keeps the object. Crop has remembered the size it replaced.</li>
+  <li data-msg="run rotate" data-state="Picture: 3000×3000, rotation 90, no filters">Rotate is run and kept on top.</li>
+  <li data-msg="run filter" data-state="Picture: 3000×3000, rotation 90, warm">A filter is added. The done stack is now a complete record of the session, newest on top.</li>
+  <li data-msg="undo" data-state="Picture: 3000×3000, rotation 90, no filters">Undo takes the newest command off the done stack, calls its undo method and puts it on the undone stack.</li>
+  <li data-msg="undo" data-state="Picture: 3000×3000, rotation 0, no filters">A second undo reverses the rotation in the same way. The history has no idea what either command did.</li>
+  <li data-msg="redo" data-state="Picture: 3000×3000, rotation 90, no filters">Redo takes the top of the undone stack, runs it again and returns it to the done stack.</li>
+  <li data-msg="run filter" data-state="Picture: 3000×3000, rotation 90, grain">The user does something new. It goes on the done stack, and the undone stack is thrown away: the future that was undone no longer follows from the present.</li>
+</ol>
+<figcaption>Because each action is an object that knows how to reverse itself, undo and redo are a few lines that work for every action, including ones not yet written.</figcaption>
+</figure>
+
+<p>The test ran the sequence in the figure and then undid everything. The picture returned to 4000 by 3000 with no rotation and no filters, which is the property that matters: undoing every command in reverse order restores the starting point exactly.</p>
+<p>Two designs exist for the “take it back” half, and they trade memory against work.</p>
+<table>
+<thead><tr><th></th><th>Each command reverses itself</th><th>Keep a snapshot before each command</th></tr></thead>
+<tbody>
+<tr><th>What is stored</th><td>The command and whatever it needs to reverse: a few numbers</td><td>A full copy of the state. This is the <dfn>memento</dfn> pattern</td></tr>
+<tr><th>Writing a new action</th><td>Needs a correct <code>undo</code>, which is easy to get subtly wrong</td><td>Nothing extra. Undo is “put the old copy back”</td></tr>
+<tr><th>Cost</th><td>Small memory, some computation on undo</td><td>Memory in proportion to the size of the state</td></tr>
+</tbody>
+</table>
+<div class="widget" data-widget="undo">
+<h4>Undo history: snapshots or commands</h4>
+<p>Memory needed to undo a number of edits to an uncompressed picture, held as full copies or as command objects.</p>
+<div class="controls">
+  <label>Picture size, megapixels<input type="number" name="mp" value="12" min="0.1" max="1000" step="0.1"></label>
+  <label>Edits that can be undone<input type="number" name="steps" value="50" min="1" max="100000" step="1"></label>
+  <label>Size of one command, bytes<input type="number" name="cmd" value="64" min="1" max="1000000" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>One snapshot</dt><dd data-out="one">48 MB</dd></div>
+  <div><dt>History as snapshots</dt><dd data-out="snaps">2.4 GB</dd></div>
+  <div><dt>History as commands</dt><dd data-out="cmds">3.2 kB</dd></div>
+  <div><dt>Ratio</dt><dd data-out="ratio">750 thousand to 1</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">A picture of 12 megapixels is 48 MB in memory at 4 bytes a pixel. A full copy before each of 50 edits takes 2.4 GB. The same history as commands of 64 bytes takes 3.2 kB. Commands are the only practical choice at this size, at the price of a correct undo for every kind of edit.</p>
+</div>
+<p>Real editors mix the two: commands for most actions, and an occasional snapshot so that a long history can be replayed from a recent copy instead of from the start. That combination, a log of changes plus periodic snapshots, is also how databases recover and how event-sourced systems rebuild state (<x-ref to="storage-engines"></x-ref>, <x-ref to="event-driven-architecture#event-sourcing"></x-ref>).</p>
+<p>Undo is the textbook use. In back-end code the pattern appears more often in other forms: a job placed on a queue is a command sent to another process (<x-ref to="message-queues"></x-ref>), an audit log is a list of commands that were run, and the “C” of CQRS is this word (<x-ref to="event-driven-architecture#cqrs"></x-ref>). In those forms the command is plain data, such as <code>{ kind: "crop", width: 3000, height: 3000 }</code>, and a separate function carries it out, because methods do not survive being written to a queue and read back.</p>
+
+<h2 id="chain">Chain of responsibility</h2>
+<p>Before a request reaches the code that lists photos, several questions have to be answered. Is the caller signed in? Have they made too many requests? Should the request be logged? Each question is independent of the others, and each can end the request on its own.</p>
+<p>In a <dfn>chain of responsibility</dfn>, a request is passed along a line of handlers. Each handler either deals with the request or passes it to the next, and the sender does not know which one will answer.</p>
+<pre data-lang="ts" data-title="Middleware: each link answers or calls the rest of the chain">
+export interface Request {
+  path: string;
+  user?: string;
+}
+export interface Response {
+  status: number;
+  body: string;
+}
+
+export type Handler = (request: Request) => Promise<Response>;
+// A link in the chain: answer the request itself, or pass it to the rest of the chain.
+export type Middleware = (request: Request, next: Handler) => Promise<Response>;
+
+// Builds one handler from a list of links and the final handler, innermost first.
+export const chain = (links: Middleware[], last: Handler): Handler =>
+  links.reduceRight<Handler>((next, link) => (request) => link(request, next), last);
+
+export const logged = (log: (line: string) => void): Middleware => async (request, next) => {
+  const response = await next(request);
+  log(`${request.path} ${response.status}`);
+  return response;
+};
+
+export const signedIn: Middleware = async (request, next) =>
+  request.user ? next(request) : { status: 401, body: "sign in first" };
+
+export const limited = (perUser: number): Middleware => {
+  const seen = new Map<string, number>();
+  return async (request, next) => {
+    const user = request.user ?? "anonymous";
+    const count = (seen.get(user) ?? 0) + 1;
+    seen.set(user, count);
+    return count > perUser ? { status: 429, body: "slow down" } : next(request);
+  };
+};
+</pre>
+
+<figure class="fig wide" id="fig-chain">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 396" role="img" aria-labelledby="f615t f615d">
+<title id="f615t">A request passing along a chain of handlers</title>
+<desc id="f615d">Two sequences between a client and a chain of four: logged, signedIn, limited and the photos handler. In the first, a signed-in user’s request is passed along by each link in turn, reaches the handler, and the response 200 returns through every link. In the second, the same user’s third request is passed along by logged and signedIn, but limited answers 429 itself. The handler never runs, and the response returns through signedIn and logged.</desc>
+<text class="tb" x="10" y="16">A request that reaches the end of the chain</text>
+<g data-scene="through">
+<text class="tb mid" x="60" y="36">Client</text>
+<line class="axis" x1="60" y1="44" x2="60" y2="196"/>
+<text class="tb mid" x="210" y="36">logged</text>
+<line class="axis" x1="210" y1="44" x2="210" y2="196"/>
+<text class="tb mid" x="360" y="36">signedIn</text>
+<line class="axis" x1="360" y1="44" x2="360" y2="196"/>
+<text class="tb mid" x="510" y="36">limited(2)</text>
+<line class="axis" x1="510" y1="44" x2="510" y2="196"/>
+<text class="tb mid" x="650" y="36">photos handler</text>
+<line class="axis" x1="650" y1="44" x2="650" y2="196"/>
+<g data-s="1">
+<path class="e sig" d="M61 72H209"/>
+<text class="ts mid" x="135.0" y="66">1. GET /photos</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M211 99H359"/>
+<text class="ts mid" x="285.0" y="93">2. next(request)</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M361 126H509"/>
+<text class="ts mid" x="435.0" y="120">3. next(request)</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M511 153H649"/>
+<text class="ts mid" x="580.0" y="147">4. next(request)</text>
+</g>
+<g data-s="5">
+<path class="e uses" d="M649 180H61"/>
+<text class="ts mid" x="355.0" y="174">5. 200 photos</text>
+</g>
+</g>
+<path class="e none dash" d="M10 212H710"/>
+<text class="tb" x="10" y="232">A request that one link answers itself</text>
+<g data-scene="refused">
+<text class="tb mid" x="60" y="252">Client</text>
+<line class="axis" x1="60" y1="260" x2="60" y2="380"/>
+<text class="tb mid" x="210" y="252">logged</text>
+<line class="axis" x1="210" y1="260" x2="210" y2="380"/>
+<text class="tb mid" x="360" y="252">signedIn</text>
+<line class="axis" x1="360" y1="260" x2="360" y2="380"/>
+<text class="tb mid" x="510" y="252">limited(2)</text>
+<line class="axis" x1="510" y1="260" x2="510" y2="380"/>
+<text class="tb mid" x="650" y="252">photos handler</text>
+<line class="axis" x1="650" y1="260" x2="650" y2="380"/>
+<g data-s="1">
+<path class="e sig" d="M61 288H209"/>
+<text class="ts mid" x="135.0" y="282">1. GET /photos</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M211 315H359"/>
+<text class="ts mid" x="285.0" y="309">2. next(request)</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M361 342H509"/>
+<text class="ts mid" x="435.0" y="336">3. next(request)</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M509 369H61"/>
+<text class="ts mid" x="285.0" y="363">4. 429 slow down</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="through" data-label="Reaches the handler">
+  <li data-state="Requests counted for ana: 0; Handler has run: no">The request enters at the outermost link. logged has nothing to do yet. It wants to see the response, so it passes the request on and waits.</li>
+  <li>signedIn looks for a user on the request, finds ana and passes it on unchanged.</li>
+  <li data-state="Requests counted for ana: 1; Handler has run: no">limited counts this as ana’s first request. The limit is two, so it passes the request on.</li>
+  <li data-state="Requests counted for ana: 1; Handler has run: yes">The last link is the handler that does the work the request asked for.</li>
+  <li data-msg="200" data-state="Requests counted for ana: 1; Handler has run: yes">The response travels back through every link. logged, which has been waiting since the first step, writes “/photos 200”.</li>
+</ol>
+<ol class="steps" data-scene="refused" data-label="Stopped by a link">
+  <li data-state="Requests counted for ana: 2; Handler has run: no">Ana’s third request arrives. logged passes it on as before.</li>
+  <li>She is still signed in, so signedIn passes it on.</li>
+  <li data-state="Requests counted for ana: 3; Handler has run: no">limited counts three, which is over the limit of two.</li>
+  <li data-msg="429" data-state="Requests counted for ana: 3; Handler has run: no">limited answers the request itself and does not call next. The handler never runs. The response still passes back through logged, which writes “/photos 429”.</li>
+</ol>
+<figcaption>Each link decides one thing: answer, or pass along. The sender does not know which link will answer, and the links do not know each other.</figcaption>
+</figure>
+
+<p>Five requests were sent through <code>chain([logged, signedIn, limited(2)], photos)</code> in a test: one with no user, three from Ana and one from Ben. The statuses were 401, 200, 200, 429 and 200. The photos handler ran three times, and the log had five lines, because <code>logged</code> is outermost and sees every response, including the refusals.</p>
+<p>This is the shape of middleware in most web frameworks. Two properties need care.</p>
+<ul>
+  <li><b>Order is behavior.</b> With <code>limited</code> before <code>signedIn</code>, anonymous requests would be counted against a shared “anonymous” user and could lock each other out. With <code>logged</code> innermost, refused requests would leave no trace. The list passed to <code>chain</code> is a design decision and deserves the same attention as the order of decorators in <x-ref to="structural-patterns#decorator"></x-ref>.</li>
+  <li><b>Something must answer.</b> A classic chain can reach its end with nobody having handled the request. Giving the chain a required final handler, as here, removes that case.</li>
+</ul>
+<p>A link that always calls <code>next</code> and only adds something, like <code>logged</code>, is a decorator. A link that may stop the request, like <code>signedIn</code>, is what makes it a chain. Middleware is both at once, which is why the two names are used loosely.</p>
+
+<h2 id="template">Template method</h2>
+<p>Photos can be imported from a folder, from a zip archive and from a memory card. Every import does the same things in the same order: list what is there, skip what is not a picture, read each file, save it, and report. Only the listing and the reading differ.</p>
+<p>A <dfn>template method</dfn> is a method in a base class that defines the steps of an algorithm and their order, and calls other methods for the steps that vary. Subclasses supply those steps and cannot rearrange the whole.</p>
+<pre data-lang="ts" data-title="The order of an import is fixed in the base class">
+export interface ImportReport {
+  imported: string[];
+  skipped: string[];
+}
+type Save = (name: string, bytes: Uint8Array) => Promise<void>;
+
+// The template method form: the base class owns the steps and their order.
+export abstract class Importer {
+  private readonly save: Save;
+  constructor(save: Save) {
+    this.save = save;
+  }
+
+  // The template method. Subclasses cannot change it, only fill in its steps.
+  async run(source: string): Promise<ImportReport> {
+    const report: ImportReport = { imported: [], skipped: [] };
+    for (const name of await this.list(source)) {
+      if (!this.accepts(name)) {
+        report.skipped.push(name);
+        continue;
+      }
+      await this.save(name, await this.read(source, name));
+      report.imported.push(name);
+    }
+    return report;
+  }
+
+  protected abstract list(source: string): Promise<string[]>;
+  protected abstract read(source: string, name: string): Promise<Uint8Array>;
+  // A hook: a step with a default that a subclass may replace.
+  protected accepts(name: string): boolean {
+    return /\.(jpe?g|png|heic)$/i.test(name);
+  }
+}
+</pre>
+<p>A subclass for folders implements <code>list</code> and <code>read</code>, and that is all it can do. It never calls <code>run</code>’s steps itself. The base class calls the subclass, the reverse of the usual direction, and this is the arrangement every framework is built on: you write the pieces, and the framework decides when to call them. A step with a default, such as <code>accepts</code>, is called a <dfn>hook</dfn>.</p>
+<p>The pattern uses inheritance, with the costs described in <x-ref to="oop-in-typescript#inheritance"></x-ref>. In TypeScript the same guarantee is available without it: write the algorithm as a function, and pass the varying steps in as an object.</p>
+<pre data-lang="ts" data-title="The same import as a function that is given its steps">
+export interface Reader {
+  list(source: string): Promise<string[]>;
+  read(source: string, name: string): Promise<Uint8Array>;
+  accepts?(name: string): boolean;
+}
+const isImage = (name: string): boolean => /\.(jpe?g|png|heic)$/i.test(name);
+
+export async function importFrom(reader: Reader, source: string, save: Save): Promise<ImportReport> {
+  const report: ImportReport = { imported: [], skipped: [] };
+  for (const name of await reader.list(source)) {
+    if (!(reader.accepts ?? isImage)(name)) {
+      report.skipped.push(name);
+      continue;
+    }
+    await save(name, await reader.read(source, name));
+    report.imported.push(name);
+  }
+  return report;
+}
+</pre>
+<p>In a test, both forms imported <code>a.jpg</code>, <code>b.HEIC</code> and <code>c.png</code> from the same folder and skipped <code>notes.txt</code> and <code>clip.mov</code>, with identical reports. The function form is a template method implemented with a strategy, and it is usually the better choice in new code. The class form remains common where a framework expects you to extend its classes.</p>
+
+<h2 id="iterator">Iterator</h2>
+<p>An album might keep its photos in an array, in a map grouped by year, or on a server that returns them a hundred at a time. Code that wants to look at each photo should not need to know which.</p>
+<p>An <dfn>iterator</dfn> is an object that hands out the items of a collection one at a time, on request, without revealing how the collection is stored. JavaScript builds the pattern into the language: any object with a <code>Symbol.iterator</code> method works with <code>for…of</code>, spread syntax and destructuring, and a <dfn>generator function</dfn>, marked with <code>*</code>, is the short way to write one.</p>
+<pre data-lang="ts" data-title="Iterating a collection in memory, and one that arrives in pages">
+// A collection that can be walked without showing how it is stored.
+export class Shelf implements Iterable<string> {
+  private readonly byYear = new Map<number, string[]>();
+
+  add(year: number, photo: string): void {
+    const list = this.byYear.get(year) ?? [];
+    list.push(photo);
+    this.byYear.set(year, list);
+  }
+
+  // A generator function: each yield hands over one item and pauses until the next is asked for.
+  *[Symbol.iterator](): Iterator<string> {
+    for (const year of [...this.byYear.keys()].sort()) yield* this.byYear.get(year) ?? [];
+  }
+}
+
+export interface Page {
+  photos: string[];
+  next: string | null; // the cursor for the following page, or null on the last one
+}
+export type FetchPage = (cursor: string | null) => Promise<Page>;
+
+// The same idea over a network: pages are fetched only as the consumer reaches them.
+export async function* allPhotos(fetchPage: FetchPage): AsyncGenerator<string> {
+  let cursor: string | null = null;
+  do {
+    const page: Page = await fetchPage(cursor);
+    yield* page.photos;
+    cursor = page.next;
+  } while (cursor !== null);
+}
+</pre>
+<p>The important property is that an iterator is lazy. Nothing is produced until it is asked for. In the test, the server held 500 photos in pages of 100.</p>
+<table>
+<thead><tr><th>What the consumer did</th><th>Photos received</th><th>Pages fetched</th></tr></thead>
+<tbody>
+<tr><th>Looped over all of them</th><td>500</td><td>5</td></tr>
+<tr><th>Stopped with <code>break</code> on finding <code>p150</code></th><td>151</td><td>2</td></tr>
+</tbody>
+</table>
+<p>The consumer’s loop is the same in both rows, and it contains no cursor, no page size and no network call. The paging scheme of <x-ref to="api-styles#pagination"></x-ref> is hidden behind the one line <code>for await (const photo of allPhotos(fetchPage))</code>. Since ECMAScript 2025, synchronous iterators also have <code>map</code>, <code>filter</code> and <code>take</code> methods of their own, which stay lazy where the array methods of the same names build a whole new array at each step.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Collecting an iterator into an array “to be safe”. <code>[...everything]</code> or a loop that pushes every item into a list throws away the laziness, and for a large collection it loads into memory what was designed to stream past.</p></div>
+
+<h2 id="others">The other four</h2>
+<p>Four patterns from the catalog complete the group. They are rarer, and worth recognizing more than rehearsing.</p>
+<table>
+<thead><tr><th>Pattern</th><th>What it is</th><th>Where you meet it</th></tr></thead>
+<tbody>
+<tr><th>Mediator</th><td>Objects that would all talk to each other talk to one coordinator instead</td><td>A form whose fields enable and disable one another. A chat room between users. Take care that the coordinator does not become a class that knows everything</td></tr>
+<tr><th>Memento</th><td>A snapshot of an object’s state that only the object itself can interpret</td><td>The snapshot column of the undo table above. Saved games. Editor checkpoints</td></tr>
+<tr><th>Visitor</th><td>A new operation added to a family of classes without editing them, by passing an object that has one method for each class</td><td>Compilers and linters walking a syntax tree. In TypeScript, a <code>switch</code> over a union with a <code>never</code> check gives the same safety with less ceremony (<x-ref to="oop-in-typescript#unions"></x-ref>)</td></tr>
+<tr><th>Interpreter</th><td>A small language represented as a tree of objects, each of which can evaluate itself</td><td>Search filters, rule engines, formulas in a spreadsheet</td></tr>
+</tbody>
+</table>
+
+<h2 id="choosing">Recognizing them</h2>
+<table>
+<thead><tr><th>You notice</th><th>Consider</th><th>Leave it out when</th></tr></thead>
+<tbody>
+<tr><th>An <code>if</code> chain choosing between ways of doing the same step</th><td>Strategy</td><td>There are two ways and no third in sight</td></tr>
+<tr><th>A method that ends with a growing list of “and also tell…” calls</th><td>Observer</td><td>There is one reaction and it must succeed for the action to count. Call it directly</td></tr>
+<tr><th>The same <code>switch (this.state)</code> in several methods</th><td>State</td><td>States are labels with no behavior. Use a table</td></tr>
+<tr><th>A need to undo, queue, schedule, log or replay actions</th><td>Command</td><td>The action happens once, now, and is never referred to again</td></tr>
+<tr><th>Checks that each might reject a request before the real work</th><td>Chain of responsibility</td><td>There is one check, or the checks depend on each other’s results</td></tr>
+<tr><th>Two procedures that are the same except for one or two steps</th><td>Template method, or a function taking the steps</td><td>The similarity is a coincidence and the two will drift apart</td></tr>
+<tr><th>Callers reaching into a collection’s internals to loop over it</th><td>Iterator</td><td>Never. The language already provides it</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Three of these carry most low-level design answers. Strategy covers anything described as a policy: pricing, matching, scheduling, splitting a bill. State covers anything with modes. Observer covers “notify the user when…”. Introduce each at the point where the requirement that needs it comes up, say what would have to change without it, and keep going. A design that names six patterns in the first two minutes reads as recall, not judgment.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>A strategy interface, a class for each variant and a factory, for two fixed variants</th><td>Five files where an <code>if</code> would do</td><td>Wait for the third variant, or pass a function</td></tr>
+<tr><th>Listeners that are never unsubscribed</th><td>Memory that cannot be freed, and reactions from screens that have closed</td><td>Keep the unsubscribe function and call it when the listener’s owner goes away</td></tr>
+<tr><th>Business rules that depend on which listener runs first</th><td>A reordering of unrelated code breaks them</td><td>If order matters, make it one listener, or a direct call</td></tr>
+<tr><th>Events used for a step that must not fail silently</th><td>The photo is saved, the listener that charges for storage throws, and nobody finds out</td><td>Call required steps directly. Use events for reactions that are allowed to lag or fail</td></tr>
+<tr><th>State objects for a machine with three label-only states</th><td>More classes than rules</td><td>A table of transitions</td></tr>
+<tr><th>A command whose <code>undo</code> recomputes instead of restoring</th><td>Undo that is nearly right: a crop undone to the wrong size</td><td>Remember what was replaced, and test that undoing everything restores the start</td></tr>
+<tr><th>Middleware in an order nobody chose</th><td>Unauthenticated requests are counted, refusals are not logged</td><td>Assemble the chain in one place and review its order as a design decision</td></tr>
+<tr><th>A template method with a dozen hooks</th><td>Subclasses that must understand the whole base class to change one step</td><td>A function taking the steps, or several smaller strategies</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="structural-patterns"></x-ref>: decorator and bridge, the nearest relatives of chain of responsibility and strategy.</li>
+  <li><x-ref to="uml-diagrams"></x-ref>: the state diagram this chapter’s state pattern implements.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: retry and backoff policies, which are strategies.</li>
+  <li><x-ref to="event-driven-architecture"></x-ref>: observer and command between services, as events and commands on a broker.</li>
+  <li><x-ref to="concurrency-in-code"></x-ref>: what changes when listeners and handlers are asynchronous.</li>
+  <li><x-ref to="errors-and-testing"></x-ref>: passing in clocks and collaborators so that behavior can be tested.</li>
+  <li><x-ref to="lld-method"></x-ref>: choosing among these under interview time.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A strategy is a step passed in from outside. In TypeScript it is usually a function, and you have used one every time you passed a comparison to <code>sort</code>.</li>
+  <li>An observer lets a subject announce events without knowing who reacts. Decide what happens when a listener throws, and always provide a way to unsubscribe.</li>
+  <li>The state pattern gives each state a class. It has the structure of strategy, with the difference that the object replaces its own state from inside.</li>
+  <li>Use a transition table while states are labels, and state objects once states have behavior of their own.</li>
+  <li>A command is an action as an object, which is what makes undo, queues, logs and replay possible.</li>
+  <li>A chain of responsibility passes a request along until a link answers. In middleware, the order of the links is behavior.</li>
+  <li>A template method fixes the order of an algorithm and lets steps vary. A function that takes the steps does the same without inheritance.</li>
+  <li>Iterators are built into the language and are lazy. A consumer that stops early saves the work of producing the rest.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Strategy and state have nearly the same class diagram. What is the difference, and how would you tell which one a piece of code is?</summary><p>Who changes the object that is held, and when. A strategy is chosen by the caller, passed in, and normally kept for the life of the object that uses it. A state is replaced by the state objects themselves as events arrive, and nothing outside picks it. Look for assignments to the field: one in the constructor suggests strategy, assignments in response to events suggest state.</p></details>
+<details><summary>An emitter has three listeners for an event and the second one throws. What happens to the third with the emitter in this chapter, with Node.js’s <code>EventEmitter</code> and with the browser’s <code>EventTarget</code>?</summary><p>This chapter’s emitter catches the error, calls the third listener and returns the error to the code that emitted. Node.js’s <code>EventEmitter</code> does not catch: the error propagates out of <code>emit</code> and the third listener is never called. The browser’s <code>EventTarget</code> calls the third listener and reports the error separately, without throwing from <code>dispatchEvent</code>.</p></details>
+<details><summary>After saving a new photo, the service must charge the user’s storage quota and should also update the activity feed. Which of the two belongs in an observer, and why?</summary><p>The feed. It is a reaction that may lag or fail without making the save wrong. Charging the quota is part of what it means for the save to have succeeded, so it should be a direct call whose failure fails the operation. An observer hides the call and, in most emitters, its errors too.</p></details>
+<details><summary>A user runs commands A, B and C, undoes twice, then runs D. What is on the done stack and the undone stack, and what does redo do now?</summary><p>Done holds A and D. Undone is empty, because running a new command clears it: B and C described a future that no longer follows from the present state. Redo does nothing.</p></details>
+<details><summary>In the chain <code>[logged, signedIn, limited(2)]</code>, what changes if <code>limited(2)</code> is moved in front of <code>signedIn</code>?</summary><p>Requests are counted before the user is checked. Anonymous requests have no user and are all counted under the same key, so two of them use up the allowance and every later anonymous request gets 429 where it should get 401. Signed-in users are counted as before. The order of links is part of the behavior.</p></details>
+<details><summary>A paged async iterator serves 500 items in pages of 100. A consumer breaks out of its <code>for await</code> loop at the 150th item it reads. How many pages were fetched, and why?</summary><p>Two. The generator fetches a page only when the consumer asks for an item beyond what it already has. Items 1 to 100 come from the first page and 101 to 150 from the second. When the loop exits, the generator is closed and the remaining three pages are never requested.</p></details>
+<details><summary>Rewrite this requirement as a pattern choice: “Shipping cost is flat within the country, by weight to neighboring countries, and quoted by a carrier’s API elsewhere, and marketing wants to add free shipping over a threshold.”</summary><p>Strategy: a function or interface from an order to a cost, with one implementation for each rule. The threshold rule is a wrapper around another strategy, returning zero above the threshold and otherwise asking the wrapped one. The checkout code receives a strategy and never mentions countries or carriers.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Erich Gamma, Richard Helm, Ralph Johnson and John Vlissides, <cite>Design Patterns: Elements of Reusable Object-Oriented Software</cite>, Addison-Wesley, 1994. Chapter 5 covers the eleven behavioral patterns.</li>
+  <li>Refactoring.Guru, <a href="https://refactoring.guru/design-patterns/behavioral-patterns">Behavioral Design Patterns</a>. Each pattern with diagrams and TypeScript examples.</li>
+  <li>Robert Nystrom, <a href="https://gameprogrammingpatterns.com/contents.html"><cite>Game Programming Patterns</cite></a>, 2014. Free online. The chapters on command, observer and state are among the clearest written.</li>
+  <li>Node.js documentation, <a href="https://nodejs.org/api/events.html">Events</a>. How <code>EventEmitter</code> calls listeners and handles errors.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols">Iteration protocols</a> and <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Iterator">Iterator</a>. The language’s built-in iterator pattern and the iterator helper methods.</li>
+  <li>Marc Brooker, <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">Exponential Backoff and Jitter</a>, AWS Architecture Blog, 2015. The waiting strategies used in this chapter’s first example.</li>
+</ol>
+</section>

@@ -1,0 +1,758 @@
+<!--meta
+{ "description": "Multi-tenancy explained for system design: silo, pool and bridge models, database per tenant versus shared tables, tenant keys and PostgreSQL row-level security, carrying tenant context through code, where data leaks, noisy neighbors and fair queuing, tenant placement, cell-based architecture and shuffle sharding.",
+  "lede": "Software sold to organizations serves many customers from one system. Each customer, called a tenant, must feel as if the system were theirs alone: their data invisible to everyone else, their performance unaffected by anyone else. This chapter is about how to share a system safely, what to share and what to keep apart, and how to stop one tenant’s trouble from reaching the rest.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="what">One system, many customers</h2>
+<p>Suppose the photo app adds a product for organizations. A design studio called Acme, a school called Birch and a newspaper called Cedar each sign up, add their staff as users, and keep their photos there. Each organization is a <dfn>tenant</dfn>: a customer that owns a set of users and data and expects it to be separate from every other customer’s.</p>
+<p>There are two basic ways to serve them. In a <dfn>single-tenant</dfn> arrangement every customer gets a separate copy of the software, on separate machines. In a <dfn>multi-tenant</dfn> arrangement one running system serves all of them. Nearly every business product delivered over the internet is multi-tenant to some degree, for three reasons:</p>
+<ul>
+  <li><b>Cost.</b> Most tenants are small and mostly idle. A thousand of them fit comfortably on hardware that would be wasted on one.</li>
+  <li><b>Operations.</b> One system to deploy, monitor and upgrade, instead of a thousand. Everyone is on the same version.</li>
+  <li><b>Onboarding.</b> A new customer is a new row in a table, ready in seconds, instead of new infrastructure.</li>
+</ul>
+<p>Sharing has a price, and it is the subject of the rest of the chapter. Two promises that come free with separate copies must now be kept by design:</p>
+<ul>
+  <li><b>Data isolation.</b> No tenant ever sees or changes another’s data.</li>
+  <li><b>Performance isolation.</b> No tenant’s activity degrades another’s service.</li>
+</ul>
+<p>A failure of the first is a security incident, of the kind that ends contracts. A failure of the second is an outage with a particular shape: one customer does something unusual and others suffer for it.</p>
+
+<h2 id="models">Silo, pool and bridge</h2>
+<p>The choice is not all or nothing. It is made separately for each part of the system, and three words from AWS’s guidance for software-as-a-service have become the common vocabulary.</p>
+
+<figure class="fig wide" id="fig-models">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-labelledby="f441t f441d">
+<title id="f441t">The silo, pool and bridge models of multi-tenancy</title>
+<desc id="f441d">Three arrangements. In the silo model each of three tenants, Acme, Birch and Cedar, has its own application and its own database. Isolation is strongest and reasoning is simple, and cost and operations grow with every tenant. In the pool model one shared application and one database, with rows tagged by tenant, serve all tenants. It is cheapest for each tenant and there is one thing to operate, and isolation must be built in software. In the bridge model the application is shared, most tenants share a database and one tenant, Cedar, has its own. Things are shared where that is safe and separate where a tenant needs or pays for it.</desc>
+<text class="tb" x="10" y="18">Silo: a stack for each tenant</text>
+<rect class="n sig" x="10" y="34" width="66" height="28" rx="6"/>
+<text class="ts tb mid" x="43" y="52.5">App</text>
+<rect class="n store" x="10" y="72" width="66" height="28" rx="6"/>
+<text class="ts tb mid" x="43" y="90.5">DB</text>
+<path class="e none" d="M43 62V72"/>
+<text class="ts mid" x="43" y="120">Acme</text>
+<rect class="n sig" x="84" y="34" width="66" height="28" rx="6"/>
+<text class="ts tb mid" x="117" y="52.5">App</text>
+<rect class="n store" x="84" y="72" width="66" height="28" rx="6"/>
+<text class="ts tb mid" x="117" y="90.5">DB</text>
+<path class="e none" d="M117 62V72"/>
+<text class="ts mid" x="117" y="120">Birch</text>
+<rect class="n sig" x="158" y="34" width="66" height="28" rx="6"/>
+<text class="ts tb mid" x="191" y="52.5">App</text>
+<rect class="n store" x="158" y="72" width="66" height="28" rx="6"/>
+<text class="ts tb mid" x="191" y="90.5">DB</text>
+<path class="e none" d="M191 62V72"/>
+<text class="ts mid" x="191" y="120">Cedar</text>
+<text class="ts" x="10" y="146">Strongest isolation and simple</text>
+<text class="ts" x="10" y="161">reasoning. Cost and operations</text>
+<text class="ts" x="10" y="176">grow with every tenant.</text>
+<text class="tb" x="250" y="18">Pool: everything shared</text>
+<rect class="n sig" x="250" y="34" width="214" height="28" rx="6"/>
+<text class="ts tb mid" x="357" y="52.5">App, shared</text>
+<rect class="n store" x="250" y="72" width="214" height="28" rx="6"/>
+<text class="ts tb mid" x="357" y="90.5">DB: rows tagged by tenant</text>
+<path class="e none" d="M357 62V72"/>
+<text class="ts mid" x="357" y="120">Acme, Birch, Cedar and all the others</text>
+<text class="ts" x="250" y="146">Cheapest for each tenant and one</text>
+<text class="ts" x="250" y="161">thing to operate. Isolation must</text>
+<text class="ts" x="250" y="176">be built in software.</text>
+<text class="tb" x="490" y="18">Bridge: some of each</text>
+<rect class="n sig" x="490" y="34" width="220" height="28" rx="6"/>
+<text class="ts tb mid" x="600" y="52.5">App, shared</text>
+<rect class="n store" x="490" y="72" width="136" height="28" rx="6"/>
+<text class="ts tb mid" x="558" y="90.5">DB, shared</text>
+<rect class="n store" x="634" y="72" width="76" height="28" rx="6"/>
+<text class="ts tb mid" x="672" y="90.5">DB</text>
+<path class="e none" d="M558 62V72"/>
+<path class="e none" d="M672 62V72"/>
+<text class="ts mid" x="558" y="120">Acme, Birch, others</text>
+<text class="ts mid" x="672" y="120">Cedar</text>
+<text class="ts" x="490" y="146">Shared where that is safe, separate</text>
+<text class="ts" x="490" y="161">where a tenant needs or pays</text>
+<text class="ts" x="490" y="176">for it. The most common result.</text>
+
+</svg>
+</div>
+<figcaption>Silo and pool are the two ends. Most real systems are bridges: some layers pooled, some separate, and sometimes different answers for different customers.</figcaption>
+</figure>
+
+<p>For the database, which is where the decision matters most, there are three standard positions between the ends.</p>
+<table>
+<thead><tr><th></th><th>Database per tenant</th><th>Schema per tenant</th><th>Shared tables</th></tr></thead>
+<tbody>
+<tr><th>What separates tenants</th><td>A separate database, possibly a separate server</td><td>A namespace of tables inside one database</td><td>A <code>tenant_id</code> column on every row</td></tr>
+<tr><th>Data isolation</th><td>Strong, enforced by connection</td><td>Moderate, enforced by permissions</td><td>Enforced by every query, or by row-level security</td></tr>
+<tr><th>Cost for a small tenant</th><td>High: an idle database each</td><td>Low</td><td>Lowest</td></tr>
+<tr><th>Schema change</th><td>Run once per tenant, track which are done</td><td>Run once per tenant</td><td>Run once</td></tr>
+<tr><th>Tenants it handles well</th><td>Tens to hundreds</td><td>Hundreds to a few thousand</td><td>Millions</td></tr>
+<tr><th>Backup and restore of one tenant</th><td>Simple</td><td>Possible</td><td>Hard: one tenant’s rows are mixed with everyone’s</td></tr>
+<tr><th>Noisy neighbors</th><td>Contained, if on separate servers</td><td>Shared</td><td>Shared</td></tr>
+</tbody>
+</table>
+<p>The tenant counts are rough guides, not limits. What sets them is operations: a schema migration that must be applied ten thousand times, with some failing halfway, becomes a project of its own, and a database server with hundreds of thousands of tables behaves poorly in ways its makers did not optimize for.</p>
+<p>A workable default for a new product is shared tables, with the option kept open to move a large or sensitive tenant onto separate storage later. The sections below show how to build shared tables so that the option stays open.</p>
+
+<h2 id="data">Shared tables done properly</h2>
+<p>In the pooled model, every table that holds tenant data carries the tenant’s identifier, and the identifier takes part in every key.</p>
+
+<pre data-lang="sql" data-title="schema.sql">create table tenants (
+  id   uuid primary key,
+  name text not null
+);
+
+create table users (
+  tenant_id uuid not null references tenants (id),
+  id        uuid not null default gen_random_uuid(),
+  email     text not null,
+  primary key (tenant_id, id),
+  unique (tenant_id, email)
+);
+
+create table photos (
+  tenant_id uuid not null,
+  id        uuid not null default gen_random_uuid(),
+  owner_id  uuid not null,
+  caption   text,
+  taken_at  timestamptz not null default now(),
+  primary key (tenant_id, id),
+  foreign key (tenant_id, owner_id) references users (tenant_id, id)
+);
+
+create index photos_recent on photos (tenant_id, taken_at desc);</pre>
+
+<p>Four details in this schema do work.</p>
+<ul>
+  <li><b>The tenant leads every primary key.</b> A photo is identified by tenant and ID together. Rows of one tenant sit next to each other in the index, and the table is ready to be partitioned or sharded by tenant, as <x-ref to="partitioning#shard-key"></x-ref> recommended.</li>
+  <li><b>Uniqueness is per tenant.</b> <code>unique (tenant_id, email)</code> lets Ana have an account at Acme and another at Birch with the same address. A plain <code>unique (email)</code> would let one tenant discover, by a failed signup, who is a customer of another.</li>
+  <li><b>Foreign keys include the tenant.</b> The photo’s owner must be a user <em>of the same tenant</em>. Without the tenant in the key, a bug could attach Acme’s photo to Birch’s user and the database would accept it.</li>
+  <li><b>Indexes lead with the tenant.</b> Every query filters by tenant first, so every index should start there. <x-ref to="indexes-and-queries#composite"></x-ref> explains why the order matters.</li>
+</ul>
+
+<h3 id="rls">Row-level security as a second lock</h3>
+<p>With shared tables, isolation depends on every query including <code>where tenant_id = …</code>. Application code gets this right nearly always, and nearly always is not good enough: one forgotten condition in one report query exposes every tenant.</p>
+<p>PostgreSQL can enforce the condition itself. With <dfn>row-level security</dfn>, a policy attached to a table is added to every query on it, whatever the query says.</p>
+
+<pre data-lang="sql" data-title="isolation.sql">alter table photos enable row level security;
+alter table photos force row level security;
+
+create policy tenant_isolation on photos
+  using (tenant_id = current_setting('app.tenant_id')::uuid);</pre>
+
+<p>The policy reads a setting that the application supplies at the start of each transaction.</p>
+
+<pre data-lang="sql" data-title="one request">begin;
+select set_config('app.tenant_id', '11111111-1111-1111-1111-111111111111', true);
+select caption from photos order by taken_at desc limit 20;   -- only this tenant's rows
+commit;</pre>
+
+<p>Running this schema with two tenants confirms the behavior. Each tenant sees only its own photos from <code>select * from photos</code>. An <code>update photos set …</code> with no <code>where</code> clause, run as Birch, changes one row, Birch’s, and leaves Acme’s two alone. An insert that names another tenant is refused with <code>new row violates row-level security policy</code>. A query with no tenant set fails with an error instead of returning everything. The query plan shows the policy’s condition used as an index condition on <code>photos_recent</code>, so the protection does not cost a table scan.</p>
+<p>Row-level security is a second lock, not a replacement for the first. It has edges that must be known to rely on it.</p>
+<ul>
+  <li><b>Owners and superusers bypass it.</b> By default a table’s owner is not subject to its policies. <code>force row level security</code> removes that exception. Superusers and roles with the <code>BYPASSRLS</code> attribute always bypass. The application must connect as an ordinary role that owns nothing, or the policy does nothing at all.</li>
+  <li><b>The setting must be local to the transaction.</b> The third argument <code>true</code> in <code>set_config</code> makes the value disappear at commit. With <code>false</code> it stays on the connection. Connections are pooled and reused, so the next request on that connection, for a different tenant, would inherit it. In the test, a request that forgot to set its tenant after a session-level setting read the previous tenant’s photos.</li>
+  <li><b>Integrity checks see everything.</b> The PostgreSQL manual warns that unique and foreign-key checks bypass row security to keep data correct, so an error from a constraint can reveal that a value exists in another tenant. Tenant-scoped keys, as in the schema above, close this.</li>
+  <li><b>It covers one database.</b> The cache, the search index, the object store and the message queue know nothing about it.</li>
+</ul>
+
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Enabling row-level security, testing as the database owner, seeing every row, and concluding it is broken, or worse, testing nothing and assuming it works. Test it as the role the application really uses, with an automated test that logs in as one tenant and tries to read another’s rows.</p></div>
+
+<h2 id="context">Carrying the tenant through the code</h2>
+<p>Every request belongs to exactly one tenant, and every layer needs to know which. Two questions follow: where the answer comes from, and how it travels.</p>
+<p><b>Where it comes from.</b> The tenant must be derived from something the caller cannot forge: the verified login token, an API key looked up on the server, or a subdomain checked against the token. It must never be taken from a field the client can set freely, such as a <code>tenantId</code> in the request body or an <code>X-Tenant</code> header. A client that can name its tenant can name someone else’s.</p>
+
+<figure class="fig wide" id="fig-context">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 234" role="img" aria-labelledby="f442t f442d">
+<title id="f442t">Tenant context resolved once and applied at every layer</title>
+<desc id="f442d">A request to acme.photos.example arrives. A step resolves the tenant from the verified token and creates a request context holding tenant acme and user ana. Five things read from that context. The database gets the tenant set for row-level security for this transaction. Cache keys start with t colon acme. Every queue message names its tenant. Object store paths start with tenants slash acme. Every log line and metric point is tagged. The tenant is decided once, at the edge, from something the caller cannot forge, and no function takes a tenant as an ordinary argument that a caller could get wrong.</desc>
+<rect class="n" x="10" y="20" width="170" height="50" rx="6"/>
+<text class="ts tb mid" x="95" y="41">Request</text>
+<text class="ts mid" x="95" y="58">acme.photos.example</text>
+<rect class="n async" x="250" y="20" width="200" height="50" rx="6"/>
+<text class="ts tb mid" x="350" y="41">Resolve the tenant</text>
+<text class="ts mid" x="350" y="58">from the verified token</text>
+<rect class="n sig" x="520" y="20" width="190" height="50" rx="6"/>
+<text class="ts tb mid" x="615" y="41">Request context</text>
+<text class="ts mid" x="615" y="58">tenant: acme, user: ana</text>
+<g data-s="1">
+<path class="e" d="M180 45H250"/>
+</g>
+<g data-s="2">
+<path class="e sig" d="M450 45H520"/>
+</g>
+<rect class="n store" x="10" y="118" width="132" height="62" rx="6"/>
+<text class="ts tb mid" x="76" y="136.5">Database</text>
+<text class="ts mid" x="76" y="153.5">row-level security</text>
+<text class="ts mid" x="76" y="170.5">set for this transaction</text>
+<g data-s="3">
+<path class="e sig" d="M76 94V118"/>
+</g>
+<rect class="n store" x="152" y="118" width="132" height="62" rx="6"/>
+<text class="ts tb mid" x="218" y="136.5">Cache</text>
+<text class="ts mid" x="218" y="153.5">key starts with</text>
+<text class="ts mid" x="218" y="170.5">t:acme:</text>
+<g data-s="3">
+<path class="e sig" d="M218 94V118"/>
+</g>
+<rect class="n" x="294" y="118" width="132" height="62" rx="6"/>
+<text class="ts tb mid" x="360" y="136.5">Queue</text>
+<text class="ts mid" x="360" y="153.5">every message</text>
+<text class="ts mid" x="360" y="170.5">names its tenant</text>
+<g data-s="3">
+<path class="e sig" d="M360 94V118"/>
+</g>
+<rect class="n store" x="436" y="118" width="132" height="62" rx="6"/>
+<text class="ts tb mid" x="502" y="136.5">Object store</text>
+<text class="ts mid" x="502" y="153.5">path starts with</text>
+<text class="ts mid" x="502" y="170.5">tenants/acme/</text>
+<g data-s="3">
+<path class="e sig" d="M502 94V118"/>
+</g>
+<rect class="n" x="578" y="118" width="132" height="62" rx="6"/>
+<text class="ts tb mid" x="644" y="136.5">Logs and metrics</text>
+<text class="ts mid" x="644" y="153.5">every line and</text>
+<text class="ts mid" x="644" y="170.5">point is tagged</text>
+<g data-s="3">
+<path class="e sig" d="M644 94V118"/>
+<path class="e none sig" d="M615 70V94M644 94H76"/>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="206">The tenant is decided once, at the edge, from something the caller cannot forge. Everything below reads it from the context.</text>
+<text class="ts" x="10" y="222">No function takes a tenant as an ordinary argument that a caller could get wrong.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="request">A request arrives. Before anything else, the tenant is worked out from the verified token, which the caller cannot forge.</li>
+  <li data-msg="tenant: acme">The tenant and the user are placed in a request context that travels with the request.</li>
+  <li data-msg="tenant: acme">Every layer takes the tenant from that context. The database sets row-level security for the transaction, cache keys and storage paths begin with the tenant, each queued message names it, and every log line is tagged.</li>
+  <li>No function takes the tenant as an ordinary argument that a caller could get wrong.</li>
+</ol>
+<figcaption>Decide once, apply everywhere. The boxes on the bottom row are the places a tenant boundary is most often forgotten.</figcaption>
+</figure>
+
+<p><b>How it travels.</b> Passing a tenant ID as an argument to every function works and is easy to get wrong, because any caller can pass the wrong one. The safer design sets the tenant once for the whole request and makes the data layer read it from there. In Node.js, <code>AsyncLocalStorage</code> holds a value that follows one request through all its asynchronous calls, without leaking into other requests running at the same time.</p>
+
+<pre data-lang="ts" data-title="tenant-context.ts">import { AsyncLocalStorage } from "node:async_hooks";
+
+type TenantContext = { tenantId: string; userId: string };
+const store = new AsyncLocalStorage<TenantContext>();
+
+export function runAs<T>(ctx: TenantContext, fn: () => Promise<T>): Promise<T> {
+  return store.run(ctx, fn);
+}
+
+export function currentTenant(): string {
+  const ctx = store.getStore();
+  if (!ctx) throw new Error("no tenant in context");   // fail closed
+  return ctx.tenantId;
+}
+
+interface Tx { query(sql: string, params?: unknown[]): Promise<unknown[]> }
+interface Pool { transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> }
+
+export class TenantDb {
+  constructor(private pool: Pool) {}
+
+  /** Every query runs in a transaction that has the tenant set for row-level security. */
+  run<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+    const tenantId = currentTenant();
+    return this.pool.transaction(async (tx) => {
+      await tx.query("select set_config('app.tenant_id', $1, true)", [tenantId]);
+      return fn(tx);
+    });
+  }
+}
+
+// Keys that always carry the tenant
+export const cacheKey = (name: string) => `t:${currentTenant()}:${name}`;
+export const objectKey = (path: string) => `tenants/${currentTenant()}/${path}`;</pre>
+
+<p>The request handler calls <code>runAs</code> once, after authentication. From then on the only way to reach the database is <code>TenantDb.run</code>, which cannot be called without a tenant, and the only way to build a cache key or a storage path adds the tenant to it. A test with three overlapping requests confirms that each sees its own tenant throughout.</p>
+<p>The important property is that code with no tenant <em>fails</em>. The alternative, a default tenant or an unfiltered query when none is set, turns every missed case into a leak.</p>
+<p>The context stops at the edge of the process. A message put on a queue must carry its tenant ID in the message, and the consumer must call <code>runAs</code> with it before doing anything. A scheduled job that works across tenants should loop over them and enter each one’s context in turn, so that the per-tenant code path is the same one requests use.</p>
+
+<h2 id="leaks">Where data leaks</h2>
+<p>Cross-tenant leaks rarely come from the main query path, which is tested daily by every user. They come from the edges.</p>
+<table>
+<thead><tr><th>Place</th><th>How it leaks</th><th>Defense</th></tr></thead>
+<tbody>
+<tr><th>Caches</th><td>A key such as <code>feed:recent</code> without the tenant. The first tenant to ask fills it, and everyone gets their answer.</td><td>The tenant in every key, added by the key-building function</td></tr>
+<tr><th>Object identifiers</th><td><code>GET /photos/1042</code> checked for existence and not for ownership. Change the number and see another tenant’s photo.</td><td>Look up by tenant and ID together. Random IDs help and are not a defense alone. See <x-ref to="unique-ids#security"></x-ref></td></tr>
+<tr><th>Search</th><td>One shared index queried without a tenant filter</td><td>A mandatory filter added by the search client, or an index per tenant</td></tr>
+<tr><th>Files</th><td>A download link built from a path the client supplied</td><td>Paths prefixed by tenant, and presigned links created only after an ownership check</td></tr>
+<tr><th>Background jobs and exports</th><td>Code that runs outside a request and so outside the usual checks</td><td>Enter the tenant context explicitly. No job runs without one</td></tr>
+<tr><th>Logs, analytics, error reports</th><td>One tenant’s data copied into a system that support staff or other tenants can read</td><td>Tag with tenant, restrict access, keep content out of logs</td></tr>
+<tr><th>Staff tools</th><td>An internal admin page that can open any tenant, used carelessly or by a stolen account</td><td>Time-limited, logged access with a stated reason</td></tr>
+</tbody>
+</table>
+<p>The second row is among the most common web vulnerabilities, and multi-tenancy raises its cost: the stranger whose record is exposed is a different company.</p>
+<p>The durable defense is a test suite that attacks the boundary. Create two tenants. For every endpoint, log in as the first and request the second’s resources by ID. Every response must be “not found”. Add the test when the endpoint is added, so that isolation is checked by a machine on every change.</p>
+
+<h2 id="noisy-neighbors">Noisy neighbors</h2>
+<p>A <dfn>noisy neighbor</dfn> is a tenant whose load degrades the service for others who share its resources. It is seldom malicious. Acme’s new intern runs an export of every photo since 2015. Cedar’s integration script has a bug and retries in a tight loop. A customer simply grows ten times larger than the rest.</p>
+<p>Whatever is pooled can be monopolized: database connections and CPU, worker threads, queue position, cache memory, an outbound API’s rate limit. The defenses give each tenant a bounded share of each.</p>
+<ul>
+  <li><b>Rate limits for each tenant.</b> A token bucket keyed by tenant, as in <x-ref to="resilience-patterns#token-bucket"></x-ref>, with a size that can differ by plan.</li>
+  <li><b>Concurrency limits for each tenant.</b> A cap on requests in progress, which is the bulkhead of <x-ref to="resilience-patterns#bulkheads"></x-ref> with one compartment per tenant. This matters more than a rate limit for expensive operations: ten simultaneous exports can hurt more than a thousand quick reads.</li>
+  <li><b>Quotas.</b> Limits on stored bytes, rows, users or API calls a month, which also keep costs in line with what the tenant pays.</li>
+  <li><b>Fair scheduling.</b> For background work, take jobs from tenants in turn instead of in arrival order.</li>
+</ul>
+
+<figure class="fig wide" id="fig-fairqueue">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 204" role="img" aria-labelledby="f443t f443d">
+<title id="f443t">A single queue compared with a fair queue across tenants</title>
+<desc id="f443d">On the left, one queue served first come first served holds nine of Acme’s jobs followed by one of Birch’s. Acme queued 1,000 exports, Birch asked for one thumbnail a moment later and waits behind all of them. On the right there is a queue for each tenant: Acme with 1,000 jobs, Birch with two, Cedar with one. They are served in turn, giving the order Acme, Birch, Cedar, Acme, Birch, Acme. Birch and Cedar are served at once, and Acme’s backlog delays only Acme.</desc>
+<text class="tb" x="10" y="18">One queue, first come first served</text>
+<rect class="n async" x="10" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="21.0" y="51">A</text>
+<rect class="n async" x="36" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="47.0" y="51">A</text>
+<rect class="n async" x="62" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="73.0" y="51">A</text>
+<rect class="n async" x="88" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="99.0" y="51">A</text>
+<rect class="n async" x="114" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="125.0" y="51">A</text>
+<rect class="n async" x="140" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="151.0" y="51">A</text>
+<rect class="n async" x="166" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="177.0" y="51">A</text>
+<rect class="n async" x="192" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="203.0" y="51">A</text>
+<rect class="n async" x="218" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="229.0" y="51">A</text>
+<rect class="n store" x="244" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="255.0" y="51">B</text>
+<path class="e none" d="M10 70H262"/>
+<text class="ts" x="10" y="88">served first</text>
+<text class="ts end" x="262" y="88">served last</text>
+<text class="ts" x="10" y="114">Acme (A) queued 1,000 exports. Birch (B) asked for</text>
+<text class="ts" x="10" y="129">one thumbnail a moment later and waits behind</text>
+<text class="ts" x="10" y="144">all of them.</text>
+<path class="e none dash" d="M376 8V196"/>
+<text class="tb" x="396" y="18">A queue for each tenant, served in turn</text>
+<text class="ts" x="396" y="51">Acme</text>
+<rect class="n async" x="446" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="457.0" y="51">A</text>
+<rect class="n async" x="472" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="483.0" y="51">A</text>
+<rect class="n async" x="498" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="509.0" y="51">A</text>
+<rect class="n async" x="524" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="535.0" y="51">A</text>
+<rect class="n async" x="550" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="561.0" y="51">A</text>
+<rect class="n async" x="576" y="36" width="22" height="22" rx="3"/>
+<text class="ts mid" x="587.0" y="51">A</text>
+<text class="ts" x="606" y="51">… 1,000</text>
+<text class="ts" x="396" y="81">Birch</text>
+<rect class="n store" x="446" y="66" width="22" height="22" rx="3"/>
+<text class="ts mid" x="457.0" y="81">B</text>
+<rect class="n store" x="472" y="66" width="22" height="22" rx="3"/>
+<text class="ts mid" x="483.0" y="81">B</text>
+<text class="ts" x="396" y="111">Cedar</text>
+<rect class="n sig" x="446" y="96" width="22" height="22" rx="3"/>
+<text class="ts mid" x="457.0" y="111">C</text>
+<text class="ts" x="396" y="140">Order served:</text>
+<rect class="n async" x="480" y="125" width="22" height="22" rx="3"/>
+<text class="ts mid" x="491.0" y="140">A</text>
+<rect class="n store" x="506" y="125" width="22" height="22" rx="3"/>
+<text class="ts mid" x="517.0" y="140">B</text>
+<rect class="n sig" x="532" y="125" width="22" height="22" rx="3"/>
+<text class="ts mid" x="543.0" y="140">C</text>
+<rect class="n async" x="558" y="125" width="22" height="22" rx="3"/>
+<text class="ts mid" x="569.0" y="140">A</text>
+<rect class="n store" x="584" y="125" width="22" height="22" rx="3"/>
+<text class="ts mid" x="595.0" y="140">B</text>
+<rect class="n async" x="610" y="125" width="22" height="22" rx="3"/>
+<text class="ts mid" x="621.0" y="140">A</text>
+<text class="ts" x="396" y="172">Birch and Cedar are served at once. Acme’s</text>
+<text class="ts" x="396" y="187">backlog delays only Acme.</text>
+</svg>
+</div>
+<figcaption>First come, first served is fair to jobs and unfair to tenants. Taking turns makes a tenant wait behind its own work only.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="fair-queue.ts">export class FairQueue<T> {
+  private queues = new Map<string, T[]>();
+  private order: string[] = [];          // tenants that have work, in turn order
+
+  push(tenantId: string, job: T): void {
+    let q = this.queues.get(tenantId);
+    if (!q) { q = []; this.queues.set(tenantId, q); this.order.push(tenantId); }
+    q.push(job);
+  }
+
+  /** Takes one job from the tenant whose turn it is, then moves that tenant to the back. */
+  pop(): { tenantId: string; job: T } | undefined {
+    const tenantId = this.order.shift();
+    if (tenantId === undefined) return undefined;
+    const q = this.queues.get(tenantId)!;
+    const job = q.shift()!;
+    if (q.length > 0) this.order.push(tenantId);
+    else this.queues.delete(tenantId);
+    return { tenantId, job };
+  }
+}</pre>
+
+<p>With 1,000 jobs from Acme queued first, then two from Birch and one from Cedar, this serves them in the order a1, b1, c1, a2, b2, a3. In a single queue Birch’s first job would have been number 1,001. Production systems refine the idea with weights, so that a tenant on a larger plan gets more turns, and with a cap on how many of one tenant’s jobs run at once.</p>
+<p>None of this works without measurement. Record the tenant on every request, query and job, and keep a view of the top tenants by load. When the system is slow, the first question is whether everyone is slow or one tenant is making it so, and only tenant-tagged metrics can answer it. Tagging every metric with a tenant ID multiplies the number of time series, the cardinality problem from <x-ref to="specialized-databases#cardinality"></x-ref>, so the usual compromise is tenant tags on logs and traces and on a few key metrics.</p>
+
+<h2 id="placement">Placing tenants</h2>
+<p>When one database is no longer enough, tenants are spread across several. The tenant is the natural shard key: almost every query stays inside one tenant, so almost every query stays on one shard. The usual mechanism is the directory from <x-ref to="partitioning#directory"></x-ref>: a small table that records where each tenant lives.</p>
+
+<figure class="fig wide" id="fig-placement">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f444t f444d">
+<title id="f444t">A tenant directory mapping tenants to shards</title>
+<desc id="f444d">A directory table lists tenants and the shard each lives on: Acme on shard 2, Birch on shard 1, Cedar on shard 7, Dune on shard 1. Every request looks up its tenant here first, and the table is small, cached and rarely changes. Shard 1 holds 3,000 small tenants and shard 2 holds 2,800, packed together to share the cost. Shard 7 holds Cedar alone, the largest tenant, with a shard to itself. Moving a tenant is a copy and one changed row.</desc>
+<text class="tb" x="10" y="18">Tenant directory</text>
+<rect class="n sunk" x="10" y="30" width="100" height="24" rx="0"/>
+<text class="ts tb" x="17" y="46">Tenant</text>
+<rect class="n sunk" x="110" y="30" width="90" height="24" rx="0"/>
+<text class="ts tb" x="117" y="46">Lives on</text>
+<rect class="n" x="10" y="54" width="100" height="24" rx="0"/>
+<text class="ts" x="17" y="70">Birch</text>
+<rect class="n" x="110" y="54" width="90" height="24" rx="0"/>
+<text class="ts" x="117" y="70">shard 1</text>
+<rect class="n" x="10" y="78" width="100" height="24" rx="0"/>
+<text class="ts" x="17" y="94">Dune</text>
+<rect class="n" x="110" y="78" width="90" height="24" rx="0"/>
+<text class="ts" x="117" y="94">shard 1</text>
+<rect class="n" x="10" y="102" width="100" height="24" rx="0"/>
+<text class="ts" x="17" y="118">Acme</text>
+<rect class="n" x="110" y="102" width="90" height="24" rx="0"/>
+<text class="ts" x="117" y="118">shard 2</text>
+<rect class="n async" x="10" y="126" width="100" height="24" rx="0"/>
+<text class="ts" x="17" y="142">Cedar</text>
+<rect class="n async" x="110" y="126" width="90" height="24" rx="0"/>
+<text class="ts" x="117" y="142">shard 7</text>
+<rect class="n" x="10" y="150" width="100" height="24" rx="0"/>
+<text class="ts" x="17" y="166">…</text>
+<rect class="n" x="110" y="150" width="90" height="24" rx="0"/>
+<text class="ts" x="117" y="166">…</text>
+<text class="ts" x="10" y="196">Every request looks up its tenant here first.</text>
+<text class="ts" x="10" y="211">The table is small, cached and rarely changes.</text>
+<rect class="n store" x="300" y="30" width="180" height="44" rx="6"/>
+<text class="ts tb mid" x="390" y="48">Shard 1</text>
+<text class="ts mid" x="390" y="65">3,000 small tenants</text>
+<rect class="n store" x="300" y="86" width="180" height="44" rx="6"/>
+<text class="ts tb mid" x="390" y="104">Shard 2</text>
+<text class="ts mid" x="390" y="121">2,800 small tenants</text>
+<rect class="n async" x="300" y="142" width="180" height="44" rx="6"/>
+<text class="ts tb mid" x="390" y="160">Shard 7</text>
+<text class="ts mid" x="390" y="177">Cedar alone</text>
+<path class="e store" d="M200 66C250 66 250 46 300 46"/>
+<path class="e store" d="M200 90C250 90 250 60 300 60"/>
+<path class="e store" d="M200 114C250 114 250 108 300 108"/>
+<path class="e async" d="M200 138C250 138 250 164 300 164"/>
+<text class="ts" x="500" y="46">Small tenants are packed</text>
+<text class="ts" x="500" y="61">together to share the cost.</text>
+<text class="ts" x="500" y="152">The largest tenant has a shard</text>
+<text class="ts" x="500" y="167">to itself. Moving a tenant is a</text>
+<text class="ts" x="500" y="182">copy and one changed row.</text>
+</svg>
+</div>
+<figcaption>A directory turns the silo-or-pool decision into data. Cedar’s move to a dedicated shard changed one row, and no code.</figcaption>
+</figure>
+
+<p>Tenant sizes are very uneven. In most business products a few customers account for a large share of all data and traffic. Hashing tenants evenly across shards therefore does not spread load evenly: whichever shard receives the largest tenant is the hot one. The directory handles this by placing tenants deliberately. Small ones are packed together, and the largest get shards to themselves.</p>
+<p>Notion’s account of sharding its PostgreSQL database, published in 2021, is a well-documented example. It partitioned by workspace ID, its tenant. It created 480 logical shards, each a PostgreSQL schema, spread over 32 physical databases with 15 schemas on each. The number 480 was chosen because it divides evenly by many numbers, so the logical shards can later be redistributed over 40 or 48 machines without splitting any of them. This is the fixed-partitions technique from <x-ref to="partitioning#fixed-partitions"></x-ref>.</p>
+<p>Moving a tenant between shards while it is in use follows the migration steps in <x-ref to="partitioning#migrating"></x-ref>: copy, keep in step, verify, switch the directory entry, clean up. Build this operation early. It is what makes every later change possible: rebalancing, isolating a noisy tenant, upgrading a customer to dedicated hardware, and moving a customer’s data to another country.</p>
+
+<h2 id="cells">Cells</h2>
+<p>Sharding the database limits how much data one failure can touch. The stateless layers above it are usually still one shared pool, so a bad deployment or an overload there still reaches every tenant. A <dfn>cell-based architecture</dfn> applies the shard idea to the whole stack.</p>
+<p>A <dfn>cell</dfn> is a complete, independent copy of the system: its own web servers, services, queues, caches and databases. Each tenant is assigned to one cell. In front of the cells sits a thin router whose only job is to send each request to its tenant’s cell.</p>
+
+<figure class="fig wide" id="fig-cells">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 254" role="img" aria-labelledby="f445t f445d">
+<title id="f445t">A cell-based architecture with a thin router and three independent cells</title>
+<desc id="f445d">A cell router maps each tenant to a cell and does nothing else. Below it are three cells. Each cell contains its own web tier, services, queue and database. Cell 2 has a bad deployment and all of its parts are failing. Each cell is a complete copy of the system serving its own share of the tenants. Cells share nothing and never call each other. A failure or a bad deployment in cell 2 reaches a third of the tenants, and with thirty cells it would reach about 3 percent.</desc>
+<rect class="n" x="210" y="14" width="300" height="36" rx="6"/>
+<text class="ts tb mid" x="360" y="36.5">Cell router: tenant → cell, and nothing else</text>
+<rect class="n ghost" x="10" y="84" width="220" height="118" rx="8"/>
+<text class="ts tb" x="22" y="104">Cell 1</text>
+<rect class="n sig" x="22" y="114" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="70" y="134.5">Web</text>
+<rect class="n sig" x="122" y="114" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="170" y="134.5">Services</text>
+<rect class="n async" x="22" y="154" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="70" y="174.5">Queue</text>
+<rect class="n store" x="122" y="154" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="170" y="174.5">Database</text>
+<path class="e" d="M360 50C360 70 120 62 120 84"/>
+<rect class="n fault" x="250" y="84" width="220" height="118" rx="8"/>
+<text class="ts tb" x="262" y="104">Cell 2: bad deploy</text>
+<rect class="n fault" x="262" y="114" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="310" y="134.5">Web</text>
+<rect class="n fault" x="362" y="114" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="410" y="134.5">Services</text>
+<rect class="n fault" x="262" y="154" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="310" y="174.5">Queue</text>
+<rect class="n fault" x="362" y="154" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="410" y="174.5">Database</text>
+<path class="e fault" d="M360 50C360 70 360 62 360 84"/>
+<rect class="n ghost" x="490" y="84" width="220" height="118" rx="8"/>
+<text class="ts tb" x="502" y="104">Cell 3</text>
+<rect class="n sig" x="502" y="114" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="550" y="134.5">Web</text>
+<rect class="n sig" x="602" y="114" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="650" y="134.5">Services</text>
+<rect class="n async" x="502" y="154" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="550" y="174.5">Queue</text>
+<rect class="n store" x="602" y="154" width="96" height="32" rx="6"/>
+<text class="ts tb mid" x="650" y="174.5">Database</text>
+<path class="e" d="M360 50C360 70 600 62 600 84"/>
+<text class="ts" x="10" y="226">Each cell is a complete copy of the system serving its own share of the tenants. Cells share nothing and never call each other.</text>
+<text class="ts" x="10" y="242">A failure or a bad deployment in cell 2 reaches a third of the tenants. With thirty cells it would reach about 3%.</text>
+
+</svg>
+</div>
+<figcaption>A cell is a failure domain in the sense of <x-ref to="availability-and-reliability#failure-domains"></x-ref>, drawn around tenants instead of around hardware.</figcaption>
+</figure>
+
+<p>Cells buy three things.</p>
+<ul>
+  <li><b>A bounded blast radius.</b> A fault in one cell, whether from hardware, a bad change, corrupt data or one abusive tenant, affects that cell’s tenants and no others. With <i>N</i> equal cells, that is 1/<i>N</i> of customers.</li>
+  <li><b>Safer deployment.</b> A change goes to one cell, is watched, and then goes to the next. Most bad changes are caught having reached a small fraction of customers.</li>
+  <li><b>A tested unit of scale.</b> A cell has a maximum size that has been load-tested. Growth means adding cells of a known size, instead of growing one system into territory nobody has tested.</li>
+</ul>
+<p>Slack moved to a cellular design after an incident in June 2021, in which a network fault in one availability zone degraded the whole service because its internal services called each other freely across zones. In Slack’s design each availability zone is a cell, traffic stays inside its cell, and an operator can drain all traffic away from a failing cell in under five minutes. AWS describes many of its own services as cellular and publishes guidance on the pattern.</p>
+<p>The costs are real and should be stated in any design that proposes cells.</p>
+<ul>
+  <li><b>The router is shared by everyone.</b> It is the one part whose failure reaches all tenants, so it must be as simple and as static as possible: a lookup and a forward, with its table cached at the edge.</li>
+  <li><b>Nothing crosses cells cheaply.</b> A feature that needs data from two tenants in different cells, such as sharing an album between organizations, has to go through a slow, explicit path. Global features such as login, billing and search across tenants need a home outside the cells, and that home is another shared dependency.</li>
+  <li><b>More to run.</b> Many small copies cost more than one large system, in machines and in the tooling to deploy, observe and rebalance them.</li>
+  <li><b>Migration between cells</b> is needed from the first day a cell fills up.</li>
+</ul>
+<p>Cells are a tool for systems that are large and for which a full outage is very expensive. A product with a hundred tenants does not need them. It does benefit from the habits that make them possible later: a tenant directory, tenant-scoped keys, and no cross-tenant queries.</p>
+
+<h3 id="shuffle-sharding">Shuffle sharding</h3>
+<p>Cells give each tenant one fixed group of resources, shared with every other tenant in the cell. For a shared stateless layer there is a cleverer assignment, described by Colm MacCárthaigh of AWS, that shrinks the group of tenants who share a fate.</p>
+<p>Take eight workers. Plain sharding divides them into four shards of two and assigns each tenant to a shard. If one tenant sends requests that crash or exhaust its workers, both workers of that shard go down and every tenant on it, a quarter of all tenants, loses service.</p>
+<p><dfn>Shuffle sharding</dfn> instead gives each tenant its own combination of two workers, chosen from all eight. There are 28 such pairs. Two tenants rarely have the same pair, so a tenant that takes down its two workers fully takes down only those tenants who share both.</p>
+
+<figure class="fig wide" id="fig-shuffle">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f446t f446d">
+<title id="f446t">Plain sharding compared with shuffle sharding across eight workers</title>
+<desc id="f446d">On the left, eight workers are divided into four fixed shards of two. One tenant’s bad requests take down workers 1 and 2. Every tenant on shard 1 loses both of its workers, so 25 percent of all tenants are down. On the right, each tenant gets its own pair of workers. Acme, which is misbehaving, uses workers 3 and 7, and both are down. Birch uses workers 5 and 7, so worker 5 is still up. Cedar uses workers 3 and 8, so worker 8 is still up. Birch and Cedar each share one worker with Acme and keep a healthy one to retry on. Only a tenant with the same pair, 1 in 28, is fully down.</desc>
+<text class="tb" x="10" y="18">Plain sharding: 4 fixed shards of 2</text>
+<rect class="n fault" x="10" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="25" y="53.5">w1</text>
+<rect class="n fault" x="48" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="63" y="53.5">w2</text>
+<rect class="n" x="96" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="111" y="53.5">w3</text>
+<rect class="n" x="134" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="149" y="53.5">w4</text>
+<rect class="n" x="182" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="197" y="53.5">w5</text>
+<rect class="n" x="220" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="235" y="53.5">w6</text>
+<rect class="n" x="268" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="283" y="53.5">w7</text>
+<rect class="n" x="306" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="321" y="53.5">w8</text>
+<path class="e none fault" d="M10 70v6H78v-6"/>
+<text class="ts mid" x="44" y="92">shard 1</text>
+<path class="e none" d="M96 70v6H164v-6"/>
+<text class="ts mid" x="130" y="92">shard 2</text>
+<path class="e none" d="M182 70v6H250v-6"/>
+<text class="ts mid" x="216" y="92">shard 3</text>
+<path class="e none" d="M268 70v6H336v-6"/>
+<text class="ts mid" x="302" y="92">shard 4</text>
+<text class="ts" x="10" y="118">One tenant’s bad requests take down w1 and w2.</text>
+<text class="ts" x="10" y="133">Every tenant on shard 1 loses both of its workers:</text>
+<text class="ts" x="10" y="148">25% of all tenants are down.</text>
+<path class="e none dash" d="M366 8V236"/>
+<text class="tb" x="386" y="18">Shuffle sharding: each tenant gets its own pair</text>
+<rect class="n" x="386" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="401" y="53.5">w1</text>
+<rect class="n" x="424" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="439" y="53.5">w2</text>
+<rect class="n fault" x="462" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="477" y="53.5">w3</text>
+<rect class="n" x="500" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="515" y="53.5">w4</text>
+<rect class="n" x="538" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="553" y="53.5">w5</text>
+<rect class="n" x="576" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="591" y="53.5">w6</text>
+<rect class="n fault" x="614" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="629" y="53.5">w7</text>
+<rect class="n" x="652" y="36" width="30" height="26" rx="6"/>
+<text class="ts mid" x="667" y="53.5">w8</text>
+<text class="ts" x="386" y="103">Acme, misbehaving</text>
+<rect class="n fault" x="520" y="86" width="30" height="26" rx="6"/>
+<text class="ts mid" x="535" y="103.5">w3</text>
+<rect class="n fault" x="558" y="86" width="30" height="26" rx="6"/>
+<text class="ts mid" x="573" y="103.5">w7</text>
+<text class="ts" x="604" y="103">both down</text>
+<text class="ts" x="386" y="135">Birch</text>
+<rect class="n store" x="520" y="118" width="30" height="26" rx="6"/>
+<text class="ts mid" x="535" y="135.5">w5</text>
+<rect class="n fault" x="558" y="118" width="30" height="26" rx="6"/>
+<text class="ts mid" x="573" y="135.5">w7</text>
+<text class="ts" x="604" y="135">w5 still up</text>
+<text class="ts" x="386" y="167">Cedar</text>
+<rect class="n fault" x="520" y="150" width="30" height="26" rx="6"/>
+<text class="ts mid" x="535" y="167.5">w3</text>
+<rect class="n store" x="558" y="150" width="30" height="26" rx="6"/>
+<text class="ts mid" x="573" y="167.5">w8</text>
+<text class="ts" x="604" y="167">w8 still up</text>
+<text class="ts" x="386" y="196">Birch and Cedar each share one worker with Acme and</text>
+<text class="ts" x="386" y="211">keep a healthy one to retry on. Only a tenant with the</text>
+<text class="ts" x="386" y="226">same pair, 1 in 28, is fully down.</text>
+
+</svg>
+</div>
+<figcaption>The same eight workers, and the same two lost. What changes is how many tenants depend on exactly those two.</figcaption>
+</figure>
+
+<div class="widget" data-widget="shuffle">
+<h4>Shuffle sharding</h4>
+<p>How many other tenants share the fate of one misbehaving tenant, with fixed shards and with shuffled ones.</p>
+<div class="controls">
+  <label>Workers<input type="number" name="workers" value="8" min="2" max="5000" step="1"></label>
+  <label>Workers per tenant<input type="number" name="size" value="2" min="1" max="12" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Affected with plain shards</dt><dd data-out="plainshare">25%</dd></div>
+  <div><dt>Possible worker sets</dt><dd data-out="combos">28</dd></div>
+  <div><dt>Tenants with the same set</dt><dd data-out="same">3.57%</dd></div>
+  <div><dt>Tenants sharing part of it</dt><dd data-out="partial">42.9%</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Plain sharding gives 4 shards, so one tenant that overloads its shard takes 25% of all tenants down with it. Shuffle sharding gives 28 possible sets of 2 workers. Another tenant has exactly the same set only 3.57% of the time. 42.9% share some but not all of the bad tenant’s workers, and still have a healthy one to retry on.</p>
+</div>
+
+<p>Try 100 workers with 5 for each tenant: over 75 million combinations. AWS reports that Route 53 uses 2,048 virtual name servers in shuffle shards of four, which gives about 730 billion combinations, enough that every customer domain can have a set that overlaps fully with no other.</p>
+<p>The assignment needs no table. Score each worker by hashing the tenant ID together with the worker’s name and take the highest scores. The same tenant always gets the same workers, and different tenants get different mixes. This is called rendezvous hashing.</p>
+
+<pre data-lang="ts" data-title="shuffle-shard.ts">import { createHash } from "node:crypto";
+
+function score(tenantId: string, worker: string): number {
+  return createHash("sha256").update(`${tenantId}/${worker}`).digest().readUInt32BE(0);
+}
+
+/** The same tenant always gets the same `size` workers. Different tenants get different mixes. */
+export function shuffleShard(tenantId: string, workers: string[], size: number): string[] {
+  return [...workers]
+    .sort((a, b) => score(tenantId, b) - score(tenantId, a))
+    .slice(0, size)
+    .sort();
+}</pre>
+
+<p>Assigning 20,000 tenants to eight workers with this function used all 28 pairs. Compared with one chosen tenant, 3.4% of the others had the same pair and 43.3% shared one worker, close to the 3.57% and 42.9% that the arithmetic predicts.</p>
+<p>The figure and the numbers rest on one condition: the client must retry on its other worker when one fails. Tenants who share one worker with the bad tenant are safe only because they have a second to turn to. Shuffle sharding also suits stateless workers far better than databases, since a tenant’s data cannot be spread over an arbitrary pair of servers as easily as its requests can.</p>
+
+<h2 id="tiers">Isolation as a product</h2>
+<p>How much isolation a tenant gets is often part of what it buys. A common arrangement:</p>
+<table>
+<thead><tr><th>Plan</th><th>Compute</th><th>Data</th><th>Limits</th></tr></thead>
+<tbody>
+<tr><th>Free and small teams</th><td>Pooled</td><td>Shared tables on pooled shards</td><td>Tight rate limits and quotas</td></tr>
+<tr><th>Business</th><td>Pooled</td><td>Pooled shards with fewer tenants on each</td><td>Higher limits</td></tr>
+<tr><th>Enterprise</th><td>Pooled, or a dedicated cell</td><td>A dedicated database, a chosen region, the customer’s own encryption key</td><td>Negotiated</td></tr>
+</tbody>
+</table>
+<p>This is the bridge model as a price list, and the tenant directory is what makes it cheap to offer: the plan decides where the directory points.</p>
+<p>What must not vary by tenant is the code. Every large customer eventually asks for something special. Build it as configuration or a feature flag in the one codebase, never as a separate branch or build for that customer. A separate version for each large customer brings back, one customer at a time, the operations problem that multi-tenancy was adopted to solve.</p>
+<p>Two enterprise requirements shape architecture more than the rest. Customers increasingly require that their data stay in a named country or region, which is covered in <x-ref to="multi-region#residency"></x-ref>. Some require that their data be encrypted with a key they control and can revoke, which is covered in <x-ref to="cryptography-in-practice"></x-ref>. Both are much easier when every piece of data already knows its tenant.</p>
+
+<h2 id="lifecycle">The life of a tenant</h2>
+<ul>
+  <li><b>Onboarding</b> should be fully automatic: a directory entry, default settings, a first user. If creating a tenant needs a person, the silo parts of the design will limit growth.</li>
+  <li><b>Metering.</b> Record usage for each tenant: requests, storage, active users. It feeds billing, quota enforcement, capacity planning and the question of which customers cost more than they pay.</li>
+  <li><b>Schema changes.</b> With shared tables, one migration serves everyone, and it must be an online migration of the kind in <x-ref to="schema-design#migrations"></x-ref>, because there is no quiet hour that suits every customer. With a schema or database per tenant, a migration is a batch job that must record progress and be safe to resume.</li>
+  <li><b>Restore.</b> “Please restore our data to last Tuesday” is simple for a tenant with its own database and hard for one whose rows are mixed into shared tables, since a full restore would rewind every tenant. Decide early what you will offer: per-tenant export on a schedule, soft deletion with an undo period, or history tables.</li>
+  <li><b>Offboarding.</b> A departing tenant’s data must be exported on request and then deleted everywhere: tables, caches, search indexes, object storage, analytics copies and, on a stated schedule, backups. Tenant-scoped keys and paths turn this into a list of prefixes to remove. Without them it is an investigation.</li>
+</ul>
+
+<div class="note interview"><p><span class="label">In an interview.</span> When a design serves businesses, say early that the tenant ID is part of every key, cache entry and message, and that it is the shard key. Then address both isolations by name: data isolation, by scoped queries with row-level security behind them, and performance isolation, by per-tenant limits and fair queuing. Mention the directory, and that the largest tenants can be moved to dedicated shards. Raise cells only if the scale or the availability target calls for them, and name the router as their shared dependency.</p></div>
+
+<h2 id="choosing">Choosing</h2>
+<table>
+<thead><tr><th>Situation</th><th>Reasonable choice</th></tr></thead>
+<tbody>
+<tr><th>A new product, many small tenants</th><td>Pool everything. Shared tables with tenant-scoped keys and row-level security</td></tr>
+<tr><th>A few dozen large customers with strict demands</th><td>Database per tenant, shared application</td></tr>
+<tr><th>Mostly small tenants and a few very large ones</th><td>Bridge: pooled shards and dedicated shards behind one directory</td></tr>
+<tr><th>Regulated data, or contracts that forbid shared storage</th><td>Silo the data layer for those tenants. Keep one codebase</td></tr>
+<tr><th>One tenant keeps slowing the others</th><td>Per-tenant limits and fair queues first. Then move that tenant</td></tr>
+<tr><th>Large scale, and a full outage is unacceptable</th><td>Cells, and shuffle sharding in shared stateless layers</td></tr>
+</tbody>
+</table>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Adding the tenant later.</b> Retrofitting <code>tenant_id</code> onto tables, keys, caches and messages of a running system is one of the more painful migrations there is. Put it in from the first table, even with one customer.</li>
+  <li><b>Trusting the client’s word for its tenant.</b> Reading the tenant from a request field instead of from the verified identity.</li>
+  <li><b>Filtering by hand in every query.</b> One forgotten condition is a breach. Centralize the scoping and back it with row-level security.</li>
+  <li><b>Session-level tenant settings on pooled connections.</b> The next request inherits them.</li>
+  <li><b>Caches, search and files without the tenant.</b> Isolation enforced in the database alone.</li>
+  <li><b>Global uniqueness on tenant data.</b> It leaks existence across tenants and blocks legitimate duplicates.</li>
+  <li><b>No per-tenant limits.</b> The first runaway script becomes everyone’s outage.</li>
+  <li><b>No per-tenant metrics.</b> Without them, “the system is slow” cannot be told apart from “one tenant is making it slow”.</li>
+  <li><b>A code fork for a big customer.</b> It never merges back.</li>
+  <li><b>Cells too early.</b> The operational cost arrives at once and the benefit only at scale.</li>
+  <li><b>No way to move a tenant.</b> Every fix for skew, noise and residency depends on it.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="partitioning"></x-ref>: the tenant as shard key, directories, and moving data between shards.</li>
+  <li><x-ref to="schema-design"></x-ref> and <x-ref to="indexes-and-queries"></x-ref>: composite keys and indexes that lead with the tenant.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: rate limits and bulkheads, applied per tenant.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: failure domains, which cells draw around tenants.</li>
+  <li><x-ref to="multi-region"></x-ref>: placing tenants by geography and keeping their data where they require.</li>
+  <li><x-ref to="authorization"></x-ref>: the checks inside a tenant, once the tenant boundary itself is secure.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Multi-tenancy trades the automatic isolation of separate copies for lower cost and simpler operations. Data isolation and performance isolation must then be designed.</li>
+  <li>Silo, pool and bridge describe how much is shared. The choice is made per layer, and most systems end up as bridges.</li>
+  <li>In shared tables the tenant ID leads every primary key, foreign key, unique constraint and index. Row-level security backs up the application’s own filtering.</li>
+  <li>Resolve the tenant once from the verified identity, carry it in the request context, and make code without a tenant fail.</li>
+  <li>Leaks happen at the edges: caches, identifiers, search, files, background jobs. Test the boundary automatically.</li>
+  <li>Per-tenant rate limits, concurrency limits, quotas and fair queues contain noisy neighbors. Per-tenant metrics reveal them.</li>
+  <li>A tenant directory makes placement a matter of data: pack small tenants, isolate large ones, and move them when needed.</li>
+  <li>Cells bound the blast radius of any failure to a fraction of tenants. Shuffle sharding shrinks the group that shares a fate further, provided clients retry.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>What are the two kinds of isolation a multi-tenant system must provide, and what does a failure of each look like?</summary><p>Data isolation: no tenant can see or change another’s data. Its failure is a security breach. Performance isolation: no tenant’s load degrades another’s service. Its failure is an outage or slowdown caused by one customer and felt by others.</p></details>
+<details><summary>Why should a users table in a pooled design use <code>unique (tenant_id, email)</code> and not <code>unique (email)</code>?</summary><p>The same person may legitimately have accounts in two tenants, which a global constraint would forbid. A global constraint also leaks information: a signup that fails with “email already in use” tells one tenant that the address exists in another.</p></details>
+<details><summary>Row-level security is enabled on a table, yet the application still sees every tenant’s rows. Give two likely causes.</summary><p>The application connects as the table’s owner and <code>force row level security</code> was not set, since owners bypass policies by default. Or it connects as a superuser or a role with <code>BYPASSRLS</code>, which always bypass. A third possibility is a tenant setting left on a pooled connection at session level by an earlier request.</p></details>
+<details><summary>Why must the tenant setting be local to the transaction when connections are pooled?</summary><p>A pooled connection is reused by later requests for other tenants. A session-level setting stays on the connection after the request ends, so a later request that fails to set its own tenant would run with the previous one and read that tenant’s data. A transaction-local setting disappears at commit or rollback.</p></details>
+<details><summary>One tenant queues 5,000 report jobs. Ten other tenants then queue one job each. Compare when the ten are served under a single first-in, first-out queue and under round-robin across tenants.</summary><p>In a single queue they wait behind all 5,000. With round-robin, the queue alternates between tenants that have work, so the ten jobs are all served within the first eleven turns, and the large tenant’s remaining jobs follow.</p></details>
+<details><summary>A system has 12 workers and gives each tenant 3. How many tenants are affected by one bad tenant with plain sharding? With shuffle sharding, how many combinations are there and what share of tenants has exactly the same one?</summary><p>Plain sharding makes 4 shards of 3, so a quarter of tenants, 25%, are affected. Shuffle sharding has 12 × 11 × 10 ÷ 6 = 220 combinations, so about 0.45% of tenants share all three workers. The widget confirms it.</p></details>
+<details><summary>What is the one component of a cell-based architecture whose failure affects every tenant, and how is the risk kept small?</summary><p>The cell router, which maps tenants to cells. It is kept as simple as possible: a lookup and a forward, with no business logic, a mapping that changes rarely and is cached widely, and changes to it rolled out with great care.</p></details>
+<details><summary>A customer asks for all its data to be restored to its state three days ago. Why is this hard in a shared-table design, and what can be prepared in advance?</summary><p>The backup contains every tenant’s rows together, so restoring it would rewind everyone. Restoring one tenant means loading the backup elsewhere and copying just that tenant’s rows back, across every table and store. Preparing means tenant-scoped keys throughout, scheduled per-tenant exports, soft deletion with an undo period, or history tables.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>AWS, <a href="https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/silo-pool-and-bridge-models.html">Silo, pool, and bridge models</a>, SaaS Lens of the AWS Well-Architected Framework. The origin of the three terms as used here.</li>
+  <li>PostgreSQL Global Development Group, <a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html">Row Security Policies</a>, PostgreSQL documentation. Owner bypass, <code>FORCE</code>, <code>BYPASSRLS</code> and the warning about integrity checks.</li>
+  <li>Garrett Fidalgo, <a href="https://www.notion.com/blog/sharding-postgres-at-notion">Herding elephants: lessons learned from sharding Postgres at Notion</a>, October 2021. Workspace ID as the partition key, and 480 logical shards on 32 databases.</li>
+  <li>Colm MacCárthaigh, <a href="https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/">Workload isolation using shuffle sharding</a>, Amazon Builders’ Library. The eight-worker example and the Route 53 figures.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/reducing-scope-of-impact-with-cell-based-architecture.html">Reducing the scope of impact with cell-based architecture</a>, AWS Well-Architected whitepaper.</li>
+  <li>Cooper Bethea, <a href="https://slack.engineering/slacks-migration-to-a-cellular-architecture/">Slack’s migration to a cellular architecture</a>, Slack Engineering, 2023.</li>
+  <li>Node.js, <a href="https://nodejs.org/api/async_context.html">Asynchronous context tracking</a>. The <code>AsyncLocalStorage</code> API.</li>
+  <li>Microsoft, <a href="https://learn.microsoft.com/en-us/azure/architecture/guide/multitenant/overview">Architect multitenant solutions on Azure</a>, Azure Architecture Center. A second treatment of tenancy models and noisy neighbors. Its deployment stamps are cells under another name.</li>
+</ol>
+</section>

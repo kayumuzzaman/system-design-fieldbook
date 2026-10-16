@@ -1,0 +1,624 @@
+<!--meta
+{ "description": "A high-level design of search autocomplete: requirements and estimates, a cacheable suggestion API, a data path that counts searches with decay and builds a prefix index, a trie with the best completions stored at every node, measured lookup cost and memory, how quickly trends appear under four ways of counting, caching and sharding the hot short prefixes, personalization and filtering.",
+  "lede": "Type one letter into a search box and ten suggestions appear before the next key is pressed. The lookup must take a few milliseconds, every keystroke of every user is a request, and the suggestions must notice within hours that the whole world has started searching for something new. This chapter designs the service as two paths, a fast one that only reads and a slow one that counts, and measures the structure in the middle: a trie that answers in one step per letter because it has done the ranking in advance.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the autocomplete for a search box. As the user types, show up to ten completions of what they have typed, ranked by how popular they are, in their language and region. Popular new searches should appear quickly, the user’s own recent searches should be offered, and offensive suggestions must never be shown.</p></div>
+<p>The difficulty is the request rate against the time budget. Every keystroke is a request, so the service receives several times as many requests as the search engine behind it, and an answer that arrives after the next keystroke is useless. That rules out any work at request time beyond a lookup: no counting, no sorting, no scanning. In the terms of <x-ref to="hld-method"></x-ref>, it is a read-heavy problem whose answer is to precompute, and the interesting questions are what to precompute, how often, and how to keep it fresh.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Up to ten completions of a prefix, most popular first</th><td>Yes</td></tr>
+<tr><th>Suggestions by language and region</th><td>Yes</td></tr>
+<tr><th>Rising searches appear within an hour or two</th><td>Yes</td></tr>
+<tr><th>The user’s own recent searches, which they can delete</th><td>Yes</td></tr>
+<tr><th>Never suggest anything on a blocklist of violent, hateful or similar terms</th><td>Yes</td></tr>
+<tr><th>Spelling correction, “did you mean”</th><td>No: a follow-up</td></tr>
+<tr><th>The search results themselves</th><td>No: <x-ref to="search-systems"></x-ref></td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>1 billion searches a day, and a request for most keystrokes</td></tr>
+<tr><th>Latency</th><td>Under 20 ms at the server for 99% of requests, under 100 ms as the user sees it</td></tr>
+<tr><th>Availability</th><td>99.99%: if autocomplete fails, the search box still works, so degrade to no suggestions</td></tr>
+<tr><th>Freshness</th><td>Counts at most an hour old</td></tr>
+<tr><th>Consistency</th><td>None needed between users: two people may briefly see different lists</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<p>Assume each search produces five lookups after the browser skips keystrokes that come in quick succession, and that an edge cache answers half of them (<x-ref to="estimation#method"></x-ref>; the simulation later in this chapter measured fewer lookups and more cache hits, so these are cautious).</p>
+<div class="formula">searches: 1 billion a day ÷ 86,400 s ≈ 11,600 a second, about 35,000 at a peak of three times that<br>
+lookups: 5 per search ≈ 58,000 a second on average, about 174,000 at the peak<br>
+reaching the servers: half of the peak ≈ 87,000 a second<br>
+index: 100 million distinct queries × about 90 bytes ≈ 9 GB<br>
+logs into the counting job: 1 billion searches × about 100 bytes = 100 GB a day</div>
+<p>The index fits in the memory of one ordinary server, which decides the shape of the design: copy the whole index to every server and spread requests across the copies, rather than splitting it. The 90 bytes per query come from counts measured below, 1.35 tree nodes per query, with assumed sizes of 32 bytes per node, a 4-byte id for each of five stored suggestions and the query’s text. The request rate is high but each request is a lookup in memory; in one run of the chapter’s code, one core did 2.5 million lookups a second, so the cost of a request is its network handling, not the search.</p>
+
+<div class="widget" data-widget="suggest87">
+<h4>Requests and memory for autocomplete</h4>
+<p>Lookups at the peak, how many reach the servers, and the size of an index held in memory.</p>
+<div class="controls">
+  <label>Searches a day, millions<input type="number" name="searches" value="1000" min="1" max="100000" step="10"></label>
+  <label>Lookups per search<input type="number" name="lookups" value="5" min="1" max="50" step="0.5"></label>
+  <label>Answered by the edge cache, %<input type="number" name="cached" value="50" min="0" max="99" step="1"></label>
+  <label>Distinct queries in the index, millions<input type="number" name="queries" value="100" min="0.01" max="100000" step="1"></label>
+  <label>Bytes per query<input type="number" name="perQuery" value="90" min="10" max="10000" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Lookups a second at the peak</dt><dd data-out="peak">174 thousand</dd></div>
+  <div><dt>Reaching the servers</dt><dd data-out="servers">86.8 thousand</dd></div>
+  <div><dt>Index size</dt><dd data-out="index">9 GB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At three times the average rate, 174 thousand lookups a second arrive and 86.8 thousand get past the edge cache. An index of 9 GB fits in one server’s memory, so every server can hold a full copy and requests are spread across copies.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="One lookup, cacheable by anyone">
+GET /v1/suggest?q=wea&lang=en&region=bd&seq=3
+
+200 OK
+Cache-Control: public, max-age=300
+{ "seq": 3, "prefix": "wea",
+  "suggestions": ["weather", "weather tomorrow", "wear os", "weaving", …] }
+</pre>
+<pre data-lang="http" data-title="The user’s own history: private, never cached by others">
+GET /v1/me/recent?q=wea              → { "recent": ["weather dhaka"] }      Cache-Control: private
+DELETE /v1/me/recent/8f1c            → 204: removed from history and from suggestions
+POST /v1/suggest/report              { "prefix": "wea", "text": "…" }  → 202: queued for review
+</pre>
+<p>The public lookup depends only on the prefix, the language and the region, so the same answer serves everyone and can be cached by the browser, the edge and the service (<x-ref to="cdn-and-edge#cache-key"></x-ref>). Anything personal goes in a separate request marked private, or is merged in the browser, because a shared cache that stored one user’s history would show it to the next. The <code>seq</code> number lets the browser ignore an answer that arrives after a newer one. There is no pagination: ten results is the whole answer.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>Search event</th><td>time, then an id</td><td>Query text, language, region, user or anonymous id, whether a suggestion was picked</td><td>A log in a queue (<x-ref to="event-streaming"></x-ref>), then object storage</td></tr>
+<tr><th>Query count</th><td>(language, region, query)</td><td>A decayed count and when it was last updated</td><td>State of the counting job, checkpointed</td></tr>
+<tr><th>Prefix index</th><td>version</td><td>For every prefix, the best completions: an immutable file built every hour</td><td>Object storage; loaded into every index server’s memory</td></tr>
+<tr><th>Blocklist</th><td>pattern</td><td>Terms and patterns never to suggest</td><td>A small table, applied when building and when serving</td></tr>
+<tr><th>Recent searches</th><td>user id</td><td>The user’s last 100 searches, with times</td><td>A key-value store with expiry (<x-ref to="data-models#key-value"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>The index is built, never updated in place. A builder produces a complete new version, the servers load it beside the old one and switch, and a bad version is undone by switching back. That is simpler and safer than updating a tree that is serving 87,000 lookups a second, and it costs only memory for two copies during the switch.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f871t f871d">
+<title id="f871t">The parts of an autocomplete service</title>
+<desc id="f871d">Two paths. On the request path, the browser asks an edge cache for suggestions for a prefix; on a miss the suggestion service reads the top completions from index servers that hold the whole prefix index in memory, blends in the user’s own recent searches, and filters the result. On the data path, the search service logs every search to a queue; a counting job keeps decayed counts per query; a builder filters them and computes the top completions for every prefix; the snapshot is stored in object storage, and the index servers load each new snapshot.</desc>
+<text class="tb" x="10" y="16">Request path: every keystroke, in milliseconds</text>
+<rect class="n " x="10" y="30" width="110" height="52" rx="6"/>
+<text class="tb mid" x="65.0" y="53.0">Browser</text>
+<text class="ts mid" x="65.0" y="70.0">debounces</text>
+<rect class="n sig" x="170" y="30" width="120" height="52" rx="6"/>
+<text class="tb mid" x="230.0" y="53.0">Edge cache</text>
+<text class="ts mid" x="230.0" y="70.0">short prefixes</text>
+<rect class="n sig" x="340" y="30" width="150" height="52" rx="6"/>
+<text class="tb mid" x="415.0" y="53.0">Suggestion service</text>
+<text class="ts mid" x="415.0" y="70.0">blends, filters</text>
+<rect class="n sig" x="560" y="30" width="150" height="52" rx="6"/>
+<text class="tb mid" x="635.0" y="53.0">Index servers</text>
+<text class="ts mid" x="635.0" y="70.0">whole index in RAM</text>
+<rect class="n store" x="340" y="116" width="150" height="46" rx="6"/>
+<text class="tb mid" x="415.0" y="136.0">User history</text>
+<text class="ts mid" x="415.0" y="153.0">recent searches</text>
+<path class="e sig both" d="M120 56H170"/>
+<text class="ts mid" x="145" y="50">prefix</text>
+<path class="e sig both" d="M290 56H340"/>
+<text class="ts mid" x="315" y="50">miss</text>
+<path class="e sig both" d="M490 56H560"/>
+<text class="ts mid" x="525" y="50">top k</text>
+<path class="e store" d="M415 82V116"/>
+<text class="tb" x="10" y="196">Data path: every search, within the hour</text>
+<rect class="n " x="10" y="212" width="124" height="52" rx="6"/>
+<text class="tb mid" x="72.0" y="235.0">Search service</text>
+<text class="ts mid" x="72.0" y="252.0">logs each search</text>
+<rect class="n async" x="152" y="212" width="124" height="52" rx="6"/>
+<text class="tb mid" x="214.0" y="235.0">Log queue</text>
+<text class="ts mid" x="214.0" y="252.0">search events</text>
+<rect class="n async" x="294" y="212" width="124" height="52" rx="6"/>
+<text class="tb mid" x="356.0" y="235.0">Counter</text>
+<text class="ts mid" x="356.0" y="252.0">decayed counts</text>
+<rect class="n async" x="436" y="212" width="124" height="52" rx="6"/>
+<text class="tb mid" x="498.0" y="235.0">Index builder</text>
+<text class="ts mid" x="498.0" y="252.0">top k per prefix</text>
+<rect class="n store" x="578" y="212" width="124" height="52" rx="6"/>
+<text class="tb mid" x="640.0" y="235.0">Snapshots</text>
+<text class="ts mid" x="640.0" y="252.0">object storage</text>
+<path class="e async" d="M134 238H152"/>
+<path class="e async" d="M276 238H294"/>
+<path class="e async" d="M418 238H436"/>
+<path class="e async" d="M560 238H578"/>
+<path class="e sig" d="M65 82V212"/>
+<text class="ts" x="73" y="150">searches</text>
+<path class="e async" d="M650 212V82"/>
+<text class="ts end" x="642" y="150">load hourly</text>
+</svg>
+</div>
+<figcaption>The request path only reads a prebuilt index; everything that counts, ranks and filters happens on the data path, away from the keystrokes.</figcaption>
+</figure>
+
+<p>The data path runs on the scale of hours. The search service writes an event for every search to a queue. A counting job, a streaming aggregation (<x-ref to="batch-and-stream-processing#windows"></x-ref>), keeps a count per query that fades with age. Every hour the builder takes the counts above a threshold, removes anything on the blocklist, computes the best completions of every prefix and writes a new index. The request path runs in milliseconds and only reads.</p>
+
+<figure class="fig wide" id="fig-typing">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f872t f872d">
+<title id="f872t">Three keystrokes, a cache hit and a late answer</title>
+<desc id="f872d">A sequence between the browser, the edge cache and the suggestion service as a user types w, e, a. The request for w is answered by the edge cache. The request for we misses the cache and goes to the suggestion service; before it returns, the user types a, and the request for wea is sent as well. The answer for wea arrives first and is shown. The answer for we arrives afterward and is dropped, because its sequence number is older than the one on screen.</desc>
+<text class="tb mid" x="80" y="20">Browser</text>
+<line class="axis" x1="80" y1="28" x2="80" y2="257"/>
+<text class="tb mid" x="370" y="20">Edge cache</text>
+<line class="axis" x1="370" y1="28" x2="370" y2="257"/>
+<text class="tb mid" x="640" y="20">Suggestion service</text>
+<line class="axis" x1="640" y1="28" x2="640" y2="257"/>
+<g data-s="1">
+<path class="e sig" d="M81 56H369"/>
+<text class="ts mid" x="225.0" y="50">1. “w”, request 1</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M369 83H81"/>
+<text class="ts mid" x="225.0" y="77">2. hit: weather, walmart…</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M81 110H369"/>
+<text class="ts mid" x="225.0" y="104">3. “we”, request 2</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M371 137H639"/>
+<text class="ts mid" x="505.0" y="131">4. miss: “we”</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M81 164H369"/>
+<text class="ts mid" x="225.0" y="158">5. “wea”, request 3</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M371 191H639"/>
+<text class="ts mid" x="505.0" y="185">6. miss: “wea”</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M639 218H81"/>
+<text class="ts mid" x="360.0" y="212">7. request 3: weather, wear…</text>
+</g>
+<g data-s="8">
+<path class="e fault" d="M639 245H81"/>
+<text class="ts mid" x="360.0" y="239">8. request 2 arrives late</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="w #1" data-state="On screen: nothing; waiting for: 1">The user types w. The browser waits a few tens of milliseconds for another key, then asks for suggestions.</li>
+  <li data-msg="#1 hit" data-state="On screen: request 1; waiting for: none">Everyone types w. Its suggestions are cached at the edge for a few minutes, so the answer comes from nearby.</li>
+  <li data-msg="we #2" data-state="On screen: request 1; waiting for: 2">The user types e. A new request, with the next sequence number.</li>
+  <li data-msg="we">This prefix is not in the cache, so the request goes on to the suggestion service.</li>
+  <li data-msg="wea #3" data-state="On screen: request 1; waiting for: 2, 3">The user types a before the answer to request 2 returns. A third request goes out.</li>
+  <li data-msg="wea">It misses too and goes to a different server, which happens to be less busy.</li>
+  <li data-msg="#3" data-state="On screen: request 3; waiting for: 2">The answer to request 3 arrives first. It is newer than what is on screen, so it is shown.</li>
+  <li data-msg="#2" data-state="On screen: request 3; dropped: request 2">The answer to request 2 arrives last. It is older than what is shown, so it is dropped instead of replacing the right suggestions with stale ones.</li>
+</ol>
+<figcaption>Debouncing cuts requests, the edge cache answers the short prefixes everyone types, and a sequence number stops a slow answer from overwriting a newer one.</figcaption>
+</figure>
+
+<p>The browser does real work in this design. It waits a few tens of milliseconds after each keystroke before asking, a technique called <dfn>debouncing</dfn>: a key pressed before the wait is over cancels the pending request, so a fast typist sends one request for several letters. It keeps the answers it has received, so deleting a letter costs nothing. And it numbers its requests, because answers from different servers can arrive out of order.</p>
+<pre data-lang="ts" data-title="The browser: wait for a pause, number requests, drop older answers">
+// Called on every keystroke with the whole text typed so far.
+  typed(prefix: string): void {
+    if (this.pending !== null) this.timer.clear(this.pending); // a new key cancels the wait
+    const seq = this.nextSeq++;
+    const known = this.cache.get(prefix);
+    if (known) { this.show(seq, known); return; } // deleting a letter costs nothing
+    this.pending = this.timer.set(() => {
+      this.pending = null;
+      this.requests += 1;
+      this.fetch(prefix, seq).then((r) => {
+        this.cache.set(prefix, r.suggestions);
+        this.show(r.seq, r.suggestions);
+      }, () => {}); // a failed lookup leaves the box working, without suggestions
+    }, this.waitMs);
+  }
+
+  private show(seq: number, suggestions: string[]): void {
+    if (seq <= this.shownSeq) return; // an answer older than what is on screen
+    this.shownSeq = seq;
+    this.shown = suggestions;
+  }
+}
+</pre>
+<p>In the chapter’s test, four quick keystrokes and a backspace sent two requests, and an answer that arrived late was not shown.</p>
+
+<h2 id="trie">Step 6a: A trie with the answers stored in it</h2>
+<p>A <dfn>trie</dfn> is a tree for strings with one node for every distinct prefix: the path from the root to a node spells the prefix, and the node’s children are the letters that can follow it. Finding the node for a prefix takes one step per character, whatever the number of strings stored. The name comes from “retrieval”, from Edward Fredkin’s paper of 1960.</p>
+
+<figure class="fig wide" id="fig-trie">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 344" role="img" aria-labelledby="f873t f873d">
+<title id="f873t">A trie with the best two completions stored at each node</title>
+<desc id="f873d">A trie of eight queries with their counts: to 200, tokyo 150, tennis 120, ten 80, toy 60, tea 50, tent 40 and ted 30. Each node is one letter, and the path from the top spells a prefix. The node for t stores to and tokyo, the node for te stores tennis and ten, and the node for to stores to and tokyo. To answer the prefix te, the lookup walks two nodes and reads the stored list; without stored lists it would visit all eight nodes below e and sort what it found.</desc>
+<rect class="n sunk" x="128" y="146" width="236" height="188" rx="10" style="fill:none;stroke-dasharray:4 4"/>
+<text class="ts" x="372" y="330">without lists: visit all 8 nodes below e</text>
+<path class="e none sig" d="M360 40L360 62" style="stroke-width:2.5"/>
+<path class="e none sig" d="M360 86L240 108" style="stroke-width:2.5"/>
+<path class="e none" d="M360 86L500 108"/>
+<path class="e none" d="M240 132L150 154"/>
+<path class="e none" d="M240 132L220 154"/>
+<path class="e none" d="M240 132L300 154"/>
+<path class="e none" d="M300 178L260 200"/>
+<path class="e none" d="M300 178L340 200"/>
+<path class="e none" d="M260 224L260 246"/>
+<path class="e none" d="M260 270L260 292"/>
+<path class="e none" d="M500 132L450 154"/>
+<path class="e none" d="M500 132L560 154"/>
+<path class="e none" d="M560 178L560 200"/>
+<path class="e none" d="M560 224L560 246"/>
+<circle class="n" cx="360" cy="28" r="12"/>
+<text class="ts mid tb" x="360" y="32">·</text>
+<circle class="n sig" cx="360" cy="74" r="12"/>
+<text class="ts mid tb" x="360" y="78">t</text>
+<circle class="n sig" cx="240" cy="120" r="12"/>
+<text class="ts mid tb" x="240" y="124">e</text>
+<circle class="n store" cx="500" cy="120" r="12"/>
+<text class="ts mid tb" x="500" y="124">o</text>
+<text class="ts" x="517" y="125">200</text>
+<circle class="n store" cx="150" cy="166" r="12"/>
+<text class="ts mid tb" x="150" y="170">a</text>
+<text class="ts" x="167" y="171">50</text>
+<circle class="n store" cx="220" cy="166" r="12"/>
+<text class="ts mid tb" x="220" y="170">d</text>
+<text class="ts" x="237" y="171">30</text>
+<circle class="n store" cx="300" cy="166" r="12"/>
+<text class="ts mid tb" x="300" y="170">n</text>
+<text class="ts" x="317" y="171">80</text>
+<circle class="n" cx="260" cy="212" r="12"/>
+<text class="ts mid tb" x="260" y="216">n</text>
+<circle class="n store" cx="340" cy="212" r="12"/>
+<text class="ts mid tb" x="340" y="216">t</text>
+<text class="ts" x="357" y="217">40</text>
+<circle class="n" cx="260" cy="258" r="12"/>
+<text class="ts mid tb" x="260" y="262">i</text>
+<circle class="n store" cx="260" cy="304" r="12"/>
+<text class="ts mid tb" x="260" y="308">s</text>
+<text class="ts" x="277" y="309">120</text>
+<circle class="n store" cx="450" cy="166" r="12"/>
+<text class="ts mid tb" x="450" y="170">y</text>
+<text class="ts" x="467" y="171">60</text>
+<circle class="n" cx="560" cy="166" r="12"/>
+<text class="ts mid tb" x="560" y="170">k</text>
+<circle class="n" cx="560" cy="212" r="12"/>
+<text class="ts mid tb" x="560" y="216">y</text>
+<circle class="n store" cx="560" cy="258" r="12"/>
+<text class="ts mid tb" x="560" y="262">o</text>
+<text class="ts" x="577" y="263">150</text>
+<rect class="n sig" x="10" y="86" width="118" height="50" rx="5"/>
+<text class="ts tb" x="18" y="100">list at “te”</text>
+<text class="ts" x="18" y="116">tennis 120</text>
+<text class="ts" x="18" y="132">ten 80</text>
+<path class="e none dash" d="M228 120L128 112"/>
+<rect class="n sig" x="398" y="8" width="118" height="50" rx="5"/>
+<text class="ts tb" x="406" y="22">list at “t”</text>
+<text class="ts" x="406" y="38">to 200</text>
+<text class="ts" x="406" y="54">tokyo 150</text>
+<path class="e none dash" d="M372 70L398 40"/>
+<rect class="n sig" x="590" y="40" width="118" height="50" rx="5"/>
+<text class="ts tb" x="598" y="54">list at “to”</text>
+<text class="ts" x="598" y="70">to 200</text>
+<text class="ts" x="598" y="86">tokyo 150</text>
+<path class="e none dash" d="M510 112L590 72"/>
+<text class="tb" x="10" y="24">Lookup for “te”: 2 steps</text>
+<circle class="n store" cx="196" cy="20" r="6"/>
+<text class="ts" x="208" y="24">a query ends here</text>
+</svg>
+</div>
+<figcaption>Each node stores the best completions of everything below it, so a lookup costs one step per character typed instead of a walk over a subtree that, for a one-letter prefix, holds a large share of all queries.</figcaption>
+</figure>
+
+<p>Finding the node is not the same as finding the answer. The best completions of “te” are somewhere in the subtree below it, and without help the lookup must visit that whole subtree and sort what it finds. The fix is to do that work once, when the index is built: each node stores the best <i>k</i> completions of everything below it. A node’s list is the best <i>k</i> of its own query and its children’s lists, so building visits each node once, children first.</p>
+<pre data-lang="ts" data-title="Building the stored lists, and a lookup that only reads them">
+// Store at every node the best k completions below it, children first. The list of a node is
+  // the best k of its own query and its children's lists, so each node merges a few short lists.
+  build(): void {
+    const visit = (n: TrieNode): Suggestion[] => {
+      const all: Suggestion[] = n.score > 0 ? [{ text: n.text, score: n.score }] : [];
+      for (const c of n.children.values()) all.push(...visit(c));
+      n.top = all.sort(better).slice(0, this.k);
+      return n.top;
+    };
+    visit(this.root);
+  }
+
+  // With precomputed lists: walk down the prefix, read the list. Cost: the length of the prefix.
+  complete(prefix: string): { results: Suggestion[]; visited: number } {
+    const { node, visited } = this.find(prefix);
+    return { results: node ? node.top : [], visited };
+  }
+</pre>
+<p>The chapter’s code built a trie of 100,000 synthetic queries with a long-tailed popularity, and replayed 100,000 searches in which users typed one letter at a time and stopped when their query was suggested. The test checks the stored lists against sorting all matching queries, for 300 random prefixes.</p>
+
+<figure class="fig wide" id="fig-cost">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 320" role="img" aria-labelledby="f874t f874d">
+<title id="f874t">Nodes visited per lookup, by length of the prefix</title>
+<desc id="f874d">For prefixes of one to six characters, as requested by 100,000 simulated searches over 100,000 queries, the mean number of trie nodes visited. Walking the subtree: 1 character: 52,971, 2 characters: 19,194, 3 characters: 5,562, 4 characters: 3,044, 5 characters: 3,406, 6 characters: 773. Reading the stored list: 2, 3, 4, 5, 6, 7, one more than the length.</desc>
+<rect class="bar mute" x="10" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="30" y="20">walking the subtree</text>
+<rect class="bar" x="190" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="210" y="20">reading the stored list</text>
+<line class="grid" x1="150.0" y1="46" x2="150.0" y2="296"/>
+<text class="ts mid" x="150.0" y="42">1</text>
+<line class="grid" x1="248.0" y1="46" x2="248.0" y2="296"/>
+<text class="ts mid" x="248.0" y="42">10</text>
+<line class="grid" x1="346.0" y1="46" x2="346.0" y2="296"/>
+<text class="ts mid" x="346.0" y="42">100</text>
+<line class="grid" x1="444.0" y1="46" x2="444.0" y2="296"/>
+<text class="ts mid" x="444.0" y="42">1,000</text>
+<line class="grid" x1="542.0" y1="46" x2="542.0" y2="296"/>
+<text class="ts mid" x="542.0" y="42">10,000</text>
+<line class="grid" x1="640.0" y1="46" x2="640.0" y2="296"/>
+<text class="ts mid" x="640.0" y="42">100,000</text>
+<text class="ts end" x="138" y="70">1 character</text>
+<rect class="bar mute" x="150" y="52" width="463.0" height="12" rx="2"/>
+<text class="ts" x="619.0" y="62">52,971</text>
+<rect class="bar " x="150" y="67" width="29.5" height="12" rx="2"/>
+<text class="ts" x="185.5" y="77">2</text>
+<rect class="hit" x="8" y="48" width="704" height="38" data-tip="Prefixes of 1 character|walking the subtree: 52,971 nodes on average|reading the stored list: 2 nodes|100,000 requests in the simulation"/>
+<text class="ts end" x="138" y="112">2 characters</text>
+<rect class="bar mute" x="150" y="94" width="419.8" height="12" rx="2"/>
+<text class="ts" x="575.8" y="104">19,194</text>
+<rect class="bar " x="150" y="109" width="46.8" height="12" rx="2"/>
+<text class="ts" x="202.8" y="119">3</text>
+<rect class="hit" x="8" y="90" width="704" height="38" data-tip="Prefixes of 2 characters|walking the subtree: 19,194 nodes on average|reading the stored list: 3 nodes|61,249 requests in the simulation"/>
+<text class="ts end" x="138" y="154">3 characters</text>
+<rect class="bar mute" x="150" y="136" width="367.0" height="12" rx="2"/>
+<text class="ts" x="523.0" y="146">5,562</text>
+<rect class="bar " x="150" y="151" width="59.0" height="12" rx="2"/>
+<text class="ts" x="215.0" y="161">4</text>
+<rect class="hit" x="8" y="132" width="704" height="38" data-tip="Prefixes of 3 characters|walking the subtree: 5,562 nodes on average|reading the stored list: 4 nodes|51,526 requests in the simulation"/>
+<text class="ts end" x="138" y="196">4 characters</text>
+<rect class="bar mute" x="150" y="178" width="341.4" height="12" rx="2"/>
+<text class="ts" x="497.4" y="188">3,044</text>
+<rect class="bar " x="150" y="193" width="68.5" height="12" rx="2"/>
+<text class="ts" x="224.5" y="203">5</text>
+<rect class="hit" x="8" y="174" width="704" height="38" data-tip="Prefixes of 4 characters|walking the subtree: 3,044 nodes on average|reading the stored list: 5 nodes|34,307 requests in the simulation"/>
+<text class="ts end" x="138" y="238">5 characters</text>
+<rect class="bar mute" x="150" y="220" width="346.2" height="12" rx="2"/>
+<text class="ts" x="502.2" y="230">3,406</text>
+<rect class="bar " x="150" y="235" width="76.3" height="12" rx="2"/>
+<text class="ts" x="232.3" y="245">6</text>
+<rect class="hit" x="8" y="216" width="704" height="38" data-tip="Prefixes of 5 characters|walking the subtree: 3,406 nodes on average|reading the stored list: 6 nodes|24,686 requests in the simulation"/>
+<text class="ts end" x="138" y="280">6 characters</text>
+<rect class="bar mute" x="150" y="262" width="283.0" height="12" rx="2"/>
+<text class="ts" x="439.0" y="272">773</text>
+<rect class="bar " x="150" y="277" width="82.8" height="12" rx="2"/>
+<text class="ts" x="238.8" y="287">7</text>
+<rect class="hit" x="8" y="258" width="704" height="38" data-tip="Prefixes of 6 characters|walking the subtree: 773 nodes on average|reading the stored list: 7 nodes|17,801 requests in the simulation"/>
+<text class="ts" x="10" y="310">Logarithmic scale. Averages weighted by how often each prefix was requested.</text>
+</svg>
+</div>
+<figcaption>Measured on the chapter’s synthetic query log. The prefixes people type most are the shortest, and they are exactly the ones whose subtrees are largest.</figcaption>
+</figure>
+
+<p>The cost of walking the subtree is worst exactly where it matters most. A one-letter prefix has a subtree of tens of thousands of nodes, about 53,000 on average here, and one-letter prefixes were 32% of all requests. With stored lists, every lookup is two to seven node visits.</p>
+<p>The price is memory. The 100,000 queries, 12.6 characters long on average, made 586,460 nodes, 5.86 per query, and with five suggestions at every node, 736,366 stored entries. Most nodes have a single child: merging each chain of single-child nodes into one node, a radix tree, left 135,089 nodes, 1.35 per query, and only those need lists, since every prefix inside a chain has the same completions as the node at its end. Storing each suggestion as a 4-byte id into a table of query texts, rather than as the text itself, keeps the lists small. That is where the estimate of about 90 bytes per query came from.</p>
+<aside class="sn"><b>Other ways to store it</b>A hash table from every prefix to its list does the same job with a plain key-value store, at the cost of storing each prefix as a key; it is the easiest version to build in an interview. Search engines offer a compact form of the trie called a finite state transducer, which shares suffixes as well as prefixes: Elasticsearch’s completion suggester is built this way, and its documentation describes the structure as “entirely heap resident” and “optimized for speed”.</aside>
+
+<h2 id="freshness">Step 6b: Counting so that trends appear</h2>
+<p>The ranking is only as good as the counts. Counting every search since the service began makes the list stable and blind: a query searched a million times last year outranks one searched a hundred thousand times this morning. The usual answer is to let old searches count for less. With <dfn>exponential decay</dfn>, a count loses half its weight every fixed period, its half-life, so the score of a query is a sum in which recent searches dominate. It can be updated as each search arrives, by multiplying the stored count by the decay since its last update and adding one, which suits a streaming job.</p>
+<pre data-lang="ts" data-title="A decayed count needs two numbers per query">
+// Counts that lose half their weight every `halfLife` hours, updated as each search arrives.
+// Only the count and the time of its last update are kept for each query.
+export class DecayedCounts {
+  private readonly halfLife: number;
+  private readonly entries = new Map<string, { value: number; at: number }>();
+  constructor(halfLifeHours: number) {
+    this.halfLife = halfLifeHours;
+  }
+  add(query: string, at: number, weight = 1): void {
+    this.entries.set(query, { value: this.value(query, at) + weight, at });
+  }
+  value(query: string, now: number): number {
+    const e = this.entries.get(query);
+    return e ? e.value * 0.5 ** ((now - e.at) / this.halfLife) : 0;
+  }
+}
+</pre>
+<p>How the counting is done decides how soon a trend shows up and how long it stays. The chapter’s model takes one prefix with ten established queries and adds a new one that rises over three hours to twice the volume of the most popular, holds for a day, then halves every 12 hours.</p>
+
+<figure class="fig wide" id="fig-trend">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f875t f875d">
+<title id="f875t">Where a sudden trend ranks, hour by hour, under four ways of counting</title>
+<desc id="f875d">A new query rises to 10,000 searches an hour, twice the most popular established query under its prefix, holds for a day and then halves every 12 hours. Its rank among the five suggestions shown, from the hour it starts: All-time counts, rebuilt daily: never shown. Last 7 days, rebuilt daily: shown from hour 41 to hour 208. Last 7 days, rebuilt hourly: shown from hour 22 to hour 192. Decayed, half-life 1 day, hourly: shown from hour 6 to hour 113.</desc>
+<line class="grid" x1="110" y1="40" x2="670" y2="40"/>
+<text class="ts end" x="100" y="44">rank 1</text>
+<line class="grid" x1="110" y1="70" x2="670" y2="70"/>
+<text class="ts end" x="100" y="74">rank 2</text>
+<line class="grid" x1="110" y1="100" x2="670" y2="100"/>
+<text class="ts end" x="100" y="104">rank 3</text>
+<line class="grid" x1="110" y1="130" x2="670" y2="130"/>
+<text class="ts end" x="100" y="134">rank 4</text>
+<line class="grid" x1="110" y1="160" x2="670" y2="160"/>
+<text class="ts end" x="100" y="164">rank 5</text>
+<line class="grid" x1="110" y1="208" x2="670" y2="208"/>
+<text class="ts end" x="100" y="212">not shown</text>
+<text class="ts mid" x="110.0" y="236">0</text>
+<text class="ts mid" x="172.2" y="236">24</text>
+<text class="ts mid" x="234.4" y="236">48</text>
+<text class="ts mid" x="296.7" y="236">72</text>
+<text class="ts mid" x="358.9" y="236">96</text>
+<text class="ts mid" x="421.1" y="236">120</text>
+<text class="ts mid" x="483.3" y="236">144</text>
+<text class="ts mid" x="545.6" y="236">168</text>
+<text class="ts mid" x="607.8" y="236">192</text>
+<text class="ts mid" x="670.0" y="236">216</text>
+<text class="ts mid" x="390.0" y="256">hours since the trend began</text>
+<path class="line" style="stroke:var(--ink-3)" d="M110.0 210.0 L670.0 210.0"/>
+<text class="ts" x="415.9" y="200">all-time counts, daily: never shown</text>
+<path class="line" style="stroke:var(--async);stroke-dasharray:6 4" d="M110.0 206.0 L216.3 206.0 L216.3 98.0 L589.6 98.0 L589.6 128.0 L651.9 128.0 L651.9 206.0 L670.0 206.0"/>
+<path class="line" style="stroke:var(--async);stroke-dasharray:6 4" d="M426.3 116h18"/>
+<text class="ts" x="450.3" y="120">last 7 days, daily</text>
+<path class="line" style="stroke:var(--sig)" d="M110.0 210.0 L167.0 210.0 L167.0 162.0 L180.0 162.0 L180.0 132.0 L205.9 132.0 L205.9 102.0 L576.7 102.0 L576.7 132.0 L597.4 132.0 L597.4 162.0 L610.4 162.0 L610.4 210.0 L670.0 210.0"/>
+<path class="line" style="stroke:var(--sig)" d="M426.3 88h18"/>
+<text class="ts" x="450.3" y="92">last 7 days, hourly</text>
+<path class="line" style="stroke:var(--store)" d="M110.0 208.0 L125.6 208.0 L125.6 160.0 L128.1 160.0 L128.1 130.0 L133.3 130.0 L133.3 100.0 L146.3 100.0 L146.3 70.0 L177.4 70.0 L177.4 40.0 L250.0 40.0 L250.0 70.0 L314.8 70.0 L314.8 100.0 L356.3 100.0 L356.3 130.0 L384.8 130.0 L384.8 160.0 L405.6 160.0 L405.6 208.0 L670.0 208.0"/>
+<text class="ts" x="261.2" y="44">decayed, hourly</text>
+<rect class="hit" x="110" y="24" width="15.5556" height="196" data-tip="Hours 0 to 5|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: not shown|last 7 days, rebuilt hourly: not shown|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="125.556" y="24" width="15.5556" height="196" data-tip="Hours 6 to 11|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: not shown|last 7 days, rebuilt hourly: not shown|decayed, half-life 1 day, hourly: rank 5"/>
+<rect class="hit" x="141.111" y="24" width="15.5556" height="196" data-tip="Hours 12 to 17|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: not shown|last 7 days, rebuilt hourly: not shown|decayed, half-life 1 day, hourly: rank 3"/>
+<rect class="hit" x="156.667" y="24" width="15.5556" height="196" data-tip="Hours 18 to 23|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: not shown|last 7 days, rebuilt hourly: not shown|decayed, half-life 1 day, hourly: rank 2"/>
+<rect class="hit" x="172.222" y="24" width="15.5556" height="196" data-tip="Hours 24 to 29|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: not shown|last 7 days, rebuilt hourly: rank 5|decayed, half-life 1 day, hourly: rank 2"/>
+<rect class="hit" x="187.778" y="24" width="15.5556" height="196" data-tip="Hours 30 to 35|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: not shown|last 7 days, rebuilt hourly: rank 4|decayed, half-life 1 day, hourly: rank 1"/>
+<rect class="hit" x="203.333" y="24" width="15.5556" height="196" data-tip="Hours 36 to 41|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: not shown|last 7 days, rebuilt hourly: rank 4|decayed, half-life 1 day, hourly: rank 1"/>
+<rect class="hit" x="218.889" y="24" width="15.5556" height="196" data-tip="Hours 42 to 47|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 1"/>
+<rect class="hit" x="234.444" y="24" width="15.5556" height="196" data-tip="Hours 48 to 53|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 1"/>
+<rect class="hit" x="250" y="24" width="15.5556" height="196" data-tip="Hours 54 to 59|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 2"/>
+<rect class="hit" x="265.556" y="24" width="15.5556" height="196" data-tip="Hours 60 to 65|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 2"/>
+<rect class="hit" x="281.111" y="24" width="15.5556" height="196" data-tip="Hours 66 to 71|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 2"/>
+<rect class="hit" x="296.667" y="24" width="15.5556" height="196" data-tip="Hours 72 to 77|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 2"/>
+<rect class="hit" x="312.222" y="24" width="15.5556" height="196" data-tip="Hours 78 to 83|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 2"/>
+<rect class="hit" x="327.778" y="24" width="15.5556" height="196" data-tip="Hours 84 to 89|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 3"/>
+<rect class="hit" x="343.333" y="24" width="15.5556" height="196" data-tip="Hours 90 to 95|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 3"/>
+<rect class="hit" x="358.889" y="24" width="15.5556" height="196" data-tip="Hours 96 to 101|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 4"/>
+<rect class="hit" x="374.444" y="24" width="15.5556" height="196" data-tip="Hours 102 to 107|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 4"/>
+<rect class="hit" x="390" y="24" width="15.5556" height="196" data-tip="Hours 108 to 113|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: rank 5"/>
+<rect class="hit" x="405.556" y="24" width="15.5556" height="196" data-tip="Hours 114 to 119|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="421.111" y="24" width="15.5556" height="196" data-tip="Hours 120 to 125|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="436.667" y="24" width="15.5556" height="196" data-tip="Hours 126 to 131|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="452.222" y="24" width="15.5556" height="196" data-tip="Hours 132 to 137|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="467.778" y="24" width="15.5556" height="196" data-tip="Hours 138 to 143|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="483.333" y="24" width="15.5556" height="196" data-tip="Hours 144 to 149|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="498.889" y="24" width="15.5556" height="196" data-tip="Hours 150 to 155|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="514.444" y="24" width="15.5556" height="196" data-tip="Hours 156 to 161|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="530" y="24" width="15.5556" height="196" data-tip="Hours 162 to 167|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="545.556" y="24" width="15.5556" height="196" data-tip="Hours 168 to 173|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="561.111" y="24" width="15.5556" height="196" data-tip="Hours 174 to 179|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 3|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="576.667" y="24" width="15.5556" height="196" data-tip="Hours 180 to 185|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 3|last 7 days, rebuilt hourly: rank 4|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="592.222" y="24" width="15.5556" height="196" data-tip="Hours 186 to 191|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 4|last 7 days, rebuilt hourly: rank 4|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="607.778" y="24" width="15.5556" height="196" data-tip="Hours 192 to 197|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 4|last 7 days, rebuilt hourly: rank 5|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="623.333" y="24" width="15.5556" height="196" data-tip="Hours 198 to 203|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 4|last 7 days, rebuilt hourly: not shown|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="638.889" y="24" width="15.5556" height="196" data-tip="Hours 204 to 209|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: rank 4|last 7 days, rebuilt hourly: not shown|decayed, half-life 1 day, hourly: not shown"/>
+<rect class="hit" x="654.444" y="24" width="15.5556" height="196" data-tip="Hours 210 to 215|all-time counts, rebuilt daily: not shown|last 7 days, rebuilt daily: not shown|last 7 days, rebuilt hourly: not shown|decayed, half-life 1 day, hourly: not shown"/>
+</svg>
+</div>
+<figcaption>From the chapter’s model, with daily rebuilds at midnight and the trend starting at 7 in the morning. All-time counts never show it; a 7-day window shows it late and keeps it a week; decayed counts react within hours and let it go.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Counting</th><th>Rebuilt</th><th>First shown</th><th>Last shown</th><th>Best rank</th></tr></thead>
+<tbody>
+<tr><th>Every search ever</th><td>Daily</td><td>Never</td><td>Never</td><td>Not in the top five</td></tr>
+<tr><th>Searches in the last 7 days</th><td>Daily</td><td>Hour 41</td><td>Hour 208</td><td>3</td></tr>
+<tr><th>Searches in the last 7 days</th><td>Hourly</td><td>Hour 22</td><td>Hour 192</td><td>3</td></tr>
+<tr><th>Decayed, half-life of one day</th><td>Hourly</td><td>Hour 6</td><td>Hour 113</td><td>1</td></tr>
+</tbody>
+</table>
+<p>A window reacts late because the trend’s total must catch up with a week of the others’ totals, and then holds on for the rest of the week after interest has gone. Decay reacts within hours, ranks the trend first while it is at its peak, and lets go a few days after it fades. Rebuilding more often helps only as much as the counts allow. A design can go further with a separate fast path that detects queries rising sharply above their usual rate and boosts them, at the risk of amplifying something nobody should see, which is why the blocklist and human review sit on the same path.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Counting searches rather than people. One script repeating a query ten thousand times an hour would put it in everyone’s suggestions. Count distinct users per query and period, ignore traffic from clients already flagged as automated, and require a query to come from many users before it can be suggested at all. Requiring a minimum number of users also keeps rare queries, which may contain names or other private details, out of the index.</p></div>
+
+<h2 id="serving">Step 6c: Serving the short prefixes</h2>
+<p>In the simulation, queries were 10.7 characters long on average and users found the one they wanted among five suggestions after 3.1 characters, in 99.2% of searches. That makes the request stream lopsided: 32% of requests were for one-letter prefixes, 20% for two and 17% for three, and only 18,352 distinct prefixes were requested at all. Caching the 100 most requested prefixes would have answered 60% of requests, the 1,000 most requested 83%, and 10,000 answered 97%. A small cache at the edge, or in the browser for the first letter, absorbs most of the load. Real query logs have a longer tail than this model, so expect a lower hit rate, which is why the estimate assumed half.</p>
+<p>If the index outgrows one server’s memory, it must be split, and how matters. Splitting by first letter, all prefixes from a to c on one shard and so on, puts each hot one-letter prefix on one shard together with everything that starts with it: with eight shards, the busiest received 2.23 times the average load. Splitting by a hash of the whole prefix spreads them better, 1.58 times the average, because each prefix’s list is independent of every other’s (<x-ref to="partitioning#hash"></x-ref>). It cannot do better than that: a single prefix such as “s” cannot be split, so it needs replicas or a cache in front of it, the hot key problem of <x-ref to="partitioning#hot-keys"></x-ref>.</p>
+
+<h2 id="personal">Step 6d: Personal suggestions and filtering</h2>
+<p>The user’s own history is small, private and changes with every search, so it does not belong in the shared index. The suggestion service fetches the global list for the prefix, with more candidates than it will show, say twenty, and the user’s recent searches that start with the prefix, then ranks the combination with a boost for the user’s own and for the user’s location. Facebook described this split in 2010: an aggregator with no index of its own queries one service for global objects and one for the user’s own neighborhood in the social graph, while the browser prefetches the user’s friends and pages as soon as the search box gets focus.</p>
+<p>Filtering happens twice. The builder drops blocked queries so they never enter the index, and the suggestion service checks again at request time, because a pattern added to the blocklist must take effect in minutes, not at the next hourly build. The check at request time is a lookup in a small set, and it is the one place where the request path does more than read.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>An index server crashes</th><td>Nothing</td><td>Every server holds the whole index, so the load balancer sends lookups to the others</td></tr>
+<tr><th>The builder produces a broken or empty index</th><td>Bad or missing suggestions, everywhere</td><td>Servers refuse a version that fails checks (size, known queries present, no blocked terms), and keep the previous one; versions can be rolled back</td></tr>
+<tr><th>The counting job stops</th><td>Suggestions stop changing</td><td>The last index keeps serving. Freshness degrades, nothing breaks</td></tr>
+<tr><th>The whole suggestion service is down</th><td>No suggestions</td><td>The search box works without them; the browser gives up after its time budget</td></tr>
+<tr><th>An offensive suggestion gets through</th><td>A screenshot in the news</td><td>Request-time blocklist, a report endpoint, and review that also removes variations</td></tr>
+<tr><th>Someone floods a query to promote it</th><td>A suggestion nobody searched for</td><td>Counting distinct users, ignoring automated traffic, a minimum number of users per query</td></tr>
+</tbody>
+</table>
+<p><b>At ten times the scale</b>, 10 billion searches a day, the peak reaches about 1.7 million lookups a second and 870,000 reach the servers at the same cache rate: more replicas, not a different design. The index grows with distinct queries rather than with traffic, and a billion of them, about 90 GB, still fits in a large server’s memory or splits by hash across a few. One index per language and region keeps each smaller. <b>At a hundred times</b>, the edge cache carries more of the load and the counting pipeline becomes a large streaming system in its own right, sharded by query (<x-ref to="hld-ad-click-aggregation"></x-ref> counts events at that scale).</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Google</b> explained in October 2020 that its predictions “reflect searches that have been done on Google”, starting from common and trending queries that match what was typed, shaped by language and location, with freshness able to lift a rising topic above more common ones. Automated systems try to block predictions that are violent, sexually explicit, hateful, disparaging or dangerous, and enforcement teams remove those that get through, often with closely related variations.</li>
+  <li><b>Facebook’s typeahead</b>, described in May 2010, prefetched the user’s friends, pages, groups, applications and events to the browser as soon as the search box was focused, and sent other prefixes to a stateless aggregator that queried a global service and a social-graph service in parallel. The post notes that spending more than 100 milliseconds on a result makes the typeahead “stutter”.</li>
+  <li><b>Elasticsearch’s completion suggester</b>, as documented in 2026, keeps its lookup structures in memory, describes the completion index as “entirely heap resident” and itself as “optimized for speed”, and supports a weight for ranking each suggestion and contexts for filtering.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Tolerate typos</th><td>Look up prefixes within one edit of what was typed as well, with a penalty in ranking; or a fuzzy automaton over the index</td><td>Precomputed lists for exact prefixes</td></tr>
+<tr><th>Match words in the middle (“york” finds “new york”)</th><td>Index every word start of every query, not only the beginning</td><td>The trie, now with more entries</td></tr>
+<tr><th>Suggest products or people, not queries</th><td>The scores come from sales or connections; the index includes ids for display</td><td>The two paths</td></tr>
+<tr><th>Suggestions updated within minutes</th><td>A fast path for rising queries merged with the hourly index at request time</td><td>The full rebuild for everything else</td></tr>
+<tr><th>Hundreds of languages and regions</th><td>One index per language and region, loaded where it is needed</td><td>The structure of each</td></tr>
+<tr><th>Measure whether suggestions help</th><td>Log which suggestion was shown and picked; run experiments on ranking</td><td>The lookup</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Five minutes on requirements, then estimates that end with “the index fits in memory, so replicate it”. Draw the two paths early and say that the request path only reads. Spend the deep dive on the trie with stored lists, giving the lookup cost before and after, then on counting with decay and how often to rebuild. Mention debouncing, the edge cache for short prefixes, and stale responses in one breath each; finish with filtering, which interviewers often ask about.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Querying the search index or a database with a prefix match on every keystroke</th><td>Latency and load grow with the data; one-letter prefixes match millions of rows</td><td>A precomputed list per prefix, in memory</td></tr>
+<tr><th>Walking the trie’s subtree at request time</th><td>About 53,000 node visits for a one-letter prefix in the test</td><td>Store the best <i>k</i> at every node when building</td></tr>
+<tr><th>Ranking by all-time counts</th><td>Trends never appear</td><td>Decayed counts, or a recent window, rebuilt often</td></tr>
+<tr><th>Updating the live index in place</th><td>Locks on the hot path; a bad update is hard to undo</td><td>Build a new version, switch to it, keep the old one</td></tr>
+<tr><th>Caching personal suggestions in a shared cache</th><td>One user’s history shown to another</td><td>Public lists cached, personal ones fetched privately</td></tr>
+<tr><th>Sharding by first letter</th><td>The busiest shard at over twice the average in the test</td><td>Replicate if it fits; otherwise hash the prefix, and cache the hottest</td></tr>
+<tr><th>Showing whichever answer arrives last</th><td>Suggestions for an earlier prefix replace the right ones</td><td>Number requests and drop older answers</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="search-systems"></x-ref>: the search engine behind the box, and why its index is the wrong tool for prefixes.</li>
+  <li><x-ref to="batch-and-stream-processing#windows"></x-ref>: counting in windows, as the data path does.</li>
+  <li><x-ref to="caching"></x-ref> and <x-ref to="cdn-and-edge"></x-ref>: where the short prefixes are answered.</li>
+  <li><x-ref to="partitioning#hot-keys"></x-ref>: the hot prefix that no split can divide.</li>
+  <li><x-ref to="probabilistic-structures#topk"></x-ref>: finding the most frequent items in a stream with bounded memory.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Split the design into a request path that only reads and a data path that counts, ranks, filters and builds, on a schedule of hours.</li>
+  <li>Store the best completions at every trie node. A lookup becomes one step per character: 2 node visits instead of about 53,000 for a one-letter prefix in the test.</li>
+  <li>Merge single-child chains and store ids, not texts: about 1.35 nodes and 90 bytes per query, so a large index fits in memory and is replicated, not sharded.</li>
+  <li>Count with decay. All-time counts never showed a sudden trend; a one-day half-life showed it within 6 hours and let it go within days.</li>
+  <li>Short prefixes are most of the traffic and are the same for everyone: cache them at the edge and in the browser.</li>
+  <li>Keep personal suggestions out of shared caches, count people rather than searches, and filter both when building and when serving.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why is finding the trie node for a prefix not enough to answer a lookup quickly?</summary><p>The node only marks where the completions are. They are spread through its subtree, which for a short prefix holds a large share of all queries, so finding the best ones means visiting and sorting all of them. Storing the best k at each node when the index is built moves that work out of the request.</p></details>
+<details><summary>Why does a radix tree need lists only at its nodes, not at every character?</summary><p>A chain of single-child nodes has exactly one way to continue, so every prefix inside the chain has the same set of completions as the node at the end of the chain. One list serves them all.</p></details>
+<details><summary>A query spikes this morning. Why does ranking by all-time counts never suggest it?</summary><p>Its few hours of searches are compared with years of searches for established queries. Even at twice their hourly rate, it cannot catch up with their totals before interest fades.</p></details>
+<details><summary>How can a decayed count be updated as each search arrives, without keeping the history?</summary><p>Store the count and the time it was last updated. On a new search, multiply the stored count by one half raised to the time elapsed divided by the half-life, add one, and store the new time.</p></details>
+<details><summary>Why is a one-letter prefix a problem for sharding, and what solves it?</summary><p>All requests for that prefix go to whichever shard holds it, and no way of splitting can divide a single key. Splitting by hash spreads different prefixes evenly but not one hot prefix. Replicas of the shard, or caching that prefix’s answer at the edge and in the browser, carry its load.</p></details>
+<details><summary>The answer for “we” arrives after the answer for “wea”. What should the browser do and how does it know?</summary><p>Drop it. Each request carries an increasing sequence number that the answer echoes, and the browser shows an answer only if its number is higher than the one on screen.</p></details>
+<details><summary>Why must the blocklist be applied at request time as well as when the index is built?</summary><p>Because the index is rebuilt every hour or so, and a newly harmful suggestion must disappear in minutes. The request-time check is a small set lookup, cheap enough for every request.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Danny Sullivan, <a href="https://blog.google/products/search/how-google-autocomplete-predictions-work/">How Google autocomplete predictions work</a>, Google, 8 October 2020. Where predictions come from, and the policies for removing them.</li>
+  <li>Keith Adams, <a href="https://engineering.fb.com/2010/05/17/web/the-life-of-a-typeahead-query/">The Life of a Typeahead Query</a>, Engineering at Meta, 17 May 2010. Prefetching to the browser, an aggregator, and global and social-graph services.</li>
+  <li>Elastic, <a href="https://www.elastic.co/docs/reference/elasticsearch/rest-apis/search-suggesters">Suggesters: completion suggester</a>, Elasticsearch reference, accessed October 2026. An in-memory prefix suggester with weights and contexts.</li>
+  <li>NIST, <a href="https://xlinux.nist.gov/dads/HTML/trie.html">trie</a>, Dictionary of Algorithms and Data Structures. The definition, and Edward Fredkin, “Trie Memory”, <cite>Communications of the ACM</cite> 3(9), 1960.</li>
+</ol>
+</section>

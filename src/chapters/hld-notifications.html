@@ -1,0 +1,657 @@
+<!--meta
+{ "description": "A notification system designed with the method of chapter 76: requirements and estimates for a billion notifications a day over push, email and SMS, an idempotent API, preferences, quiet hours and caps, queues by channel and priority, where duplicates come from and what removes them, campaigns that cannot delay a security code, retries and a circuit breaker when a provider fails, all measured by simulation, and what APNs, FCM and LinkedIn document.",
+  "lede": "Every product ends up sending notifications: codes, receipts, alerts, reminders, offers. A shared service for them must send a billion a day through providers it does not control, never lose a security code behind a marketing campaign, respect what each user asked for, and not send the same message twice, although every layer below it retries.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a notification service. Other services ask it to tell a user something: a login code, an order update, a new follower, a weekly offer. It delivers by push notification, email or SMS, as the user prefers, and the marketing team can send a campaign to millions of users at once.</p></div>
+<p>The service does not deliver anything itself. It hands each notification to a provider, such as Apple’s or Google’s push service, an SMS gateway or an email service, and those providers are best effort, rate limited and sometimes down. Between the requesting service and the provider sit several layers, each of which may retry, so the same notification can arrive twice. And the traffic is lumpy: a campaign of 50 million lands at once, while a login code queued behind it is useless after a few minutes. <x-ref to="realtime-communication#push"></x-ref> gave the rule for push, treat it as a tap on the shoulder, and this chapter builds the service around it. The method of <x-ref to="hld-method"></x-ref> takes these in order.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<p>The questions that change this design are which channels, how urgent the most urgent notification is, what may be sent twice, and how large a campaign can be. With the answers written down:</p>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>An API for other services: send a template to a user, with data</th><td>In scope</td></tr>
+<tr><th>Channels: push to phones and browsers, email, SMS, and an inbox inside the app</th><td>In scope</td></tr>
+<tr><th>Preferences per category and channel, quiet hours, a daily cap, unsubscribing</th><td>In scope</td></tr>
+<tr><th>Campaigns to a segment of users, spread over a time window</th><td>In scope</td></tr>
+<tr><th>The status of each notification, and removing dead device tokens</th><td>In scope</td></tr>
+<tr><th>Running mail servers, writing the content, A/B tests, analytics dashboards</th><td>Out of scope. Mail servers are <x-ref to="hld-email"></x-ref></td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>200 million users, 5 notifications each a day on average, so a billion a day. Campaigns and large events bring peaks of five times the average</td></tr>
+<tr><th>Latency</th><td>Critical notifications, such as login codes and security alerts, handed to the provider within 2 seconds, 99% of the time. Normal ones within 30 seconds. Campaigns within their window</td></tr>
+<tr><th>Delivery</th><td>A critical or transactional notification accepted by the API is never lost before its expiry. A marketing one may be dropped rather than sent twice</td></tr>
+<tr><th>Duplicates</th><td>None visible for push. For email and SMS, only where a missing notification would be worse, such as a login code</td></tr>
+<tr><th>Availability</th><td>99.99% for the API. A provider failing delays notifications but loses none</td></tr>
+<tr><th>Respect</th><td>Preferences and opt-outs are checked when sending, not when the request arrived</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">total      200 million × 5 = 1 billion a day ≈ 11,600 a second       peak × 5 ≈ 58,000
+push       80% of them ≈ 46,000 a second at peak
+email      15% ≈ 8,700 a second at peak
+SMS        1% = 10 million a day; at an assumed $0.01 each, $100,000 a day
+dedup      a billion keys × 100 bytes = 100 GB for a day of keys
+log        a billion × 500 bytes = 500 GB a day; 30 days ≈ 15 TB
+campaign   50 million at 20,000 a second ≈ 42 minutes</div>
+<p>The channel shares, the SMS price and the sizes are assumptions; replace the price with your provider’s. The arithmetic is that of <x-ref to="estimation#method"></x-ref>, and each line decides something.</p>
+<table>
+<thead><tr><th>The number</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><th>58,000 a second at peak</th><td>A fleet of senders behind queues; the API only accepts and records</td></tr>
+<tr><th>$100,000 a day of SMS</th><td>SMS is kept for what must arrive even without the app: codes and security alerts</td></tr>
+<tr><th>100 GB of dedup keys</th><td>A day of keys fits in the memory of a small partitioned cluster, with each key expiring after a day</td></tr>
+<tr><th>42 minutes for a campaign</th><td>Campaigns are throttled and run in their own queues, below everything else</td></tr>
+</tbody>
+</table>
+
+<div class="widget wide" data-widget="notify83">
+<h4>Volume by channel, SMS cost and campaign time</h4>
+<p>Recomputes step 2.</p>
+<div class="controls">
+  <label>Users<input type="number" name="users" value="200000000" min="1" max="10000000000" step="1000000"></label>
+  <label>Notifications per user a day<input type="number" name="each" value="5" min="0" max="1000" step="0.5"></label>
+  <label>Push (%)<input type="number" name="push" value="80" min="0" max="100" step="1"></label>
+  <label>Email (%)<input type="number" name="email" value="15" min="0" max="100" step="1"></label>
+  <label>SMS (%)<input type="number" name="sms" value="1" min="0" max="100" step="0.5"></label>
+  <label>Peak factor<input type="number" name="peak" value="5" min="1" max="100" step="0.5"></label>
+  <label>Price of one SMS ($)<input type="number" name="price" value="0.01" min="0" max="10" step="0.001"></label>
+  <label>Campaign size<input type="number" name="campaign" value="50000000" min="0" max="10000000000" step="1000000"></label>
+  <label>Campaign sends a second<input type="number" name="rate" value="20000" min="1" max="100000000" step="1000"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 160" role="img" aria-label="Bars of notifications a day by channel, push, email, SMS and in-app only, with the daily cost of SMS."><text x="10" y="16" class="ts">Notifications a day by channel, and what SMS costs</text><text x="100" y="42" class="ts end">Push</text><rect x="110" y="28" width="320" height="18" rx="2" class="bar"></rect><text x="438" y="42" class="ts tb">800 million</text><text x="100" y="70" class="ts end">Email</text><rect x="110" y="56" width="60" height="18" rx="2" class="bar store"></rect><text x="178" y="70" class="ts tb">150 million</text><text x="100" y="98" class="ts end">SMS</text><rect x="110" y="84" width="4" height="18" rx="2" class="bar fault"></rect><text x="122" y="98" class="ts tb">10 million, $100 thousand</text><text x="100" y="126" class="ts end">In-app only</text><rect x="110" y="112" width="16" height="18" rx="2" class="bar mute"></rect><text x="134" y="126" class="ts tb">40 million</text><text x="10" y="150" class="ts">Bars are shares of all notifications; the SMS price is an assumption to replace with your own.</text></svg>
+<dl class="results">
+  <div><dt>All notifications</dt><dd data-out="total">11.6 thousand /s, peak 57.9 thousand /s</dd></div>
+  <div><dt>Push</dt><dd data-out="push">46.3 thousand /s at peak</dd></div>
+  <div><dt>Email</dt><dd data-out="email">8,681 /s at peak</dd></div>
+  <div><dt>SMS</dt><dd data-out="sms">579 /s at peak, 10 million a day</dd></div>
+  <div><dt>SMS cost</dt><dd data-out="cost">$100 thousand a day</dd></div>
+  <div><dt>Dedup keys in memory</dt><dd data-out="keys">100 GB for a day of keys</dd></div>
+  <div><dt>One campaign</dt><dd data-out="campaign">41.7 min</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">1 billion notifications a day is 11.6 thousand a second, 57.9 thousand at peak. SMS, at 1% of notifications, costs $100 thousand a day, so it is kept for what cannot wait or fail. A campaign of 50 million at 20 thousand a second takes 41.7 min.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Send one notification">
+POST /v1/notifications
+Authorization: Bearer …
+Idempotency-Key: order-81723-shipped
+Content-Type: application/json
+
+{ "user": "u_41", "template": "order_shipped", "category": "orders", "priority": "normal",
+  "data": { "order": "81723" }, "expiresAt": "2026-10-14T08:00:00Z" }
+
+HTTP/1.1 202 Accepted
+{ "id": "n_7c41", "status": "queued" }
+</pre>
+<pre data-lang="http" data-title="Campaigns, status, preferences and devices">
+POST /v1/campaigns  { "template": "autumn_offer", "segment": "s_17", "window": ["09:00", "20:00"], "perSecond": 20000 }
+                    → 202 Accepted
+GET  /v1/notifications/n_7c41   → 200 OK  { "push": "sent", "email": "skipped: preference" }
+PUT  /v1/users/u_41/preferences → 204     { "orders": ["push", "email"], "marketing": [],
+                                            "quietHours": ["22:00", "07:00"], "timeZone": "Asia/Dhaka" }
+POST /v1/users/u_41/devices     → 201     { "token": "…", "platform": "ios" }
+</pre>
+<ul>
+  <li><b>Retries.</b> The idempotency key is chosen by the caller from the event that caused the notification, such as the order’s shipping event. A repeated request with the same key returns the first answer and sends nothing (<x-ref to="api-styles#idempotency-keys"></x-ref>).</li>
+  <li><b>202, not 200.</b> The API accepts the request and records it; sending happens later. The status endpoint reports what happened on each channel.</li>
+  <li><b>Expiry and priority.</b> A login code expires in minutes and is critical; an offer can wait for the morning. Both are part of the request because both change how it is sent.</li>
+  <li><b>Errors.</b> 400 for an unknown template or missing data, 404 for an unknown user, 429 for a caller over its quota (<x-ref to="hld-rate-limiter"></x-ref>). Results from providers come back by webhook, signed and checked (<x-ref to="realtime-communication#webhooks"></x-ref>).</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>An idempotency key and its state: sending or sent</th><td>The key</td><td>An in-memory store with expiry, partitioned by key</td><td>One atomic set-if-absent per request; a day of keys is 100 GB</td></tr>
+<tr><th>A notification and its status per channel</th><td>User, then time</td><td>A wide-column store, kept 30 days</td><td>Written several times as it moves; read by user for the in-app inbox (<x-ref to="data-models#wide-column"></x-ref>)</td></tr>
+<tr><th>Preferences, quiet hours, time zone</th><td>User</td><td>A key-value store with a cache in front</td><td>Read for every notification, changed rarely (<x-ref to="caching"></x-ref>)</td></tr>
+<tr><th>Device tokens</th><td>User, then device</td><td>A relational table</td><td>Added on install, removed when a provider says a token is dead</td></tr>
+<tr><th>Templates, by language and version</th><td>Template and version</td><td>A relational table, cached in every router</td><td>Small, edited by people, read constantly</td></tr>
+<tr><th>Today’s count per user and category</th><td>User and day</td><td>The in-memory store, expiring daily</td><td>For the daily cap</td></tr>
+<tr><th>Requests and items to send</th><td>None</td><td>A log and queues (<x-ref to="event-streaming"></x-ref>, <x-ref to="message-queues"></x-ref>)</td><td>Accepted work that must survive crashes</td></tr>
+</tbody>
+</table>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 392" role="img" aria-labelledby="f831t f831d">
+<title id="f831t">The design of the notification system</title>
+<desc id="f831d">Services call the notification API, which claims the request’s idempotency key in a store of dedup keys and writes the request to an intake log. Routers read the log, check the user’s preferences, caps and quiet hours, render the template, and put one item per channel into queues by channel and priority. Senders take items from the queues and call the providers, putting failed items back in the queues after a delay. Providers deliver to users’ devices and report results, which a status updater writes to the notification log; it also removes device tokens that the providers say are dead.</desc>
+<rect class="n" x="10" y="30" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="51">Services</text>
+<text class="ts mid" x="60" y="68">orders, security</text>
+<rect class="n sig" x="134" y="30" width="110" height="50" rx="6"/>
+<text class="tb mid" x="189" y="51">API</text>
+<text class="ts mid" x="189" y="68">checks the key</text>
+<rect class="n async" x="268" y="30" width="110" height="50" rx="6"/>
+<text class="tb mid" x="323" y="51">Intake log</text>
+<text class="ts mid" x="323" y="68">every request</text>
+<rect class="n async" x="402" y="30" width="140" height="50" rx="6"/>
+<text class="tb mid" x="472" y="51">Routers</text>
+<text class="ts mid" x="472" y="68">preferences, caps</text>
+<rect class="n async" x="566" y="30" width="144" height="50" rx="6"/>
+<text class="tb mid" x="638" y="51">Channel queues</text>
+<text class="ts mid" x="638" y="68">by priority</text>
+<path class="e sig" d="M110 55H134"/>
+<path class="e sig" d="M244 55H268"/>
+<path class="e async" d="M378 55H402"/>
+<path class="e async" d="M542 55H566"/>
+<rect class="n store" x="134" y="130" width="110" height="46" rx="6"/>
+<text class="tb mid" x="189" y="149">Dedup keys</text>
+<text class="ts mid" x="189" y="166">kept a day</text>
+<path class="e sig" d="M189 80V130"/>
+<rect class="n store" x="402" y="130" width="140" height="46" rx="6"/>
+<text class="tb mid" x="472" y="149">Preferences</text>
+<text class="ts mid" x="472" y="166">and device tokens</text>
+<path class="e async" d="M472 80V130"/>
+<rect class="n async" x="566" y="130" width="144" height="46" rx="6"/>
+<text class="tb mid" x="638" y="149">Senders</text>
+<text class="ts mid" x="638" y="166">push, SMS, email</text>
+<path class="e async" d="M610 80V130"/>
+<path class="e async" d="M690 130V80"/>
+<text class="ts end" x="684" y="109">retry later</text>
+<rect class="n" x="566" y="230" width="144" height="46" rx="6"/>
+<text class="tb mid" x="638" y="249">Providers</text>
+<text class="ts mid" x="638" y="266">APNs, FCM, SMS, email</text>
+<path class="e sig" d="M638 176V230"/>
+<rect class="n" x="566" y="330" width="144" height="46" rx="6"/>
+<text class="tb mid" x="638" y="349">Users’ devices</text>
+<text class="ts mid" x="638" y="366">and inboxes</text>
+<path class="e" d="M638 276V330"/>
+<rect class="n async" x="402" y="230" width="140" height="46" rx="6"/>
+<text class="tb mid" x="472" y="249">Status updater</text>
+<text class="ts mid" x="472" y="266">results and webhooks</text>
+<path class="e async" d="M566 253H542"/>
+<path class="e async" d="M472 230V176"/>
+<text class="ts" x="478" y="207">dead tokens</text>
+<rect class="n store" x="402" y="330" width="140" height="46" rx="6"/>
+<text class="tb mid" x="472" y="349">Notification log</text>
+<text class="ts mid" x="472" y="366">the status of each</text>
+<path class="e async" d="M472 276V330"/>
+<text class="ts" x="10" y="230">Solid: the request path, up to the</text>
+<text class="ts" x="10" y="246">API’s answer, and each call to a provider.</text>
+<text class="ts" x="10" y="270">Dashed: work done later, in order</text>
+<text class="ts" x="10" y="286">of priority.</text>
+</svg>
+</div>
+<figcaption>The API answers once the request is safely in the intake log. Deciding, rendering and sending happen afterward, in queues that keep each channel and priority apart.</figcaption>
+</figure>
+
+<p>The API does two things before answering: it claims the idempotency key and appends the request to a durable log. Everything else is routers and senders reading queues. The routers decide: is this category allowed on this channel for this user, is it quiet hours where the user is, has the user reached today’s cap for this category, and in which language should the template be rendered. A <dfn>frequency cap</dfn> is a limit on how many notifications of a kind one user receives in a period, such as three marketing notifications a day. <dfn>Quiet hours</dfn> are the hours in the user’s own time zone during which only critical notifications are sent; others wait in a delayed queue until the morning (<x-ref to="message-queues#delayed"></x-ref>). Checking these when sending, not when the request arrived, means a user who opts out at 9:00 receives nothing queued at 8:59.</p>
+<p>A <dfn>transactional notification</dfn> is one caused by the user’s own activity or account, such as a code or a receipt, as opposed to a marketing notification sent to many users at once. The two differ in urgency, in what may be sent twice and in the law: in many countries marketing needs consent and an easy unsubscribe. So the router gives each notification a priority from its category, and every channel has a queue per priority.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 590" role="img" aria-labelledby="f832t f832d">
+<title id="f832t">One notification, and a retry made while unsure</title>
+<desc id="f832d">Two sequences. One notification: the order service posts a notification with an idempotency key; the API claims the key and answers 202; a router checks Ben’s preferences, renders the template and queues a push; the push sender calls APNs with a collapse id, marks the key as sent, and the phone shows the notification. A retry while unsure: the sender’s call reaches APNs, which delivers it, but the answer is lost; after a timeout the sender sends again with the same collapse id; the phone replaces the first notification with the second instead of showing two; the key is marked as sent.</desc>
+<text class="tb" x="10" y="16">One notification</text>
+<g data-scene="one">
+<text class="tb mid" x="50" y="40">Order service</text>
+<line class="axis" x1="50" y1="48" x2="50" y2="318"/>
+<text class="tb mid" x="160" y="40">API</text>
+<line class="axis" x1="160" y1="48" x2="160" y2="318"/>
+<text class="tb mid" x="262" y="40">Dedup keys</text>
+<line class="axis" x1="262" y1="48" x2="262" y2="318"/>
+<text class="tb mid" x="366" y="40">Router</text>
+<line class="axis" x1="366" y1="48" x2="366" y2="318"/>
+<text class="tb mid" x="470" y="40">Push sender</text>
+<line class="axis" x1="470" y1="48" x2="470" y2="318"/>
+<text class="tb mid" x="574" y="40">APNs</text>
+<line class="axis" x1="574" y1="48" x2="574" y2="318"/>
+<text class="tb mid" x="668" y="40">Ben’s phone</text>
+<line class="axis" x1="668" y1="48" x2="668" y2="318"/>
+<g data-s="1">
+<path class="e sig" d="M51 72H159"/>
+<text class="ts mid" x="105.0" y="66">1. POST, key order-81723</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M161 99H261"/>
+<text class="ts mid" x="211.0" y="93">2. claim order-81723</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M159 126H51"/>
+<text class="ts mid" x="105.0" y="120">3. 202 Accepted</text>
+</g>
+<g data-s="4">
+<path class="e async" d="M161 153H365"/>
+<text class="ts mid" x="263.0" y="147">4. request, from the log</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n async" x="247" y="166" width="238" height="22" rx="4"/>
+<text class="ts mid" x="366" y="181">5. push allowed, not quiet hours, under cap</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M367 207H469"/>
+<text class="ts mid" x="418.0" y="201">6. push, normal priority</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M471 234H573"/>
+<text class="ts mid" x="522.0" y="228">7. POST, collapse id order-81723</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M469 261H263"/>
+<text class="ts mid" x="366.0" y="255">8. mark sent</text>
+</g>
+<g data-s="9">
+<path class="e" d="M575 288H667"/>
+<text class="ts mid" x="621.0" y="282">9. “Your order has shipped”</text>
+</g>
+</g>
+<path class="e none dash" d="M10 332H710"/>
+<text class="tb" x="10" y="354">A retry while unsure</text>
+<g data-scene="unsure">
+<text class="tb mid" x="80" y="378">Push sender</text>
+<line class="axis" x1="80" y1="386" x2="80" y2="584"/>
+<text class="tb mid" x="250" y="378">Dedup keys</text>
+<line class="axis" x1="250" y1="386" x2="250" y2="584"/>
+<text class="tb mid" x="440" y="378">APNs</text>
+<line class="axis" x1="440" y1="386" x2="440" y2="584"/>
+<text class="tb mid" x="630" y="378">Ben’s phone</text>
+<line class="axis" x1="630" y1="386" x2="630" y2="584"/>
+<g data-s="1">
+<path class="e sig" d="M81 406H439"/>
+<text class="ts mid" x="260.0" y="400">1. POST, collapse id order-81723</text>
+</g>
+<g data-s="2">
+<path class="e" d="M441 431H629"/>
+<text class="ts mid" x="535.0" y="425">2. alert</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M439 456H202.4"/>
+<path class="x" d="M187.4 449l14 14M201.4 449l-14 14"/>
+<text class="ts mid" x="321.2" y="450">3. 200</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n fault" x="88" y="467" width="152.2" height="22" rx="4"/>
+<text class="ts mid" x="164.1" y="482">4. no answer after 5 s</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M81 506H439"/>
+<text class="ts mid" x="260.0" y="500">5. retry, same collapse id</text>
+</g>
+<g data-s="6">
+<path class="e" d="M441 531H629"/>
+<text class="ts mid" x="535.0" y="525">6. alert, same collapse id</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M81 556H249"/>
+<text class="ts mid" x="165.0" y="550">7. mark sent</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="one" data-label="One">
+  <li data-msg="POST" data-state="Key order-81723: free; Ben’s phone shows: nothing">The order service asks for a “shipped” notification for Ben, with the order’s event as its idempotency key.</li>
+  <li data-msg="claim" data-state="Key order-81723: sending; Ben’s phone shows: nothing">The API claims the key with an atomic set-if-absent. A second request with this key would stop here.</li>
+  <li data-msg="202" data-state="Key order-81723: sending; Ben’s phone shows: nothing">It writes the request to the intake log and answers. The order service is done.</li>
+  <li data-msg="request" data-state="Key order-81723: sending; Ben’s phone shows: nothing">A router reads the request from the intake log.</li>
+  <li data-msg="none" data-state="Key order-81723: sending; Ben’s phone shows: nothing">Ben allows order updates by push, it is daytime where he is, and he is under his daily cap. The router renders the text in his language.</li>
+  <li data-msg="push" data-state="Key order-81723: sending; Ben’s phone shows: nothing">It queues one push for each of Ben’s devices, in the normal-priority push queue.</li>
+  <li data-msg="POST" data-state="Key order-81723: sending; Ben’s phone shows: nothing">The sender calls APNs over HTTP/2, with the key as the collapse id.</li>
+  <li data-msg="sent" data-state="Key order-81723: sent; Ben’s phone shows: nothing">APNs answers 200, and the sender records the key as sent.</li>
+  <li data-msg="alert" data-state="Key order-81723: sent; Ben’s phone shows: one notification">APNs delivers it when the phone is reachable. Delivery is best effort, which is why the app also shows it in its own inbox.</li>
+</ol>
+<ol class="steps" data-scene="unsure" data-label="Unsure">
+  <li data-msg="POST" data-state="Key order-81723: sending; Ben’s phone shows: nothing">The sender calls APNs. The request arrives.</li>
+  <li data-msg="alert" data-state="Key order-81723: sending; Ben’s phone shows: one notification">APNs delivers the notification to Ben’s phone, as it normally would.</li>
+  <li data-msg="200" data-state="Key order-81723: sending; Ben’s phone shows: one notification">The answer is lost on the way back.</li>
+  <li data-msg="none" data-state="Key order-81723: sending; Ben’s phone shows: one notification">The sender cannot tell whether APNs sent it. The key still says “sending”.</li>
+  <li data-msg="POST" data-state="Key order-81723: sending; Ben’s phone shows: one notification">For a push, sending again is safe, so it does, with the same collapse id.</li>
+  <li data-msg="alert" data-state="Key order-81723: sending; Ben’s phone shows: one notification">The phone merges notifications with the same collapse id, so Ben still sees one.</li>
+  <li data-msg="sent" data-state="Key order-81723: sent; Ben’s phone shows: one notification">This time the 200 arrives, and the key is marked as sent.</li>
+</ol>
+<figcaption>The key stops repeated requests before any work is done. A send whose outcome is unknown is repeated, and the collapse id turns the possible duplicate into a replacement.</figcaption>
+</figure>
+
+<p>The flows show two kinds of protection. A <dfn>collapse key</dfn> is an identifier sent with a notification so that a device, or the provider holding notifications for it, shows only one of several notifications that carry it; APNs calls it <code>apns-collapse-id</code> and FCM <code>collapse_key</code>. The idempotency key stops a request that has already been accepted, before any work. The collapse key stops a send that may already have reached the phone, after the provider may have acted.</p>
+
+<h2 id="dedup">Step 6a: Duplicates, and what removes them</h2>
+<p>Exactly-once delivery is not on offer (<x-ref to="idempotency-and-delivery#guarantees"></x-ref>), and a notification crosses several layers that each deliver at least once. The simulation sent a million notifications through a pipeline with typical faults: 2% of producers call again because an answer was lost, the log hands 0.5% of messages to a second worker, the provider fails 3% of calls outright and leaves 1% unanswered, having sent half of those, and one worker in 2,000 dies after the provider accepted a notification but before recording it.</p>
+
+<figure class="fig wide" id="fig-dupes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 286" role="img" aria-labelledby="f833t f833d">
+<title id="f833t">Where a notification gets sent twice</title>
+<desc id="f833d">A pipeline of five stages: producer, API, intake log, worker and provider, ending at the user. Three places can make a second copy. A producer whose answer was lost calls again, and a log can hand a message to two workers: with retries and no idempotency key, these upstream copies caused 24,775 extra notifications per million. A worker can die after the provider accepted, before recording it: 567 per million. A provider can fail to answer after sending: 5,560 per million. The key removes the first kind; for the others the sender must choose between a possible duplicate and a possible loss.</desc>
+<rect class="n" x="10" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="65" y="67.5">Producer</text>
+<rect class="n" x="150" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="205" y="67.5">API</text>
+<rect class="n store" x="290" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="345" y="67.5">Intake log</text>
+<rect class="n" x="430" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="485" y="67.5">Worker</text>
+<rect class="n" x="570" y="40" width="110" height="46" rx="6"/>
+<text class="tb mid" x="625" y="67.5">Provider</text>
+<path class="e sig" d="M120 63H150"/>
+<path class="e sig" d="M260 63H290"/>
+<path class="e sig" d="M400 63H430"/>
+<path class="e sig" d="M540 63H570"/>
+<text class="tb" x="10" y="22">Extra notifications per million, with retries and no idempotency key, measured</text>
+<circle class="n fault" cx="135" cy="63" r="10"/>
+<text class="ts mid tb" x="135" y="67">1</text>
+<circle class="n fault" cx="415" cy="63" r="10"/>
+<text class="ts mid tb" x="415" y="67">1</text>
+<circle class="n fault" cx="485" cy="104" r="10"/>
+<text class="ts mid tb" x="485" y="108">2</text>
+<circle class="n fault" cx="555" cy="63" r="10"/>
+<text class="ts mid tb" x="555" y="67">3</text>
+<rect class="n sunk" x="10" y="132" width="330" height="28" rx="0"/>
+<text class="ts tb" x="17" y="150">Source</text>
+<rect class="n sunk" x="340" y="132" width="110" height="28" rx="0"/>
+<text class="ts tb" x="347" y="150">Per million</text>
+<rect class="n sunk" x="450" y="132" width="260" height="28" rx="0"/>
+<text class="ts tb" x="457" y="150">What removes it</text>
+<rect class="n" x="10" y="160" width="330" height="28" rx="0"/>
+<text class="ts" x="17" y="178">1. Copies from upstream: a producer’s retry, a log’s redelivery</text>
+<rect class="n" x="340" y="160" width="110" height="28" rx="0"/>
+<text class="ts" x="347" y="178">24,775</text>
+<rect class="n" x="450" y="160" width="260" height="28" rx="0"/>
+<text class="ts" x="457" y="178">Fixed by the idempotency key: 11 left</text>
+<rect class="n" x="10" y="188" width="330" height="28" rx="0"/>
+<text class="ts" x="17" y="206">2. A worker died after the provider accepted</text>
+<rect class="n" x="340" y="188" width="110" height="28" rx="0"/>
+<text class="ts" x="347" y="206">567</text>
+<rect class="n" x="450" y="188" width="260" height="28" rx="0"/>
+<text class="ts" x="457" y="206">The key says “sending”: resend or not</text>
+<rect class="n" x="10" y="216" width="330" height="28" rx="0"/>
+<text class="ts" x="17" y="234">3. The provider sent but never answered</text>
+<rect class="n" x="340" y="216" width="110" height="28" rx="0"/>
+<text class="ts" x="347" y="234">5,560</text>
+<rect class="n" x="450" y="216" width="260" height="28" rx="0"/>
+<text class="ts" x="457" y="234">Resend or not; a collapse id makes it safe</text>
+<text class="ts" x="10" y="268">Upstream copies merge to one claim of the key, so only kinds 2 and 3 remain with a key: 5,700 per million.</text>
+</svg>
+</div>
+<figcaption>Three places make a second copy. An idempotency key removes the most common. The other two happen after the provider has acted, so the sender must choose what to risk.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Strategy</th><th>Lost, per million</th><th>Duplicates, per million</th><th>Provider calls</th></tr></thead>
+<tbody>
+<tr><th>Send once, no key</th><td>34,050</td><td>23,779</td><td>1,025,487</td></tr>
+<tr><th>Retry up to 5 times, no key</th><td>0</td><td>30,902</td><td>1,068,236</td></tr>
+<tr><th>Retry, with an idempotency key</th><td>0</td><td>5,700</td><td>1,042,233</td></tr>
+<tr><th>Key, and no retry when unsure</th><td>5,136</td><td>0</td><td>1,030,709</td></tr>
+<tr><th>Key, and retry with a collapse key (push)</th><td>0</td><td>0</td><td>1,042,233</td></tr>
+</tbody>
+</table>
+<p>Sending once loses 3.4% and still duplicates, because upstream copies are sent too. Retries remove the losses and add duplicates. The idempotency key removes the upstream copies, the most common kind, which brings duplicates from 30,902 to 5,700 per million. What remains comes after the provider may have acted: a call with no answer, and a worker that died before recording success. The key cannot help there, because it records only that someone started.</p>
+<pre data-lang="ts" data-title="The dedup store: claim a key once, then record the outcome">
+export class DedupStore {
+  private readonly keys = new Map<string, KeyState>();
+  // Atomic "set if absent", as in Redis SET NX or a conditional write: true if this caller claimed the key.
+  claim(key: string): boolean {
+    if (this.keys.has(key)) return false;
+    this.keys.set(key, 'sending');
+    return true;
+  }
+  state(key: string): KeyState | undefined {
+    return this.keys.get(key);
+  }
+  markSent(key: string): void {
+    this.keys.set(key, 'sent');
+  }
+}
+</pre>
+<p>When the outcome is unknown, the sender has to choose what to risk, and the right choice depends on the notification. A login code is retried: a second code is harmless, a missing one locks the user out. A marketing email is not: in the simulation that choice lost 5,136 per million and duplicated none. A push is retried with a collapse key, which makes the second copy replace the first, so the simulation shows none lost and none visible twice. That is the policy step 1 asked for. Where an email or SMS provider accepts a request id of its own and ignores a repeat, it plays the part of the collapse key, and the choice disappears.</p>
+
+<h2 id="priorities">Step 6b: Priorities and campaigns</h2>
+<p>A campaign is millions of notifications created at once. If they enter the same queue as everything else, everything else waits. The simulation gave the senders 5,000 calls a second, 2,000 notifications a second of everyday traffic, 5% of them critical, and then queued a campaign of 2 million.</p>
+
+<figure class="fig wide" id="fig-campaign">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 316" role="img" aria-labelledby="f834t f834d">
+<title id="f834t">Critical notifications behind a campaign</title>
+<desc id="f834d">A line chart of the longest wait of any critical notification created in each second, from 0 to 600 seconds, while 2,000 notifications a second arrive and a campaign of 2,000,000 is queued at second 30. With one queue the wait jumps to 400 seconds at the campaign and falls slowly, to 58 seconds at second 600. With a queue per priority it stays under 0.1 seconds throughout.</desc>
+<text class="tb" x="10" y="18">Longest wait of a critical notification, by the second it was created</text>
+<line class="grid" x1="60" y1="250.0" x2="560" y2="250.0"/>
+<text class="ts end" x="52" y="254.0">0 s</text>
+<line class="grid" x1="60" y1="197.5" x2="560" y2="197.5"/>
+<text class="ts end" x="52" y="201.5">100 s</text>
+<line class="grid" x1="60" y1="145.0" x2="560" y2="145.0"/>
+<text class="ts end" x="52" y="149.0">200 s</text>
+<line class="grid" x1="60" y1="92.5" x2="560" y2="92.5"/>
+<text class="ts end" x="52" y="96.5">300 s</text>
+<line class="grid" x1="60" y1="40.0" x2="560" y2="40.0"/>
+<text class="ts end" x="52" y="44.0">400 s</text>
+<line class="axis" x1="60" y1="250" x2="560" y2="250"/>
+<text class="ts mid" x="60.0" y="268">0 s</text>
+<text class="ts mid" x="143.3" y="268">100 s</text>
+<text class="ts mid" x="226.7" y="268">200 s</text>
+<text class="ts mid" x="310.0" y="268">300 s</text>
+<text class="ts mid" x="393.3" y="268">400 s</text>
+<text class="ts mid" x="476.7" y="268">500 s</text>
+<text class="ts mid" x="560.0" y="268">600 s</text>
+<text class="ts" x="60" y="290">Second the notification was created. Senders make 5,000 calls a second. code/83-hld-notifications.</text>
+<path class="e none dash" d="M85.0 34V250"/>
+<text class="ts" x="91.0" y="42">2 million campaign queued</text>
+<path class="line" style="stroke:var(--fault)" d="M60.4 250.0 L61.2 250.0 L62.1 250.0 L62.9 250.0 L63.8 250.0 L64.6 250.0 L65.4 250.0 L66.2 250.0 L67.1 250.0 L67.9 250.0 L68.8 250.0 L69.6 250.0 L70.4 250.0 L71.2 250.0 L72.1 250.0 L72.9 250.0 L73.8 250.0 L74.6 250.0 L75.4 250.0 L76.2 250.0 L77.1 250.0 L77.9 250.0 L78.8 250.0 L79.6 250.0 L80.4 250.0 L81.2 250.0 L82.1 250.0 L82.9 250.0 L83.8 250.0 L84.6 250.0 L85.4 40.1 L86.2 40.4 L87.1 40.7 L87.9 41.0 L88.8 41.3 L89.6 41.6 L90.4 41.9 L91.2 42.3 L92.1 42.6 L92.9 42.9 L93.8 43.3 L94.6 43.6 L95.4 43.8 L96.2 44.1 L97.1 44.5 L97.9 44.8 L98.8 45.1 L99.6 45.5 L100.4 45.8 L101.2 46.1 L102.1 46.4 L102.9 46.7 L103.8 47.0 L104.6 47.3 L105.4 47.7 L106.2 48.0 L107.1 48.3 L107.9 48.6 L108.8 48.9 L109.6 49.2 L110.4 49.6 L111.2 49.9 L112.1 50.2 L112.9 50.5 L113.8 50.8 L114.6 51.1 L115.4 51.4 L116.2 51.8 L117.1 52.1 L117.9 52.4 L118.8 52.7 L119.6 53.0 L120.4 53.3 L121.2 53.7 L122.1 54.0 L122.9 54.3 L123.8 54.6 L124.6 54.9 L125.4 55.2 L126.2 55.5 L127.1 55.8 L127.9 56.1 L128.8 56.4 L129.6 56.7 L130.4 57.1 L131.2 57.4 L132.1 57.7 L132.9 58.1 L133.8 58.4 L134.6 58.7 L135.4 59.0 L136.2 59.3 L137.1 59.6 L137.9 59.9 L138.8 60.3 L139.6 60.6 L140.4 60.9 L141.2 61.2 L142.1 61.5 L142.9 61.8 L143.8 62.1 L144.6 62.4 L145.4 62.7 L146.2 63.0 L147.1 63.4 L147.9 63.7 L148.8 64.0 L149.6 64.3 L150.4 64.6 L151.2 64.9 L152.1 65.3 L152.9 65.6 L153.8 65.9 L154.6 66.2 L155.4 66.5 L156.2 66.8 L157.1 67.1 L157.9 67.5 L158.8 67.8 L159.6 68.1 L160.4 68.4 L161.2 68.7 L162.1 69.0 L162.9 69.3 L163.8 69.7 L164.6 70.0 L165.4 70.3 L166.2 70.6 L167.1 70.9 L167.9 71.2 L168.8 71.6 L169.6 71.9 L170.4 72.2 L171.2 72.5 L172.1 72.8 L172.9 73.1 L173.8 73.4 L174.6 73.8 L175.4 74.1 L176.2 74.4 L177.1 74.7 L177.9 75.0 L178.8 75.3 L179.6 75.6 L180.4 76.0 L181.2 76.3 L182.1 76.6 L182.9 76.9 L183.8 77.2 L184.6 77.5 L185.4 77.9 L186.2 78.2 L187.1 78.5 L187.9 78.8 L188.8 79.1 L189.6 79.4 L190.4 79.7 L191.2 80.1 L192.1 80.4 L192.9 80.7 L193.8 81.0 L194.6 81.3 L195.4 81.6 L196.2 81.9 L197.1 82.3 L197.9 82.6 L198.8 82.9 L199.6 83.2 L200.4 83.5 L201.2 83.8 L202.1 84.2 L202.9 84.5 L203.8 84.8 L204.6 85.1 L205.4 85.4 L206.2 85.7 L207.1 86.0 L207.9 86.4 L208.8 86.7 L209.6 87.0 L210.4 87.3 L211.2 87.6 L212.1 87.9 L212.9 88.2 L213.8 88.6 L214.6 88.9 L215.4 89.2 L216.2 89.5 L217.1 89.8 L217.9 90.1 L218.8 90.5 L219.6 90.8 L220.4 91.1 L221.2 91.4 L222.1 91.7 L222.9 92.0 L223.8 92.3 L224.6 92.7 L225.4 93.0 L226.2 93.3 L227.1 93.6 L227.9 93.9 L228.8 94.2 L229.6 94.5 L230.4 94.9 L231.2 95.2 L232.1 95.5 L232.9 95.8 L233.8 96.1 L234.6 96.4 L235.4 96.8 L236.2 97.1 L237.1 97.4 L237.9 97.7 L238.8 98.0 L239.6 98.3 L240.4 98.6 L241.2 99.0 L242.1 99.3 L242.9 99.6 L243.8 99.9 L244.6 100.2 L245.4 100.5 L246.2 100.8 L247.1 101.2 L247.9 101.5 L248.8 101.8 L249.6 102.1 L250.4 102.4 L251.2 102.7 L252.1 103.1 L252.9 103.4 L253.8 103.7 L254.6 104.0 L255.4 104.3 L256.2 104.6 L257.1 104.9 L257.9 105.3 L258.8 105.6 L259.6 105.9 L260.4 106.2 L261.2 106.5 L262.1 106.8 L262.9 107.1 L263.8 107.5 L264.6 107.8 L265.4 108.1 L266.2 108.4 L267.1 108.7 L267.9 109.0 L268.8 109.4 L269.6 109.7 L270.4 110.0 L271.2 110.3 L272.1 110.6 L272.9 110.9 L273.8 111.2 L274.6 111.6 L275.4 111.9 L276.2 112.2 L277.1 112.5 L277.9 112.8 L278.8 113.1 L279.6 113.4 L280.4 113.8 L281.2 114.1 L282.1 114.4 L282.9 114.7 L283.8 115.0 L284.6 115.3 L285.4 115.7 L286.2 116.0 L287.1 116.3 L287.9 116.6 L288.8 116.9 L289.6 117.2 L290.4 117.5 L291.2 117.9 L292.1 118.2 L292.9 118.5 L293.8 118.8 L294.6 119.1 L295.4 119.4 L296.2 119.7 L297.1 120.1 L297.9 120.4 L298.8 120.7 L299.6 121.0 L300.4 121.3 L301.2 121.6 L302.1 122.0 L302.9 122.3 L303.8 122.6 L304.6 122.9 L305.4 123.2 L306.2 123.5 L307.1 123.8 L307.9 124.2 L308.8 124.5 L309.6 124.8 L310.4 125.1 L311.2 125.4 L312.1 125.7 L312.9 126.0 L313.8 126.4 L314.6 126.7 L315.4 127.0 L316.2 127.3 L317.1 127.6 L317.9 127.9 L318.8 128.3 L319.6 128.6 L320.4 128.9 L321.2 129.2 L322.1 129.5 L322.9 129.8 L323.8 130.1 L324.6 130.5 L325.4 130.8 L326.2 131.1 L327.1 131.4 L327.9 131.7 L328.8 132.0 L329.6 132.3 L330.4 132.7 L331.2 133.0 L332.1 133.3 L332.9 133.6 L333.8 133.9 L334.6 134.2 L335.4 134.6 L336.2 134.9 L337.1 135.2 L337.9 135.5 L338.8 135.8 L339.6 136.1 L340.4 136.4 L341.2 136.8 L342.1 137.1 L342.9 137.4 L343.8 137.7 L344.6 138.0 L345.4 138.3 L346.2 138.6 L347.1 139.0 L347.9 139.3 L348.8 139.6 L349.6 139.9 L350.4 140.2 L351.2 140.5 L352.1 140.9 L352.9 141.2 L353.8 141.5 L354.6 141.8 L355.4 142.1 L356.2 142.4 L357.1 142.7 L357.9 143.1 L358.8 143.4 L359.6 143.7 L360.4 144.0 L361.2 144.3 L362.1 144.6 L362.9 144.9 L363.8 145.3 L364.6 145.6 L365.4 145.9 L366.2 146.2 L367.1 146.5 L367.9 146.8 L368.8 147.2 L369.6 147.5 L370.4 147.8 L371.2 148.2 L372.1 148.5 L372.9 148.8 L373.8 149.1 L374.6 149.4 L375.4 149.7 L376.2 150.0 L377.1 150.4 L377.9 150.7 L378.8 151.0 L379.6 151.3 L380.4 151.6 L381.2 151.9 L382.1 152.2 L382.9 152.6 L383.8 152.8 L384.6 153.1 L385.4 153.5 L386.2 153.8 L387.1 154.1 L387.9 154.4 L388.8 154.8 L389.6 155.1 L390.4 155.4 L391.2 155.7 L392.1 156.0 L392.9 156.3 L393.8 156.6 L394.6 156.9 L395.4 157.3 L396.2 157.6 L397.1 157.9 L397.9 158.2 L398.8 158.5 L399.6 158.9 L400.4 159.2 L401.2 159.5 L402.1 159.8 L402.9 160.1 L403.8 160.4 L404.6 160.8 L405.4 161.1 L406.2 161.4 L407.1 161.7 L407.9 162.0 L408.8 162.3 L409.6 162.6 L410.4 163.0 L411.2 163.3 L412.1 163.6 L412.9 163.9 L413.8 164.2 L414.6 164.6 L415.4 164.8 L416.2 165.2 L417.1 165.5 L417.9 165.8 L418.8 166.2 L419.6 166.4 L420.4 166.8 L421.2 167.1 L422.1 167.4 L422.9 167.7 L423.8 168.0 L424.6 168.3 L425.4 168.6 L426.2 168.9 L427.1 169.3 L427.9 169.6 L428.8 169.9 L429.6 170.2 L430.4 170.5 L431.2 170.8 L432.1 171.1 L432.9 171.5 L433.8 171.8 L434.6 172.1 L435.4 172.4 L436.2 172.7 L437.1 173.0 L437.9 173.3 L438.8 173.7 L439.6 174.0 L440.4 174.3 L441.2 174.6 L442.1 174.9 L442.9 175.2 L443.8 175.6 L444.6 175.9 L445.4 176.2 L446.2 176.5 L447.1 176.9 L447.9 177.1 L448.8 177.4 L449.6 177.8 L450.4 178.1 L451.2 178.4 L452.1 178.8 L452.9 179.0 L453.8 179.3 L454.6 179.7 L455.4 180.0 L456.2 180.3 L457.1 180.6 L457.9 180.9 L458.8 181.2 L459.6 181.6 L460.4 181.9 L461.2 182.2 L462.1 182.5 L462.9 182.8 L463.8 183.1 L464.6 183.4 L465.4 183.7 L466.2 184.1 L467.1 184.4 L467.9 184.7 L468.8 185.0 L469.6 185.3 L470.4 185.6 L471.2 185.9 L472.1 186.3 L472.9 186.6 L473.8 186.9 L474.6 187.2 L475.4 187.5 L476.2 187.8 L477.1 188.2 L477.9 188.5 L478.8 188.8 L479.6 189.1 L480.4 189.4 L481.2 189.7 L482.1 190.0 L482.9 190.4 L483.8 190.7 L484.6 191.0 L485.4 191.3 L486.2 191.6 L487.1 191.9 L487.9 192.2 L488.8 192.6 L489.6 192.9 L490.4 193.2 L491.2 193.5 L492.1 193.8 L492.9 194.1 L493.8 194.5 L494.6 194.8 L495.4 195.1 L496.2 195.4 L497.1 195.7 L497.9 196.1 L498.8 196.3 L499.6 196.7 L500.4 197.0 L501.2 197.3 L502.1 197.7 L502.9 198.0 L503.8 198.2 L504.6 198.6 L505.4 198.9 L506.2 199.2 L507.1 199.5 L507.9 199.9 L508.8 200.2 L509.6 200.5 L510.4 200.8 L511.2 201.1 L512.1 201.4 L512.9 201.8 L513.8 202.1 L514.6 202.4 L515.4 202.7 L516.2 203.0 L517.1 203.3 L517.9 203.6 L518.8 204.0 L519.6 204.2 L520.4 204.6 L521.2 204.9 L522.1 205.2 L522.9 205.5 L523.8 205.8 L524.6 206.2 L525.4 206.4 L526.2 206.8 L527.1 207.1 L527.9 207.4 L528.8 207.7 L529.6 208.0 L530.4 208.3 L531.2 208.7 L532.1 209.0 L532.9 209.3 L533.8 209.6 L534.6 209.9 L535.4 210.2 L536.2 210.5 L537.1 210.8 L537.9 211.2 L538.8 211.5 L539.6 211.8 L540.4 212.1 L541.2 212.4 L542.1 212.7 L542.9 213.0 L543.8 213.4 L544.6 213.7 L545.4 214.0 L546.2 214.3 L547.1 214.6 L547.9 214.9 L548.8 215.2 L549.6 215.6 L550.4 215.9 L551.2 216.2 L552.1 216.5 L552.9 216.8 L553.8 217.1 L554.6 217.4 L555.4 217.8 L556.2 218.1 L557.1 218.4 L557.9 218.7 L558.8 219.0 L559.6 219.3"/>
+<path class="line" style="stroke:var(--store)" d="M60.4 250.0 L61.2 250.0 L62.1 250.0 L62.9 250.0 L63.8 250.0 L64.6 250.0 L65.4 250.0 L66.2 250.0 L67.1 250.0 L67.9 250.0 L68.8 250.0 L69.6 250.0 L70.4 250.0 L71.2 250.0 L72.1 250.0 L72.9 250.0 L73.8 250.0 L74.6 250.0 L75.4 250.0 L76.2 250.0 L77.1 250.0 L77.9 250.0 L78.8 250.0 L79.6 250.0 L80.4 250.0 L81.2 250.0 L82.1 250.0 L82.9 250.0 L83.8 250.0 L84.6 250.0 L85.4 250.0 L86.2 250.0 L87.1 250.0 L87.9 250.0 L88.8 250.0 L89.6 250.0 L90.4 250.0 L91.2 250.0 L92.1 250.0 L92.9 250.0 L93.8 250.0 L94.6 250.0 L95.4 250.0 L96.2 250.0 L97.1 250.0 L97.9 250.0 L98.8 250.0 L99.6 250.0 L100.4 250.0 L101.2 250.0 L102.1 250.0 L102.9 250.0 L103.8 250.0 L104.6 250.0 L105.4 250.0 L106.2 250.0 L107.1 250.0 L107.9 250.0 L108.8 250.0 L109.6 250.0 L110.4 250.0 L111.2 250.0 L112.1 250.0 L112.9 250.0 L113.8 250.0 L114.6 250.0 L115.4 250.0 L116.2 250.0 L117.1 250.0 L117.9 250.0 L118.8 250.0 L119.6 250.0 L120.4 250.0 L121.2 250.0 L122.1 250.0 L122.9 250.0 L123.8 250.0 L124.6 250.0 L125.4 250.0 L126.2 250.0 L127.1 250.0 L127.9 250.0 L128.8 250.0 L129.6 250.0 L130.4 250.0 L131.2 250.0 L132.1 250.0 L132.9 250.0 L133.8 250.0 L134.6 250.0 L135.4 250.0 L136.2 250.0 L137.1 250.0 L137.9 250.0 L138.8 250.0 L139.6 250.0 L140.4 250.0 L141.2 250.0 L142.1 250.0 L142.9 250.0 L143.8 250.0 L144.6 250.0 L145.4 250.0 L146.2 250.0 L147.1 250.0 L147.9 250.0 L148.8 250.0 L149.6 250.0 L150.4 250.0 L151.2 250.0 L152.1 250.0 L152.9 250.0 L153.8 250.0 L154.6 250.0 L155.4 250.0 L156.2 250.0 L157.1 250.0 L157.9 250.0 L158.8 250.0 L159.6 250.0 L160.4 250.0 L161.2 250.0 L162.1 250.0 L162.9 250.0 L163.8 250.0 L164.6 250.0 L165.4 250.0 L166.2 250.0 L167.1 250.0 L167.9 250.0 L168.8 250.0 L169.6 250.0 L170.4 250.0 L171.2 250.0 L172.1 250.0 L172.9 250.0 L173.8 250.0 L174.6 250.0 L175.4 250.0 L176.2 250.0 L177.1 250.0 L177.9 250.0 L178.8 250.0 L179.6 250.0 L180.4 250.0 L181.2 250.0 L182.1 250.0 L182.9 250.0 L183.8 250.0 L184.6 250.0 L185.4 250.0 L186.2 250.0 L187.1 250.0 L187.9 250.0 L188.8 250.0 L189.6 250.0 L190.4 250.0 L191.2 250.0 L192.1 250.0 L192.9 250.0 L193.8 250.0 L194.6 250.0 L195.4 250.0 L196.2 250.0 L197.1 250.0 L197.9 250.0 L198.8 250.0 L199.6 250.0 L200.4 250.0 L201.2 250.0 L202.1 250.0 L202.9 250.0 L203.8 250.0 L204.6 250.0 L205.4 250.0 L206.2 250.0 L207.1 250.0 L207.9 250.0 L208.8 250.0 L209.6 250.0 L210.4 250.0 L211.2 250.0 L212.1 250.0 L212.9 250.0 L213.8 250.0 L214.6 250.0 L215.4 250.0 L216.2 250.0 L217.1 250.0 L217.9 250.0 L218.8 250.0 L219.6 250.0 L220.4 250.0 L221.2 250.0 L222.1 250.0 L222.9 250.0 L223.8 250.0 L224.6 250.0 L225.4 250.0 L226.2 250.0 L227.1 250.0 L227.9 250.0 L228.8 250.0 L229.6 250.0 L230.4 250.0 L231.2 250.0 L232.1 250.0 L232.9 250.0 L233.8 250.0 L234.6 250.0 L235.4 250.0 L236.2 250.0 L237.1 250.0 L237.9 250.0 L238.8 250.0 L239.6 250.0 L240.4 250.0 L241.2 250.0 L242.1 250.0 L242.9 250.0 L243.8 250.0 L244.6 250.0 L245.4 250.0 L246.2 250.0 L247.1 250.0 L247.9 250.0 L248.8 250.0 L249.6 250.0 L250.4 250.0 L251.2 250.0 L252.1 250.0 L252.9 250.0 L253.8 250.0 L254.6 250.0 L255.4 250.0 L256.2 250.0 L257.1 250.0 L257.9 250.0 L258.8 250.0 L259.6 250.0 L260.4 250.0 L261.2 250.0 L262.1 250.0 L262.9 250.0 L263.8 250.0 L264.6 250.0 L265.4 250.0 L266.2 250.0 L267.1 250.0 L267.9 250.0 L268.8 250.0 L269.6 250.0 L270.4 250.0 L271.2 250.0 L272.1 250.0 L272.9 250.0 L273.8 250.0 L274.6 250.0 L275.4 250.0 L276.2 250.0 L277.1 250.0 L277.9 250.0 L278.8 250.0 L279.6 250.0 L280.4 250.0 L281.2 250.0 L282.1 250.0 L282.9 250.0 L283.8 250.0 L284.6 250.0 L285.4 250.0 L286.2 250.0 L287.1 250.0 L287.9 250.0 L288.8 250.0 L289.6 250.0 L290.4 250.0 L291.2 250.0 L292.1 250.0 L292.9 250.0 L293.8 250.0 L294.6 250.0 L295.4 250.0 L296.2 250.0 L297.1 250.0 L297.9 250.0 L298.8 250.0 L299.6 250.0 L300.4 250.0 L301.2 250.0 L302.1 250.0 L302.9 250.0 L303.8 250.0 L304.6 250.0 L305.4 250.0 L306.2 250.0 L307.1 250.0 L307.9 250.0 L308.8 250.0 L309.6 250.0 L310.4 250.0 L311.2 250.0 L312.1 250.0 L312.9 250.0 L313.8 250.0 L314.6 250.0 L315.4 250.0 L316.2 250.0 L317.1 250.0 L317.9 250.0 L318.8 250.0 L319.6 250.0 L320.4 250.0 L321.2 250.0 L322.1 250.0 L322.9 250.0 L323.8 250.0 L324.6 250.0 L325.4 250.0 L326.2 250.0 L327.1 250.0 L327.9 250.0 L328.8 250.0 L329.6 250.0 L330.4 250.0 L331.2 250.0 L332.1 250.0 L332.9 250.0 L333.8 250.0 L334.6 250.0 L335.4 250.0 L336.2 250.0 L337.1 250.0 L337.9 250.0 L338.8 250.0 L339.6 250.0 L340.4 250.0 L341.2 250.0 L342.1 250.0 L342.9 250.0 L343.8 250.0 L344.6 250.0 L345.4 250.0 L346.2 250.0 L347.1 250.0 L347.9 250.0 L348.8 250.0 L349.6 250.0 L350.4 250.0 L351.2 250.0 L352.1 250.0 L352.9 250.0 L353.8 250.0 L354.6 250.0 L355.4 250.0 L356.2 250.0 L357.1 250.0 L357.9 250.0 L358.8 250.0 L359.6 250.0 L360.4 250.0 L361.2 250.0 L362.1 250.0 L362.9 250.0 L363.8 250.0 L364.6 250.0 L365.4 250.0 L366.2 250.0 L367.1 250.0 L367.9 250.0 L368.8 250.0 L369.6 250.0 L370.4 250.0 L371.2 250.0 L372.1 250.0 L372.9 250.0 L373.8 250.0 L374.6 250.0 L375.4 250.0 L376.2 250.0 L377.1 250.0 L377.9 250.0 L378.8 250.0 L379.6 250.0 L380.4 250.0 L381.2 250.0 L382.1 250.0 L382.9 250.0 L383.8 250.0 L384.6 250.0 L385.4 250.0 L386.2 250.0 L387.1 250.0 L387.9 250.0 L388.8 250.0 L389.6 250.0 L390.4 250.0 L391.2 250.0 L392.1 250.0 L392.9 250.0 L393.8 250.0 L394.6 250.0 L395.4 250.0 L396.2 250.0 L397.1 250.0 L397.9 250.0 L398.8 250.0 L399.6 250.0 L400.4 250.0 L401.2 250.0 L402.1 250.0 L402.9 250.0 L403.8 250.0 L404.6 250.0 L405.4 250.0 L406.2 250.0 L407.1 250.0 L407.9 250.0 L408.8 250.0 L409.6 250.0 L410.4 250.0 L411.2 250.0 L412.1 250.0 L412.9 250.0 L413.8 250.0 L414.6 250.0 L415.4 250.0 L416.2 250.0 L417.1 250.0 L417.9 250.0 L418.8 250.0 L419.6 250.0 L420.4 250.0 L421.2 250.0 L422.1 250.0 L422.9 250.0 L423.8 250.0 L424.6 250.0 L425.4 250.0 L426.2 250.0 L427.1 250.0 L427.9 250.0 L428.8 250.0 L429.6 250.0 L430.4 250.0 L431.2 250.0 L432.1 250.0 L432.9 250.0 L433.8 250.0 L434.6 250.0 L435.4 250.0 L436.2 250.0 L437.1 250.0 L437.9 250.0 L438.8 250.0 L439.6 250.0 L440.4 250.0 L441.2 250.0 L442.1 250.0 L442.9 250.0 L443.8 250.0 L444.6 250.0 L445.4 250.0 L446.2 250.0 L447.1 250.0 L447.9 250.0 L448.8 250.0 L449.6 250.0 L450.4 250.0 L451.2 250.0 L452.1 250.0 L452.9 250.0 L453.8 250.0 L454.6 250.0 L455.4 250.0 L456.2 250.0 L457.1 250.0 L457.9 250.0 L458.8 250.0 L459.6 250.0 L460.4 250.0 L461.2 250.0 L462.1 250.0 L462.9 250.0 L463.8 250.0 L464.6 250.0 L465.4 250.0 L466.2 250.0 L467.1 250.0 L467.9 250.0 L468.8 250.0 L469.6 250.0 L470.4 250.0 L471.2 250.0 L472.1 250.0 L472.9 250.0 L473.8 250.0 L474.6 250.0 L475.4 250.0 L476.2 250.0 L477.1 250.0 L477.9 250.0 L478.8 250.0 L479.6 250.0 L480.4 250.0 L481.2 250.0 L482.1 250.0 L482.9 250.0 L483.8 250.0 L484.6 250.0 L485.4 250.0 L486.2 250.0 L487.1 250.0 L487.9 250.0 L488.8 250.0 L489.6 250.0 L490.4 250.0 L491.2 250.0 L492.1 250.0 L492.9 250.0 L493.8 250.0 L494.6 250.0 L495.4 250.0 L496.2 250.0 L497.1 250.0 L497.9 250.0 L498.8 250.0 L499.6 250.0 L500.4 250.0 L501.2 250.0 L502.1 250.0 L502.9 250.0 L503.8 250.0 L504.6 250.0 L505.4 250.0 L506.2 250.0 L507.1 250.0 L507.9 250.0 L508.8 250.0 L509.6 250.0 L510.4 250.0 L511.2 250.0 L512.1 250.0 L512.9 250.0 L513.8 250.0 L514.6 250.0 L515.4 250.0 L516.2 250.0 L517.1 250.0 L517.9 250.0 L518.8 250.0 L519.6 250.0 L520.4 250.0 L521.2 250.0 L522.1 250.0 L522.9 250.0 L523.8 250.0 L524.6 250.0 L525.4 250.0 L526.2 250.0 L527.1 250.0 L527.9 250.0 L528.8 250.0 L529.6 250.0 L530.4 250.0 L531.2 250.0 L532.1 250.0 L532.9 250.0 L533.8 250.0 L534.6 250.0 L535.4 250.0 L536.2 250.0 L537.1 250.0 L537.9 250.0 L538.8 250.0 L539.6 250.0 L540.4 250.0 L541.2 250.0 L542.1 250.0 L542.9 250.0 L543.8 250.0 L544.6 250.0 L545.4 250.0 L546.2 250.0 L547.1 250.0 L547.9 250.0 L548.8 250.0 L549.6 250.0 L550.4 250.0 L551.2 250.0 L552.1 250.0 L552.9 250.0 L553.8 250.0 L554.6 250.0 L555.4 250.0 L556.2 250.0 L557.1 250.0 L557.9 250.0 L558.8 250.0 L559.6 250.0"/>
+<text class="ts" x="310.0" y="115.1">one queue for everything</text>
+<text class="ts" x="310.0" y="242.0">a queue per priority: under 0.1 s</text>
+<rect class="hit" x="60" y="40" width="8.33333" height="210" data-tip="created at 0 to 10 s|one queue: up to 0.0 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="68.3333" y="40" width="8.33333" height="210" data-tip="created at 10 to 20 s|one queue: up to 0.0 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="76.6667" y="40" width="8.33333" height="210" data-tip="created at 20 to 30 s|one queue: up to 0.0 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="85" y="40" width="8.33333" height="210" data-tip="created at 30 to 40 s|one queue: up to 399.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="93.3333" y="40" width="8.33333" height="210" data-tip="created at 40 to 50 s|one queue: up to 393.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="101.667" y="40" width="8.33333" height="210" data-tip="created at 50 to 60 s|one queue: up to 387.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="110" y="40" width="8.33333" height="210" data-tip="created at 60 to 70 s|one queue: up to 381.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="118.333" y="40" width="8.33333" height="210" data-tip="created at 70 to 80 s|one queue: up to 375.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="126.667" y="40" width="8.33333" height="210" data-tip="created at 80 to 90 s|one queue: up to 369.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="135" y="40" width="8.33333" height="210" data-tip="created at 90 to 100 s|one queue: up to 363.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="143.333" y="40" width="8.33333" height="210" data-tip="created at 100 to 110 s|one queue: up to 357.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="151.667" y="40" width="8.33333" height="210" data-tip="created at 110 to 120 s|one queue: up to 351.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="160" y="40" width="8.33333" height="210" data-tip="created at 120 to 130 s|one queue: up to 345.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="168.333" y="40" width="8.33333" height="210" data-tip="created at 130 to 140 s|one queue: up to 339.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="176.667" y="40" width="8.33333" height="210" data-tip="created at 140 to 150 s|one queue: up to 333.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="185" y="40" width="8.33333" height="210" data-tip="created at 150 to 160 s|one queue: up to 327.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="193.333" y="40" width="8.33333" height="210" data-tip="created at 160 to 170 s|one queue: up to 321.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="201.667" y="40" width="8.33333" height="210" data-tip="created at 170 to 180 s|one queue: up to 315.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="210" y="40" width="8.33333" height="210" data-tip="created at 180 to 190 s|one queue: up to 309.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="218.333" y="40" width="8.33333" height="210" data-tip="created at 190 to 200 s|one queue: up to 303.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="226.667" y="40" width="8.33333" height="210" data-tip="created at 200 to 210 s|one queue: up to 297.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="235" y="40" width="8.33333" height="210" data-tip="created at 210 to 220 s|one queue: up to 291.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="243.333" y="40" width="8.33333" height="210" data-tip="created at 220 to 230 s|one queue: up to 285.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="251.667" y="40" width="8.33333" height="210" data-tip="created at 230 to 240 s|one queue: up to 279.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="260" y="40" width="8.33333" height="210" data-tip="created at 240 to 250 s|one queue: up to 273.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="268.333" y="40" width="8.33333" height="210" data-tip="created at 250 to 260 s|one queue: up to 267.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="276.667" y="40" width="8.33333" height="210" data-tip="created at 260 to 270 s|one queue: up to 261.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="285" y="40" width="8.33333" height="210" data-tip="created at 270 to 280 s|one queue: up to 255.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="293.333" y="40" width="8.33333" height="210" data-tip="created at 280 to 290 s|one queue: up to 249.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="301.667" y="40" width="8.33333" height="210" data-tip="created at 290 to 300 s|one queue: up to 243.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="310" y="40" width="8.33333" height="210" data-tip="created at 300 to 310 s|one queue: up to 237.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="318.333" y="40" width="8.33333" height="210" data-tip="created at 310 to 320 s|one queue: up to 231.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="326.667" y="40" width="8.33333" height="210" data-tip="created at 320 to 330 s|one queue: up to 225.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="335" y="40" width="8.33333" height="210" data-tip="created at 330 to 340 s|one queue: up to 219.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="343.333" y="40" width="8.33333" height="210" data-tip="created at 340 to 350 s|one queue: up to 213.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="351.667" y="40" width="8.33333" height="210" data-tip="created at 350 to 360 s|one queue: up to 207.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="360" y="40" width="8.33333" height="210" data-tip="created at 360 to 370 s|one queue: up to 201.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="368.333" y="40" width="8.33333" height="210" data-tip="created at 370 to 380 s|one queue: up to 195.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="376.667" y="40" width="8.33333" height="210" data-tip="created at 380 to 390 s|one queue: up to 189.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="385" y="40" width="8.33333" height="210" data-tip="created at 390 to 400 s|one queue: up to 183.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="393.333" y="40" width="8.33333" height="210" data-tip="created at 400 to 410 s|one queue: up to 177.9 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="401.667" y="40" width="8.33333" height="210" data-tip="created at 410 to 420 s|one queue: up to 171.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="410" y="40" width="8.33333" height="210" data-tip="created at 420 to 430 s|one queue: up to 165.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="418.333" y="40" width="8.33333" height="210" data-tip="created at 430 to 440 s|one queue: up to 159.7 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="426.667" y="40" width="8.33333" height="210" data-tip="created at 440 to 450 s|one queue: up to 153.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="435" y="40" width="8.33333" height="210" data-tip="created at 450 to 460 s|one queue: up to 147.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="443.333" y="40" width="8.33333" height="210" data-tip="created at 460 to 470 s|one queue: up to 141.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="451.667" y="40" width="8.33333" height="210" data-tip="created at 470 to 480 s|one queue: up to 135.7 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="460" y="40" width="8.33333" height="210" data-tip="created at 480 to 490 s|one queue: up to 129.7 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="468.333" y="40" width="8.33333" height="210" data-tip="created at 490 to 500 s|one queue: up to 123.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="476.667" y="40" width="8.33333" height="210" data-tip="created at 500 to 510 s|one queue: up to 117.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="485" y="40" width="8.33333" height="210" data-tip="created at 510 to 520 s|one queue: up to 111.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="493.333" y="40" width="8.33333" height="210" data-tip="created at 520 to 530 s|one queue: up to 105.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="501.667" y="40" width="8.33333" height="210" data-tip="created at 530 to 540 s|one queue: up to 99.7 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="510" y="40" width="8.33333" height="210" data-tip="created at 540 to 550 s|one queue: up to 93.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="518.333" y="40" width="8.33333" height="210" data-tip="created at 550 to 560 s|one queue: up to 87.7 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="526.667" y="40" width="8.33333" height="210" data-tip="created at 560 to 570 s|one queue: up to 81.7 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="535" y="40" width="8.33333" height="210" data-tip="created at 570 to 580 s|one queue: up to 75.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="543.333" y="40" width="8.33333" height="210" data-tip="created at 580 to 590 s|one queue: up to 69.8 s|a queue per priority: up to 0.0 s"/>
+<rect class="hit" x="551.667" y="40" width="8.33333" height="210" data-tip="created at 590 to 600 s|one queue: up to 63.8 s|a queue per priority: up to 0.0 s"/>
+</svg>
+</div>
+<figcaption>In one queue, a security code created after the campaign waits behind it for almost seven minutes. With a queue per priority the campaign uses only what is left over.</figcaption>
+</figure>
+
+<p>With one queue, critical notifications created after the campaign waited a median of 221 seconds and up to 400, long after a login code expires. With a queue per priority, served strictly in order, they waited less than a tenth of a second, and so did the normal ones; the campaign used what was left and finished after 628 seconds instead of 400. Separate queues are a bulkhead (<x-ref to="resilience-patterns#bulkheads"></x-ref>). Two rules complete it: campaigns are also throttled to a rate the providers accept, and they are spread over the user’s daytime, which quiet hours require anyway.</p>
+<p>The campaign itself is a fan-out, like a post to millions of followers (<x-ref to="hld-news-feed"></x-ref>). A campaign service reads the segment in pages of a few thousand users and turns each page into requests with keys made from the campaign and the user, so that a restarted campaign does not send twice. It releases pages at the campaign’s rate with a token bucket (<x-ref to="resilience-patterns#token-bucket"></x-ref>): 50 million users at 20,000 a second is the 42 minutes of step 2. Each user’s preferences and quiet hours are checked as their notification is routed, so a user in a time zone where it is night is held until morning, and the campaign becomes a wave that follows daylight around the world. Starting slowly, with a small share of the segment first, lets a mistake in the template or the segment be caught before it reaches everyone.</p>
+<p>Caps and digests are the same idea seen from the user. Low-priority notifications of one category within an hour can be merged into one (“5 people liked your photo”), which also cuts the volume.</p>
+
+<h2 id="providers">Step 6c: When a provider fails</h2>
+<p>Providers fail in their own ways: a push service throttles, an SMS gateway goes down, an email service rejects a burst. The simulation took the provider down for 60 seconds while 2,000 notifications a second kept arriving, with up to 10 attempts per notification, and compared four ways of retrying.</p>
+
+<figure class="fig wide" id="fig-outage">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 212" role="img" aria-labelledby="f835t f835d">
+<title id="f835t">Calls to a provider that is down, and what was lost</title>
+<desc id="f835d">Horizontal bars of the calls made to a provider during a 60-second outage, for four retry policies, with the notifications lost because their attempts ran out: retry at once: 300,500 calls, 8,529 lost; retry after 1 s: 296,401 calls, 7,112 lost; backoff with jitter: 298,522 calls, 187 lost; backoff and a circuit breaker: 187 calls, 0 lost.</desc>
+<text class="tb" x="10" y="18">Calls to the provider during its 60-second outage, and notifications lost</text>
+<line class="grid" x1="230.0" y1="32" x2="230.0" y2="160"/>
+<text class="ts mid" x="230.0" y="176">0</text>
+<line class="grid" x1="340.0" y1="32" x2="340.0" y2="160"/>
+<text class="ts mid" x="340.0" y="176">100,000</text>
+<line class="grid" x1="450.0" y1="32" x2="450.0" y2="160"/>
+<text class="ts mid" x="450.0" y="176">200,000</text>
+<line class="grid" x1="560.0" y1="32" x2="560.0" y2="160"/>
+<text class="ts mid" x="560.0" y="176">300,000</text>
+<text class="ts end" x="220" y="52">retry at once</text>
+<rect class="bar fault" x="230" y="38" width="330.6" height="18" rx="2"/>
+<text class="ts tb" x="568.5" y="52">300,500 calls, 8,529 lost</text>
+<rect class="hit" x="10" y="34" width="700" height="26" data-tip="retry at once|300,500 calls during the outage|8,529 notifications lost after 10 attempts|backlog cleared 37 s after the provider recovered"/>
+<text class="ts end" x="220" y="84">retry after 1 s</text>
+<rect class="bar fault" x="230" y="70" width="326.0" height="18" rx="2"/>
+<text class="ts tb" x="564.0" y="84">296,401 calls, 7,112 lost</text>
+<rect class="hit" x="10" y="66" width="700" height="26" data-tip="retry after 1 s|296,401 calls during the outage|7,112 notifications lost after 10 attempts|backlog cleared 37 s after the provider recovered"/>
+<text class="ts end" x="220" y="116">backoff with jitter</text>
+<rect class="bar fault" x="230" y="102" width="328.4" height="18" rx="2"/>
+<text class="ts tb" x="566.4" y="116">298,522 calls, 187 lost</text>
+<rect class="hit" x="10" y="98" width="700" height="26" data-tip="backoff with jitter|298,522 calls during the outage|187 notifications lost after 10 attempts|backlog cleared 40 s after the provider recovered"/>
+<text class="ts end" x="220" y="148">backoff and a circuit breaker</text>
+<rect class="bar store" x="230" y="134" width="1.0" height="18" rx="2"/>
+<text class="ts tb" x="239.0" y="148">187 calls, 0 lost</text>
+<rect class="hit" x="10" y="130" width="700" height="26" data-tip="backoff and a circuit breaker|187 calls during the outage|0 notifications lost after 10 attempts|backlog cleared 39 s after the provider recovered"/>
+<text class="ts" x="10" y="200">2,000 notifications a second, senders able to make 5,000 calls a second, up to 10 attempts each. code/83-hld-notifications.</text>
+</svg>
+</div>
+<figcaption>Retrying sooner does not deliver sooner when the provider is down; it uses up attempts. A circuit breaker stops calling and lets the queue hold the work.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Policy</th><th>Calls to the failing provider</th><th>Notifications lost</th><th>Normal notifications, 99th percentile</th></tr></thead>
+<tbody>
+<tr><th>Retry at once</th><td>300,500</td><td>8,529</td><td>68.7 s</td></tr>
+<tr><th>Retry after 1 s</th><td>296,401</td><td>7,112</td><td>69.6 s</td></tr>
+<tr><th>Backoff with jitter</th><td>298,522</td><td>187</td><td>79.9 s</td></tr>
+<tr><th>Backoff and a circuit breaker</th><td>187</td><td>0</td><td>59.3 s</td></tr>
+</tbody>
+</table>
+<p>Retrying at once or after a fixed second spends the attempts during the outage: thousands of notifications ran out of attempts and were lost. Backoff with jitter spreads the attempts over minutes and loses few, but the senders still call the dead provider as fast as they can, because new notifications keep failing. A circuit breaker (<x-ref to="resilience-patterns#circuit-breaker"></x-ref>) stops calling once most calls fail, tests with a single call every 5 seconds, and leaves the notifications in their queues with their attempts unspent. It made 187 calls during the outage and lost nothing. In every case the backlog cleared 37 to 40 seconds after the provider recovered, because the senders then work at full speed on a queue that is already ordered by priority.</p>
+<p>Three more rules follow from the providers’ own behavior. A notification past its expiry is dropped, not sent late: a code from ten minutes ago is noise. For SMS, a second provider takes over when the breaker for the first stays open. And a response that says a device token is no longer valid, 410 from APNs, removes the token, so the system stops paying for sends that cannot arrive.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A provider is down</th><td>Late notifications</td><td>The breaker opens; queues hold the work; SMS fails over to a second provider</td></tr>
+<tr><th>A sender crashes mid-send</th><td>At worst one duplicate</td><td>The queue redelivers; the key says “sending”, and the category decides whether to resend</td></tr>
+<tr><th>The dedup store loses a partition</th><td>A few duplicates</td><td>Requests are still accepted; for a short while repeats are not caught. Its copies limit the loss</td></tr>
+<tr><th>A campaign is misconfigured, to the wrong segment</th><td>Unwanted messages</td><td>Campaigns start slowly and can be stopped; the throttle bounds the damage per minute</td></tr>
+<tr><th>The preference cache is stale</th><td>A notification right after opting out</td><td>Opt-outs write through to the cache; marketing checks the store itself</td></tr>
+<tr><th>A token is dead</th><td>Nothing</td><td>The provider’s answer removes it</td></tr>
+</tbody>
+</table>
+<p>The signals that show these failures early are few: the age of the oldest item in each priority’s queue, each provider’s error rate and breaker state, the share of requests stopped by the dedup store, and the rate at which tokens are found dead. A sudden rise in dedup hits means a producer is retrying hard; a rise in dead tokens after an app release means registration is broken (<x-ref to="observability"></x-ref>).</p>
+<p>At ten times the volume, 580,000 notifications a second at peak, the routers and senders grow with their queues, and the dedup store holds a terabyte of keys, partitioned. The providers’ limits become the constraint: more connections to APNs, more sender accounts, campaigns spread over longer windows. At a hundred times, which only a few companies reach, each region runs its own pipeline for its own users, and the providers’ own regional endpoints are used.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>APNs.</b> Apple’s documentation, checked in October 2026, calls APNs a best-effort service that may reorder notifications. A provider connects over HTTP/2 with TLS 1.2 or later, and a payload may be up to 4 KB. If a device is offline, APNs stores the notification for up to 30 days depending on <code>apns-expiration</code>, but only one per app: usually the latest. <code>apns-collapse-id</code> merges notifications that carry the same value. A 410 answer means the device token is no longer active; Apple’s guide says not to retry such answers, and that answers in the 500s may be retried after 15 minutes, with back-off.</li>
+  <li><b>FCM.</b> Google’s documentation, checked in October 2026, says a collapsible message may be replaced by a newer one not yet delivered, with at most four collapse keys per device at a time. Up to 100 non-collapsible messages are stored for an offline device; beyond that all are discarded and the app is told. A message lives up to 28 days, the default, and a data payload is at most 4 KB.</li>
+  <li><b>LinkedIn, 2018.</b> LinkedIn described Air Traffic Controller, a service built on Samza and Kafka that decides for each of over a billion requests a day whether to notify, through which channel and when, with deduplication, aggregation and rate limits. LinkedIn reported that member complaints were cut in half, and that the 90th percentile latency of push notifications for messages between members fell from about 12 seconds to about 1.5.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“If the push is not opened in 10 minutes, send an email”</th><td>A delayed check per notification, scheduled when the push is sent and canceled by the open event (<x-ref to="scheduling-and-workflows#timers"></x-ref>)</td><td>The senders</td></tr>
+<tr><th>“Only notify when it is likely to be opened”</th><td>A model scores each notification in the router; low scores are dropped or merged into a digest</td><td>Queues and providers</td></tr>
+<tr><th>“Notify at 9:00 local time”</th><td>Each notification is delayed to its user’s 9:00; a campaign becomes 24 time-zone waves</td><td>Priorities</td></tr>
+<tr><th>“Live updates, such as a delivery driver’s position”</th><td>Collapse keys so that only the newest is kept, and an expiry of seconds</td><td>The pipeline</td></tr>
+<tr><th>“Prove a message was sent, for compliance”</th><td>The notification log becomes an append-only record kept for years</td><td>Delivery</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Spend 5 minutes on requirements and ask which notifications are critical and which may be duplicated, 3 on estimates and the SMS cost, 5 on the API with its idempotency key and the data model, and 10 on the drawing. In the deep dives, say where duplicates come from and that the key removes only some of them, then separate queues per priority, then retries with a circuit breaker. Keep 5 minutes for failures.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Calling providers inside the API request</th><td>The caller waits on a third party; a provider outage fails the caller</td><td>Accept, record, answer 202; send from queues</td></tr>
+<tr><th>No idempotency key</th><td>Every upstream retry becomes a second notification: 24,775 per million in the simulation</td><td>A key chosen by the caller from the causing event</td></tr>
+<tr><th>Believing the key gives exactly once</th><td>Duplicates after timeouts and crashes, 5,700 per million</td><td>Decide per category; collapse keys for push</td></tr>
+<tr><th>One queue for everything</th><td>A login code waits up to 400 seconds behind a campaign</td><td>A queue per channel and priority</td></tr>
+<tr><th>Retrying at once, or on a fixed interval</th><td>Attempts are spent during an outage and notifications lost</td><td>Backoff with jitter, and a circuit breaker per provider</td></tr>
+<tr><th>Checking preferences when the request arrives</th><td>Users who opted out still receive what was queued</td><td>Check when sending</td></tr>
+<tr><th>Keeping dead device tokens</th><td>Paid sends that cannot arrive</td><td>Remove a token when the provider says it is dead</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="hld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="realtime-communication"></x-ref>: how push works, and webhooks from providers.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: why exactly once is not available, and keys.</li>
+  <li><x-ref to="message-queues"></x-ref>: queues, delayed messages and priorities.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: retries, backoff, circuit breakers and bulkheads.</li>
+  <li><x-ref to="hld-chat"></x-ref> and <x-ref to="hld-news-feed"></x-ref>: the services that ask for notifications.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Accept, record and answer; route and send later, from queues.</li>
+  <li>Duplicates come from upstream copies, from crashes after a send, and from calls with no answer. An idempotency key removes only the first kind.</li>
+  <li>When the outcome is unknown, choose per category: retry codes, do not retry offers, and give pushes a collapse key.</li>
+  <li>A queue per channel and priority keeps a campaign from delaying a login code by minutes.</li>
+  <li>Back off with jitter, and open a circuit breaker when a provider is down, so attempts are not spent and nothing is lost.</li>
+  <li>Check preferences, quiet hours and caps when sending; drop what has expired.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>The order service times out calling the notification API and calls again. How does the design avoid two notifications?</summary><p>Both calls carry the same idempotency key, derived from the order’s event. The first claims the key with an atomic set-if-absent; the second finds it claimed and gets the first answer without sending anything.</p></details>
+<details><summary>With retries and an idempotency key, the simulation still showed 5,700 duplicates per million. Where do they come from?</summary><p>From calls to the provider that got no answer although the provider had sent, and from workers that died after the provider accepted but before recording it. Both happen after the provider acted, which the key cannot see.</p></details>
+<details><summary>Should a sender retry a login code whose call timed out? A marketing email?</summary><p>The code, yes: a duplicate code is harmless and a missing one blocks the user. The email, no: a missed offer costs little and a duplicate annoys. In the simulation, not retrying when unsure gave no duplicates and lost about 0.5%.</p></details>
+<details><summary>How does a collapse key make a retried push safe?</summary><p>Both copies carry the same collapse key, so the device, or the provider before delivery, keeps one of them. The user sees one notification even if both were sent.</p></details>
+<details><summary>A 2-million campaign is queued. Why do critical notifications not wait?</summary><p>Each priority has its own queue and senders serve critical, then normal, then bulk. The campaign gets only the capacity left over; in the simulation critical notifications waited under 0.1 s instead of up to 400 s.</p></details>
+<details><summary>Why did immediate retries lose notifications during a one-minute outage?</summary><p>Each failed notification went straight back and failed again, using up its 10 attempts within the outage. Backoff spreads the attempts over minutes, and a circuit breaker stops calling altogether, so the attempts are still there when the provider recovers.</p></details>
+<details><summary>A user opts out of marketing at 9:00. A campaign queued at 8:00 reaches them at 9:30. Is that a bug?</summary><p>Yes. Preferences must be checked when sending, not when the request was accepted, and opt-outs must reach the router’s cache at once.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Apple Developer Documentation, <a href="https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns">“Sending notification requests to APNs”</a>, checked October 2026. Headers, storage of notifications for offline devices, and limits.</li>
+  <li>Apple Developer Documentation, <a href="https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns">“Handling notification responses from APNs”</a>, checked October 2026. Status codes, which answers to retry, and when.</li>
+  <li>Firebase Documentation, <a href="https://firebase.google.com/docs/cloud-messaging/concept-options">“About FCM messages”</a>, checked October 2026. Collapsible messages, lifespan, priority and payload size.</li>
+  <li>Changji Shi and Adriel Fuad, <a href="https://engineering.linkedin.com/blog/2018/03/air-traffic-controller--member-first-notifications-at-linkedin">“Air Traffic Controller: Member-First Notifications at LinkedIn”</a>, LinkedIn Engineering, March 2018.</li>
+</ol>
+</section>

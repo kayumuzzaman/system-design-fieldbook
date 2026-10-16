@@ -1,0 +1,763 @@
+<!--meta
+{ "description": "A low-level design of cinema ticket booking in TypeScript, tested and simulated: shows that own their seats, holds that lapse by themselves with an injected clock, all-or-nothing claims, payment in the middle with idempotency keys and refunds for late answers, double booking measured with read-then-write against check-and-set in memory and with threads on SQLite, and how long a hold should last.",
+  "lede": "Two people click the same seat at the same moment, and only one of them may have it. A movie ticket booking system is the parking lot again with three new difficulties: customers take several seats at once, a claim lasts only a few minutes, and a payment that can fail, stall or arrive twice sits between the claim and the sale. This chapter builds the core, measures how often the obvious code sells a seat twice, and simulates a day of sales to choose how long a hold should last.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the booking core of a cinema’s ticketing system. A customer picks a show, chooses seats on a seat map and pays. The seats are held for a few minutes while they pay. No seat may be sold twice, a failed payment must free the seats, and nobody may end up paying for seats they did not get.</p></div>
+<p>In the terms of <x-ref to="lld-method#shapes"></x-ref>, this is handing out a limited resource, the shape of <x-ref to="lld-parking-lot"></x-ref>. Three things make it harder: one order takes several seats, a claim lasts only minutes, and a payment sits in the middle. Sales of a hit concert to a hundred thousand people at once, with waiting rooms and inventory spread over many servers, are the subject of <x-ref to="hld-ticket-booking"></x-ref>.</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>What is sold?</th><td>Seats at a show: one film on one screen at one time. A screen’s layout never changes</td></tr>
+<tr><th>How many seats in one order?</th><td>Several. The customer gets all of them or none</td></tr>
+<tr><th>How long are seats held?</th><td>Ten minutes, as a setting. The chapter measures what other values do</td></tr>
+<tr><th>What if the customer leaves without a word?</th><td>The hold lapses on its own. Nothing has to run for that</td></tr>
+<tr><th>How is payment taken?</th><td>Through a provider that approves, declines, or answers late, and treats a repeated key as the same charge</td></tr>
+<tr><th>What must never happen?</th><td>A seat sold twice. Money kept for seats not booked</td></tr>
+<tr><th>How many servers?</th><td>Several, sharing one database. The rules are written once in memory and once in SQL</td></tr>
+</tbody>
+</table>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+<table>
+<thead><tr><th>Concept</th><th>Kind</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Movie, Screen, Seat</th><td>Values</td><td>Reference data. A seat is a place in a room, the same for every show</td></tr>
+<tr><th>Show</th><td>Aggregate</td><td>One screening. It owns the state of every seat for that screening</td></tr>
+<tr><th>Seat state</th><td>Value</td><td>Available, held by one hold until a time, or booked by one booking</td></tr>
+<tr><th>Hold</th><td>Entity</td><td>A customer’s claim on some seats until a time, the relationship promoted to an entity as the parking ticket was</td></tr>
+<tr><th>Booking</th><td>Entity</td><td>Seats sold: the hold it came from, the amount, the charge</td></tr>
+<tr><th>Policy</th><td>Value</td><td>How long a hold lasts, and what happens to a late payment</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th></tr></thead>
+<tbody>
+<tr><th>Every seat is available, held by one live hold, or booked by one booking</th><td><code>Show</code></td></tr>
+<tr><th>A hold gets all its seats or none</th><td><code>Show.hold</code></td></tr>
+<tr><th>A booked seat is never held or booked again</th><td><code>Show.book</code>, and in SQL the primary key of <code>booked_seats</code></td></tr>
+<tr><th>A hold counts only until its end time</th><td><code>Show.isFree</code>, which compares the end with the clock</td></tr>
+<tr><th>One checkout key, one charge</th><td><code>BookingService.checkout</code>, and the provider</td></tr>
+<tr><th>Money taken equals money for booked seats plus money refunded</th><td><code>BookingService</code>, checked after every event of the simulation</td></tr>
+</tbody>
+</table>
+
+<h2 id="classes">Step 4: The classes</h2>
+
+<figure class="fig wide" id="fig-classes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 444" role="img" aria-labelledby="f741t f741d">
+<title id="f741t">The classes of the booking core</title>
+<desc id="f741d">A class diagram. BookingService holds the shows, the holds, the bookings and the checkouts by idempotency key, and offers hold, release and checkout. It owns any number of Holds and Bookings, has any number of Shows, and calls a PaymentPort. A Show owns one SeatState for each seat of its Screen: available, held with a hold id and an end time, or booked with a booking id. PaymentPort, with charge and refund, is implemented by FakePayments in the tests; Clock, with now, by ManualClock. A Policy sets the hold time, the grace given when payment starts, and whether a late payment may book seats that are still free.</desc>
+<rect class="n sig" x="10" y="14" width="240" height="144" rx="4"/>
+<text class="tb mid" x="130" y="33">BookingService</text>
+<line class="sep sig" x1="10" y1="42" x2="250" y2="42"/>
+<text class="ts" x="18" y="58">− shows, holds, bookings</text>
+<text class="ts" x="18" y="74">− checkouts: Map&lt;key, Promise&gt;</text>
+<text class="ts" x="18" y="90">− payments, clock, policy</text>
+<line class="sep sig" x1="10" y1="100" x2="250" y2="100"/>
+<text class="ts" x="18" y="116">+ hold(showId, customer, seats)</text>
+<text class="ts" x="18" y="132">+ release(holdId)</text>
+<text class="ts" x="18" y="148">+ checkout(holdId, key): Outcome</text>
+<rect class="n store" x="290" y="14" width="220" height="144" rx="4"/>
+<text class="tb mid" x="400" y="33">Show</text>
+<line class="sep store" x1="290" y1="42" x2="510" y2="42"/>
+<text class="ts" x="298" y="58">movie, screen, startsAt, prices</text>
+<text class="ts" x="298" y="74">− seats: Map&lt;SeatId, SeatState&gt;</text>
+<line class="sep store" x1="290" y1="84" x2="510" y2="84"/>
+<text class="ts" x="298" y="100">+ hold(holdId, seats, now, until)</text>
+<text class="ts" x="298" y="116">+ extend(…), release(…)</text>
+<text class="ts" x="298" y="132">+ book(holdId, seats, id, now, …)</text>
+<text class="ts" x="298" y="148">+ counts(now)</text>
+<path class="e has" d="M250 57.2 L290 57.2"/>
+<text class="ts mid" x="270" y="50.2">*</text>
+<rect class="n store" x="545" y="14" width="165" height="100" rx="4"/>
+<text class="ts mid" x="627.5" y="30">«union»</text>
+<text class="tb mid" x="627.5" y="47">SeatState</text>
+<line class="sep store" x1="545" y1="56" x2="710" y2="56"/>
+<text class="ts" x="553" y="72">available</text>
+<text class="ts" x="553" y="88">held: holdId, until</text>
+<text class="ts" x="553" y="104">booked: bookingId</text>
+<path class="e owns" d="M510 71.6 L545 74"/>
+<rect class="n" x="545" y="140" width="165" height="70" rx="4"/>
+<text class="tb mid" x="627.5" y="159">Screen</text>
+<line class="sep" x1="545" y1="168" x2="710" y2="168"/>
+<text class="ts" x="553" y="184">seats: Seat[]</text>
+<text class="ts" x="553" y="200">capacity</text>
+<path class="e assoc" d="M510 136.4 L545 175"/>
+<rect class="n" x="10" y="200" width="130" height="102" rx="4"/>
+<text class="tb mid" x="75" y="219">Hold</text>
+<line class="sep" x1="10" y1="228" x2="140" y2="228"/>
+<text class="ts" x="18" y="244">id, customer</text>
+<text class="ts" x="18" y="260">seats, amount</text>
+<text class="ts" x="18" y="276">expiresAt</text>
+<text class="ts" x="18" y="292">status</text>
+<rect class="n" x="150" y="200" width="110" height="86" rx="4"/>
+<text class="tb mid" x="205" y="219">Booking</text>
+<line class="sep" x1="150" y1="228" x2="260" y2="228"/>
+<text class="ts" x="158" y="244">id, holdId</text>
+<text class="ts" x="158" y="260">seats, amount</text>
+<text class="ts" x="158" y="276">chargeId</text>
+<path class="e owns" d="M82 158 L81.5 200"/>
+<text class="ts mid" x="91.75" y="185">*</text>
+<path class="e owns" d="M215 158 L205 200"/>
+<text class="ts mid" x="220" y="185">*</text>
+<rect class="n async" x="300" y="230" width="200" height="84" rx="4"/>
+<text class="ts mid" x="400" y="246">«interface»</text>
+<text class="tb mid" x="400" y="263">PaymentPort</text>
+<line class="sep async" x1="300" y1="272" x2="500" y2="272"/>
+<text class="ts" x="308" y="288">+ charge(request): Promise</text>
+<text class="ts" x="308" y="304">+ refund(chargeId)</text>
+<path class="e assoc" d="M250 132.08 L272 132.08 L272 212 L340 212 L340 230"/>
+<rect class="n" x="300" y="350" width="200" height="80" rx="4"/>
+<text class="tb mid" x="400" y="369">FakePayments</text>
+<line class="sep" x1="300" y1="378" x2="500" y2="378"/>
+<text class="ts" x="308" y="394">answers: approve, decline, wait</text>
+<line class="sep" x1="300" y1="404" x2="500" y2="404"/>
+<text class="ts" x="308" y="420">+ settle(key, approve)</text>
+<path class="e implements" d="M400 350 L400 314"/>
+<rect class="n" x="545" y="240" width="165" height="68" rx="4"/>
+<text class="ts mid" x="627.5" y="256">«interface»</text>
+<text class="tb mid" x="627.5" y="273">Clock</text>
+<line class="sep" x1="545" y1="282" x2="710" y2="282"/>
+<text class="ts" x="553" y="298">+ now(): number</text>
+<rect class="n" x="545" y="350" width="165" height="54" rx="4"/>
+<text class="tb mid" x="627.5" y="369">ManualClock</text>
+<line class="sep" x1="545" y1="378" x2="710" y2="378"/>
+<text class="ts" x="553" y="394">+ set(t), advance(ms)</text>
+<path class="e implements" d="M627.5 350 L627.5 308"/>
+<rect class="n" x="10" y="350" width="250" height="86" rx="4"/>
+<text class="tb mid" x="135" y="369">Policy</text>
+<line class="sep" x1="10" y1="378" x2="260" y2="378"/>
+<text class="ts" x="18" y="394">holdMs</text>
+<text class="ts" x="18" y="410">payGraceMs: extend the hold on pay</text>
+<text class="ts" x="18" y="426">lapsedMayBook: late but free is fine</text>
+</svg>
+</div>
+<figcaption>The show is the one owner of every seat’s state. The service holds the money side: holds, bookings, and checkouts remembered by key. Payment and time come in through interfaces.</figcaption>
+</figure>
+
+<p>The decision that shapes everything is where a seat’s state lives. A seat belongs to a screen and exists for every show, so it cannot say whether it is sold. That fact belongs to the pair of a show and a seat, and the show owns all such pairs for its screening. Every rule about seats is then a method of one object that sees all of them: the place that can promise each seat to one customer.</p>
+<p>Payment and time come in through interfaces, a port for each, as in <x-ref to="application-architecture#hexagon"></x-ref>. The tests use a fake provider that can approve, decline or wait until told, and a clock that moves only when the test moves it, so a ten-minute hold takes no time to test, as with the clock of <x-ref to="lld-rate-limiter"></x-ref>.</p>
+
+<h2 id="varies">Step 5: What varies</h2>
+<table>
+<thead><tr><th>What varies</th><th>Where it is decided</th></tr></thead>
+<tbody>
+<tr><th>How long a hold lasts</th><td><code>Policy.holdMs</code></td></tr>
+<tr><th>What happens to a payment that answers late</th><td><code>Policy</code>: <code>STRICT</code> or <code>GRACE</code></td></tr>
+<tr><th>Who takes the money</th><td>The <code>PaymentPort</code> adapter</td></tr>
+<tr><th>Where the seat states are kept</th><td>A <code>Show</code> in memory, or the <code>show_seats</code> table</td></tr>
+<tr><th>Which seats to offer</th><td>The caller. The simulation picks the most central free block in the best row</td></tr>
+</tbody>
+</table>
+
+<h2 id="code">Step 6: The code</h2>
+<h3 id="seats">Seats, and holds that lapse by themselves</h3>
+<pre data-lang="ts" data-title="A seat’s state at one show">
+// What one seat is doing at one show. A hold carries the time at which it lapses. A lapsed hold
+// is left as it is and read as available: nothing has to run at the moment a hold runs out.
+export type SeatState =
+  | { readonly kind: "available" }
+  | { readonly kind: "held"; readonly holdId: string; readonly until: number }
+  | { readonly kind: "booked"; readonly bookingId: string };
+</pre>
+<pre data-lang="ts" data-title="Show: free means available or lapsed, and a hold takes all seats or none">
+// Free means available, or held by a hold that has lapsed.
+  isFree(seatId: SeatId, now: number): boolean {
+    const s = this.state(seatId);
+    return s.kind === "available" || (s.kind === "held" && s.until <= now);
+  }
+
+  heldBy(seatId: SeatId, holdId: string, now: number): boolean {
+    const s = this.state(seatId);
+    return s.kind === "held" && s.holdId === holdId && s.until > now;
+  }
+
+  // All or nothing. Every seat is checked before any is changed, and there is no await in between,
+  // so no other call can run between the check and the claim.
+  hold(holdId: string, seatIds: readonly SeatId[], now: number, until: number): HoldAnswer {
+    this.validate(seatIds);
+    const unavailable = seatIds.filter((id) => !this.isFree(id, now));
+    if (unavailable.length > 0) return { ok: false, unavailable };
+    for (const id of seatIds) this.seats.set(id, { kind: "held", holdId, until });
+    return { ok: true };
+  }
+</pre>
+<p>A held seat stores when its hold ends. Nothing changes it at that moment: every reader compares the end with the clock, and a hold whose end has passed reads as available. Expiring by reading instead of by a timer removes a whole class of bugs. There is no timer to lose when a server restarts, and no timer firing in the middle of a payment. A <dfn>hold</dfn> is a claim on seats that lapses at a stated time unless it is turned into a booking, a <x-ref to="distributed-fundamentals#pauses">lease</x-ref> on seats.</p>
+
+<figure class="fig wide" id="fig-states">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 258" role="img" aria-labelledby="f742t f742d">
+<title id="f742t">The states of one seat, and seat C7 over a few minutes</title>
+<desc id="f742d">Above, three states: available, held and booked. Hold takes an available seat, paid books a held one, release or a declined payment frees it, and a hold lapses on its own when its end time passes, with nothing written. Below, seat C7 on a time line from 17:00 to 17:25: Ana holds it until 17:10; from 17:10 it is still stored as hers but read as available; Ben holds it at 17:11; Ana’s late release at 17:12 leaves Ben’s hold alone; Ben’s payment books it at 17:15.</desc>
+<rect class="n " x="30" y="40" width="150" height="46" rx="8"/>
+<text class="tb mid" x="105" y="60">Available</text>
+<text class="ts mid" x="105" y="77">free to hold</text>
+<rect class="n sig" x="285" y="40" width="150" height="46" rx="8"/>
+<text class="tb mid" x="360" y="60">Held</text>
+<text class="ts mid" x="360" y="77">by one hold, until a time</text>
+<rect class="n store" x="540" y="40" width="150" height="46" rx="8"/>
+<text class="tb mid" x="615" y="60">Booked</text>
+<text class="ts mid" x="615" y="77">sold, for good</text>
+<path class="e sig" d="M180 52H285"/>
+<text class="ts mid" x="232" y="46">hold</text>
+<path class="e sig" d="M285 76H180"/>
+<text class="ts mid" x="232" y="92">release, declined</text>
+<path class="e async dash" d="M360 86V112H105V86"/>
+<text class="ts mid" x="232" y="126">lapses: the clock passes its end, nothing is written</text>
+<path class="e store" d="M435 63H540"/>
+<text class="ts mid" x="487" y="57">paid</text>
+<line class="axis" x1="60" y1="206" x2="690.0" y2="206"/>
+<line class="axis" x1="60.0" y1="206" x2="60.0" y2="211"/>
+<text class="ts mid" x="60.0" y="224">17:00</text>
+<line class="axis" x1="186.0" y1="206" x2="186.0" y2="211"/>
+<text class="ts mid" x="186.0" y="224">17:05</text>
+<line class="axis" x1="312.0" y1="206" x2="312.0" y2="211"/>
+<text class="ts mid" x="312.0" y="224">17:10</text>
+<line class="axis" x1="438.0" y1="206" x2="438.0" y2="211"/>
+<text class="ts mid" x="438.0" y="224">17:15</text>
+<line class="axis" x1="564.0" y1="206" x2="564.0" y2="211"/>
+<text class="ts mid" x="564.0" y="224">17:20</text>
+<line class="axis" x1="690.0" y1="206" x2="690.0" y2="211"/>
+<text class="ts mid" x="690.0" y="224">17:25</text>
+<text class="tb" x="10" y="195">C7</text>
+<g data-s="1" data-packet="none">
+<rect class="n sig" x="60.0" y="182" width="252.0" height="20" rx="3"/>
+<text class="ts mid" x="186.0" y="176">Ana, until 17:10</text>
+</g>
+<g class="hide" data-s="1" data-e="1">
+<path class="e none sig" style="stroke-width:4" d="M180 52H285"/>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n sunk" x="312.0" y="182" width="25.2" height="20" rx="3"/>
+<path class="e none" d="M324.6 182V165"/>
+<text class="ts mid" x="324.6" y="158">still stored as Ana’s, read as available</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<path class="e none async" style="stroke-width:4" d="M360 86V112H105V86"/>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n sig" x="337.2" y="182" width="100.8" height="20" rx="3"/>
+<text class="ts mid" x="387.6" y="176">Ben, until 17:21</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<path class="e none sig" style="stroke-width:4" d="M180 52H285"/>
+</g>
+<g data-s="4" data-packet="none">
+<path class="x" d="M357.4 187l10 10M367.4 187l-10 10"/>
+<path class="e none" d="M362.4 204V234"/>
+<text class="ts" x="368.4" y="246">17:12: Ana’s late release, ignored</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n store" x="438.0" y="182" width="252.0" height="20" rx="3"/>
+<text class="ts mid" x="564.0" y="176">booked by Ben</text>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<path class="e none store" style="stroke-width:4" d="M435 63H540"/>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="C7 stored: held by Ana until 17:10; C7 read as: held">Ana holds C7 until 17:10. The seat stores the hold’s id and its end time.</li>
+  <li data-msg="none" data-state="C7 stored: held by Ana until 17:10; C7 read as: available">At 17:10 nothing runs and nothing is written. Every reader compares the end time with the clock, and from now on reads C7 as available.</li>
+  <li data-msg="none" data-state="C7 stored: held by Ben until 17:21; C7 read as: held">At 17:11 Ben holds C7. To his hold, a lapsed hold is the same as a free seat.</li>
+  <li data-msg="none" data-state="C7 stored: held by Ben until 17:21; C7 read as: held">At 17:12 Ana’s page sends a release. Release frees only seats its own hold still has, so Ben keeps C7.</li>
+  <li data-msg="none" data-state="C7 stored: booked by Ben; C7 read as: booked">Ben’s payment is approved at 17:15, and his hold becomes a booking. Booked seats never lapse.</li>
+</ol>
+<figcaption>A hold lapses by being read, not by being changed: no timer has to fire at 17:10. The test checks each of these moments on a real Show.</figcaption>
+</figure>
+
+<p><code>hold</code> checks every seat before it changes any, so a customer who asks for C5 to C7 when C7 is taken gets nothing and is told which seat was the problem. The test sent 2,000 overlapping requests for one to four adjacent seats of one row, one a second, with holds of 5 to 60 seconds: 265 were granted whole and 1,735 refused with nothing held, and after every request each live hold still had all its seats. Taking seat by seat and stopping at the first taken one would have left 284 seats held for customers who had been told no, up to 9 of the row’s 10 at once.</p>
+<p>The method has no <code>await</code> between the check and the claim. In one Node.js process nothing else can run in between (<x-ref to="concurrency-in-code#races"></x-ref>), which the test checks with 1,000 customers arriving within two milliseconds for pairs of seats: 42 holds granted, 84 seats, none twice.</p>
+
+<h3 id="checkout">Checkout: payment in the middle</h3>
+<pre data-lang="ts" data-title="BookingService.checkout: one attempt per key, and every case of the payment">
+// Pay for a hold and turn it into a booking. A retry with the same key gets the same answer from the
+  // same single attempt, even while that attempt is still waiting for the payment.
+  checkout(holdId: string, key: string): Promise<Outcome> {
+    const known = this.checkouts.get(key);
+    if (known) return known;
+    const attempt = this.pay(this.holdOf(holdId), key);
+    this.checkouts.set(key, attempt);
+    return attempt;
+  }
+
+  private async pay(hold: Hold, key: string): Promise<Outcome> {
+    if (hold.status === "booked") return { kind: "booked", booking: this.bookings.get(hold.bookingId as string) as Booking };
+    if (hold.status === "paying") return { kind: "busy" };
+    const start = this.clock.now();
+    const until = Math.max(hold.expiresAt, start + this.policy.payGraceMs);
+    if (hold.status !== "held" || !hold.show.extend(hold.id, hold.seats, start, until)) return { kind: "expired" };
+    hold.expiresAt = until;
+    hold.status = "paying";
+
+    const charge = await this.payments.charge({ key, amount: hold.amount, customer: hold.customer });
+    // Anything may have happened while we waited, including the hold lapsing and the seats being sold.
+    const now = this.clock.now();
+    if (!charge.ok) {
+      hold.show.release(hold.id, hold.seats);
+      hold.status = "released";
+      return { kind: "declined", reason: charge.reason };
+    }
+    const bookingId = `B${this.next++}`;
+    if (hold.show.book(hold.id, hold.seats, bookingId, now, this.policy.lapsedMayBook)) {
+      const booking: Booking = { id: bookingId, holdId: hold.id, showId: hold.show.id, customer: hold.customer, seats: hold.seats, amount: hold.amount, chargeId: charge.chargeId };
+      this.bookings.set(bookingId, booking);
+      hold.status = "booked";
+      hold.bookingId = bookingId;
+      return { kind: "booked", booking };
+    }
+    hold.status = "refunded";
+    await this.payments.refund(charge.chargeId);
+    return { kind: "refunded", chargeId: charge.chargeId };
+  }
+</pre>
+<p>Checkout is where the money meets the seats, and it is written around the <code>await</code>. Before it, the hold must still be live, and it is marked <code>paying</code> and extended by the policy’s grace, so that a customer who presses pay with ten seconds left is not punished for a slow bank. After it, anything may have happened, including the hold lapsing and someone else holding the seats. So the code asks the show again, and the show books the seats only if they are still this hold’s.</p>
+
+<figure class="fig wide" id="fig-payment">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 482" role="img" aria-labelledby="f744t f744d">
+<title id="f744t">Payment in the middle: in time, and too late</title>
+<desc id="f744d">Two sequences between the customer, the booking service, the show and the payment provider. Above, Ana checks out at 17:09; the service extends her hold to 17:14, charges 18.00 with her key, hears approved and books the seats. Below, the provider takes until 17:20 to answer; her hold ends at 17:14, Ben holds the seats at 17:15, so the booking is refused and the service refunds the charge.</desc>
+<g data-scene="intime">
+<text class="tb mid" x="60" y="20">Customer</text>
+<line class="axis" x1="60" y1="28" x2="60" y2="208"/>
+<text class="tb mid" x="250" y="20">BookingService</text>
+<line class="axis" x1="250" y1="28" x2="250" y2="208"/>
+<text class="tb mid" x="440" y="20">Show</text>
+<line class="axis" x1="440" y1="28" x2="440" y2="208"/>
+<text class="tb mid" x="630" y="20">Provider</text>
+<line class="axis" x1="630" y1="28" x2="630" y2="208"/>
+<g data-s="1">
+<path class="e sig" d="M61 56H249"/>
+<text class="ts mid" x="155.0" y="50">1. checkout(H1, key k1)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M251 84H439"/>
+<text class="ts mid" x="345.0" y="78">2. extend H1 to 17:14</text>
+</g>
+<g data-s="3">
+<path class="e async" d="M251 112H629"/>
+<text class="ts mid" x="440.0" y="106">3. charge 18.00, key k1</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M629 140H251"/>
+<text class="ts mid" x="440.0" y="134">4. approved ch_1</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M251 168H439"/>
+<text class="ts mid" x="345.0" y="162">5. book H1’s seats</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M249 196H61"/>
+<text class="ts mid" x="155.0" y="190">6. booked B2</text>
+</g>
+</g>
+<path class="e none dash" d="M10 224H710"/>
+<g data-scene="late">
+<text class="tb mid" x="60" y="252">Customer</text>
+<line class="axis" x1="60" y1="260" x2="60" y2="468"/>
+<text class="tb mid" x="250" y="252">BookingService</text>
+<line class="axis" x1="250" y1="260" x2="250" y2="468"/>
+<text class="tb mid" x="440" y="252">Show</text>
+<line class="axis" x1="440" y1="260" x2="440" y2="468"/>
+<text class="tb mid" x="630" y="252">Provider</text>
+<line class="axis" x1="630" y1="260" x2="630" y2="468"/>
+<g data-s="1">
+<path class="e sig" d="M61 288H249"/>
+<text class="ts mid" x="155.0" y="282">1. checkout(H1, key k1)</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M251 316H629"/>
+<text class="ts mid" x="440.0" y="310">2. charge 18.00, key k1</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n fault" x="255.4" y="330" width="176.6" height="22" rx="4"/>
+<text class="ts mid" x="343.7" y="345">3. 17:15: Ben holds C5, C6</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M629 372H251"/>
+<text class="ts mid" x="440.0" y="366">4. approved ch_1 (17:20)</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M251 400H439"/>
+<text class="ts mid" x="345.0" y="394">5. book H1’s seats?</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M251 428H629"/>
+<text class="ts mid" x="440.0" y="422">6. refund ch_1</text>
+</g>
+<g data-s="7">
+<path class="e fault" d="M249 456H61"/>
+<text class="ts mid" x="155.0" y="450">7. refunded</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="intime" data-label="In time">
+  <li data-state="Hold H1: held until 17:10; C5, C6: held">At 17:09 Ana presses pay. The call carries an idempotency key, so a retry reaches the same attempt.</li>
+  <li data-state="Hold H1: paying, until 17:14; C5, C6: held">The hold is extended to five minutes from now, so a slow bank does not lose her the seats.</li>
+  <li>The service asks for the money. Nothing is booked yet.</li>
+  <li>The provider approves the charge and returns its id, ch_1.</li>
+  <li data-state="Hold H1: booked; C5, C6: booked">The show checks that the seats are still this hold’s and books them, both or neither.</li>
+  <li>Ana is told her seats are booked.</li>
+</ol>
+<ol class="steps" data-scene="late" data-label="Too late">
+  <li data-state="Hold H1: paying, until 17:14; C5, C6: held">Again Ana presses pay at 17:09, and the hold is extended to 17:14.</li>
+  <li>This time her bank is slow to answer.</li>
+  <li data-msg="none" data-state="Hold H1: paying, lapsed; C5, C6: held by Ben">At 17:14 her hold lapses. At 17:15 Ben finds the seats free and holds them.</li>
+  <li>At 17:20 the bank approves. The money is taken, but the seats are gone.</li>
+  <li>The show refuses: the seats belong to Ben’s live hold.</li>
+  <li data-state="Hold H1: refunded; C5, C6: held by Ben">The service gives the money back. Charged and refunded is better than paid with no seat.</li>
+  <li>Ana is told the truth: no seats, money returned.</li>
+</ol>
+<figcaption>The seats are held while the money moves, and the hold, not the payment, decides who gets them. A payment that answers after the seats are gone is refunded.</figcaption>
+</figure>
+
+<p>Every way out leaves the books balanced. A declined payment frees the seats at once instead of ten minutes later. An approved payment books the seats or, if they are gone, is refunded. The simulation checks after every event that the money taken equals the money for booked seats plus the money refunded.</p>
+
+<h2 id="double">Two customers, one seat</h2>
+<p>With several servers, the seat states live in a shared store, and every question to it is a round trip. Code that asks whether seats are free and then, in a second call, writes the customer’s name has a gap between the two calls, and another customer’s question can fall into it.</p>
+
+<figure class="fig wide" id="fig-race">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 258" role="img" aria-labelledby="f743t f743d">
+<title id="f743t">Two customers, two seats: read then write, or check and set</title>
+<desc id="f743d">Two sequences side by side. On the left, Ana and Ben each ask the seat store whether C5 and C6 are free, both hear yes, then both write their name, and both are told they hold the seats. On the right, each sends one claim that checks and writes together where the data lives: Ana’s claim succeeds, and Ben’s, arriving after, is refused.</desc>
+<path class="e none dash" d="M362 8V250"/>
+<g data-scene="racy">
+<text class="tb mid" x="40" y="20">Ana</text>
+<line class="axis" x1="40" y1="28" x2="40" y2="215"/>
+<text class="tb mid" x="180" y="20">Seat store</text>
+<line class="axis" x1="180" y1="28" x2="180" y2="215"/>
+<text class="tb mid" x="320" y="20">Ben</text>
+<line class="axis" x1="320" y1="28" x2="320" y2="215"/>
+<g data-s="1">
+<path class="e sig" d="M41 58H179"/>
+<text class="ts mid" x="110.0" y="52">1. read C5, C6</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M179 87H41"/>
+<text class="ts mid" x="110.0" y="81">2. free, free</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M319 116H181"/>
+<text class="ts mid" x="250.0" y="110">3. read C5, C6</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M181 145H319"/>
+<text class="ts mid" x="250.0" y="139">4. free, free</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M41 174H179"/>
+<text class="ts mid" x="110.0" y="168">5. write: Ana</text>
+</g>
+<g data-s="6">
+<path class="e fault" d="M319 203H181"/>
+<text class="ts mid" x="250.0" y="197">6. write: Ben</text>
+</g>
+</g>
+<g data-scene="safe">
+<text class="tb mid" x="400" y="20">Ana</text>
+<line class="axis" x1="400" y1="28" x2="400" y2="157"/>
+<text class="tb mid" x="540" y="20">Seat store</text>
+<line class="axis" x1="540" y1="28" x2="540" y2="157"/>
+<text class="tb mid" x="680" y="20">Ben</text>
+<line class="axis" x1="680" y1="28" x2="680" y2="157"/>
+<g data-s="1">
+<path class="e sig" d="M401 58H539"/>
+<text class="ts mid" x="470.0" y="52">1. claim if free</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M539 87H401"/>
+<text class="ts mid" x="470.0" y="81">2. yes, held</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M679 116H541"/>
+<text class="ts mid" x="610.0" y="110">3. claim if free</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M541 145H679"/>
+<text class="ts mid" x="610.0" y="139">4. no: C5, C6 held</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="racy" data-label="Read, then write">
+  <li data-state="C5, C6: free; told yes: nobody">Ana’s server asks whether C5 and C6 are free. They are.</li>
+  <li>The answer is true when it is sent. It starts going stale at once.</li>
+  <li>Before Ana’s write arrives, Ben’s server asks the same question.</li>
+  <li>Nothing has changed yet, so Ben hears the same answer.</li>
+  <li data-state="C5, C6: Ana; told yes: Ana">Ana’s server writes her name on both seats and tells her they are hers.</li>
+  <li data-state="C5, C6: Ben; told yes: Ana and Ben">Ben’s server writes over them and tells him the same. Two customers hold one pair of seats.</li>
+</ol>
+<ol class="steps" data-scene="safe" data-label="Check and set">
+  <li data-state="C5, C6: free; told yes: nobody">Ana’s claim checks and writes in one step where the seats are kept.</li>
+  <li data-state="C5, C6: Ana; told yes: Ana">Both were free, so both are now hers.</li>
+  <li>Ben’s claim arrives a moment later, asking the same question with the same step.</li>
+  <li data-state="C5, C6: Ana; told yes: Ana">The check sees Ana’s hold, so nothing is written and Ben is told no.</li>
+</ol>
+<figcaption>In one thread an await between the check and the write lets others in; across processes, so does every round trip. The fix is the same in both: check and write in one step where the data lives.</figcaption>
+</figure>
+
+<p>The test measured the gap with a store that takes 1 to 3 milliseconds a call. Customers each wanted two adjacent seats of a 100-seat hall, chosen at random. One run:</p>
+<table>
+<thead><tr><th>Customers</th><th>Read, then write: seats promised to two or more, average (worst)</th><th>Read, then write: customers told yes</th><th>Check and set: customers told yes</th></tr></thead>
+<tbody>
+<tr><th>2 at once</th><td>0.1 (1)</td><td>2</td><td>2</td></tr>
+<tr><th>10 at once</th><td>1.4 (4)</td><td>9.9</td><td>8.9</td></tr>
+<tr><th>100 at once</th><td>54.3 (62)</td><td>89.7</td><td>35.8</td></tr>
+<tr><th>1,000 at once</th><td>99.9 (100)</td><td>795.3</td><td>41.1</td></tr>
+<tr><th>1,000 over one second</th><td>4 (5)</td><td>44</td><td>42.3</td></tr>
+</tbody>
+</table>
+<p>Two customers rarely collide, which is why the bug survives testing by hand. A hundred at once, the opening minute of a popular show, and over half the hall is promised twice. Even spread over a second, a few seats were. Check and set never promised a seat twice in any trial.</p>
+<p>In SQL the check and the write become one statement. The parking lot claimed one space with a conditional <code>UPDATE</code> (<x-ref to="lld-parking-lot#gates"></x-ref>); here an order claims several seats, and a hold can lapse, so the condition includes the time and the statement counts what it changed.</p>
+<pre data-lang="ts" data-title="Holding seats in SQL: a conditional UPDATE, kept only if it took every seat">
+// All or nothing: a conditional UPDATE changes only seats that are free now. Unless it changed every one, nothing is kept.
+export function holdSeats(db: DatabaseSync, showId: string, holdId: string, seatIds: readonly SeatId[], now: number, until: number): boolean {
+  return inTransaction(db, () => {
+    const { changes } = db.prepare(`
+      UPDATE show_seats SET status = 'held', hold_id = ?, held_until = ?
+      WHERE show_id = ? AND seat_id IN (${marks(seatIds.length)})
+        AND (status = 'available' OR (status = 'held' AND held_until <= ?))`).run(holdId, until, showId, ...seatIds, now);
+    return Number(changes) === seatIds.length;
+  });
+}
+</pre>
+<p><code>BEGIN IMMEDIATE</code> makes SQLite take the write lock when the transaction starts, so two connections cannot both be inside it at once. If the update changed fewer rows than seats were asked for, some seat was not free, and the rollback undoes the rest. The rule that no seat is sold twice is also written into the schema: <code>booked_seats</code> has the primary key <code>(show_id, seat_id)</code>, so a second booking of a seat fails whatever code path tries it. That is the last line of defense against a bug elsewhere, or against a second sales channel written by another team (<x-ref to="transactions#constraints"></x-ref>).</p>
+<p>The test ran this for real: 8 worker threads, each with its own connection to one database file, released at the same instant 20 times to hold the same 3 seats. Reading then writing told all 8 customers yes in every round, 160 in all; only the primary key kept the bookings to one a round, leaving 7 customers each time who had been promised seats they could not buy. The conditional update told exactly one customer yes every round.</p>
+
+<h2 id="late">Paying late, and paying twice</h2>
+<p>A payment that answers after the hold has ended is the case most designs forget. The two policies treat it differently; the test ran each case under both.</p>
+<table>
+<thead><tr><th>The answer arrives</th><th><code>STRICT</code>: no grace, late is refused</th><th><code>GRACE</code>: five more minutes, late but free is fine</th></tr></thead>
+<tbody>
+<tr><th>90 seconds after the hold’s original end, seats untouched</th><td>Refunded</td><td>Booked</td></tr>
+<tr><th>30 minutes after, seats still free</th><td>Refunded</td><td>Booked</td></tr>
+<tr><th>After the end, with the seats held by someone else</th><td>Refunded</td><td>Refunded</td></tr>
+<tr><th>Declined, at any time</th><td colspan="2">The seats are free at once</td></tr>
+</tbody>
+</table>
+<p>Neither policy ever sells a seat twice; they differ in how often they refund someone who could have been served. <code>GRACE</code> is kinder, and the design keeps it a setting because a box office may prefer the rule that is simplest to explain.</p>
+<p>Paying twice is the other danger. A customer double-clicks, or the page retries after a timeout, and the server sees the same checkout several times. An <x-ref to="idempotency-and-delivery#keys">idempotency key</x-ref> makes those one attempt: the service keeps the promise of the first call under its key and hands the same promise to every repeat, even while the payment is still running, and passes the key to the provider, which Stripe, for example, documents as returning the saved result for a repeated key. In the test, three calls with one key made one charge and one booking. A later call with a new key found the hold already booked and returned the same booking, and a second key while the first payment was still running was told <code>busy</code>. Without the key and the <code>paying</code> state, the same three calls charged the card three times, booked once and refunded twice.</p>
+
+<h2 id="hold-time">How long to hold</h2>
+<p>A hold protects a customer who is paying, and costs everyone else the seats of a customer who has left. Seats in abandoned holds follow <x-ref to="latency-and-throughput#littles-law"></x-ref>: on average, the number in the system equals the rate they arrive times how long each stays.</p>
+<div class="formula">seats held by people who left = holds an hour ÷ 60 × share abandoned × seats a hold × minutes a hold lasts<br>= 500 ÷ 60 × 0.25 × 2.25 × 10 ≈ 46.9 seats</div>
+<p>The simulation tested the formula in a hall too large to fill, so nobody was turned away: 242 of 1,000 customers abandoned, with 557 seats. The formula predicts 557 ÷ 120 minutes × 10 = 46.4 seats held by people who had left; the simulation measured 44.5, the shortfall coming from holds still running at the end of the two hours.</p>
+
+<div class="widget" data-widget="holdseats74">
+<h4>Seats held by people who have left</h4>
+<p>The average number of seats in holds that will never be paid for, by Little’s law. The defaults are the simulation’s customers.</p>
+<div class="controls">
+  <label>Holds an hour<input type="number" name="rate" value="500" min="0" max="100000" step="10"></label>
+  <label>Share abandoned, %<input type="number" name="quit" value="25" min="0" max="100" step="1"></label>
+  <label>Seats a hold<input type="number" name="seats" value="2.25" min="1" max="20" step="0.05"></label>
+  <label>Minutes a hold lasts<input type="number" name="minutes" value="10" min="0" max="120" step="1"></label>
+  <label>Seats in the hall<input type="number" name="capacity" value="100" min="1" max="100000" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 200" role="img" aria-label="Seats in abandoned holds rising in a straight line with the minutes a hold lasts, against a horizontal line for the whole hall, with the chosen hold time marked."><line x1="52" x2="490" y1="164" y2="164" class="axis"></line><text x="52" y="180" class="ts mid">0</text><text x="125" y="180" class="ts mid">5</text><text x="198" y="180" class="ts mid">10</text><text x="271" y="180" class="ts mid">15</text><text x="344" y="180" class="ts mid">20</text><text x="417" y="180" class="ts mid">25</text><text x="490" y="180" class="ts mid">30</text><text x="271" y="196" class="ts mid">minutes a hold lasts</text><line x1="52" x2="490" y1="57.3" y2="57.3" class="grid"></line><text x="498" y="61.3" class="ts tb">whole hall: 100</text><path d="M52 164 L490 14" class="line" style="stroke:var(--async)"></path><text x="498" y="26" class="ts tb">in abandoned holds</text><line x1="198" x2="198" y1="114" y2="164" class="axis" stroke-dasharray="4 4"></line><circle cx="198" cy="114" r="5" class="dot" style="fill:var(--async)"></circle><text x="190" y="105" class="ts end">46.9 seats</text></svg>
+<dl class="results">
+  <div><dt>Seats in abandoned holds</dt><dd data-out="blocked">46.9</dd></div>
+  <div><dt>Share of the hall</dt><dd data-out="share">47%</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">On average 46.9 seats are held by people who have already left, 47% of the hall, a large share to keep out of reach while people who would pay are being turned away.</p>
+</div>
+
+<p>The formula gives the cost of a long hold, not the best length, because a short hold has a cost too: customers still paying lose their seats. The simulation plays a day of sales for one 100-seat show. A thousand customers arrive over two hours, each wanting one to four adjacent seats; a quarter of those who get seats leave without paying; the rest press pay after 30 seconds plus a random wait averaging two and a half minutes. Most payments take seconds, some take minutes, 3% take ten minutes or more, and one in ten is declined. These are assumptions, not data from a real cinema. Each day was run for nine hold times on the same seeded customers, through the real <code>BookingService</code> with the manual clock.</p>
+
+<figure class="fig wide" id="fig-holdtime">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f745t f745d">
+<title id="f745t">How long to hold: lost while paying, turned away, and selling out</title>
+<desc id="f745d">Two charts against the hold time, from 1 to 30 minutes, averaged over 20 simulated days of 1,000 customers for 100 seats. Left: customers whose hold lapsed before they paid, 254.1 at 1 min, 75.5 at 2 min, 36.6 at 3 min, 12.3 at 5 min, 4.6 at 7 min, 1.6 at 10 min, 0.4 at 15 min, 0 at 20 min, 0 at 30 min; and customers turned away while abandoned holds sat on enough seats, 36.8 at 1 min, 45.8 at 2 min, 61.4 at 3 min, 96.2 at 5 min, 116.7 at 7 min, 165.9 at 10 min, 261.7 at 15 min, 366.8 at 20 min, 513.9 at 30 min. Right: the minute the last seat sold, 85.7 at 1 min, 49.6 at 2 min, 43 at 3 min, 40 at 5 min, 39 at 7 min, 46.4 at 10 min, 65.9 at 15 min, 74.3 at 20 min, 95.1 at 30 min.</desc>
+<text class="tb" x="10" y="18">Customers, of 1,000</text>
+<line class="axis" x1="50" y1="214.0" x2="370" y2="214.0"/>
+<text class="ts end" x="44" y="218.0">0</text>
+<line class="grid" x1="50" y1="182.4" x2="370" y2="182.4"/>
+<text class="ts end" x="44" y="186.4">100</text>
+<line class="grid" x1="50" y1="150.7" x2="370" y2="150.7"/>
+<text class="ts end" x="44" y="154.7">200</text>
+<line class="grid" x1="50" y1="119.1" x2="370" y2="119.1"/>
+<text class="ts end" x="44" y="123.1">300</text>
+<line class="grid" x1="50" y1="87.5" x2="370" y2="87.5"/>
+<text class="ts end" x="44" y="91.5">400</text>
+<line class="grid" x1="50" y1="55.8" x2="370" y2="55.8"/>
+<text class="ts end" x="44" y="59.8">500</text>
+<text class="ts mid" x="50.0" y="230">0</text>
+<text class="ts mid" x="103.3" y="230">5</text>
+<text class="ts mid" x="156.7" y="230">10</text>
+<text class="ts mid" x="210.0" y="230">15</text>
+<text class="ts mid" x="263.3" y="230">20</text>
+<text class="ts mid" x="316.7" y="230">25</text>
+<text class="ts mid" x="370.0" y="230">30</text>
+<text class="ts mid" x="210.0" y="246">minutes a hold lasts</text>
+<path class="line" style="stroke:var(--fault)" d="M60.7 133.6 L71.3 190.1 L82.0 202.4 L103.3 210.1 L124.7 212.5 L156.7 213.5 L210.0 213.9 L263.3 214.0 L370.0 214.0"/>
+<circle class="dot" style="fill:var(--fault)" cx="60.7" cy="133.6" r="3"/>
+<circle class="dot" style="fill:var(--fault)" cx="71.3" cy="190.1" r="3"/>
+<circle class="dot" style="fill:var(--fault)" cx="82.0" cy="202.4" r="3"/>
+<circle class="dot" style="fill:var(--fault)" cx="103.3" cy="210.1" r="3"/>
+<circle class="dot" style="fill:var(--fault)" cx="124.7" cy="212.5" r="3"/>
+<circle class="dot" style="fill:var(--fault)" cx="156.7" cy="213.5" r="3"/>
+<circle class="dot" style="fill:var(--fault)" cx="210.0" cy="213.9" r="3"/>
+<circle class="dot" style="fill:var(--fault)" cx="263.3" cy="214.0" r="3"/>
+<circle class="dot" style="fill:var(--fault)" cx="370.0" cy="214.0" r="3"/>
+<text class="ts tb" x="130" y="198">hold lapsed before paying</text>
+<path class="line" style="stroke:var(--async)" d="M60.7 202.4 L71.3 199.5 L82.0 194.6 L103.3 183.6 L124.7 177.1 L156.7 161.5 L210.0 131.2 L263.3 98.0 L370.0 51.4"/>
+<circle class="dot" style="fill:var(--async)" cx="60.7" cy="202.4" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="71.3" cy="199.5" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="82.0" cy="194.6" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="103.3" cy="183.6" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="124.7" cy="177.1" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="156.7" cy="161.5" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="210.0" cy="131.2" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="263.3" cy="98.0" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="370.0" cy="51.4" r="3"/>
+<text class="ts tb" x="62" y="86">turned away by abandoned holds</text>
+<text class="tb" x="400" y="18">Minute the last seat sold</text>
+<line class="axis" x1="440" y1="214.0" x2="700" y2="214.0"/>
+<text class="ts end" x="434" y="218.0">0</text>
+<line class="grid" x1="440" y1="185.0" x2="700" y2="185.0"/>
+<text class="ts end" x="434" y="189.0">20</text>
+<line class="grid" x1="440" y1="156.0" x2="700" y2="156.0"/>
+<text class="ts end" x="434" y="160.0">40</text>
+<line class="grid" x1="440" y1="127.0" x2="700" y2="127.0"/>
+<text class="ts end" x="434" y="131.0">60</text>
+<line class="grid" x1="440" y1="98.0" x2="700" y2="98.0"/>
+<text class="ts end" x="434" y="102.0">80</text>
+<line class="grid" x1="440" y1="69.0" x2="700" y2="69.0"/>
+<text class="ts end" x="434" y="73.0">100</text>
+<line class="grid" x1="440" y1="40.0" x2="700" y2="40.0"/>
+<text class="ts end" x="434" y="44.0">120</text>
+<text class="ts mid" x="440.0" y="230">0</text>
+<text class="ts mid" x="483.3" y="230">5</text>
+<text class="ts mid" x="526.7" y="230">10</text>
+<text class="ts mid" x="570.0" y="230">15</text>
+<text class="ts mid" x="613.3" y="230">20</text>
+<text class="ts mid" x="656.7" y="230">25</text>
+<text class="ts mid" x="700.0" y="230">30</text>
+<text class="ts mid" x="570.0" y="246">minutes a hold lasts</text>
+<path class="line" style="stroke:var(--sig)" d="M448.7 89.7 L457.3 142.1 L466.0 151.7 L483.3 156.0 L500.7 157.4 L526.7 146.7 L570.0 118.4 L613.3 106.3 L700.0 76.1"/>
+<circle class="dot" style="fill:var(--sig)" cx="448.7" cy="89.7" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="457.3" cy="142.1" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="466.0" cy="151.7" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="483.3" cy="156.0" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="500.7" cy="157.4" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="526.7" cy="146.7" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="570.0" cy="118.4" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="613.3" cy="106.3" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="700.0" cy="76.1" r="3"/>
+<text class="ts tb" x="0" y="0"></text>
+<rect class="hit" x="52.6667" y="36" width="16" height="182" data-tip="Holds of 1 min|hold lapsed before paying: 254.1|turned away by abandoned holds: 36.8|last seat sold at minute 85.7|refunded: 1.6"/>
+<rect class="hit" x="440.667" y="36" width="16" height="182" data-tip="Holds of 1 min|hold lapsed before paying: 254.1|turned away by abandoned holds: 36.8|last seat sold at minute 85.7|refunded: 1.6"/>
+<rect class="hit" x="63.3333" y="36" width="16" height="182" data-tip="Holds of 2 min|hold lapsed before paying: 75.5|turned away by abandoned holds: 45.8|last seat sold at minute 49.6|refunded: 2"/>
+<rect class="hit" x="449.333" y="36" width="16" height="182" data-tip="Holds of 2 min|hold lapsed before paying: 75.5|turned away by abandoned holds: 45.8|last seat sold at minute 49.6|refunded: 2"/>
+<rect class="hit" x="74" y="36" width="16" height="182" data-tip="Holds of 3 min|hold lapsed before paying: 36.6|turned away by abandoned holds: 61.4|last seat sold at minute 43|refunded: 2.2"/>
+<rect class="hit" x="458" y="36" width="16" height="182" data-tip="Holds of 3 min|hold lapsed before paying: 36.6|turned away by abandoned holds: 61.4|last seat sold at minute 43|refunded: 2.2"/>
+<rect class="hit" x="95.3333" y="36" width="16" height="182" data-tip="Holds of 5 min|hold lapsed before paying: 12.3|turned away by abandoned holds: 96.2|last seat sold at minute 40|refunded: 2.3"/>
+<rect class="hit" x="475.333" y="36" width="16" height="182" data-tip="Holds of 5 min|hold lapsed before paying: 12.3|turned away by abandoned holds: 96.2|last seat sold at minute 40|refunded: 2.3"/>
+<rect class="hit" x="116.667" y="36" width="16" height="182" data-tip="Holds of 7 min|hold lapsed before paying: 4.6|turned away by abandoned holds: 116.7|last seat sold at minute 39|refunded: 2.1"/>
+<rect class="hit" x="492.667" y="36" width="16" height="182" data-tip="Holds of 7 min|hold lapsed before paying: 4.6|turned away by abandoned holds: 116.7|last seat sold at minute 39|refunded: 2.1"/>
+<rect class="hit" x="148.667" y="36" width="16" height="182" data-tip="Holds of 10 min|hold lapsed before paying: 1.6|turned away by abandoned holds: 165.9|last seat sold at minute 46.4|refunded: 1.6"/>
+<rect class="hit" x="518.667" y="36" width="16" height="182" data-tip="Holds of 10 min|hold lapsed before paying: 1.6|turned away by abandoned holds: 165.9|last seat sold at minute 46.4|refunded: 1.6"/>
+<rect class="hit" x="202" y="36" width="16" height="182" data-tip="Holds of 15 min|hold lapsed before paying: 0.4|turned away by abandoned holds: 261.7|last seat sold at minute 65.9|refunded: 1.7"/>
+<rect class="hit" x="562" y="36" width="16" height="182" data-tip="Holds of 15 min|hold lapsed before paying: 0.4|turned away by abandoned holds: 261.7|last seat sold at minute 65.9|refunded: 1.7"/>
+<rect class="hit" x="255.333" y="36" width="16" height="182" data-tip="Holds of 20 min|hold lapsed before paying: 0|turned away by abandoned holds: 366.8|last seat sold at minute 74.3|refunded: 1.3"/>
+<rect class="hit" x="605.333" y="36" width="16" height="182" data-tip="Holds of 20 min|hold lapsed before paying: 0|turned away by abandoned holds: 366.8|last seat sold at minute 74.3|refunded: 1.3"/>
+<rect class="hit" x="362" y="36" width="16" height="182" data-tip="Holds of 30 min|hold lapsed before paying: 0|turned away by abandoned holds: 513.9|last seat sold at minute 95.1 (13 of 20 days sold out)|refunded: 1.1"/>
+<rect class="hit" x="692" y="36" width="16" height="182" data-tip="Holds of 30 min|hold lapsed before paying: 0|turned away by abandoned holds: 513.9|last seat sold at minute 95.1 (13 of 20 days sold out)|refunded: 1.1"/>
+</svg>
+</div>
+<figcaption>Averages of 20 seeded days from the chapter’s simulation. Short holds lose customers who are still paying; long holds let abandoned carts lock seats. Here the hall sold out soonest with holds of 7 minutes.</figcaption>
+</figure>
+
+<p>With one-minute holds, 254 customers on average lost their seats before they could pay, and the hall sold out at minute 86. With thirty-minute holds, nobody lost seats while paying, but 514 customers were turned away while abandoned holds sat on enough seats for them, and only 13 of the 20 days sold out within two hours. In between, five to seven minutes sold out soonest, near minute 39. The best value depends on how long real customers take to pay, which a real system measures. The shape of the trade-off does not. In the test, one seeded day at five hold times, with the invariants checked after every one of more than 1,100 events each, no seat was promised twice and the money always balanced.</p>
+
+<h2 id="walk">Step 7: Walk it</h2>
+<p>Follow Ana booking C5 and C6 at 17:00 with ten-minute holds and the <code>GRACE</code> policy.</p>
+<ol>
+  <li>The page calls <code>hold("S1", "ana", ["C5", "C6"])</code>. The show finds both free, stores them as held by H1 until 17:10, and returns the hold. Price: two standard seats, 18.00.</li>
+  <li>At 17:09 she presses pay. The page sends <code>checkout("H1", key)</code>, with a key it made when the page loaded and reuses on every retry.</li>
+  <li>The service finds no attempt under that key, sees H1 still held, extends it to 17:14, marks it <code>paying</code>, and asks the provider for 18.00 with the same key.</li>
+  <li>The page times out and retries. The retry finds the key and waits on the same promise. No second charge is made.</li>
+  <li>The provider approves at 17:10:30, after the original end. The show finds C5 and C6 still held by H1, which now lasts until 17:14, and books them. Both calls return the same booking.</li>
+</ol>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Several servers</th><td>Seat states move to the database: the conditional update and the primary key above</td><td>The rules and the service</td></tr>
+<tr><th>A live seat map</th><td>Servers push seat changes to open pages. The map is a hint; the hold decides</td><td>The show is still the only judge</td></tr>
+<tr><th>A hit concert, a hundred thousand buyers in a minute</th><td>A waiting room and inventory split across servers, in <x-ref to="hld-ticket-booking"></x-ref></td><td>Holds, keys and refunds</td></tr>
+<tr><th>Do not leave single empty seats</th><td>A rule in seat selection that refuses an order leaving a gap of one</td><td>The show’s claim, which takes the seats it is given or none</td></tr>
+<tr><th>Customers cancel bookings</th><td>A booking gains a status. Canceling frees its seats and refunds through the port</td><td>Payments by key, and the money invariant</td></tr>
+<tr><th>Prices by time of day or by customer</th><td>A pricing strategy, as in <x-ref to="lld-parking-lot#pricing"></x-ref>, fixed on the hold so the price cannot change during payment</td><td>Everything about seats</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Draw the seat states first, available, held until a time, booked, and put them in the show. Say that a hold lapses by being read, with an injected clock. Then name the race, check then write, and fix it twice: no await between the check and the claim in one process, and a conditional update plus a unique key in the database. Spend the rest on the payment: idempotency keys, what happens when the money arrives after the hold, and refunds.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Read whether seats are free, then write in a second call</th><td>With 100 customers at once, over half the seats were promised twice</td><td>Check and write in one step: no await between, or one conditional statement</td></tr>
+<tr><th>Claim seat by seat</th><td>Seats held for customers who were told no</td><td>All or nothing, checked before anything changes</td></tr>
+<tr><th>A timer for each hold that frees its seats</th><td>Timers lost on restart, and a timer firing during payment</td><td>Store the end time; read a lapsed hold as free</td></tr>
+<tr><th>Booking after payment without checking the hold again</th><td>A seat sold twice, or paid for and not received</td><td>Ask the show after the await; refund if the seats are gone</td></tr>
+<tr><th>Retrying checkout without an idempotency key</th><td>Three clicks, three charges</td><td>One key per checkout, kept by the service and sent to the provider</td></tr>
+<tr><th>Keeping the seats for a declined payment until the hold ends</th><td>Seats out of reach for minutes, for nobody</td><td>Release on decline</td></tr>
+<tr><th>Trusting the application alone</th><td>One buggy path sells a seat twice</td><td>A unique key on booked seats in the database</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="lld-parking-lot#gates"></x-ref>: the same atomic claim for one space.</li>
+  <li><x-ref to="concurrency-in-code#races"></x-ref>: check, await, act, and why it fails.</li>
+  <li><x-ref to="transactions#constraints"></x-ref>: rules the database enforces whatever the code does.</li>
+  <li><x-ref to="idempotency-and-delivery#keys"></x-ref>: one key, one effect.</li>
+  <li><x-ref to="latency-and-throughput#littles-law"></x-ref>: the law behind the cost of long holds.</li>
+  <li><x-ref to="hld-ticket-booking"></x-ref>: the same core at the scale of a stadium on sale day.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A seat’s state belongs to the show, not the seat: available, held by one hold until a time, or booked.</li>
+  <li>Let holds lapse by being read. Store the end time and compare it with an injected clock; no timer has to fire.</li>
+  <li>Claim all the seats of an order or none, and check before changing anything.</li>
+  <li>Never put a round trip between checking seats and claiming them. Read-then-write promised over half the hall twice with 100 customers at once.</li>
+  <li>In the database: one conditional update that counts its rows, and a unique key on booked seats as the last line.</li>
+  <li>Around the payment: an idempotency key, a release on decline, a fresh check after the await, and a refund when the seats are gone.</li>
+  <li>Hold length is a trade-off between customers lost while paying and seats locked by people who left. Little’s law prices the second.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does a seat’s state belong to the show and not to the seat?</summary><p>A seat is part of a screen and exists for every show on it. Whether it is sold is a fact about one seat at one show, and putting all such facts for a show in one object gives one place that can promise each seat to only one customer.</p></details>
+<details><summary>A hold ended at 17:10 and nothing has touched it since. At 17:12, is the seat free?</summary><p>Yes. The stored state still says held until 17:10, but every reader compares that time with the clock, so the seat reads as available and the next customer can hold it. Nothing had to run at 17:10.</p></details>
+<details><summary>Ben asks for C7 to C9 while Ana holds C7. What should he get, and why not C8 and C9?</summary><p>Nothing, and a message naming C7. A partial hold would keep C8 and C9 from other customers for minutes while Ben, who wanted three seats together, is told no.</p></details>
+<details><summary>The seat check and the write are each atomic statements. Why can two customers still get the same seat?</summary><p>Because the pair is not atomic. Between one customer’s read and write, another customer’s read sees the same free seats. The fix is a single statement whose condition is the check: <code>UPDATE … WHERE status = 'available' …</code>, with the number of changed rows telling whether it worked.</p></details>
+<details><summary>Ana’s bank approves her payment at 17:20; her hold ended at 17:14, and Ben holds her seats. What happens?</summary><p>The service asks the show to book the seats; the show refuses because they belong to Ben’s live hold; the service refunds Ana’s charge and tells her so. The money taken still equals the money for booked seats plus refunds.</p></details>
+<details><summary>A page sends checkout three times with the same key while the first payment is still running. How many charges are made?</summary><p>One. The service stores the first attempt’s promise under the key and returns it to every repeat, and the provider treats the repeated key as the same charge. In the test, three calls made one charge and one booking.</p></details>
+<details><summary>500 holds an hour, a quarter abandoned, 2.25 seats each, 10-minute holds. How many seats are held by people who have left, and what happens if holds last 20 minutes?</summary><p>500 ÷ 60 × 0.25 × 2.25 × 10 ≈ 47 seats on average, and twice that, about 94, at 20 minutes: nearly the whole of a 100-seat hall while demand lasts.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Stripe, <a href="https://docs.stripe.com/api/idempotent_requests">Idempotent requests</a>, Stripe API reference. A repeated key returns the saved result of the first request, and keys may be pruned after 24 hours.</li>
+  <li>SQLite, <a href="https://www.sqlite.org/lang_transaction.html">Transaction</a>. What <code>BEGIN IMMEDIATE</code> does, and when <code>SQLITE_BUSY</code> is returned.</li>
+</ol>
+</section>

@@ -1,0 +1,623 @@
+<!--meta
+{ "description": "A high-level design of a digital wallet that moves money between users at a million transfers a second: wallets split into partitions, each a replicated log of events applied in memory, transfers across partitions as sagas measured against debit-then-credit under crashes, two-phase commit and try-confirm-cancel compared on a hot merchant account, deterministic replay and snapshots, group commit measured, and read models for balances and history.",
+  "lede": "A payment system talks to banks it does not control. A wallet keeps the money itself: balances in an app, sent between friends and to shops, and at the scale of a national payment app, a million transfers a second at the peak. No single database does that, so the balances must be split over many machines, and then most transfers cross from one to another. This chapter designs the wallet as a set of replicated logs of events, measures what goes wrong when a transfer between them is interrupted, and shows that every balance can be rebuilt, and explained, from its history.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the back end of a digital wallet. Users hold a balance in an app, top it up from a bank, send money to each other and pay merchants. At the peak the system handles a million transfers a second. Money must never be created or lost, a transfer happens completely or not at all, and for any wallet the company must be able to show its balance at any past moment and the history that produced it.</p></div>
+<p>A <dfn>digital wallet</dfn> is an account of stored money held by an app on a user’s behalf, whose balance changes by transfers recorded by the app itself rather than by a bank. The payment chapter (<x-ref to="hld-payments"></x-ref>) kept its ledger in one database, because a hundred payments a second fit. A million transfers a second do not fit any single machine’s database, so wallets are split into partitions, and the hard part becomes a transfer between two wallets in different partitions, which no single local transaction can cover. In the terms of <x-ref to="hld-method#shapes"></x-ref>, this is the second money problem: transfers across machines at volume, with reproducible balances.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Transfer between two wallets, with an id from the client</th><td>Yes</td></tr>
+<tr><th>Balance and history of a wallet</th><td>Yes</td></tr>
+<tr><th>The balance of any wallet at any past moment, with the events that produced it</th><td>Yes</td></tr>
+<tr><th>Top-ups from and withdrawals to banks</th><td>At the edges, through the payment system</td></tr>
+<tr><th>Several currencies, interest, credit</th><td>No</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>500 million wallets; 1 million transfers a second at the peak, 200,000 on average</td></tr>
+<tr><th>Correctness</th><td>The sum of all balances plus money in flight never changes, except by top-ups and withdrawals</td></tr>
+<tr><th>Atomicity</th><td>No transfer half done once the system settles</td></tr>
+<tr><th>Durability</th><td>A confirmed transfer survives the loss of any one server</td></tr>
+<tr><th>Latency</th><td>A transfer confirmed in under 100 ms at the 99th percentile</td></tr>
+<tr><th>Audit</th><td>Every balance reproducible from history, which is never edited</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">a relational database, one run on 2 cores: 4,976 transfer transactions a second ⇒ about 200 such nodes for a million, before any cross-node transfers<br>
+events: a transfer inside a partition is 1 event; across partitions, 3 (send, receive, settle); with 15 partitions, 14 in 15 transfers cross ⇒ about 2.9 events a transfer<br>
+partitions: 1 million × 2.9 ÷ 200,000 events a second each ⇒ 15 partitions, 45 servers with 3 replicas each<br>
+log: 200,000 transfers a second on average × 2.9 events × 100 bytes ≈ 5 TB a day</div>
+<p>The first line is why the design is not a sharded relational database (<x-ref to="estimation#method"></x-ref>). The chapter ran a transfer, two locked updates and two ledger lines, through pgbench on PostgreSQL 16: about 5,000 a second on a small two-core server, conserving every cent. Bigger servers do more, but a million a second would still take dozens of nodes, and most transfers would cross between them. The design instead keeps each partition’s balances in memory and records changes in a log, which a single thread can process far faster, as Step 6c measures. The cost the estimate also shows: splitting more finely makes more transfers cross partitions, and a crossing transfer costs three events instead of one.</p>
+
+<div class="widget" data-widget="wallet95">
+<h4>How many partitions</h4>
+<p>Partitions needed when a transfer within a partition is one event and one across partitions is three, with wallets spread evenly.</p>
+<div class="controls">
+  <label>Transfers a second at the peak<input type="number" name="peak" value="1000000" min="1000" max="100000000" step="100000"></label>
+  <label>Events a second one partition can take<input type="number" name="cap" value="200000" min="1000" max="10000000" step="10000"></label>
+  <label>Servers per partition<input type="number" name="replicas" value="3" min="1" max="9" step="2"></label>
+  <label>Peak over average<input type="number" name="ratio" value="5" min="1" max="50" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 220" role="img" aria-label="Events a second per partition as the number of partitions grows, against what one partition can take."><line x1="100" y1="180" x2="500" y2="180" class="grid"></line><text x="92" y="184" class="ts end">0</text><line x1="100" y1="105.5" x2="500" y2="105.5" class="grid"></line><text x="92" y="109.5" class="ts end">500 thousand</text><line x1="100" y1="30.9" x2="500" y2="30.9" class="grid"></line><text x="92" y="34.9" class="ts end">1 million</text><path d="M100 30.9 L113.8 30.9 L127.6 64 L141.4 86.8 L155.2 102.5 L169 113.7 L182.8 122.2 L196.6 128.8 L210.3 134 L224.1 138.3 L237.9 141.8 L251.7 144.8 L265.5 147.4 L279.3 149.6 L293.1 151.5 L306.9 153.2 L320.7 154.7 L334.5 156.1 L348.3 157.3 L362.1 158.4 L375.9 159.4 L389.7 160.3 L403.4 161.1 L417.2 161.9 L431 162.6 L444.8 163.2 L458.6 163.8 L472.4 164.4 L486.2 164.9 L500 165.4" class="line"></path><line x1="100" y1="150.2" x2="500" y2="150.2" class="axis" style="stroke-dasharray:5 4"></line><text x="506" y="154.2" class="ts">a partition’s limit</text><circle cx="293.1" cy="151.5" r="4.5" class="dot"></circle><text x="301.1" y="143.5" class="ts tb">15 partitions</text><text x="100" y="198" class="ts mid">1</text><text x="293.1" y="198" class="ts mid">15</text><text x="500" y="198" class="ts mid">30</text><text x="300" y="216" class="ts mid">partitions; the line is events a second each must take</text></svg>
+<dl class="results">
+  <div><dt>Partitions</dt><dd data-out="parts">15</dd></div>
+  <div><dt>Servers</dt><dd data-out="servers">45</dd></div>
+  <div><dt>Events per transfer</dt><dd data-out="per">2.9</dd></div>
+  <div><dt>Log a day</dt><dd data-out="log">4.95 TB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">1 million transfers a second need 15 partitions of 200 thousand events a second, 45 servers in all. With 15 partitions, 93% of transfers cross from one to another and cost three events, so each transfer averages 2.9. At the average rate the log grows by 4.95 TB a day, at 100 bytes an event.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Transfers, balances, history">
+POST /v1/transfers
+{ "id": "tr-01J9Z…", "from": "w-ana", "to": "w-ben", "amount": 3000, "currency": "EUR" }
+
+200 OK        { "id": "tr-01J9Z…", "status": "completed", "from_balance": 7000, "event": 42 }
+202 Accepted  { "id": "tr-01J9Z…", "status": "in_flight" }       ← across partitions, completing
+409 Conflict  { "id": "tr-01J9Z…", "status": "rejected", "reason": "insufficient_funds" }
+
+GET /v1/wallets/w-ana/balance                    → { "balance": 7000, "as_of_event": 42 }
+GET /v1/wallets/w-ana/history?before=…           → events, newest first, by cursor
+GET /v1/wallets/w-ana/balance?at=2026-09-30T23:59:59Z   → for audits and disputes
+</pre>
+<p>The transfer id, made once by the app, is the idempotency key, and the partitions remember it, so a retry returns the first outcome instead of moving money again (<x-ref to="idempotency-and-delivery#keys"></x-ref>). A transfer within one partition completes in the call; one across partitions is accepted with the sender’s money already taken and in flight, and completes a moment later. Every read says which event it reflects, because reads come from copies that follow the log.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>Event log</th><td>partition, sequence number</td><td>Opened, Deposited, Transferred, SendStarted, Received, SendCompleted, SendReturned, Rejected</td><td>Replicated log per partition (<x-ref to="consensus#log"></x-ref>), archived to object storage</td></tr>
+<tr><th>Wallet state</th><td>wallet</td><td>Balance; transfers in flight; ids already handled</td><td>Memory of the partition’s leader and followers, derived from the log</td></tr>
+<tr><th>Snapshots</th><td>partition, sequence number</td><td>The whole state as of one event</td><td>Object storage, every few minutes</td></tr>
+<tr><th>Balance cache</th><td>wallet</td><td>Balance as of an event number</td><td>Key-value store, fed from the events</td></tr>
+<tr><th>History</th><td>wallet, time</td><td>Each wallet’s events, for the app and for support</td><td>Wide-column store, fed from the events (<x-ref to="data-models#wide-column"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>The log is the record and everything else is derived from it, which is event sourcing (<x-ref to="event-driven-architecture#event-sourcing"></x-ref>) with the read side split off as in CQRS (<x-ref to="event-driven-architecture#cqrs"></x-ref>). Wallets are assigned to partitions by a hash of the wallet id, with a directory for wallets that must move, such as a merchant that outgrows its share (<x-ref to="partitioning#directory"></x-ref>).</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 360" role="img" aria-labelledby="f951t f951d">
+<title id="f951t">A wallet as partitioned, replicated logs of events</title>
+<desc id="f951d">Apps send transfer commands with an id to a stateless command service, which routes each to the partition that holds the sending wallet. A partition is a small group of servers that agree on one log of events with a consensus protocol: the leader decides, appends the events, and applies them to balances held in memory once a majority has stored them. A transfer to a wallet in another partition is finished by a relay that reads the sender’s log and delivers the second half to the other partition, and settles the first. Events flow out to read models: a balance cache, a transaction history, and an archive with snapshots used to restart partitions and to audit.</desc>
+<text class="tb" x="10" y="18">Commands: decided by one partition, recorded in its replicated log</text>
+<rect class="n " x="10" y="34" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="56.0">Apps</text>
+<text class="ts mid" x="60" y="73.0">transfer, id</text>
+<rect class="n sig" x="160" y="34" width="150" height="50" rx="6"/>
+<text class="tb mid" x="235" y="56.0">Command service</text>
+<text class="ts mid" x="235" y="73.0">routes by wallet</text>
+<path class="e sig both" d="M110 59H160"/>
+<rect class="n sunk" x="370" y="30" width="150" height="128" rx="8"/>
+<text class="tb mid" x="445" y="48">Partition 1</text>
+<rect class="n store" x="380" y="58" width="130" height="36" rx="6"/>
+<text class="tb mid" x="445" y="73.0">Leader</text>
+<text class="ts mid" x="445" y="90.0">log + balances</text>
+<rect class="n store" x="380" y="104" width="60" height="40" rx="6"/>
+<text class="tb mid" x="410" y="129.0">Follower</text>
+<rect class="n store" x="450" y="104" width="60" height="40" rx="6"/>
+<text class="tb mid" x="480" y="129.0">Follower</text>
+<path class="e store" d="M410 94V104"/>
+<path class="e store" d="M480 94V104"/>
+<rect class="n sunk" x="560" y="30" width="150" height="128" rx="8"/>
+<text class="tb mid" x="635" y="48">Partition 2</text>
+<rect class="n store" x="570" y="58" width="130" height="36" rx="6"/>
+<text class="tb mid" x="635" y="73.0">Leader</text>
+<text class="ts mid" x="635" y="90.0">log + balances</text>
+<rect class="n store" x="570" y="104" width="60" height="40" rx="6"/>
+<text class="tb mid" x="600" y="129.0">Follower</text>
+<rect class="n store" x="640" y="104" width="60" height="40" rx="6"/>
+<text class="tb mid" x="670" y="129.0">Follower</text>
+<path class="e store" d="M600 94V104"/>
+<path class="e store" d="M670 94V104"/>
+<path class="e sig both" d="M310 59H380"/>
+<path class="e sig" d="M235 84V174H635V158"/>
+<text class="ts mid" x="292" y="168">to partition 2</text>
+<path class="e none dash" d="M10 196H710"/>
+<text class="tb" x="10" y="218">Later: the second half of transfers, and everything that reads</text>
+<rect class="n async" x="370" y="226" width="340" height="52" rx="6"/>
+<text class="tb mid" x="540" y="249.0">Relay</text>
+<text class="ts mid" x="540" y="266.0">reads each log; delivers and settles transfers between partitions</text>
+<path class="e async both" d="M445 158V226"/>
+<path class="e async both" d="M690 158V226"/>
+<rect class="n async" x="10" y="232" width="150" height="50" rx="6"/>
+<text class="tb mid" x="85" y="254.0">Event stream</text>
+<text class="ts mid" x="85" y="271.0">all partitions</text>
+<rect class="n store" x="10" y="300" width="150" height="46" rx="6"/>
+<text class="tb mid" x="85" y="320.0">Balance cache</text>
+<text class="ts mid" x="85" y="337.0">read model</text>
+<rect class="n store" x="180" y="300" width="160" height="46" rx="6"/>
+<text class="tb mid" x="260" y="320.0">History</text>
+<text class="ts mid" x="260" y="337.0">per wallet, for apps</text>
+<rect class="n store" x="370" y="300" width="160" height="46" rx="6"/>
+<text class="tb mid" x="450" y="320.0">Archive, snapshots</text>
+<text class="ts mid" x="450" y="337.0">audit, restarts</text>
+<rect class="n store" x="550" y="300" width="160" height="46" rx="6"/>
+<text class="tb mid" x="630" y="320.0">Reports, ledger</text>
+<text class="ts mid" x="630" y="337.0">finance</text>
+<path class="e async" d="M85 282V300"/>
+<path class="e async" d="M160 260H260V300"/>
+<path class="e async" d="M160 268H450V300"/>
+<path class="e async" d="M160 276H630V300"/>
+<path class="e async" d="M370 120H350V257H160"/>
+</svg>
+</div>
+<figcaption>The partitions are the only place a balance changes, by appending to a replicated log. Everything else is derived from those logs and can be rebuilt from them.</figcaption>
+</figure>
+
+<p><b>Commands.</b> A stateless command service routes each transfer to the partition that holds the sending wallet. A partition is three servers running a consensus protocol over one log: the leader checks each command against the balances in its memory, appends the resulting events, and applies them once a majority of the servers have stored them, the state machine replication of <x-ref to="consensus#log"></x-ref>. If the leader fails, a follower with the same log and the same state takes over.</p>
+<p><b>Across partitions.</b> A transfer whose receiver lives elsewhere is finished by a relay that reads the sender’s log, delivers the second half to the receiver’s partition, and reports back. Step 6a is about why this is safe.</p>
+<p><b>Reads.</b> Balances for display, history and reports are read models fed from the events, never from the partitions, so reads cannot slow the log down.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 372" role="img" aria-labelledby="f955t f955d">
+<title id="f955t">A transfer inside one partition, and reading a balance</title>
+<desc id="f955d">Two sequences. A transfer: the app sends transfer t7 from Ana to Ben with its id; the command service routes it to the leader of the partition that holds both wallets; the leader decides from the balances in memory and appends one event; the followers store it; with a majority stored, the leader applies it and answers. Reading: the app asks the balance cache, a read model fed from the events, which is a fraction of a second behind; after Ana’s own transfer the app shows the balance that the transfer returned.</desc>
+<text class="tb" x="10" y="16">A transfer</text>
+<g data-scene="write">
+<text class="tb mid" x="40" y="36">App</text>
+<line class="axis" x1="40" y1="44" x2="40" y2="222"/>
+<text class="tb mid" x="190" y="36">Command service</text>
+<line class="axis" x1="190" y1="44" x2="190" y2="222"/>
+<text class="tb mid" x="380" y="36">Leader</text>
+<line class="axis" x1="380" y1="44" x2="380" y2="222"/>
+<text class="tb mid" x="560" y="36">Followers</text>
+<line class="axis" x1="560" y1="44" x2="560" y2="222"/>
+<g data-s="1">
+<path class="e sig" d="M41 64H189"/>
+<text class="ts mid" x="115.0" y="58">1. transfer t7: Ana → Ben, 30.00</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M191 91H379"/>
+<text class="ts mid" x="285.0" y="85">2. route by wallet</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n sig" x="212" y="104" width="160" height="22" rx="4"/>
+<text class="ts mid" x="292" y="119">3. decide: 100.00 ≥ 30.00</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M381 145H559"/>
+<text class="ts mid" x="470.0" y="139">4. append event 42</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M559 172H381"/>
+<text class="ts mid" x="470.0" y="166">5. stored</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M379 199H41"/>
+<text class="ts mid" x="210.0" y="193">6. done; Ana: 70.00</text>
+</g>
+</g>
+<path class="e none dash" d="M10 236H710"/>
+<text class="tb" x="10" y="258">Reading a balance</text>
+<g data-scene="read">
+<text class="tb mid" x="40" y="278">App</text>
+<line class="axis" x1="40" y1="286" x2="40" y2="364"/>
+<text class="tb mid" x="190" y="278">Balance cache</text>
+<line class="axis" x1="190" y1="286" x2="190" y2="364"/>
+<text class="tb mid" x="380" y="278">Event stream</text>
+<line class="axis" x1="380" y1="286" x2="380" y2="364"/>
+<g data-s="1">
+<path class="e async" d="M379 306H191"/>
+<text class="ts mid" x="285.0" y="300">1. event 42</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M41 333H189"/>
+<text class="ts mid" x="115.0" y="327">2. Ben’s balance?</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M189 360H41"/>
+<text class="ts mid" x="115.0" y="354">3. 30.00, as of event 42</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="write" data-label="Transfer">
+  <li data-msg="POST /v1/transfers" data-state="Ana: 100.00; Ben: 0.00; log: 41 events">The app sends the transfer with an id it made, so that a retry is recognized.</li>
+  <li data-msg="t7">Ana and Ben are in the same partition, so the whole transfer is decided in one place.</li>
+  <li data-msg="none">The leader checks the command against balances in memory: no disk read, no lock.</li>
+  <li data-msg="event 42">It appends Transferred t7 to the log and sends it to the followers, batched with others.</li>
+  <li data-msg="ack" data-state="Ana: 70.00; Ben: 30.00; log: 42 events">Once a majority has stored the event, it is committed and cannot be lost.</li>
+  <li data-msg="200 OK">The leader applies the event to memory and answers with the new balance.</li>
+</ol>
+<ol class="steps" data-scene="read" data-label="Read">
+  <li data-msg="event 42">The read model applies the same events, a fraction of a second later.</li>
+  <li data-msg="GET balance">Ben opens his app. Reads never touch the partitions.</li>
+  <li data-msg="30.00">The answer says how fresh it is; a balance shown right after one’s own transfer comes from the transfer’s reply.</li>
+</ol>
+<figcaption>A partition decides alone and records the decision in a replicated log. Everything that only reads is fed from that log, a little later.</figcaption>
+</figure>
+
+<h2 id="cross">Step 6a: Transfers between partitions</h2>
+<p>A transfer from Ana in one partition to Ben in another changes two logs on different machines. <x-ref to="distributed-transactions"></x-ref> lists the ways to do that: two-phase commit, try-confirm-cancel and sagas. The obvious way, which is none of them, comes first, because it is what code does by default: take the money from one side, then give it to the other.</p>
+
+<figure class="fig wide" id="fig-crash">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 404" role="img" aria-labelledby="f952t f952d">
+<title id="f952t">A crash in the middle of a transfer, with and without a record of it</title>
+<desc id="f952d">Two sequences between the transfer process, partition A holding Ana’s wallet, and partition B holding Ben’s. Without a record: A takes 30.00 from Ana; the process crashes before crediting Ben; on restart nothing says the transfer existed, and 30.00 is gone. As a saga: A records the transfer as an event that also takes the 30.00, so the money is in flight; the relay delivers the credit to B and crashes before settling; on restart it finds the unsettled transfer in A’s log and delivers again; B recognizes the transfer id and ignores the repeat; the relay settles with A. Money in all accounts plus money in flight stays 100.00 throughout.</desc>
+<text class="tb" x="10" y="16">Debit, then credit</text>
+<g data-scene="naive">
+<text class="tb mid" x="90" y="36">Transfer process</text>
+<line class="axis" x1="90" y1="44" x2="90" y2="136"/>
+<text class="tb mid" x="380" y="36">Partition A</text>
+<line class="axis" x1="380" y1="44" x2="380" y2="136"/>
+<text class="tb mid" x="620" y="36">Partition B</text>
+<line class="axis" x1="620" y1="44" x2="620" y2="136"/>
+<g data-s="1">
+<path class="e sig" d="M91 64H379"/>
+<text class="ts mid" x="235.0" y="58">1. balance −30.00</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n fault" x="98" y="78" width="66.8" height="22" rx="4"/>
+<text class="ts mid" x="131.4" y="93">2. crash</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n fault" x="98" y="106" width="190" height="22" rx="4"/>
+<text class="ts mid" x="193" y="121">3. restart: nothing to resume</text>
+</g>
+</g>
+<path class="e none dash" d="M10 152H710"/>
+<text class="tb" x="10" y="174">As a saga, with the transfer recorded as an event</text>
+<g data-scene="saga">
+<text class="tb mid" x="90" y="194">Transfer process</text>
+<line class="axis" x1="90" y1="202" x2="90" y2="394"/>
+<text class="tb mid" x="380" y="194">Partition A</text>
+<line class="axis" x1="380" y1="202" x2="380" y2="394"/>
+<text class="tb mid" x="620" y="194">Partition B</text>
+<line class="axis" x1="620" y1="202" x2="620" y2="394"/>
+<g data-s="1">
+<path class="e sig" d="M91 222H379"/>
+<text class="ts mid" x="235.0" y="216">1. send t9: Ana → Ben, 30.00</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M91 250H619"/>
+<text class="ts mid" x="355.0" y="244">2. receive t9: Ben +30.00</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n fault" x="98" y="264" width="170" height="22" rx="4"/>
+<text class="ts mid" x="183" y="279">3. crash before settling</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n " x="98" y="292" width="230" height="22" rx="4"/>
+<text class="ts mid" x="213" y="307">4. restart: t9 is unsettled in A’s log</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M91 334H619"/>
+<text class="ts mid" x="355.0" y="328">5. receive t9 (again)</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M91 362H379"/>
+<text class="ts mid" x="235.0" y="356">6. settle t9: received</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="naive" data-label="Debit, then credit">
+  <li data-msg="UPDATE" data-state="Ana: 70.00; Ben: 0.00; in flight: none; total: 70.00">The process takes 30.00 from Ana’s wallet in partition A.</li>
+  <li data-msg="none" data-state="Ana: 70.00; Ben: 0.00; in flight: none; total: 70.00">Before it can credit Ben, the process crashes.</li>
+  <li data-msg="none" data-state="Ana: 70.00; Ben: 0.00; in flight: none; total: 70.00 (30.00 lost)">After a restart nothing records the transfer. The 30.00 has left Ana and arrived nowhere.</li>
+</ol>
+<ol class="steps" data-scene="saga" data-label="Saga">
+  <li data-msg="send t9" data-state="Ana: 70.00; Ben: 0.00; in flight: 30.00; total: 100.00">Partition A appends one event, SendStarted t9, which takes 30.00 from Ana and records it as in flight.</li>
+  <li data-msg="receive t9" data-state="Ana: 70.00; Ben: 30.00; in flight: 30.00 until settled; total: 100.00">The relay delivers the second half to partition B, which credits Ben and remembers t9.</li>
+  <li data-msg="none" data-state="Ana: 70.00; Ben: 30.00; in flight: 30.00 until settled; total: 100.00">The relay crashes before telling A that t9 arrived.</li>
+  <li data-msg="none">On restart it reads A’s log, finds t9 not settled, and delivers it again.</li>
+  <li data-msg="receive t9" data-state="Ana: 70.00; Ben: 30.00; in flight: 30.00 until settled; total: 100.00">Partition B has seen t9 and does nothing: the repeat is harmless.</li>
+  <li data-msg="settle t9" data-state="Ana: 70.00; Ben: 30.00; in flight: none; total: 100.00">Partition A appends SendCompleted t9. Nothing is in flight; the total never changed.</li>
+</ol>
+<figcaption>A transfer between partitions cannot be one write, but it can start with one write that records it. From then on every step can be repeated until it is done.</figcaption>
+</figure>
+
+<p>The chapter moved 100,000 transfers between four partitions while the process doing it crashed at random, one step in a thousand, then one in a hundred. Debiting and then crediting, with nothing recording the transfer between the two writes, lost 87 transfers and 2,303 euros at the lower rate, and 963 transfers and 25,131 euros at the higher one: money taken from senders that never reached anyone. As a saga, the debit and the record of the transfer are one event in the sender’s log, so a crash at any later point leaves something to resume from. The relay delivered again after each crash; receivers recognized 95 and 1,041 repeated deliveries by their transfer id and ignored them; transfers to closed accounts were returned to the sender, 92 and 84 of them. Money was conserved in every run.</p>
+<pre data-lang="ts" data-title="The receiver remembers transfer ids, so delivering twice is harmless">
+case "receive":
+      if (s.seen.has(c.id)) return [];                                         // delivered twice: already received or refused
+      return has(c.to) ? [{ type: "Received", id: c.id, to: c.to, amount: c.amount }] : [{ type: "ReceiveRefused", id: c.id, reason: "no such account" }];
+</pre>
+<p>The three textbook protocols differ in what the rest of the system waits for while a transfer is unfinished. The test sent 100,000 transfers at a thousand a second, a tenth of them to one merchant’s wallet, and let the coordinator crash in the middle of one transfer in a thousand, taking five seconds to recover.</p>
+<table>
+<thead><tr><th>Protocol</th><th>While a transfer is unfinished</th><th>In the test</th></tr></thead>
+<tbody>
+<tr><th>Two-phase commit</th><td>Both wallets are locked; after a coordinator crash, until it recovers (<x-ref to="distributed-transactions#2pc"></x-ref>)</td><td>13,986 transfers waited for a lock, 13,604 of them more than a second, 22 s on average: the merchant’s wallet was locked most of the time</td></tr>
+<tr><th>Try-confirm-cancel</th><td>Only the amount is reserved; the rest of the balance stays usable (<x-ref to="distributed-transactions#tcc"></x-ref>)</td><td>Nobody waited; on average about 240 euros were reserved and unusable at any moment</td></tr>
+<tr><th>Saga</th><td>Nothing is locked; the money is in flight, visible as such</td><td>Nobody waited; on average about 190 euros were in flight at any moment</td></tr>
+</tbody>
+</table>
+<p>The hot merchant decides it. A wallet that receives a hundred transfers a second cannot be locked for the length of a network round trip, let alone a coordinator’s recovery. The saga keeps every step a local, append-only event in one partition and accepts that, for a moment, money has left one wallet and not yet reached another. The design makes that state explicit: the sender’s partition holds it as in flight, the sum of balances plus money in flight never changes, and the API reports the transfer as in flight until it settles.</p>
+
+<h2 id="event-sourcing">Step 6b: Balances as a fold over events</h2>
+<p>Each partition is event-sourced: it stores what happened, and the balances are computed from it. Two pure functions hold all the rules. <code>decide</code> checks a command against the current state and returns events; <code>apply</code> changes the state for one event, and is the only code that does.</p>
+<pre data-lang="ts" data-title="decide for a transfer, and apply">
+case "transfer":
+      if (s.seen.has(c.id)) return [];                                         // a retry of a transfer already decided
+      if (!has(c.from) || !has(c.to)) return [{ type: "Rejected", id: c.id, reason: "no such account" }];
+      if (!Number.isSafeInteger(c.amount) || c.amount <= 0) return [{ type: "Rejected", id: c.id, reason: "bad amount" }];
+      if (bal(c.from) < c.amount) return [{ type: "Rejected", id: c.id, reason: "insufficient funds" }];
+      return [{ type: "Transferred", id: c.id, from: c.from, to: c.to, amount: c.amount }];
+export function apply(s: State, e: Event): State {
+  const add = (a: string, n: number) => s.balances.set(a, (s.balances.get(a) ?? 0) + n);
+  switch (e.type) {
+    case "Opened": s.balances.set(e.account, 0); break;
+    case "Deposited": add(e.account, e.amount); s.seen.add(e.ref); break;
+    case "Transferred": add(e.from, -e.amount); add(e.to, e.amount); s.seen.add(e.id); break;
+    case "SendStarted": add(e.from, -e.amount); s.outgoing.set(e.id, { from: e.from, amount: e.amount }); s.seen.add(e.id); break;
+    case "Received": add(e.to, e.amount); s.seen.add(e.id); break;
+    case "ReceiveRefused": s.seen.add(e.id); break;
+    case "SendCompleted": s.outgoing.delete(e.id); break;
+    case "SendReturned": { const o = s.outgoing.get(e.id); if (o) add(o.from, o.amount); s.outgoing.delete(e.id); break; }
+    case "Rejected": s.seen.add(e.id); break;
+  }
+  s.version += 1;
+  return s;
+}
+</pre>
+
+<figure class="fig wide" id="fig-replay">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f953t f953d">
+<title id="f953t">Balances are a fold over the log, from the start or from a snapshot</title>
+<desc id="f953d">Left: a log of eight events and the balances after each, applied from an empty state: Ana and Ben open wallets, Ana deposits 100.00, transfers 30.00 to Ben, Ben deposits 20.00 and sends 10.00 back, a transfer is rejected, and Ana sends 25.00 to Ben, ending with Ana 55.00 and Ben 65.00. A snapshot is taken after event 5. Right: the same final balances reached by loading the snapshot and applying only events 6 to 8.</desc>
+<text class="tb" x="10" y="18">From the start: apply every event</text>
+<text class="tb" x="390" y="18">From a snapshot: apply only what came after</text>
+<path class="e none dash" d="M372 10V290"/>
+<g data-scene="full">
+<g data-s="1" data-packet="none">
+<rect class="n sig" x="10" y="51" width="200" height="21" rx="3"/>
+<text class="ts" x="18" y="66">1. Opened ana</text>
+</g>
+<g class="hide" data-s="1" data-e="1" data-packet="none">
+<text class="ts mono" x="218" y="66">ana 0.00</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n sig" x="10" y="77" width="200" height="21" rx="3"/>
+<text class="ts" x="18" y="92">2. Opened ben</text>
+</g>
+<g class="hide" data-s="2" data-e="2" data-packet="none">
+<text class="ts mono" x="218" y="92">ana 0.00 ben 0.00</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n sig" x="10" y="103" width="200" height="21" rx="3"/>
+<text class="ts" x="18" y="118">3. Deposited ana 100.00</text>
+</g>
+<g class="hide" data-s="3" data-e="3" data-packet="none">
+<text class="ts mono" x="218" y="118">ana 100.00 ben 0.00</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n sig" x="10" y="129" width="200" height="21" rx="3"/>
+<text class="ts" x="18" y="144">4. Transferred t1 ana→ben 30.00</text>
+</g>
+<g class="hide" data-s="4" data-e="4" data-packet="none">
+<text class="ts mono" x="218" y="144">ana 70.00 ben 30.00</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n sig" x="10" y="155" width="200" height="21" rx="3"/>
+<text class="ts" x="18" y="170">5. Deposited ben 20.00</text>
+</g>
+<g class="hide" data-s="5" data-e="5" data-packet="none">
+<text class="ts mono" x="218" y="170">ana 70.00 ben 50.00</text>
+</g>
+<g data-s="6" data-packet="none">
+<rect class="n sig" x="10" y="181" width="200" height="21" rx="3"/>
+<text class="ts" x="18" y="196">6. Transferred t2 ben→ana 10.00</text>
+</g>
+<g class="hide" data-s="6" data-e="6" data-packet="none">
+<text class="ts mono" x="218" y="196">ana 80.00 ben 40.00</text>
+</g>
+<g data-s="7" data-packet="none">
+<rect class="n fault" x="10" y="207" width="200" height="21" rx="3"/>
+<text class="ts" x="18" y="222">7. Rejected t3: funds</text>
+</g>
+<g class="hide" data-s="7" data-e="7" data-packet="none">
+<text class="ts mono" x="218" y="222">ana 80.00 ben 40.00</text>
+</g>
+<g data-s="8" data-packet="none">
+<rect class="n sig" x="10" y="233" width="200" height="21" rx="3"/>
+<text class="ts" x="18" y="248">8. Transferred t4 ana→ben 25.00</text>
+</g>
+<g class="hide" data-s="8" data-packet="none">
+<text class="ts mono" x="218" y="248">ana 55.00 ben 65.00</text>
+</g>
+<path class="e none dash" style="stroke:var(--async);stroke-width:2" d="M8 178.5H360"/>
+<text class="ts" x="10" y="276">Dashed line: the snapshot, taken after event 5.</text>
+</g>
+<g data-scene="snapshot">
+<g data-s="1" data-packet="none">
+<rect class="n async" x="390" y="44" width="320" height="40" rx="4"/>
+<text class="tb" x="400" y="60">snapshot at event 5</text>
+<text class="ts mono" x="400" y="76">ana 70.00  ben 50.00</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n sig" x="390" y="115" width="220" height="21" rx="3"/>
+<text class="ts" x="398" y="130">6. Transferred t2 ben→ana 10.00</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n fault" x="390" y="145" width="220" height="21" rx="3"/>
+<text class="ts" x="398" y="160">7. Rejected t3: funds</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n sig" x="390" y="175" width="220" height="21" rx="3"/>
+<text class="ts" x="398" y="190">8. Transferred t4 ana→ben 25.00</text>
+</g>
+<g data-s="5" data-packet="none">
+<text class="ts mono tb" x="390" y="232">ana 55.00  ben 65.00: the same</text>
+<text class="ts" x="390" y="250">The test compared state hashes: identical,</text>
+<text class="ts" x="390" y="266">from the start and from a snapshot.</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="full" data-label="From the start">
+  <li data-msg="none" data-state="Ana: 0.00">Ana opens a wallet. Every state starts empty, and only events change it.</li>
+  <li data-msg="none" data-state="Ana: 0.00; Ben: 0.00">Ben opens a wallet too. Opening is an event like any other, with a zero balance.</li>
+  <li data-msg="none" data-state="Ana: 100.00; Ben: 0.00">Ana deposits 100.00 from her bank, recorded with the deposit’s own reference.</li>
+  <li data-msg="none" data-state="Ana: 70.00; Ben: 30.00">A transfer is one event in this partition: Ana −30.00, Ben +30.00, together.</li>
+  <li data-msg="none" data-state="Ana: 70.00; Ben: 50.00">Ben deposits 20.00. A snapshot is saved here: the state, and the number of the last event in it.</li>
+  <li data-msg="none" data-state="Ana: 80.00; Ben: 40.00">Ben sends 10.00 back to Ana, another single event in the same partition.</li>
+  <li data-msg="none" data-state="Ana: 80.00; Ben: 40.00">A transfer of 80.00 from Ben is rejected: the event records the decision, and changes no balance.</li>
+  <li data-msg="none" data-state="Ana: 55.00; Ben: 65.00">Ana sends 25.00. The final state: Ana 55.00, Ben 65.00.</li>
+</ol>
+<ol class="steps" data-scene="snapshot" data-label="From a snapshot">
+  <li data-msg="none" data-state="Ana: 70.00; Ben: 50.00">Load the snapshot: the balances as they were after event 5.</li>
+  <li data-msg="none" data-state="Ana: 80.00; Ben: 40.00">Apply event 6, Ben’s 10.00 back to Ana, to the loaded state.</li>
+  <li data-msg="none" data-state="Ana: 80.00; Ben: 40.00">Event 7, the rejected transfer, is applied too, and changes no balance.</li>
+  <li data-msg="none" data-state="Ana: 55.00; Ben: 65.00">Apply event 8, Ana’s 25.00 to Ben, the last event in the log.</li>
+  <li data-msg="none" data-state="Ana: 55.00; Ben: 65.00">The same balances as replaying all eight, with three events applied instead of eight.</li>
+</ol>
+<figcaption>State is computed from events and nothing else. A snapshot is a cache of that computation, and must give the same answer as replaying from the start.</figcaption>
+</figure>
+
+<p>The test drove one partition with 20,000 wallets through 200,000 transfer requests, of which 16,299 were refused for lack of funds and 3,967 were retries that decided nothing new. Replaying the 240,000 events from an empty state gave a state with the same hash as the live one, and so did loading a snapshot taken at event 216,000 and replaying the rest. For one wallet with 21 events, its balance after each event equaled the sum of the events so far: the history explains every balance. The same holds at any moment, so “what was Ana’s balance at midnight on 30 September” is a replay up to that time.</p>
+<p>This only works if <code>apply</code> is deterministic: the same events must produce the same state on every server and in every replay, years later. The test broke that on purpose with an <code>apply</code> that waived a one-cent fee in odd seconds of the clock. Two replicas applying the same events, half a second apart, ended with different states. Anything that varies, the time, a random choice, an exchange rate, is decided once in <code>decide</code> and written into the event, where every replay finds the same value (<x-ref to="scheduling-and-workflows#determinism"></x-ref>).</p>
+<p>Snapshots bound how much replay a restart needs. In one run on this chapter’s machine, replaying 1.2 million events took 1.1 s, and loading a snapshot and replaying the last 100,000 took 0.14 s. A partition saves a snapshot every few minutes; a new follower or a restarted leader loads the latest and replays the log from there.</p>
+
+<h2 id="throughput">Step 6c: A million transfers a second</h2>
+<p>Inside one partition, everything happens on one thread in memory: no locks, because nothing else touches the balances, and no disk reads. The chapter’s TypeScript partition decided and applied about 517,000 transfers a second on one thread in one run. Martin Fowler described the same design at LMAX in 2011: a business logic processor that runs in memory, event-sourced, handling 6 million orders a second on a single thread.</p>
+<p>The limit is making each event durable before it counts. Writing every event to disk and waiting for the flush caps a log at the disk’s flush rate. Group commit (<x-ref to="storage-engines#wal"></x-ref>) writes all the events that arrived while the previous flush was running and flushes them together, so that one flush makes many events durable.</p>
+
+<figure class="fig wide" id="fig-batching">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f954t f954d">
+<title id="f954t">Making events durable: one fsync per event, or one per batch</title>
+<desc id="f954d">Events appended to a log file and flushed to disk with fsync, on this chapter’s test machine, one run: 1 per fsync: 5,950 events a second, 0.17 ms per fsync; 10 per fsync: 44,668 events a second, 0.22 ms per fsync; 100 per fsync: 332,406 events a second, 0.3 ms per fsync; 1000 per fsync: 1,958,725 events a second, 0.51 ms per fsync. The axis is logarithmic.</desc>
+<text class="tb" x="10" y="18">Events made durable per second (logarithmic scale)</text>
+<line class="grid" x1="150.0" y1="30" x2="150.0" y2="186"/>
+<text class="ts mid" x="150.0" y="202">1,000</text>
+<line class="grid" x1="275.0" y1="30" x2="275.0" y2="186"/>
+<text class="ts mid" x="275.0" y="202">10,000</text>
+<line class="grid" x1="400.0" y1="30" x2="400.0" y2="186"/>
+<text class="ts mid" x="400.0" y="202">100,000</text>
+<line class="grid" x1="525.0" y1="30" x2="525.0" y2="186"/>
+<text class="ts mid" x="525.0" y="202">1 million</text>
+<line class="grid" x1="650.0" y1="30" x2="650.0" y2="186"/>
+<text class="ts mid" x="650.0" y="202">10 million</text>
+<text class="ts end" x="140" y="56">1 per fsync</text>
+<rect class="bar " x="150" y="43" width="96.8" height="20" rx="3"/>
+<text class="ts tb" x="254.8" y="57">5,950</text>
+<rect class="hit" x="0" y="40" width="720" height="30" data-tip="1 events per fsync|5,950 events a second|0.17 ms per fsync (one run)"/>
+<text class="ts end" x="140" y="92">10 per fsync</text>
+<rect class="bar " x="150" y="79" width="206.2" height="20" rx="3"/>
+<text class="ts tb" x="364.2" y="93">44,668</text>
+<rect class="hit" x="0" y="76" width="720" height="30" data-tip="10 events per fsync|44,668 events a second|0.22 ms per fsync (one run)"/>
+<text class="ts end" x="140" y="128">100 per fsync</text>
+<rect class="bar " x="150" y="115" width="315.2" height="20" rx="3"/>
+<text class="ts tb" x="473.2" y="129">332,406</text>
+<rect class="hit" x="0" y="112" width="720" height="30" data-tip="100 events per fsync|332,406 events a second|0.3 ms per fsync (one run)"/>
+<text class="ts end" x="140" y="164">1,000 per fsync</text>
+<rect class="bar store" x="150" y="151" width="411.5" height="20" rx="3"/>
+<text class="ts tb" x="569.5" y="165">1,958,725</text>
+<rect class="hit" x="0" y="148" width="720" height="30" data-tip="1,000 events per fsync|1,958,725 events a second|0.51 ms per fsync (one run)"/>
+<text class="ts" x="10" y="226">An fsync took 0.2 to 0.5 ms on this machine’s disk; it can take 10 ms elsewhere. The shape is the same: batches multiply throughput.</text>
+</svg>
+</div>
+<figcaption>The disk flush costs nearly the same for one event or a thousand. Grouping the events that arrive while one flush runs is what lets a single log take millions of events a second.</figcaption>
+</figure>
+
+<p>One run on this chapter’s machine: one event per flush made 5,950 events a second durable; batches of 10, 100 and 1,000 made 44,668, 332,406 and 1,958,725. A flush took 0.2 to 0.5 ms on this machine’s virtual disk, and can take ten times longer elsewhere, but the shape is the same. Replication adds a network round trip per batch, not per event, so the same batching carries over to consensus: the leader sends a batch, a majority stores it, and every transfer in it is committed at once. TigerBeetle, a database built for transfers, documents batches of up to 8,189 events per request for exactly this reason, “to amortize the overhead of consensus and I/O”.</p>
+<p>Partitions multiply that. Fifteen partitions at 200,000 events a second each carry the estimate’s million transfers, with room for the extra events of crossing transfers. Two refinements matter in practice. A merchant that receives a large share of all transfers is a hot partition (<x-ref to="partitioning#hot-keys"></x-ref>); its incoming payments can be split over several sub-wallets that are merged when it withdraws. And transfers between wallets that usually trade with each other, a household, a company and its staff, can be kept in one partition to make them single events.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A partition’s leader</th><td>Transfers for its wallets pause for a second or two</td><td>A follower with the same log is elected (<x-ref to="consensus#election"></x-ref>); clients retry with the same transfer id</td></tr>
+<tr><th>A minority of a partition’s servers</th><td>Nothing</td><td>A majority still commits; the server rejoins from a snapshot and the log</td></tr>
+<tr><th>The relay crashes</th><td>Some transfers stay in flight longer</td><td>It restarts from the logs; deliveries are idempotent</td></tr>
+<tr><th>A receiving wallet is closed</th><td>The sender gets the money back</td><td>The receiver refuses; the sender’s partition returns the amount</td></tr>
+<tr><th>The balance cache lags</th><td>A balance a second old</td><td>Reads carry the event number; the app shows the balance from its own transfer’s reply</td></tr>
+<tr><th>A bug in apply is found</th><td>Nothing yet</td><td>Fix it, replay from the log into a new state, compare hashes with the old, and correct with new events, never by editing history</td></tr>
+</tbody>
+</table>
+<p>At ten times the transfers, the partitions multiply and the share of transfers that cross grows toward all of them, so each transfer costs nearly three events; keeping frequent pairs together is worth more. The log grows by about 50 TB a day, so old events move to object storage and snapshots keep restarts fast. At a hundred times, the relay and the read models, which see every event, need partitioning of their own (<x-ref to="event-streaming#partitions"></x-ref>).</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li>Martin Fowler’s article on the LMAX architecture (12 July 2011) describes a business logic processor that “can handle 6 million orders per second on a single thread”, runs in memory using event sourcing, has its input journaled and replicated before processing, and takes a snapshot every night, rebuilding state by replaying events.</li>
+  <li>TigerBeetle’s documentation (as of October 2026) batches up to 8,189 accounts or transfers per request in its default configuration, to amortize consensus and I/O, and makes create events idempotent: the first with an id succeeds, later ones are told it exists. It also supports pending transfers that are posted or voided later, with timeouts.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Hold money for a pending purchase</th><td>A reservation event in the wallet, confirmed or released later: try-confirm-cancel inside one partition</td><td>The log and replay</td></tr>
+<tr><th>Several currencies</th><td>Balances per currency; a conversion is one event with the rate decided once and stored in it</td><td>Determinism</td></tr>
+<tr><th>Fraud checks before a transfer</th><td>A check in the command service before the command reaches the partition, with a deadline</td><td>The partition’s single thread</td></tr>
+<tr><th>Move a wallet to another partition</th><td>Freeze it, copy its state as of an event, update the directory, unfreeze</td><td>Its history</td></tr>
+<tr><th>Regulators ask for a wallet’s state on a date</th><td>A replay to that date, from the archive</td><td>Nothing: it is a read</td></tr>
+<tr><th>Show a wallet’s spending by category</th><td>A new read model, built by replaying all events into it</td><td>The partitions</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Start from the estimate: a million transfers a second does not fit one database, so wallets are partitioned and most transfers cross partitions. Compare two-phase commit, try-confirm-cancel and a saga for that, and pick the saga with an explicit in-flight state. Then present each partition as a replicated, event-sourced log in memory: decide and apply, determinism, snapshots, and batching for throughput. Read models last.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Debit, then credit, with nothing recording the transfer</th><td>87 lost transfers in 100,000 at a crash rate of one step in a thousand, in the test</td><td>Record the transfer in the same event as the debit; finish it as a saga</td></tr>
+<tr><th>Two-phase commit across partitions with a hot wallet</th><td>Locks held through a coordinator’s recovery: 22 s average waits in the test</td><td>A saga, or a reservation of the amount only</td></tr>
+<tr><th>Hiding money in flight</th><td>Balances that do not add up while transfers complete</td><td>An explicit in-flight state, counted in every total</td></tr>
+<tr><th>Reading the clock or a random number in apply</th><td>Replicas and replays that disagree</td><td>Decide once, store the value in the event</td></tr>
+<tr><th>One fsync per event</th><td>5,950 events a second, in one run here</td><td>Group commit</td></tr>
+<tr><th>Correcting a balance by editing state</th><td>A balance the history no longer explains</td><td>A correcting event</td></tr>
+<tr><th>Serving reads from the partitions</th><td>Reads compete with the one thread that decides</td><td>Read models fed from the events</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="event-driven-architecture#event-sourcing"></x-ref>: the pattern this design is built on.</li>
+  <li><x-ref to="consensus#log"></x-ref>: a replicated log and state machine replication.</li>
+  <li><x-ref to="distributed-transactions#sagas"></x-ref>: the protocol for crossing partitions.</li>
+  <li><x-ref to="hld-payments"></x-ref>: the ledger at a smaller scale, and money entering and leaving.</li>
+  <li><x-ref to="hld-stock-exchange"></x-ref>: one deterministic order of events, processed in microseconds.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A million transfers a second means partitions, and partitions mean most transfers cross from one to another.</li>
+  <li>Debit-then-credit loses money on a crash. Make the debit and the record of the transfer one event, and finish the transfer as an idempotent saga with money explicitly in flight.</li>
+  <li>Two-phase commit locks hot wallets through failures; a saga or a reservation of the amount does not.</li>
+  <li>Each partition is a replicated log of events applied in memory by one thread; balances are a fold over the log.</li>
+  <li>Keep apply deterministic, so replicas and replays agree; snapshots bound replay time.</li>
+  <li>Group commit, and batching in consensus, turn a flush per event into a flush per thousand.</li>
+  <li>Reads come from read models fed by the events, each saying how fresh it is.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does splitting wallets over more partitions increase the number of events per transfer?</summary><p>With wallets spread evenly over P partitions, a transfer’s two wallets are in different partitions with probability 1 − 1/P. A transfer inside a partition is one event; across partitions it is three: send, receive, settle. So more partitions push the average toward three.</p></details>
+<details><summary>The process crashes after the sender’s partition recorded SendStarted but before the receiver was credited. What happens?</summary><p>Nothing is lost. On restart the relay finds the transfer unsettled in the sender’s log and delivers it. If the receiver had already been credited, it recognizes the transfer id and ignores the repeat. Then the sender’s partition records SendCompleted.</p></details>
+<details><summary>Why is two-phase commit a poor fit for a wallet that receives a hundred transfers a second?</summary><p>Each transfer locks both wallets until the coordinator decides, and if the coordinator crashes after preparing, the locks stay until it recovers. Every transfer to that wallet queues behind them; in the test, average waits reached 22 seconds.</p></details>
+<details><summary>What does “money in flight” mean, and why must it be explicit?</summary><p>Money taken from the sender whose credit to the receiver is not yet settled. Counting it explicitly keeps the invariant checkable at every moment: all balances plus money in flight add up to the same total. Hidden, the books would appear not to balance while transfers complete.</p></details>
+<details><summary>A developer adds a fee to apply() that depends on the time of day. What breaks?</summary><p>Replicas apply events at slightly different times and replays happen later, so the same events give different balances. In the test, two replicas diverged. The fee must be decided in decide() and stored in the event.</p></details>
+<details><summary>Why does a snapshot not change the answer of a replay?</summary><p>A snapshot is the state as of a known event number, produced by the same apply function. Replaying from it applies the remaining events to the same starting point a full replay would have reached. The test compared state hashes and found them identical.</p></details>
+<details><summary>How does group commit raise throughput without weakening durability?</summary><p>A transfer is still confirmed only after its event is flushed; but one flush covers every event that arrived while the previous flush was running. The cost of a flush is shared by the batch, so in the run here a thousand events per flush gave over 300 times the throughput of one.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Fowler, <a href="https://www.martinfowler.com/articles/lmax.html">The LMAX Architecture</a>, 12 July 2011.</li>
+  <li>TigerBeetle, <a href="https://docs.tigerbeetle.com/coding/requests/">Requests</a>, documentation, consulted October 2026. Batching and idempotent creates.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/eaaDev/EventSourcing.html">Event Sourcing</a>, martinfowler.com. The pattern, with replay and snapshots.</li>
+  <li>Hector Garcia-Molina and Kenneth Salem, <a href="https://www.cs.princeton.edu/research/techreps/598">Sagas</a>, 1987, Princeton technical report, presented at SIGMOD the same year.</li>
+</ol>
+</section>

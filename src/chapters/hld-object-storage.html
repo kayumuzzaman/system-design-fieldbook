@@ -1,0 +1,602 @@
+<!--meta
+{ "description": "An S3-style object store designed with the method of chapter 76: requirements and estimates for 100 PB and 100 billion objects, separate data and metadata paths, small objects packed into append-only volumes, placement across racks measured against random placement, durability of copies and erasure codes modeled and checked by simulation, versioning and delete markers, garbage collection and compaction measured, failures, growth, and what Haystack, f4 and Ceph did.",
+  "lede": "Chapter 23 explained object storage from the outside: buckets, keys, durability promises and erasure codes. This chapter builds one. The interface is simple; the work is in keeping a hundred billion objects findable, spreading their pieces so that no single failure loses them, proving how many nines that buys, and reclaiming the space that deletes leave behind.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design an object storage service like Amazon S3. Users create buckets and put, get, list and delete objects of any size by key. Objects must not be lost.</p></div>
+<p><x-ref to="object-and-file-storage"></x-ref> described the service as its users see it. Building it raises questions the user never sees. An object of 10 KB and one of 5 TB must be stored by the same system. Every byte must survive disks, machines and whole racks failing, at a cost close to one copy rather than three. Listing a prefix and reading an object written a moment before must both be correct, at a scale where the list of objects alone is tens of terabytes. And a delete only marks space as free; something has to take it back.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>Buckets; put, get and delete objects up to 5 TB, uploaded in parts above 100 MB</th><td>In scope</td></tr>
+<tr><th>List keys by prefix, in order, a page at a time</th><td>In scope</td></tr>
+<tr><th>Versioning for each bucket, and lifecycle rules that expire objects and old versions</th><td>In scope</td></tr>
+<tr><th>Storage classes and tiering, replication to another region, object locks, static websites</th><td>Out of scope. The first two are follow-up questions</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>100 PB of data in 100 billion objects: a median of 100 KB, an average of 1 MB. At peak, 100,000 gets, 10,000 puts and 1,000 lists a second</td></tr>
+<tr><th>Latency</th><td>First byte of a small object within 200 ms for 99% of gets</td></tr>
+<tr><th>Durability</th><td>Designed for eleven nines a year for each object against hardware failure</td></tr>
+<tr><th>Availability</th><td>99.99% for gets and puts</td></tr>
+<tr><th>Consistency</th><td>A get or a list after a successful put sees it, the strong read-after-write consistency S3 documents (<x-ref to="object-and-file-storage#model"></x-ref>)</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">disk        100 PB × 1.5 for a 6 + 3 code = 150 PB          ÷ 20 TB a disk = 7,500 disks
+            three copies instead: 300 PB, 15,000 disks
+metadata    100 billion objects × 500 bytes ≈ 50 TB, three copies ≈ 150 TB
+out         100,000 gets × 1 MB = 100 GB/s ≈ 800 Gbit/s
+in          10,000 puts × 1 MB = 10 GB/s, × 1.5 to disk = 15 GB/s
+objects     100 billion ÷ 7,500 disks ≈ 13 million objects on each disk
+failures    7,500 disks × 1.36% a year ≈ 2 disks a week</div>
+<p>The 500 bytes of metadata for each object and the 20 TB disks are assumptions; the failure rate is Backblaze’s for its fleet of about 344,000 drives in 2025. Each line decides something. The code, not the disk price, decides whether the service needs 7,500 disks or 15,000. Fifty terabytes of metadata is a large database in its own right, sharded and replicated. Thirteen million objects on each disk cannot each be a file. And two disks a week fail on schedule, so repair is a permanent background process, not an incident.</p>
+
+<table>
+<thead><tr><th>The number</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><th>7,500 disks against 15,000</th><td>Erasure coding for everything that stops changing</td></tr>
+<tr><th>150 TB of metadata in three copies</th><td>A partitioned metadata store, separate from the bytes</td></tr>
+<tr><th>13 million objects a disk</th><td>Objects packed into large volumes, not files</td></tr>
+<tr><th>800 Gbit/s out</th><td>Many front ends; a CDN for objects that many people read</td></tr>
+<tr><th>2 failed disks a week</th><td>Repair that runs all the time, without a person</td></tr>
+</tbody>
+</table>
+
+<div class="widget wide" data-widget="durability80">
+<h4>Disks and durability</h4>
+<p>Raw capacity, disk failures and the chance of losing an object, for a code of k data and m parity pieces.</p>
+<div class="controls">
+  <label>Data stored, PB<input type="number" name="data" value="100" min="0.001" max="1000000" step="1"></label>
+  <label>Data pieces, k<input type="number" name="k" value="6" min="1" max="50" step="1"></label>
+  <label>Parity pieces, m<input type="number" name="m" value="3" min="0" max="20" step="1"></label>
+  <label>Disk size, TB<input type="number" name="disk" value="20" min="1" max="1000" step="1"></label>
+  <label>Disk failures a year, %<input type="number" name="afr" value="1.36" min="0.01" max="99" step="0.01"></label>
+  <label>Hours to rebuild a failed disk<input type="number" name="repair" value="24" min="0.1" max="8760" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 200" role="img" aria-label="Lines of the nines of durability a year against the time to rebuild a failed disk, for the chosen code and for three copies, with a dashed line at eleven nines and a dot at the chosen repair time."><text x="10" y="12" class="ts">Nines of durability a year, against the time to rebuild a failed disk</text><line x1="60" y1="160" x2="470" y2="160" class="grid"></line><text x="54" y="164" class="ts end">0</text><line x1="60" y1="125.5" x2="470" y2="125.5" class="grid"></line><text x="54" y="129.5" class="ts end">5</text><line x1="60" y1="91" x2="470" y2="91" class="grid"></line><text x="54" y="95" class="ts end">10</text><line x1="60" y1="56.5" x2="470" y2="56.5" class="grid"></line><text x="54" y="60.5" class="ts end">15</text><line x1="60" y1="22" x2="470" y2="22" class="grid"></line><text x="54" y="26" class="ts end">20</text><line x1="60" y1="84.1" x2="470" y2="84.1" class="axis" style="stroke-dasharray:4 3"></line><text x="470" y="80.1" class="ts end">eleven nines</text><text x="60" y="176" class="ts mid">1 h</text><text x="258" y="176" class="ts mid">1 day</text><text x="379.3" y="176" class="ts mid">1 week</text><text x="470" y="176" class="ts mid">30 days</text><path d="M60 70.3 L103.2 74.5 L146.4 78.6 L189.6 82.8 L232.8 86.9 L258 89.4 L301.2 93.5 L344.4 97.7 L379.3 101 L422.5 105.2 L470 109.7" class="line" style="stroke:var(--ink-3);stroke-width:1.5"></path><path d="M60 45.6 L103.2 51.8 L146.4 58.1 L189.6 64.3 L232.8 70.5 L258 74.2 L301.2 80.4 L344.4 86.6 L379.3 91.7 L422.5 97.9 L470 104.7" class="line"></path><text x="478" y="108.7" class="ts tb">6 + 3</text><text x="478" y="121.7" class="ts">3 copies</text><circle cx="258" cy="74.2" r="5" class="dot"></circle><text x="10" y="196" class="ts">Each piece on its own disk, disks failing independently at the rate given. Correlated failures are not in the model.</text></svg>
+<dl class="results">
+  <div><dt>Raw storage</dt><dd data-out="raw">150 PB, 1.5 times the data</dd></div>
+  <div><dt>Disks</dt><dd data-out="disks">7,500 of 20 TB</dd></div>
+  <div><dt>Disk failures</dt><dd data-out="failures">1.95 a week</dd></div>
+  <div><dt>Read to rebuild one disk</dt><dd data-out="repairread">120 TB read across the cluster</dd></div>
+  <div><dt>Chance of losing an object</dt><dd data-out="loss">1 in 2.75 trillion a year, 12.4 nines</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Storing 100 PB as 6 + 3 takes 150 PB of disk, 7,500 disks, of which about 2 fail each week. Rebuilding a failed disk reads 120 TB from the others, and with 24 hours to rebuild, a given object is lost with a chance of 1 in 2.75 trillion a year from independent disk failures alone, beyond eleven nines.</p>
+</div>
+<p>Set the parity to 2 and the data pieces to 1 to see three copies: twice the disks, and fewer nines than 6 + 3 at every repair time. Step 6b explains the model behind the last line and checks it.</p>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Objects, versions and listing">
+PUT /photos/cats/tom.jpg            (bucket in the host name)
+Content-Length: 4194304
+x-checksum-sha256: 3q2+7w…
+→ 200 OK  ETag: "9b2c…"  x-version-id: v2
+
+GET /photos/cats/tom.jpg            → 200 OK, the bytes
+GET /photos/cats/tom.jpg?versionId=v1 → 200 OK, the older bytes
+DELETE /photos/cats/tom.jpg         → 204 No Content, x-delete-marker: true
+
+GET /photos?list-type=2&prefix=cats/&max-keys=1000&continuation-token=Y2F0cy90…
+→ 200 OK  { "keys": [ "cats/tom.jpg", … ], "nextContinuationToken": "Y2F0cy96…" }
+</pre>
+<pre data-lang="http" data-title="An upload in parts">
+POST /videos/talk.mp4?uploads       → 200 OK  { "uploadId": "u-71f" }
+PUT  /videos/talk.mp4?uploadId=u-71f&partNumber=1   → 200 OK  ETag: "p1"
+…    parts 2 to 40, in any order, in parallel, each retried alone
+POST /videos/talk.mp4?uploadId=u-71f  { "parts": [ ["1","p1"], …, ["40","p40"] ] }
+→ 200 OK                             the object exists from this moment
+</pre>
+<ul>
+  <li><b>Checksums.</b> The client sends one, and the service refuses an object whose bytes do not match. Corruption between the client and the disk is caught at the door.</li>
+  <li><b>Listing</b> returns keys in order, a page at a time, and the continuation token is the last key returned, encoded (<x-ref to="api-styles#pagination"></x-ref>).</li>
+  <li><b>Multipart.</b> Completing an upload is a metadata operation: the object becomes the list of its parts, and no bytes are copied (<x-ref to="object-and-file-storage#multipart"></x-ref>). Uploads never completed are removed by a lifecycle rule.</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>An object version: size, checksum, time, and where its pieces are</th><td>Bucket, key, version</td><td>The metadata service: a key-value store partitioned by key range, three copies, consensus within each range</td><td>Reads by key and lists by prefix are both range reads. Read-after-write needs one ordered copy of each range (<x-ref to="partitioning#range"></x-ref>)</td></tr>
+<tr><th>A volume: an append-only file holding many objects’ pieces</th><td>Volume id</td><td>Storage nodes, on local disks</td><td>A few large files instead of millions of small ones; writes are appends</td></tr>
+<tr><th>A volume’s index: object, offset, length</th><td>Volume id and object</td><td>In memory on the storage node, with a copy on disk</td><td>Reading a piece is one disk seek</td></tr>
+<tr><th>The cluster map: racks, nodes, disks and their state</th><td>One document</td><td>The placement service, replicated</td><td>Every placement decision reads it; it changes when disks fail or are added</td></tr>
+</tbody>
+</table>
+<p>A listing is a range read on the metadata: start after the continuation key, return the next thousand keys of the prefix. A prefix with ten million keys takes ten thousand pages, each a cheap read on one shard, and a delimiter such as <code>/</code> lets the service return common prefixes, the “folders”, instead of every key beneath them. Partitioning the metadata by hash would spread load more evenly, but then listing <code>cats/</code> would ask every shard. Partitioning by key range keeps a prefix together, at the price of hot ranges when many keys share one prefix, which the service handles by splitting busy ranges (<x-ref to="partitioning#hot-keys"></x-ref>).</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 360" role="img" aria-labelledby="f801t f801d">
+<title id="f801t">The data path and the metadata path</title>
+<desc id="f801d">A client sends requests to front ends. For metadata, the front ends call the metadata service, sharded by key range, which maps each key to its versions and each version to the places its pieces are stored, and the placement service, which holds the map of racks and disks. For data, the front ends write and read pieces on storage nodes in six racks, one piece of each object in each of nine racks shown as six. In the background, repair rebuilds lost pieces, compaction reclaims space from deleted objects, and lifecycle rules expire objects.</desc>
+<rect class="n" x="10" y="150" width="92" height="52" rx="6"/>
+<text class="tb mid" x="56" y="172">Client</text>
+<text class="ts mid" x="56" y="189">PUT, GET, LIST</text>
+<path class="e sig" d="M102 176H140"/>
+<rect class="n sig" x="140" y="140" width="136" height="72" rx="6"/>
+<text class="tb mid" x="208" y="163.5">Front ends</text>
+<text class="ts mid" x="208" y="180.5">auth, erasure coding,</text>
+<text class="ts mid" x="208" y="197.5">checksums</text>
+<rect class="n store" x="340" y="14" width="220" height="58" rx="6"/>
+<text class="tb mid" x="450" y="39">Metadata service</text>
+<text class="ts mid" x="450" y="56">key → versions → pieces</text>
+<rect class="n" x="340" y="88" width="220" height="46" rx="6"/>
+<text class="tb mid" x="450" y="107">Placement service</text>
+<text class="ts mid" x="450" y="124">the map of racks and disks</text>
+<path class="e sig" d="M276 158L340 46"/>
+<text class="ts end" x="300" y="98">metadata</text>
+<path class="e sig" d="M276 166L340 112"/>
+<text class="ts" x="580" y="36">sharded by</text>
+<text class="ts" x="580" y="52">key range,</text>
+<text class="ts" x="580" y="68">three copies</text>
+<rect class="n store" x="300" y="196" width="60" height="96" rx="5"/>
+<text class="ts mid" x="330" y="212">rack 1</text>
+<rect class="n" x="310" y="220" width="40" height="16" rx="3"/>
+<rect class="n" x="310" y="242" width="40" height="16" rx="3"/>
+<rect class="n" x="310" y="264" width="40" height="16" rx="3"/>
+<rect class="n store" x="368" y="196" width="60" height="96" rx="5"/>
+<text class="ts mid" x="398" y="212">rack 2</text>
+<rect class="n" x="378" y="220" width="40" height="16" rx="3"/>
+<rect class="n" x="378" y="242" width="40" height="16" rx="3"/>
+<rect class="n" x="378" y="264" width="40" height="16" rx="3"/>
+<rect class="n store" x="436" y="196" width="60" height="96" rx="5"/>
+<text class="ts mid" x="466" y="212">rack 3</text>
+<rect class="n" x="446" y="220" width="40" height="16" rx="3"/>
+<rect class="n" x="446" y="242" width="40" height="16" rx="3"/>
+<rect class="n" x="446" y="264" width="40" height="16" rx="3"/>
+<rect class="n store" x="504" y="196" width="60" height="96" rx="5"/>
+<text class="ts mid" x="534" y="212">rack 4</text>
+<rect class="n" x="514" y="220" width="40" height="16" rx="3"/>
+<rect class="n" x="514" y="242" width="40" height="16" rx="3"/>
+<rect class="n" x="514" y="264" width="40" height="16" rx="3"/>
+<rect class="n store" x="572" y="196" width="60" height="96" rx="5"/>
+<text class="ts mid" x="602" y="212">rack 5</text>
+<rect class="n" x="582" y="220" width="40" height="16" rx="3"/>
+<rect class="n" x="582" y="242" width="40" height="16" rx="3"/>
+<rect class="n" x="582" y="264" width="40" height="16" rx="3"/>
+<rect class="n store" x="640" y="196" width="60" height="96" rx="5"/>
+<text class="ts mid" x="670" y="212">rack 6</text>
+<rect class="n" x="650" y="220" width="40" height="16" rx="3"/>
+<rect class="n" x="650" y="242" width="40" height="16" rx="3"/>
+<rect class="n" x="650" y="264" width="40" height="16" rx="3"/>
+<text class="ts mid" x="504" y="308">Storage nodes: append-only volumes on disks</text>
+<path class="e sig" d="M276 196L300 236"/>
+<text class="ts mid" x="212" y="246">data: pieces</text>
+<text class="ts mid" x="212" y="262">one per rack</text>
+<rect class="n async" x="10" y="300" width="110" height="46" rx="6"/>
+<text class="tb mid" x="65" y="319">Repair</text>
+<text class="ts mid" x="65" y="336">rebuild pieces</text>
+<rect class="n async" x="130" y="300" width="124" height="46" rx="6"/>
+<text class="tb mid" x="192" y="319">Compaction</text>
+<text class="ts mid" x="192" y="336">reclaim space</text>
+<rect class="n async" x="10" y="248" width="110" height="40" rx="6"/>
+<text class="tb mid" x="65" y="272.5">Lifecycle rules</text>
+<path class="e async" d="M254 323H296"/>
+<text class="ts" x="10" y="356">Blue: the request path. Green: data at rest. Purple, dashed: work done later.</text>
+</svg>
+</div>
+<figcaption>Metadata and data take separate paths: a small, strongly consistent store says where every piece is, and a large, simple one holds the pieces.</figcaption>
+</figure>
+
+<p>The defining choice is to separate the data path from the metadata path. Bytes move between clients, front ends and storage nodes, through machines built for throughput. Facts about bytes, which key, which version, which pieces where, live in a smaller store built for consistency. A put writes the bytes first and the metadata last, so an object becomes visible in one atomic step, and a failure in between leaves only unreferenced bytes for the garbage collector.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 520" role="img" aria-labelledby="f802t f802d">
+<title id="f802t">Writing an object, and reading it with one node slow</title>
+<desc id="f802d">Two sequences between a client, a front end, the metadata service and the storage nodes. Writing: the front end splits the object into six data pieces and three parity pieces, writes them to nine storage nodes in different racks, and only when all are stored commits the new version to the metadata service, then answers 200. Reading: the front end looks up the current version, asks six nodes for the data pieces, finds one slow, asks for a parity piece instead, rebuilds the missing piece, checks the checksum and streams the object.</desc>
+<text class="tb" x="10" y="16">PUT photos/cat.jpg, 4 MB</text>
+<g data-scene="put">
+<text class="tb mid" x="50" y="40">Client</text>
+<line class="axis" x1="50" y1="48" x2="50" y2="262"/>
+<text class="tb mid" x="200" y="40">Front end</text>
+<line class="axis" x1="200" y1="48" x2="200" y2="262"/>
+<text class="tb mid" x="380" y="40">Metadata</text>
+<line class="axis" x1="380" y1="48" x2="380" y2="262"/>
+<text class="tb mid" x="590" y="40">Storage nodes</text>
+<line class="axis" x1="590" y1="48" x2="590" y2="262"/>
+<g data-s="1">
+<path class="e sig" d="M51 72H199"/>
+<text class="ts mid" x="125.0" y="66">1. PUT, with a checksum</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n sig" x="208" y="85" width="182.7" height="22" rx="4"/>
+<text class="ts mid" x="299.35" y="100">2. 6 data + 3 parity pieces</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M201 126H589"/>
+<text class="ts mid" x="395.0" y="120">3. append 9 pieces, 9 racks</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M589 153H201"/>
+<text class="ts mid" x="395.0" y="147">4. stored, checksums match</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M201 180H379"/>
+<text class="ts mid" x="290.0" y="174">5. commit v2: pieces at …</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M379 207H201"/>
+<text class="ts mid" x="290.0" y="201">6. committed</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M199 234H51"/>
+<text class="ts mid" x="125.0" y="228">7. 200, ETag, version v2</text>
+</g>
+</g>
+<path class="e none dash" d="M10 276H710"/>
+<text class="tb" x="10" y="296">GET photos/cat.jpg, one node slow</text>
+<g data-scene="get">
+<text class="tb mid" x="50" y="320">Client</text>
+<line class="axis" x1="50" y1="328" x2="50" y2="512"/>
+<text class="tb mid" x="200" y="320">Front end</text>
+<line class="axis" x1="200" y1="328" x2="200" y2="512"/>
+<text class="tb mid" x="380" y="320">Metadata</text>
+<line class="axis" x1="380" y1="328" x2="380" y2="512"/>
+<text class="tb mid" x="590" y="320">Storage nodes</text>
+<line class="axis" x1="590" y1="328" x2="590" y2="512"/>
+<g data-s="1">
+<path class="e sig" d="M51 352H199"/>
+<text class="ts mid" x="125.0" y="346">1. GET</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M201 373H379"/>
+<text class="ts mid" x="290.0" y="367">2. current version?</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M379 394H201"/>
+<text class="ts mid" x="290.0" y="388">3. v2, nine places</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M201 415H589"/>
+<text class="ts mid" x="395.0" y="409">4. read the 6 data pieces</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M589 436H201"/>
+<text class="ts mid" x="395.0" y="430">5. 5 arrive, 1 is slow</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M201 457H589"/>
+<text class="ts mid" x="395.0" y="451">6. read 1 parity piece</text>
+</g>
+<g data-s="7" data-packet="none">
+<rect class="n sig" x="208" y="464" width="170.5" height="22" rx="4"/>
+<text class="ts mid" x="293.25" y="479">7. decode, check checksum</text>
+</g>
+<g data-s="8">
+<path class="e store" d="M199 499H51"/>
+<text class="ts mid" x="125.0" y="493">8. 200, the bytes</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="put" data-label="Write">
+  <li data-msg="PUT" data-state="Pieces stored: none; current version: v1">The client sends the object and its checksum. The front end checks the caller may write to the bucket.</li>
+  <li data-msg="none" data-state="Pieces stored: none; current version: v1">It splits the object into six data pieces and computes three parity pieces.</li>
+  <li data-msg="9 pieces" data-state="Pieces stored: 9 of 9; current version: v1">The nine pieces are appended to open volumes on nine nodes, each in a different rack, in parallel.</li>
+  <li data-msg="stored" data-state="Pieces stored: 9 of 9; current version: v1">Every node confirms, having checked the checksum of its piece.</li>
+  <li data-msg="commit" data-state="Pieces stored: 9 of 9; current version: v2">Only now does the new version exist: one write in the metadata store, which readers will see at once.</li>
+  <li data-msg="ok" data-state="Pieces stored: 9 of 9; current version: v2">The commit is replicated in the metadata store before it is confirmed.</li>
+  <li data-msg="200" data-state="Pieces stored: 9 of 9; current version: v2">The client is told the object is stored.</li>
+</ol>
+<ol class="steps" data-scene="get" data-label="Read">
+  <li data-msg="GET" data-state="Pieces in hand: 0 of 6 needed">A reader asks for the object.</li>
+  <li data-msg="lookup" data-state="Pieces in hand: 0 of 6 needed">The front end looks up the current version and where its pieces are.</li>
+  <li data-msg="v2" data-state="Pieces in hand: 0 of 6 needed">The answer lists nine locations, six of them data pieces.</li>
+  <li data-msg="read" data-state="Pieces in hand: 0 of 6 needed">It asks for the six data pieces, which need no decoding.</li>
+  <li data-msg="5 pieces" data-state="Pieces in hand: 5 of 6 needed">Five arrive quickly. One node is slow to answer.</li>
+  <li data-msg="read" data-state="Pieces in hand: 5 of 6 needed">Rather than wait, the front end asks for one parity piece.</li>
+  <li data-msg="none" data-state="Pieces in hand: 6 of 6 needed">Any six of the nine pieces rebuild the object. The checksum confirms the result.</li>
+  <li data-msg="200" data-state="Pieces in hand: 6 of 6 needed">The object is streamed to the reader.</li>
+</ol>
+<figcaption>A write stores the pieces first and makes the version visible last, in one metadata commit. A read needs any six of the nine pieces, so one slow node costs a little decoding, not a wait.</figcaption>
+</figure>
+
+<h2 id="placement">Step 6a: Volumes and placement</h2>
+<p>Thirteen million objects on each disk rules out a file for each object: the file system’s own metadata would need several disk reads before the object’s first byte. Facebook’s Haystack, which stored over 260 billion photos in 2010, set the pattern most stores follow. Objects are appended to a few large volume files, and each storage node keeps the index of its volumes, object to offset and length, in memory, so that reading an object costs at most one disk operation.</p>
+<p>Redundancy is then applied to volumes, not to objects. A <dfn>stripe</dfn> is a group of k data pieces and the m parity pieces computed from them, stored on k + m different disks, any k of which rebuild the data (<x-ref to="object-and-file-storage#erasure-coding"></x-ref>). Small objects are appended to an open volume kept as three copies, where appends are cheap, and when the volume is full and sealed it is encoded as 6 + 3 stripes and the copies are dropped. Objects of a few megabytes and more are encoded as they arrive, as in <x-fig to="fig-flows"></x-fig>.</p>
+<p>A volume therefore has a life of its own. It is opened on three disks in three racks chosen by the placement service, takes appends until it reaches its size, perhaps a gigabyte, and is sealed. A background job encodes it into stripes on nine disks in nine racks, records the new locations in the volume’s metadata, and frees the copies, which takes it from three times its size on disk to one and a half. Objects do not move during any of this: their metadata names the volume and offset, and the volume’s own record says where the volume now lives.</p>
+<p>Where the pieces go decides which failures they survive. The placement service chooses disks from the cluster map, and the rule that matters is one piece in each failure domain. The simulation placed 100,000 stripes on 12 racks of 10 disks and destroyed one rack.</p>
+
+<figure class="fig wide" id="fig-racks">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 156" role="img" aria-labelledby="f804t f804d">
+<title id="f804t">Objects lost when one rack of twelve is destroyed</title>
+<desc id="f804d">Bars of the share of objects lost when one rack of twelve, each of ten disks, is destroyed, averaged over which rack: 3 copies, placed at random: 0.040%; 3 copies, one piece a rack: 0.000%; 6 + 3, placed at random: 0.262%; 6 + 3, one piece a rack: 0.000%.</desc>
+<text class="tb" x="10" y="18">Share of 100,000 objects lost with one rack, 12 racks of 10 disks</text>
+<text class="ts end" x="220" y="47">3 copies, placed at random</text>
+<rect class="bar fault" x="230" y="34" width="40.6" height="17" rx="3"/>
+<text class="ts" x="278.6" y="47">0.040%</text>
+<rect class="hit" x="10" y="31" width="700" height="23" data-tip="3 copies, placed at random|0.040% of objects lost with one rack"/>
+<text class="ts end" x="220" y="75">3 copies, one piece a rack</text>
+<rect class="bar store" x="230" y="62" width="1.5" height="17" rx="3"/>
+<text class="ts" x="239.5" y="75">none</text>
+<rect class="hit" x="10" y="59" width="700" height="23" data-tip="3 copies, one piece a rack|0.000% of objects lost with one rack"/>
+<text class="ts end" x="220" y="103">6 + 3, placed at random</text>
+<rect class="bar fault" x="230" y="90" width="264.0" height="17" rx="3"/>
+<text class="ts" x="502.0" y="103">0.262%</text>
+<rect class="hit" x="10" y="87" width="700" height="23" data-tip="6 + 3, placed at random|0.262% of objects lost with one rack"/>
+<text class="ts end" x="220" y="131">6 + 3, one piece a rack</text>
+<rect class="bar store" x="230" y="118" width="1.5" height="17" rx="3"/>
+<text class="ts" x="239.5" y="131">none</text>
+<rect class="hit" x="10" y="115" width="700" height="23" data-tip="6 + 3, one piece a rack|0.000% of objects lost with one rack"/>
+<line class="axis" x1="230" y1="30" x2="230" y2="140"/>
+</svg>
+</div>
+<figcaption>Simulated placement. At random, 40 to 262 of every 100,000 objects had more pieces in the lost rack than their code can lose. With one piece in each rack, a rack is one piece of every object, and nothing is lost.</figcaption>
+</figure>
+
+<p>At random, 0.040% of objects stored as three copies and 0.262% of those stored as 6 + 3 had more pieces in the destroyed rack than their code can lose. The wider code fared worse, because nine pieces over twelve racks often put four in one. Across 100 billion objects, 0.262% is 262 million objects lost to one rack fire. With one piece in each rack, a rack holds at most one piece of any object and nothing is lost. The same rule applies one level up: a service that must survive the loss of a data center spreads pieces across three or more of them.</p>
+
+<h2 id="durability">Step 6b: How many nines</h2>
+<p>Durability claims are computed, not measured, because a loss rate of one object in a hundred billion a year cannot be observed directly. The usual figure is the <dfn>mean time to data loss</dfn>: the expected time until more pieces of one stripe have failed at once than its code can lose. The chapter’s model treats a stripe as a chain of states, zero, one, two failed pieces and so on: each healthy piece fails at the disk failure rate, each failed piece is rebuilt in the repair time, and the stripe is lost on reaching m + 1 failed pieces.</p>
+<pre data-lang="ts" data-title="The mean time to data loss of one stripe">
+export function meanHoursToLoss(k: number, m: number, annualFailureRate: number, repairHours: number): number {
+  const n = k + m;
+  const fail = -Math.log(1 - annualFailureRate) / HOURS_A_YEAR; // per piece, per hour
+  const repair = 1 / repairHours;
+  let tau = 0, total = 0;
+  for (let j = 0; j <= m; j++) {
+    tau = (1 + j * repair * tau) / ((n - j) * fail);
+    total += tau;
+  }
+  return total;
+}
+</pre>
+<p>A model is only as good as its check. The chapter simulates 120 disks in 12 racks holding 5,000 stripes for 200 years, with disks failing at random and each failed disk replaced and refilled after a fixed time, at failure rates high enough to count losses: 50% a year with 14 days to repair. Three copies lost 0.00139 stripes a year each against 0.00134 from the model, and 6 + 3 lost 0.00517 against 0.00490. The model is close at those rates, so it can be trusted at real ones.</p>
+
+<figure class="fig wide" id="fig-durability">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f803t f803d">
+<title id="f803t">Durability against repair time</title>
+<desc id="f803d">Nines of durability a year for one object, against the hours taken to rebuild a failed disk, at a disk failure rate of 1.36% a year, from the chapter’s model. 3 copies, 3.00 times the data: 1 h 13.0, 6 h 11.4, 24 h 10.2, 72 h 9.3, 168 h 8.5. 6 + 3, 1.50 times the data: 1 h 16.6, 6 h 14.2, 24 h 12.4, 72 h 11.0, 168 h 9.9. 10 + 4, 1.40 times the data: 1 h 21.1, 6 h 18.0, 24 h 15.6, 72 h 13.7, 168 h 12.2. 17 + 3, 1.18 times the data: 1 h 15.0, 6 h 12.7, 24 h 10.9, 72 h 9.4, 168 h 8.3.</desc>
+<text class="tb" x="10" y="18">Nines a year, disks failing at 1.36% a year</text>
+<line class="grid" x1="70" y1="236.0" x2="560" y2="236.0"/>
+<text class="ts end" x="62" y="240.0">0</text>
+<line class="grid" x1="70" y1="195.6" x2="560" y2="195.6"/>
+<text class="ts end" x="62" y="199.6">5</text>
+<line class="grid" x1="70" y1="155.2" x2="560" y2="155.2"/>
+<text class="ts end" x="62" y="159.2">10</text>
+<line class="grid" x1="70" y1="114.8" x2="560" y2="114.8"/>
+<text class="ts end" x="62" y="118.8">15</text>
+<line class="grid" x1="70" y1="74.4" x2="560" y2="74.4"/>
+<text class="ts end" x="62" y="78.4">20</text>
+<line class="grid" x1="70" y1="34.0" x2="560" y2="34.0"/>
+<text class="ts end" x="62" y="38.0">25</text>
+<line class="axis" x1="70" y1="147.1" x2="560" y2="147.1" style="stroke-dasharray:4 3"/>
+<text class="ts" x="74" y="161.1">eleven nines</text>
+<text class="ts mid" x="70.0" y="254">1 h</text>
+<text class="ts mid" x="241.3" y="254">6 h</text>
+<text class="ts mid" x="373.9" y="254">1 day</text>
+<text class="ts mid" x="479.0" y="254">3 days</text>
+<text class="ts mid" x="560.0" y="254">1 week</text>
+<text class="ts mid" x="315.0" y="276">Time to rebuild a failed disk (log scale)</text>
+<path class="line" style="stroke:var(--ink-3)" d="M70.0 131.0 L241.3 143.5 L373.9 153.3 L479.0 161.0 L560.0 166.9"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="70.0" cy="131.0" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="241.3" cy="143.5" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="373.9" cy="153.3" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="479.0" cy="161.0" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="560.0" cy="166.9" r="3.5"/>
+<path class="line" style="stroke:var(--sig)" d="M70.0 102.0 L241.3 120.9 L373.9 135.5 L479.0 147.1 L560.0 156.0"/>
+<circle class="dot" style="fill:var(--sig)" cx="70.0" cy="102.0" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="241.3" cy="120.9" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="373.9" cy="135.5" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="479.0" cy="147.1" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="560.0" cy="156.0" r="3.5"/>
+<path class="line" style="stroke:var(--store)" d="M70.0 65.6 L241.3 90.8 L373.9 110.2 L479.0 125.6 L560.0 137.5"/>
+<circle class="dot" style="fill:var(--store)" cx="70.0" cy="65.6" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="241.3" cy="90.8" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="373.9" cy="110.2" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="479.0" cy="125.6" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="560.0" cy="137.5" r="3.5"/>
+<path class="line" style="stroke:var(--async)" d="M70.0 114.8 L241.3 133.7 L373.9 148.3 L479.0 159.9 L560.0 168.8"/>
+<circle class="dot" style="fill:var(--async)" cx="70.0" cy="114.8" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="241.3" cy="133.7" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="373.9" cy="148.3" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="479.0" cy="159.9" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="560.0" cy="168.8" r="3.5"/>
+<text class="ts" x="568" y="141.5">10 + 4, 1.40×</text>
+<text class="ts" x="568" y="160.0">6 + 3, 1.50×</text>
+<text class="ts" x="568" y="174.0">3 copies, 3.00×</text>
+<text class="ts" x="568" y="188.0">17 + 3, 1.18×</text>
+<rect class="hit" x="70" y="34" width="85.6722" height="202" data-tip="rebuild in 1 h|3 copies: 13.0 nines|6 + 3: 16.6 nines|10 + 4: 21.1 nines|17 + 3: 15.0 nines"/>
+<rect class="hit" x="155.672" y="34" width="151.957" height="202" data-tip="rebuild in 6 h|3 copies: 11.4 nines|6 + 3: 14.2 nines|10 + 4: 18.0 nines|17 + 3: 12.7 nines"/>
+<rect class="hit" x="307.629" y="34" width="118.815" height="202" data-tip="rebuild in 1 day|3 copies: 10.2 nines|6 + 3: 12.4 nines|10 + 4: 15.6 nines|17 + 3: 10.9 nines"/>
+<rect class="hit" x="426.444" y="34" width="93.0428" height="202" data-tip="rebuild in 3 days|3 copies: 9.3 nines|6 + 3: 11.0 nines|10 + 4: 13.7 nines|17 + 3: 9.4 nines"/>
+<rect class="hit" x="519.487" y="34" width="40.5132" height="202" data-tip="rebuild in 1 week|3 copies: 8.5 nines|6 + 3: 9.9 nines|10 + 4: 12.2 nines|17 + 3: 8.3 nines"/>
+</svg>
+</div>
+<figcaption>From the chapter’s model, with every piece on its own disk and failures independent. Each code gains about one nine per parity piece for every tenfold cut in repair time, so codes with more parity gain the most.</figcaption>
+</figure>
+
+<p>At Backblaze’s 1.36% and a day to rebuild a disk, three copies give 10.2 nines, 6 + 3 gives 12.4 and 10 + 4 gives 15.6, while storing 3, 1.5 and 1.4 times the data. Repair time matters as much as the code: cutting it from a day to six hours adds about two nines to 6 + 3. That is why the rebuild of a failed disk is spread over every disk that holds a piece of its stripes, and why wide codes cost network: rebuilding one piece of a 6 + 3 stripe reads six others, so a failed 20 TB disk means 120 TB read across the cluster against 20 TB for three copies.</p>
+<p>The model leaves out what loses data in practice: failures that are not independent. A batch of disks that wear out together, a rack or a building lost at once, a bug in the repair code, and the operator who deletes the wrong prefix. Placement across failure domains answers the first two, checksums verified on every read and in background scrubbing answer silent corruption, and versioning answers the last.</p>
+<p>Scrubbing has a cost that is easy to estimate. Reading all 150 PB once every two weeks is about 124 GB/s across the fleet, 16.5 MB/s for each of 7,500 disks, a small fraction of what a disk can read, but not free: it competes with client reads and is throttled when they are busy. A corrupt piece found by a scrub is repaired like a failed disk’s, before a second fault in the same stripe can make it matter.</p>
+
+<h2 id="versions">Step 6c: Versions, deletes and garbage</h2>
+<p>With versioning on, nothing a client does destroys data at once. A put adds a version; a delete without a version id adds a <dfn>delete marker</dfn>, a version that says the key is deleted, so that a get answers 404 while every earlier version stays readable by its id. Removing the marker undeletes the object. Only a delete that names a version, or a lifecycle rule, removes data for good.</p>
+<pre data-lang="ts" data-title="Deleting: a marker with versioning, the key without">
+// Without a version id: with versioning, a delete marker becomes the current version; without, the key goes.
+  // With a version id: that version is removed for good.
+  delete(key: string, now: number, versionId?: string): { garbage: Version[] } {
+    const versions = this.keys.get(key) ?? [];
+    if (versionId) {
+      const i = versions.findIndex((x) => x.versionId === versionId);
+      if (i < 0) return { garbage: [] };
+      const [gone] = versions.splice(i, 1);
+      if (versions.length === 0) this.keys.delete(key);
+      return { garbage: gone && !gone.deleteMarker ? [gone] : [] };
+    }
+    if (!this.versioning) {
+      this.keys.delete(key);
+      return { garbage: versions.filter((v) => !v.deleteMarker) };
+    }
+    return { garbage: this.add(key, { versionId: `v${++this.counter}`, deleteMarker: true, location: null, size: 0, at: now, noncurrentSince: null }, now).garbage };
+  }
+</pre>
+<p>The test walks the cases: a delete frees no bytes, an old version stays readable, removing the marker brings the object back, and a lifecycle rule frees versions that have been noncurrent for more than 30 days. Freed versions become garbage in their volumes, and the bytes come back only when a volume is compacted: its live objects are copied into the open volume and the old one is released. The threshold for compacting is a trade between disk and rewriting, which the simulation measured over two years of puts and deletes with lifetimes of a day, a month and a year.</p>
+
+<figure class="fig wide" id="fig-compaction">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f805t f805d">
+<title id="f805t">Compaction: space against rewriting</title>
+<desc id="f805d">Each point is a compaction threshold, the share of a volume that must be garbage before it is rewritten. Across: disk space held over live data. Up: bytes written over bytes put. compact at 10% garbage: space 1.03 times live data, writes 3.69 times what was put; compact at 25% garbage: space 1.13 times live data, writes 2.58 times what was put; compact at 50% garbage: space 1.49 times live data, writes 1.47 times what was put; compact at 75% garbage: space 2.50 times live data, writes 1.21 times what was put; compact at 90% garbage: space 4.34 times live data, writes 1.02 times what was put.</desc>
+<text class="tb" x="10" y="18">Bytes written over bytes put, against space held over live data</text>
+<line class="grid" x1="70" y1="220.0" x2="560" y2="220.0"/>
+<text class="ts end" x="62" y="224.0">1×</text>
+<line class="grid" x1="70" y1="189.0" x2="560" y2="189.0"/>
+<text class="ts end" x="62" y="193.0">1.5×</text>
+<line class="grid" x1="70" y1="158.0" x2="560" y2="158.0"/>
+<text class="ts end" x="62" y="162.0">2×</text>
+<line class="grid" x1="70" y1="127.0" x2="560" y2="127.0"/>
+<text class="ts end" x="62" y="131.0">2.5×</text>
+<line class="grid" x1="70" y1="96.0" x2="560" y2="96.0"/>
+<text class="ts end" x="62" y="100.0">3×</text>
+<line class="grid" x1="70" y1="65.0" x2="560" y2="65.0"/>
+<text class="ts end" x="62" y="69.0">3.5×</text>
+<line class="grid" x1="70" y1="34.0" x2="560" y2="34.0"/>
+<text class="ts end" x="62" y="38.0">4×</text>
+<text class="ts mid" x="70.0" y="238">1×</text>
+<text class="ts mid" x="105.0" y="238">1.25×</text>
+<text class="ts mid" x="140.0" y="238">1.5×</text>
+<text class="ts mid" x="175.0" y="238">1.75×</text>
+<text class="ts mid" x="210.0" y="238">2×</text>
+<text class="ts mid" x="245.0" y="238">2.25×</text>
+<text class="ts mid" x="280.0" y="238">2.5×</text>
+<text class="ts mid" x="315.0" y="238">2.75×</text>
+<text class="ts mid" x="350.0" y="238">3×</text>
+<text class="ts mid" x="385.0" y="238">3.25×</text>
+<text class="ts mid" x="420.0" y="238">3.5×</text>
+<text class="ts mid" x="455.0" y="238">3.75×</text>
+<text class="ts mid" x="490.0" y="238">4×</text>
+<text class="ts mid" x="525.0" y="238">4.25×</text>
+<text class="ts mid" x="560.0" y="238">4.5×</text>
+<text class="ts mid" x="315.0" y="260">Disk space held, as a multiple of the live data</text>
+<path class="line" d="M74.6 53.4 L88.4 122.0 L139.3 191.1 L280.3 207.0 L537.1 219.0"/>
+<circle class="dot" cx="74.6" cy="53.4" r="4"/>
+<text class="ts" x="82.6" y="47.4">10% garbage</text>
+<rect class="hit" x="52.6204" y="31.3593" width="44" height="44" data-tip="compact at 10% garbage|space held 1.03× the live data|bytes written 3.69× the bytes put|6.1 volumes compacted a day"/>
+<circle class="dot" cx="88.4" cy="122.0" r="4"/>
+<text class="ts" x="96.4" y="116.0">25% garbage</text>
+<rect class="hit" x="66.3858" y="99.976" width="44" height="44" data-tip="compact at 25% garbage|space held 1.13× the live data|bytes written 2.58× the bytes put|4.2 volumes compacted a day"/>
+<circle class="dot" cx="139.3" cy="191.1" r="4"/>
+<text class="ts" x="147.3" y="185.1">50% garbage</text>
+<rect class="hit" x="117.281" y="169.124" width="44" height="44" data-tip="compact at 50% garbage|space held 1.49× the live data|bytes written 1.47× the bytes put|2.4 volumes compacted a day"/>
+<circle class="dot" cx="280.3" cy="207.0" r="4"/>
+<text class="ts" x="288.3" y="201.0">75% garbage</text>
+<rect class="hit" x="258.314" y="185.012" width="44" height="44" data-tip="compact at 75% garbage|space held 2.50× the live data|bytes written 1.21× the bytes put|1.9 volumes compacted a day"/>
+<circle class="dot" cx="537.1" cy="219.0" r="4"/>
+<text class="ts" x="545.1" y="213.0">90% garbage</text>
+<rect class="hit" x="515.057" y="197.041" width="44" height="44" data-tip="compact at 90% garbage|space held 4.34× the live data|bytes written 1.02× the bytes put|1.6 volumes compacted a day"/>
+</svg>
+</div>
+<figcaption>Simulated over two years of puts and deletes. Compacting early keeps little garbage and rewrites a lot; compacting late rewrites little and holds more disk.</figcaption>
+</figure>
+
+<p>Compacting a volume once 10% of it is garbage held only 3% more disk than the live data, but wrote 3.7 times the bytes that clients put, because live objects were copied again and again. Waiting until 90% held 4.3 times the live data. Halfway, at 50%, held 1.5 times and wrote 1.5 times. For erasure-coded volumes, holding 1.5 times the live data on top of the code’s 1.5 is the same disk as three copies, so stores compact well before half a volume is garbage, and they compact the emptiest volumes first, which free the most space for the least copying.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A disk, about twice a week</th><td>Nothing</td><td>Reads decode from other pieces; repair rebuilds its pieces on other disks, read from every disk that holds the rest of each stripe</td></tr>
+<tr><th>A rack or its switch</th><td>Slightly slower reads</td><td>One piece of each affected stripe is missing; reads decode, repair starts if the rack stays down</td></tr>
+<tr><th>A metadata shard’s leader</th><td>Seconds of errors for keys in its range</td><td>Consensus elects another replica (<x-ref to="consensus"></x-ref>); clients retry</td></tr>
+<tr><th>A front end during a put</th><td>The put fails and is retried</td><td>Pieces written without a metadata commit are never referenced; the garbage collector removes them</td></tr>
+<tr><th>Silent corruption on a disk</th><td>Nothing</td><td>The piece’s checksum fails on read or in a scrub, and it is rebuilt from the others</td></tr>
+<tr><th>A client deletes the wrong prefix</th><td>Objects answer 404</td><td>With versioning, removing the delete markers restores them</td></tr>
+</tbody>
+</table>
+<p>At ten times the data, 75,000 disks fail about 20 times a week and the metadata reaches 500 TB in three copies: more shards and more automation, but no new component. At a hundred times, the cost of disk dominates everything, so cold data moves to wider codes and cheaper media by lifecycle rules, and the service spans several data centers in each region, with stripes spread across them so that losing one loses no object.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Haystack</b>, Facebook’s photo store, described in 2010: over 260 billion images and 20 PB, a billion new photos a week and over a million images served a second at peak. Many photos are stored in each large file, with the metadata small enough to keep in memory, so that a read needs at most one disk operation.</li>
+  <li><b>f4</b>, its successor for warm data, described in 2014, held over 65 PB and lowered the effective replication factor of warm data, read far less often than new data, from 3.6 to 2.8 or 2.1 with erasure coding.</li>
+  <li><b>Backblaze</b> reports the failure rates of its drives every year: 1.36% across about 344,000 drives in 2025, down from 1.55% in 2024. The calculator uses that figure.</li>
+  <li><b>Ceph</b> computes where data goes with an algorithm, CRUSH, published in 2006, from a description of the cluster’s hierarchy of failure domains, rather than storing a location for every object.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“Add a cheaper class for cold data”</th><td>Lifecycle rules move sealed volumes to wider codes and denser disks; reads may take longer</td><td>Keys, metadata, the API</td></tr>
+<tr><th>“Replicate a bucket to another region”</th><td>A change log from the metadata service, read by a copier that puts objects in the other region; replication is asynchronous, with a lag to monitor</td><td>The local write path</td></tr>
+<tr><th>“Objects must not be deleted for seven years”</th><td>A retention date on each version, checked by every delete and every lifecycle rule</td><td>Storage and placement</td></tr>
+<tr><th>“Serve one object to millions of readers”</th><td>A CDN in front, because the bytes never change once written (<x-ref to="cdn-and-edge"></x-ref>)</td><td>Everything behind the front ends</td></tr>
+<tr><th>“Tell me when objects arrive”</th><td>The metadata commit also writes an event to a log that subscribers read (<x-ref to="change-data-capture"></x-ref>)</td><td>The put path’s latency</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Draw the separation of the data path and the metadata path early, and say why: it is the idea everything else rests on. Then spend the deep dives on durability, with the arithmetic of copies against erasure codes and the role of repair time and placement, and on how small objects are packed and their space reclaimed. Keep a minute for versioning: it answers the question of how data is lost in practice.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>One file for each object</th><td>Millions of files on each disk, several reads before the first byte</td><td>Large append-only volumes with an in-memory index</td></tr>
+<tr><th>Metadata and bytes in the same store</th><td>A database sized for petabytes, or a blob store asked to list in order</td><td>A consistent metadata store, and a separate store for bytes</td></tr>
+<tr><th>Placing pieces at random</th><td>One rack lost takes objects with it: 0.262% of them for 6 + 3 in the simulation</td><td>One piece in each failure domain</td></tr>
+<tr><th>Quoting nines without the repair time</th><td>A number that can be off by several orders of magnitude</td><td>State the failure rate and repair time behind it</td></tr>
+<tr><th>Making the object visible before its bytes are stored</th><td>Readers find objects whose pieces do not exist</td><td>Bytes first, then one metadata commit</td></tr>
+<tr><th>Deleting bytes when a delete arrives</th><td>No undo, and slow deletes</td><td>Markers and versions now, garbage collection later</td></tr>
+<tr><th>Compacting only when volumes are nearly empty</th><td>Disk held for garbage several times over</td><td>Compact at a threshold well below half, emptiest volumes first</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="object-and-file-storage"></x-ref>: the service from the user’s side, and erasure coding.</li>
+  <li><x-ref to="partitioning"></x-ref>: range partitioning of the metadata.</li>
+  <li><x-ref to="consensus"></x-ref>: the replicas of each metadata range.</li>
+  <li><x-ref to="storage-engines"></x-ref>: append-only files, compaction and amplification.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: failure domains and correlated failures.</li>
+  <li><x-ref to="hld-key-value-store"></x-ref>: placement and repair for small values.</li>
+  <li><x-ref to="hld-file-sync"></x-ref> and <x-ref to="hld-video-streaming"></x-ref>: services built on an object store.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Separate the data path from the metadata path: bytes in large append-only volumes, facts about them in a consistent, range-partitioned store.</li>
+  <li>Write the bytes first and commit the metadata last, so a new version appears in one step and failures leave only garbage.</li>
+  <li>Pack small objects into volumes with an in-memory index, and apply redundancy to volumes, as replicas while open and as erasure codes once sealed.</li>
+  <li>Place one piece of each stripe in each failure domain: at random, one rack lost took 0.262% of 6 + 3 objects in the simulation; with one piece a rack, none.</li>
+  <li>Durability is a model of failure rate, repair time and code: at a 1.36% failure rate and a day to repair, 3 copies give 10.2 nines and 6 + 3 gives 12.4 at half the disk.</li>
+  <li>Faster repair buys nines; wide codes buy disk and pay in repair traffic.</li>
+  <li>Versioning and delete markers protect against the losses the model does not cover, and compaction thresholds trade disk against rewriting.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why are the data path and the metadata path separate?</summary><p>They need different stores. Bytes need cheap, high-throughput capacity and never change once written. Metadata needs ordered keys for listing, consistency for read-after-write, and atomic updates to make a version visible. One store cannot be good at both at a hundred petabytes.</p></details>
+<details><summary>A put has stored all nine pieces when the front end crashes, before the metadata commit. What does a reader see?</summary><p>The old version, or 404 for a new key. The object becomes visible only with the metadata commit. The nine pieces are unreferenced and the garbage collector removes them; the client retries the put.</p></details>
+<details><summary>Why do small objects go into large volumes instead of their own files?</summary><p>With thirteen million objects on a disk, files would need several metadata reads before the first byte and waste space in small blocks. A volume with an in-memory index finds any object with one disk read.</p></details>
+<details><summary>At random placement, why did 6 + 3 lose more objects to one rack than three copies did?</summary><p>Nine pieces over twelve racks put four or more in one rack more often than three copies put all three together, and four lost pieces exceed what 6 + 3 can lose. Spreading one piece to a rack removes the problem for both.</p></details>
+<details><summary>Why does a durability figure need a repair time?</summary><p>Loss requires more failures than the code tolerates within one repair window. Halving the window makes overlapping failures far less likely: in the model, 6 + 3 goes from 12.4 nines with a day to rebuild to 14.2 with six hours.</p></details>
+<details><summary>Why does rebuilding a failed disk cost more network with 6 + 3 than with three copies?</summary><p>A missing piece of a 6 + 3 stripe is computed from six others, so each byte rebuilt needs six read. With copies, one byte is read for each byte rebuilt: 20 TB against 120 TB for a 20 TB disk.</p></details>
+<details><summary>A user deletes a prefix by mistake in a versioned bucket. What can be recovered, and how?</summary><p>Everything. Each delete added a marker and freed nothing. Removing the markers makes the previous versions current again, as long as a lifecycle rule has not yet expired those noncurrent versions.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Doug Beaver, Sanjeev Kumar, Harry C. Li, Jason Sobel and Peter Vajgel, <a href="https://www.usenix.org/conference/osdi10/finding-needle-haystack-facebooks-photo-storage">“Finding a Needle in Haystack: Facebook’s Photo Storage”</a>, OSDI 2010.</li>
+  <li>Subramanian Muralidhar and others, <a href="https://www.usenix.org/conference/osdi14/technical-sessions/presentation/muralidhar">“f4: Facebook’s Warm BLOB Storage System”</a>, OSDI 2014.</li>
+  <li>Backblaze, <a href="https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/">“Backblaze Drive Stats for 2025”</a>, 12 February 2026.</li>
+  <li>Sage Weil, Scott Brandt, Ethan Miller and Carlos Maltzahn, <a href="https://www.ssrc.ucsc.edu/Papers/weil-sc06.pdf">“CRUSH: Controlled, Scalable, Decentralized Placement of Replicated Data”</a>, SC 2006.</li>
+</ol>
+</section>

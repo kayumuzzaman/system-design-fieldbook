@@ -1,0 +1,1112 @@
+<!--meta
+{ "description": "Three small infrastructure libraries in TypeScript, designed interface first and tested on a fake clock: a structured logger with levels, context, redaction, sinks and a buffered sink that never takes the application down; an in-process publish-subscribe bus with synchronous or queued delivery; a heap-based task scheduler with one timer, a concurrency limit, missed-run policies and retries with exponential backoff and full jitter; and bounded queues for backpressure, all measured.",
+  "lede": "Every service has a logger, an event bus and something that runs tasks later, and most teams write at least one of them themselves. They are small, they are used by everything else, and their failures are strange: a log call that crashes a request, a subscriber that blocks a publisher, a nightly job that runs twice at once. This chapter designs all three around a few small interfaces, which turns out to exercise most of the patterns of Part IX, and measures how each behaves under bursts, slow consumers, pauses and failing dependencies.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design three small libraries for use inside one service: a logger with levels, per-request context and several destinations; an in-process publish-subscribe bus; and a scheduler that runs tasks at a time, after a delay or periodically, with retries. None of them may take the application down, and all of them must be testable without waiting for real time to pass.</p></div>
+<p><x-ref to="lld-method#shapes"></x-ref> calls this shape “a small library that other code builds on: interfaces first”. The users are other programmers, the requirements are about behavior under stress, and the design is mostly a matter of choosing the few points where callers can plug in their own code. Those points are where the patterns of <x-ref to="behavioral-patterns"></x-ref> and <x-ref to="structural-patterns"></x-ref> appear: strategy, observer, chain of responsibility and decorator, each for a reason.</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>One process or many?</th><td>One. Shipping logs elsewhere, brokers between services and distributed cron are other chapters’ subjects</td></tr>
+<tr><th>May logging lose records?</th><td>The caller chooses: drop when overwhelmed, or slow the application down. Never crash it</td></tr>
+<tr><th>Are subscribers called before <code>publish</code> returns?</th><td>Either, chosen per subscriber</td></tr>
+<tr><th>How precise must the scheduler be?</th><td>Milliseconds, in memory. A task due while the process is down is the caller’s problem; durable timers are in <x-ref to="scheduling-and-workflows#timers"></x-ref></td></tr>
+<tr><th>May a periodic task overlap itself?</th><td>No</td></tr>
+<tr><th>What happens to a task that throws?</th><td>It is retried if asked, then reported. The scheduler goes on</td></tr>
+</tbody>
+</table>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+<table>
+<thead><tr><th>Concept</th><th>Kind</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Log record</th><td>Value</td><td>Time, level, message and fields: data, not a string</td></tr>
+<tr><th>Logger</th><td>Object with shared core</td><td>A child logger adds fields and shares everything else</td></tr>
+<tr><th>Sink, filter, format</th><td>Interfaces</td><td>Where records go, what is changed or stopped, how a record looks as text</td></tr>
+<tr><th>Bus, subscription</th><td>Object, handle</td><td>Topics with typed messages; subscribing returns the function that unsubscribes</td></tr>
+<tr><th>Task, entry</th><td>Entity, value</td><td>A task can be canceled; an entry is one future run of it in the heap</td></tr>
+<tr><th>Bounded queue</th><td>Object</td><td>Shared by the buffered sink and queued subscribers</td></tr>
+<tr><th>Clock</th><td>Interface</td><td>The time now, and a call at a time. Real or fake</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th></tr></thead>
+<tbody>
+<tr><th>A log call never throws and never leaves a rejected promise unhandled</th><td><code>Logger.log</code></td></tr>
+<tr><th>A record that a filter fails on is dropped, not written unfiltered</th><td><code>Logger.log</code></td></tr>
+<tr><th>One failing subscriber does not stop the others</th><td><code>Bus.publish</code></td></tr>
+<tr><th>A queue never holds more than its capacity</th><td><code>BoundedQueue</code></td></tr>
+<tr><th>Tasks start in time order; ties in the order they were added</th><td><code>Scheduler</code>, through its heap</td></tr>
+<tr><th>A periodic task never overlaps itself, and a failure does not end its schedule</th><td><code>Scheduler.finish</code></td></tr>
+<tr><th>No more tasks run at once than the limit</th><td><code>Scheduler.wake</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="classes">Step 4: The classes</h2>
+
+<figure class="fig wide" id="fig-classes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 480" role="img" aria-labelledby="f751t f751d">
+<title id="f751t">Three small libraries and the parts they share</title>
+<desc id="f751d">A class diagram in three columns over a shared row. Logger, with child and log, holds a list of Filters, a chain, and a list of Sinks. Sink is an interface with write; LineSink, which uses a Format, MemorySink and BufferedSink implement it, and BufferedSink also wraps another Sink. Bus, with subscribe and publish, keeps subscriptions that deliver either inside publish or through a Worker. Scheduler, with at, after and every, keeps a MinHeap of entries and uses a Backoff for retries. Shared below: Worker, which owns a BoundedQueue with an Overflow policy, and the Clock interface, implemented by FakeClock and the system clock, which Logger and Scheduler use.</desc>
+<rect class="n sig" x="10" y="14" width="215" height="112" rx="4"/>
+<text class="tb mid" x="117.5" y="33">Logger</text>
+<line class="sep sig" x1="10" y1="42" x2="225" y2="42"/>
+<text class="ts" x="18" y="58">− level, filters, sinks</text>
+<text class="ts" x="18" y="74">− context: Fields</text>
+<line class="sep sig" x1="10" y1="84" x2="225" y2="84"/>
+<text class="ts" x="18" y="100">+ child(fields): Logger</text>
+<text class="ts" x="18" y="116">+ log(level, msg, fields)</text>
+<rect class="n" x="10" y="180" width="100" height="84" rx="4"/>
+<text class="ts mid" x="60" y="196">«function»</text>
+<text class="tb mid" x="60" y="213">Filter</text>
+<line class="sep" x1="10" y1="222" x2="110" y2="222"/>
+<text class="ts" x="18" y="238">record → record</text>
+<text class="ts" x="18" y="254">or null</text>
+<path class="e assoc" d="M40 126 L40 180"/>
+<text class="ts mid" x="50" y="157">*</text>
+<rect class="n" x="120" y="180" width="105" height="68" rx="4"/>
+<text class="ts mid" x="172.5" y="196">«interface»</text>
+<text class="tb mid" x="172.5" y="213">Sink</text>
+<line class="sep" x1="120" y1="222" x2="225" y2="222"/>
+<text class="ts" x="128" y="238">+ write(record)</text>
+<path class="e assoc" d="M170 126 L172.5 180"/>
+<text class="ts mid" x="181.25" y="157">*</text>
+<rect class="n" x="10" y="292" width="100" height="54" rx="4"/>
+<text class="tb mid" x="60" y="311">LineSink</text>
+<line class="sep" x1="10" y1="320" x2="110" y2="320"/>
+<text class="ts" x="18" y="336">format: Format</text>
+<rect class="n async" x="120" y="292" width="105" height="54" rx="4"/>
+<text class="tb mid" x="172.5" y="311">BufferedSink</text>
+<line class="sep async" x1="120" y1="320" x2="225" y2="320"/>
+<text class="ts" x="128" y="336">+ flush()</text>
+<path class="e implements" d="M60 292 L60 272 L150 272 L150 248"/>
+<path class="e implements" d="M183 292 L185 248"/>
+<path class="e has" d="M225 308.2 L240 308.2 L240 227.6 L225 227.6"/>
+<text class="ts mid" x="218" y="271.9">wraps</text>
+<rect class="n sig" x="262" y="14" width="205" height="96" rx="4"/>
+<text class="tb mid" x="364.5" y="33">Bus&lt;Topics&gt;</text>
+<line class="sep sig" x1="262" y1="42" x2="467" y2="42"/>
+<text class="ts" x="270" y="58">− topics: Map&lt;topic, subscriptions&gt;</text>
+<line class="sep sig" x1="262" y1="68" x2="467" y2="68"/>
+<text class="ts" x="270" y="84">+ subscribe(topic, handler, delivery)</text>
+<text class="ts" x="270" y="100">+ publish(topic, message)</text>
+<rect class="n" x="262" y="180" width="205" height="84" rx="4"/>
+<text class="ts mid" x="364.5" y="196">«union»</text>
+<text class="tb mid" x="364.5" y="213">Delivery</text>
+<line class="sep" x1="262" y1="222" x2="467" y2="222"/>
+<text class="ts" x="270" y="238">sync: inside publish</text>
+<text class="ts" x="270" y="254">queued: capacity, overflow</text>
+<path class="e uses" d="M364.5 110 L364.5 180"/>
+<rect class="n sig" x="505" y="14" width="205" height="112" rx="4"/>
+<text class="tb mid" x="607.5" y="33">Scheduler</text>
+<line class="sep sig" x1="505" y1="42" x2="710" y2="42"/>
+<text class="ts" x="513" y="58">− heap: MinHeap&lt;Entry&gt;</text>
+<text class="ts" x="513" y="74">− running, limit</text>
+<line class="sep sig" x1="505" y1="84" x2="710" y2="84"/>
+<text class="ts" x="513" y="100">+ at(time, fn, options)</text>
+<text class="ts" x="513" y="116">+ after(delay, …), every(period, …)</text>
+<rect class="n" x="505" y="180" width="170" height="84" rx="4"/>
+<text class="ts mid" x="590" y="196">«function»</text>
+<text class="tb mid" x="590" y="213">Backoff</text>
+<line class="sep" x1="505" y1="222" x2="675" y2="222"/>
+<text class="ts" x="513" y="238">(attempt) → ms</text>
+<text class="ts" x="513" y="254">exponential, fullJitter</text>
+<path class="e uses" d="M607.5 126 L590 180"/>
+<rect class="n async" x="262" y="316" width="205" height="80" rx="4"/>
+<text class="tb mid" x="364.5" y="335">Worker&lt;T&gt;</text>
+<line class="sep async" x1="262" y1="344" x2="467" y2="344"/>
+<text class="ts" x="270" y="360">− queue: BoundedQueue&lt;T&gt;</text>
+<line class="sep async" x1="262" y1="370" x2="467" y2="370"/>
+<text class="ts" x="270" y="386">+ put(item), flush(), close()</text>
+<path class="e owns" d="M225 332.5 L262 348"/>
+<path class="e uses" d="M385 264 L385 316"/>
+<text class="ts mid" x="411" y="294">queued</text>
+<rect class="n store" x="505" y="300" width="205" height="84" rx="4"/>
+<text class="ts mid" x="607.5" y="316">«interface»</text>
+<text class="tb mid" x="607.5" y="333">Clock</text>
+<line class="sep store" x1="505" y1="342" x2="710" y2="342"/>
+<text class="ts" x="513" y="358">+ now()</text>
+<text class="ts" x="513" y="374">+ at(time, fn): cancel</text>
+<rect class="n" x="505" y="410" width="98" height="54" rx="4"/>
+<text class="tb mid" x="554" y="429">FakeClock</text>
+<line class="sep" x1="505" y1="438" x2="603" y2="438"/>
+<text class="ts" x="513" y="454">+ advanceTo(t)</text>
+<rect class="n" x="612" y="410" width="98" height="28" rx="4"/>
+<text class="tb mid" x="661" y="429">systemClock</text>
+<path class="e implements" d="M554 410 L554 384"/>
+<path class="e implements" d="M661 410 L661 384"/>
+<path class="e uses" d="M695 126 L695 300"/>
+<text class="ts" x="262" y="452">A Worker owns a BoundedQueue: block,</text>
+<text class="ts" x="262" y="468">drop-newest or drop-oldest when full.</text>
+<text class="ts" x="10" y="380">Logger uses the Clock for each record’s</text>
+<text class="ts" x="10" y="396">time; the scheduler for its one timer.</text>
+</svg>
+</div>
+<figcaption>Each library is a small core with its variations behind one-method interfaces. The queue, the clock and the heap are shared, and so is the rule that a failing part is reported, not thrown.</figcaption>
+</figure>
+
+<p>The three libraries share three parts. A clock, so that time can be faked in tests. A bounded queue with one consumer, used wherever a fast producer meets a slow consumer. And a min-heap, the structure the scheduler keeps its future runs in, as the parking lot kept its free spaces (<x-ref to="lld-parking-lot#code"></x-ref>).</p>
+
+<h2 id="varies">Step 5: What varies</h2>
+<table>
+<thead><tr><th>What varies</th><th>Where it is decided</th><th>Pattern</th></tr></thead>
+<tbody>
+<tr><th>Where log records go</th><td>The <code>Sink</code>s given to the logger</td><td>Strategy</td></tr>
+<tr><th>What a record looks like as text</th><td>The <code>Format</code> of a line sink: JSON or text</td><td>Strategy</td></tr>
+<tr><th>Records changed or stopped on the way</th><td>The list of <code>Filter</code>s, run in order</td><td>Chain of responsibility</td></tr>
+<tr><th>A slow sink kept off the caller’s path</th><td><code>BufferedSink</code> wrapping it</td><td>Decorator</td></tr>
+<tr><th>Who hears about an event</th><td>The handlers subscribed to its topic</td><td>Observer</td></tr>
+<tr><th>When a subscriber runs, and what happens when it falls behind</th><td>Its <code>Delivery</code> and the queue’s <code>Overflow</code></td><td>Strategy</td></tr>
+<tr><th>How long to wait before a retry</th><td>The <code>Backoff</code> function, wrapped by <code>fullJitter</code></td><td>Strategy, decorated</td></tr>
+<tr><th>What a late periodic run does</th><td>The task’s <code>missed</code> policy</td><td>Strategy</td></tr>
+<tr><th>Where time comes from</th><td>The <code>Clock</code></td><td>Port</td></tr>
+</tbody>
+</table>
+
+<h2 id="code">Step 6: The code</h2>
+<h3 id="clock">Time as a dependency</h3>
+<pre data-lang="ts" data-title="Clock, and the fake that tests move by hand">
+// Where time comes from. Every library in this chapter is given a Clock instead of reading the time itself.
+export interface Clock {
+  now(): number;
+  // Calls `fn` once, at `time` or soon after. Returns a function that cancels the call.
+  at(time: number, fn: () => void): () => void;
+}
+</pre>
+<p>Every library is given a clock instead of calling <code>Date.now()</code> or <code>setTimeout</code> itself (<x-ref to="errors-and-testing#doubles"></x-ref>). The fake clock keeps its timers in the same min-heap as the scheduler and moves time only when a test asks, firing each timer due on the way and letting the code it wakes run until it waits again. A test of a nightly task with backoff of up to ten seconds then takes milliseconds, and gives the same answer every time; the whole test file runs in about six seconds.</p>
+<p>The real clock has one detail worth knowing. A <code>setTimeout</code> delay is stored as a 32-bit signed integer, so nothing longer than 2,147,483,647 ms, about 24.8 days, can be scheduled in one call. In the test, a delay of 2<sup>31</sup> ms fired after 10 ms, with a <code>TimeoutOverflowWarning</code>. The system clock waits in steps of the longest allowed delay, and the test checks that a timer 2<sup>31</sup> ms away does not fire.</p>
+
+<h3 id="logger">The logger</h3>
+<pre data-lang="ts" data-title="The three things that vary">
+// The three things that vary, each behind a small interface.
+export interface Sink {
+  write(record: LogRecord): void | Promise<void>; // where records go (a strategy)
+}
+export type Filter = (record: LogRecord) => LogRecord | null; // change it, pass it on, or stop it (a chain)
+export type Format = (record: LogRecord) => string; // what a record looks like as text (a strategy)
+</pre>
+<p>A record is data: a time, a <dfn>log level</dfn>, which is how serious the record is, from <code>debug</code> through <code>info</code> and <code>warn</code> to <code>error</code>, a message, and fields. A <dfn>sink</dfn> is a destination for records: standard output, a file, a collector. A logger has a level, and records below it are discarded before any other work is done. <code>child</code> returns a logger that adds fields, such as a request id, to every record and shares the rest, so the code handling a request never repeats them.</p>
+<pre data-lang="ts" data-title="Logger.log: filters in order, then every sink, and nothing thrown">
+// Never throws. Returns a promise only when a sink is still working on the record, for callers that must wait.
+  log(level: Level, msg: string, fields: Fields = {}): Promise<void> | undefined {
+    if (RANK[level] < RANK[this.core.level]) return undefined; // the cheapest test first
+    let record: LogRecord | null = { time: this.core.clock.now(), level, msg, fields: { ...this.context, ...fields } };
+    try {
+      for (const filter of this.core.filters) if ((record = filter(record)) === null) return undefined;
+    } catch (error) {
+      this.failed("filters", error); // a broken filter must not let an unredacted record through
+      return undefined;
+    }
+    const waits: Promise<void>[] = [];
+    for (const sink of this.core.sinks) {
+      try {
+        const done = sink.write(record);
+        if (done) waits.push(done.catch((error) => this.failed(sink, error))); // never an unhandled rejection
+      } catch (error) {
+        this.failed(sink, error); // one sink failing does not stop the others
+      }
+    }
+    return waits.length > 0 ? Promise.all(waits).then(() => undefined) : undefined;
+  }
+</pre>
+<p>Logging must never be the reason a request fails. Each filter and each sink runs inside its own <code>try</code>, and a sink that returns a promise has its rejection caught. In the test, a logger with one sink that throws, one that rejects and one that works took 1,000 calls without throwing: the healthy sink got all 1,000 records, both failures were counted 1,000 times, the error handler was told once about each instead of a thousand times, and there were no unhandled rejections. A filter that throws stops the record instead of passing it on, because the filter may be the one that hides passwords: redaction replaced <code>card</code> and a nested <code>password</code> with <code>[redacted]</code>. Sampling kept 110 of 1,000 debug records at a rate of 0.1.</p>
+<p>Formatting has its own trap. <code>JSON.stringify</code> throws on an object that contains itself and on a <code>BigInt</code>, both of which turn up in log fields. The JSON format replaces a cycle with <code>"[circular]"</code>, writes a <code>BigInt</code> as a string and an <code>Error</code> as its name and message, and the test checks that the same object appearing twice is not mistaken for a cycle.</p>
+
+<h3 id="queue">A slow sink, and a bounded queue</h3>
+<p>Writing to a file or a network collector is slower than calling a function. <code>BufferedSink</code> is a decorator: it accepts records into a queue and hands them to the slow sink later, one at a time. The queue must be a <dfn>bounded queue</dfn>, one that never holds more than a fixed number of items, because an unbounded one turns a slow sink into a process that runs out of memory. When it is full, something has to give.</p>
+<pre data-lang="ts" data-title="BoundedQueue.put: three answers to a full queue">
+// Returns nothing when the item was dealt with at once, or, under "block", a promise that
+  // resolves when a full queue has taken the item.
+  put(item: T): Promise<void> | undefined {
+    if (this.items.length < this.capacity) return void this.items.push(item);
+    switch (this.overflow) {
+      case "drop-newest":
+        this.dropped += 1;
+        return;
+      case "drop-oldest":
+        this.items.shift();
+        this.items.push(item);
+        this.dropped += 1;
+        return;
+      case "block":
+        return new Promise((resolve) => this.blocked.push({ item, resolve }));
+    }
+  }
+</pre>
+<p><code>block</code> is backpressure (<x-ref to="message-queues#backpressure"></x-ref>): the caller gets a promise and should wait for room. The test sent a burst of 1,000 records, ten a millisecond, into a buffer of 100 in front of a sink that writes one a millisecond.</p>
+
+<figure class="fig wide" id="fig-burst">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f752t f752d">
+<title id="f752t">A burst of 1,000 log records into a buffer of 100</title>
+<desc id="f752d">Which of 1,000 log records, sent ten a millisecond into a buffer of 100 in front of a sink that writes one a millisecond, were written. Drop newest: 200 written, 800 dropped; the application finished logging at 99 ms. Drop oldest: 200 written, 800 dropped; the application finished logging at 99 ms. Block: 1000 written, 0 dropped; the application finished logging at 899 ms.</desc>
+<text class="tb" x="10" y="18">Records written, by number (0 to 999)</text>
+<text class="tb" x="10" y="56">drop newest</text>
+<text class="ts" x="10" y="72">200 written</text>
+<rect class="n sunk" x="150" y="40" width="540" height="26" rx="3"/>
+<rect class="bar store" x="150.0" y="40" width="60.5" height="26"/>
+<rect class="bar store" x="214.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="220.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="225.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="231.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="236.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="241.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="247.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="252.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="258.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="263.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="268.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="274.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="279.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="285.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="290.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="295.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="301.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="306.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="312.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="317.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="322.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="328.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="333.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="339.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="344.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="349.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="355.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="360.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="366.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="371.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="376.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="382.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="387.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="393.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="398.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="403.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="409.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="414.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="420.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="425.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="430.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="436.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="441.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="447.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="452.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="457.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="463.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="468.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="474.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="479.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="484.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="490.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="495.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="501.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="506.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="511.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="517.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="522.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="528.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="533.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="538.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="544.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="549.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="555.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="560.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="565.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="571.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="576.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="582.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="587.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="592.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="598.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="603.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="609.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="614.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="619.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="625.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="630.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="636.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="641.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="646.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="652.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="657.6" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="663.0" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="668.4" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="673.8" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="679.2" y="40" width="0.9" height="26"/>
+<rect class="bar store" x="684.6" y="40" width="0.9" height="26"/>
+<text class="ts end" x="690" y="80">application done at 99 ms, last write at 200 ms</text>
+<rect class="hit" x="150" y="38" width="540" height="44" data-tip="Drop newest|written: 200, dropped: 800|application finished logging at 99 ms|last record written at 200 ms"/>
+<text class="tb" x="10" y="108">drop oldest</text>
+<text class="ts" x="10" y="124">200 written</text>
+<rect class="n sunk" x="150" y="92" width="540" height="26" rx="3"/>
+<rect class="bar store" x="150.0" y="92" width="6.5" height="26"/>
+<rect class="bar store" x="160.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="166.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="171.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="177.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="182.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="187.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="193.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="198.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="204.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="209.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="214.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="220.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="225.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="231.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="236.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="241.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="247.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="252.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="258.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="263.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="268.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="274.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="279.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="285.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="290.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="295.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="301.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="306.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="312.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="317.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="322.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="328.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="333.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="339.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="344.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="349.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="355.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="360.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="366.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="371.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="376.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="382.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="387.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="393.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="398.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="403.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="409.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="414.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="420.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="425.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="430.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="436.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="441.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="447.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="452.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="457.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="463.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="468.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="474.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="479.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="484.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="490.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="495.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="501.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="506.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="511.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="517.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="522.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="528.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="533.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="538.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="544.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="549.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="555.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="560.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="565.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="571.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="576.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="582.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="587.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="592.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="598.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="603.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="609.0" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="614.4" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="619.8" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="625.2" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="630.6" y="92" width="0.9" height="26"/>
+<rect class="bar store" x="636.0" y="92" width="54.0" height="26"/>
+<text class="ts end" x="690" y="132">application done at 99 ms, last write at 200 ms</text>
+<rect class="hit" x="150" y="90" width="540" height="44" data-tip="Drop oldest|written: 200, dropped: 800|application finished logging at 99 ms|last record written at 200 ms"/>
+<text class="tb" x="10" y="160">block</text>
+<text class="ts" x="10" y="176">1000 written</text>
+<rect class="n sunk" x="150" y="144" width="540" height="26" rx="3"/>
+<rect class="bar store" x="150.0" y="144" width="540.0" height="26"/>
+<text class="ts end" x="690" y="184">application done at 899 ms, last write at 1000 ms</text>
+<rect class="hit" x="150" y="142" width="540" height="44" data-tip="Block|written: 1000, dropped: 0|application finished logging at 899 ms|last record written at 1000 ms"/>
+<text class="ts mid" x="150.0" y="204">0</text>
+<text class="ts mid" x="285.0" y="204">250</text>
+<text class="ts mid" x="420.0" y="204">500</text>
+<text class="ts mid" x="555.0" y="204">750</text>
+<text class="ts mid" x="689.5" y="204">999</text>
+</svg>
+</div>
+<figcaption>From the chapter’s simulation. Dropping keeps the application at full speed and loses most of the burst, the newest or the oldest; blocking keeps every record and slows the application nine times, to the sink’s pace.</figcaption>
+</figure>
+
+<p>Each policy is right somewhere. Dropping the newest keeps the start of an incident, which usually explains it; dropping the oldest keeps the latest state; blocking keeps everything and makes the application pay. A logger usually drops and counts what it dropped, because a log that slows the service down to the speed of its disk turns a logging problem into an outage. An audit trail blocks.</p>
+
+<h3 id="pubsub">Publish and subscribe</h3>
+<p>The bus is the observer pattern of <x-ref to="behavioral-patterns#observer"></x-ref> with topics: publishers name a topic, subscribers register a handler for it, and neither knows the other. The type parameter maps each topic name to its message type, so <code>publish("photo.added", …)</code> is checked against what that topic’s subscribers expect.</p>
+<pre data-lang="ts" data-title="Bus.publish: every subscriber is offered the message, whatever the others do">
+// Every subscriber is offered the message, whatever the others do. The promise, when there is one,
+  // resolves once every subscriber has taken it: handled it, or queued it, or (under "block") made room for it.
+  publish<K extends keyof Topics>(topic: K, message: Topics[K]): Promise<void> | undefined {
+    const waits: Promise<void>[] = [];
+    for (const subscription of [...(this.topics.get(topic) ?? [])]) { // a copy: handlers may unsubscribe
+      try {
+        const done = subscription.deliver(message);
+        if (done) waits.push(done.catch((error) => this.onError(error, topic)));
+      } catch (error) {
+        this.onError(error, topic);
+      }
+    }
+    return waits.length > 0 ? Promise.all(waits).then(() => undefined) : undefined;
+  }
+</pre>
+<p>Two choices matter. First, a failing subscriber is reported and the others still get the message; the test had one subscriber throw and one reject, and the third got every message. Second, when does a subscriber run? With <code>sync</code> delivery the handler runs inside <code>publish</code>. That is simple, but an async handler is started for every message without waiting for the last one. In the test, 100 messages a millisecond apart to a handler taking 1 to 20 ms ran up to 15 handlers at once, and 68 messages finished before one published earlier. With <code>queued</code> delivery each subscriber has its own bounded queue and one consumer, so its messages are handled one at a time, in order, which the test checked.</p>
+<p>Queued delivery also decides who waits for a slow subscriber. With one subscriber taking 1 ms a message and another 10 ms, each with a queue of 50, and 1,000 messages a millisecond apart, the dropping policies let the publisher finish at 1,000 ms while the slow subscriber handled 150 messages; blocking delivered all 1,000 to both, and the publisher finished at 9,491 ms. One slow subscriber slows every publisher of its topic. That is why <code>block</code> is chosen per subscriber, for the ones that must see everything.</p>
+
+<h3 id="scheduler">The scheduler</h3>
+<p>The scheduler keeps every future run as an entry in a min-heap ordered by start time, and arms exactly one timer, for the earliest. Adding a task costs O(log n), however many are waiting, and the process holds one timer instead of thousands.</p>
+
+<figure class="fig wide" id="fig-scheduler">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f753t f753d">
+<title id="f753t">One heap of entries, and one timer for the earliest</title>
+<desc id="f753d">On the left, the scheduler’s heap drawn as a tree, earliest entry at the top; on the right, a time line from 0 to 35 with the current time and the one timer that is armed. Task c is added for 30, then a and a2 for 10 and b for 20, then x for 15, which is canceled. Runs are marked on the time line as they happen. The timer is always armed for the entry at the top. At 10, a and a2 run in the order they were added; at 15, x reaches the top and is dropped; at 20 b runs and at 30 c, after which the heap is empty and no timer is armed.</desc>
+<text class="tb" x="10" y="22">The heap: earliest at the top</text>
+<text class="tb" x="380" y="22">The time line, and the one timer</text>
+<line class="axis" x1="390" y1="150" x2="700" y2="150"/>
+<line class="axis" x1="390.0" y1="150" x2="390.0" y2="155"/>
+<text class="ts mid" x="390.0" y="170">0</text>
+<line class="axis" x1="478.6" y1="150" x2="478.6" y2="155"/>
+<text class="ts mid" x="478.6" y="170">10</text>
+<line class="axis" x1="522.9" y1="150" x2="522.9" y2="155"/>
+<text class="ts mid" x="522.9" y="170">15</text>
+<line class="axis" x1="567.1" y1="150" x2="567.1" y2="155"/>
+<text class="ts mid" x="567.1" y="170">20</text>
+<line class="axis" x1="655.7" y1="150" x2="655.7" y2="155"/>
+<text class="ts mid" x="655.7" y="170">30</text>
+<g class="hide" data-s="1" data-e="1" data-packet="none">
+<rect class="n sig" x="136" y="42" width="68" height="28" rx="6"/>
+<text class="ts mid tb" x="170" y="61">c @ 30</text>
+<path class="e none sig" style="stroke-width:2" d="M390.0 70V150"/>
+<text class="ts mid" x="390.0" y="62">now 0</text>
+<circle class="dot" style="fill:var(--async)" cx="655.7" cy="150" r="6"/>
+<text class="ts mid tb" x="655.7" y="132">timer: 30</text>
+</g>
+<g class="hide" data-s="2" data-e="2" data-packet="none">
+<path class="e none" d="M170 70L95 106"/>
+<path class="e none" d="M170 70L245 106"/>
+<path class="e none" d="M95 134L55 170"/>
+<rect class="n sig" x="136" y="42" width="68" height="28" rx="6"/>
+<text class="ts mid tb" x="170" y="61">a @ 10</text>
+<rect class="n " x="61" y="106" width="68" height="28" rx="6"/>
+<text class="ts mid" x="95" y="125">a2 @ 10</text>
+<rect class="n " x="211" y="106" width="68" height="28" rx="6"/>
+<text class="ts mid" x="245" y="125">b @ 20</text>
+<rect class="n " x="21" y="170" width="68" height="28" rx="6"/>
+<text class="ts mid" x="55" y="189">c @ 30</text>
+<path class="e none sig" style="stroke-width:2" d="M390.0 70V150"/>
+<text class="ts mid" x="390.0" y="62">now 0</text>
+<circle class="dot" style="fill:var(--async)" cx="478.6" cy="150" r="6"/>
+<text class="ts mid tb" x="478.6" y="132">timer: 10</text>
+</g>
+<g class="hide" data-s="3" data-e="3" data-packet="none">
+<path class="e none" d="M170 70L95 106"/>
+<path class="e none" d="M170 70L245 106"/>
+<path class="e none" d="M95 134L55 170"/>
+<path class="e none" d="M95 134L135 170"/>
+<rect class="n sig" x="136" y="42" width="68" height="28" rx="6"/>
+<text class="ts mid tb" x="170" y="61">a @ 10</text>
+<rect class="n " x="61" y="106" width="68" height="28" rx="6"/>
+<text class="ts mid" x="95" y="125">a2 @ 10</text>
+<rect class="n " x="211" y="106" width="68" height="28" rx="6"/>
+<text class="ts mid" x="245" y="125">b @ 20</text>
+<rect class="n " x="21" y="170" width="68" height="28" rx="6"/>
+<text class="ts mid" x="55" y="189">c @ 30</text>
+<rect class="n ghost" x="101" y="170" width="68" height="28" rx="6"/>
+<text class="ts mid" x="135" y="189">x @ 15 ✗</text>
+<path class="e none sig" style="stroke-width:2" d="M390.0 70V150"/>
+<text class="ts mid" x="390.0" y="62">now 0</text>
+<circle class="dot" style="fill:var(--async)" cx="478.6" cy="150" r="6"/>
+<text class="ts mid tb" x="478.6" y="132">timer: 10</text>
+</g>
+<g class="hide" data-s="4" data-e="4" data-packet="none">
+<path class="e none" d="M170 70L95 106"/>
+<path class="e none" d="M170 70L245 106"/>
+<rect class="n ghost" x="136" y="42" width="68" height="28" rx="6"/>
+<text class="ts mid tb" x="170" y="61">x @ 15 ✗</text>
+<rect class="n " x="61" y="106" width="68" height="28" rx="6"/>
+<text class="ts mid" x="95" y="125">c @ 30</text>
+<rect class="n " x="211" y="106" width="68" height="28" rx="6"/>
+<text class="ts mid" x="245" y="125">b @ 20</text>
+<path class="e none sig" style="stroke-width:2" d="M478.6 70V150"/>
+<text class="ts mid" x="478.6" y="62">now 10</text>
+<circle class="dot" style="fill:var(--async)" cx="522.9" cy="150" r="6"/>
+<text class="ts mid tb" x="522.9" y="132">timer: 15</text>
+</g>
+<g class="hide" data-s="5" data-e="5" data-packet="none">
+<path class="e none" d="M170 70L95 106"/>
+<rect class="n sig" x="136" y="42" width="68" height="28" rx="6"/>
+<text class="ts mid tb" x="170" y="61">b @ 20</text>
+<rect class="n " x="61" y="106" width="68" height="28" rx="6"/>
+<text class="ts mid" x="95" y="125">c @ 30</text>
+<path class="e none sig" style="stroke-width:2" d="M522.9 70V150"/>
+<text class="ts mid" x="522.9" y="62">now 15</text>
+<circle class="dot" style="fill:var(--async)" cx="567.1" cy="150" r="6"/>
+<text class="ts mid tb" x="567.1" y="132">timer: 20</text>
+</g>
+<g class="hide" data-s="6" data-packet="none">
+<text class="ts mid" x="170" y="60">empty</text>
+<path class="e none sig" style="stroke-width:2" d="M655.7 70V150"/>
+<text class="ts mid" x="655.7" y="62">now 30</text>
+<text class="ts mid" x="686.7142857142858" y="132">no timer</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n store" x="474.6" y="143" width="8" height="14" rx="2"/>
+<text class="ts mid tb" x="478.6" y="190">a, a2</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n store" x="518.9" y="143" width="8" height="14" rx="2"/>
+<text class="ts mid tb" x="522.9" y="190">x ✗</text>
+</g>
+<g data-s="6" data-packet="none">
+<rect class="n store" x="563.1" y="143" width="8" height="14" rx="2"/>
+<text class="ts mid tb" x="567.1" y="190">b</text>
+<rect class="n store" x="651.7" y="143" width="8" height="14" rx="2"/>
+<text class="ts mid tb" x="655.7" y="190">c</text>
+</g>
+<text class="ts" x="380" y="216">Adding or removing an entry costs O(log n). Only</text>
+<text class="ts" x="380" y="232">one timer is ever armed, however many tasks wait.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Heap: c @ 30; Timer: 30">Task c is added for 30. The heap holds one entry, and the one timer is armed for 30.</li>
+  <li data-msg="none" data-state="Heap: a @ 10, a2 @ 10, b @ 20, c @ 30; Timer: 10">a, b and a2 are added. Each addition re-arms the timer for the top of the heap: a at 10.</li>
+  <li data-msg="none" data-state="Heap: a @ 10, a2 @ 10, b @ 20, c @ 30, x @ 15; Timer: 10">x is added for 15 and canceled at once. Canceling marks the task; its entry stays where it is.</li>
+  <li data-msg="none" data-state="Heap: x @ 15, c @ 30, b @ 20; Timer: 15">At 10 the timer fires. a and a2 are both due and start, in the order they were added. The timer moves to 15.</li>
+  <li data-msg="none" data-state="Heap: b @ 20, c @ 30; Timer: 20">At 15, x reaches the top. It is canceled, so it is dropped without running.</li>
+  <li data-msg="none" data-state="Heap: empty; Timer: none">b runs at 20 and c at 30. The heap is empty, so no timer is armed and the process can sit idle.</li>
+</ol>
+<figcaption>The order of the heap’s array is the same as in the chapter’s code, and the test checks the run order: a, a2, b, c, and never x.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Scheduler: start what is due, then one timer; schedule the next run only when this one ends">
+// Starts what is due, as far as the concurrency limit allows, then sets one timer, for the earliest entry.
+  private wake(): void {
+    this.disarm?.();
+    this.disarm = null;
+    const now = this.clock.now();
+    for (let top = this.heap.peek(); top !== undefined && top.at <= now && this.running < this.limit; top = this.heap.peek()) {
+      this.heap.pop();
+      if (!top.task.canceled) this.start(top, now);
+    }
+    const next = this.heap.peek();
+    if (next !== undefined && this.running < this.limit) this.disarm = this.clock.at(next.at, () => this.wake());
+  }
+
+  private start(entry: Entry, now: number): void {
+    const { task, attempt } = entry;
+    let due = entry.due;
+    const period = task.options.every;
+    if (period !== undefined && attempt === 1 && now >= due + period) {
+      // The next run is already due, so this one was missed: the process was paused, or the last run overran.
+      const latest = due + Math.floor((now - due) / period) * period;
+      const policy = task.options.missed ?? "once";
+      if (policy === "skip") return this.push(task, latest + period, latest + period, 1); // wait for the next one
+      if (policy === "once") due = latest; // one run stands for all the missed ones
+      // "catch-up" runs this one as it is, and the next will be found missed too, until the task is on time again
+    }
+    this.running += 1;
+    Promise.resolve()
+      .then(() => task.fn({ due, attempt }))
+      .then(
+        () => this.finish(task, due, attempt, false),
+        (error: unknown) => this.finish(task, due, attempt, true, error),
+      );
+  }
+
+  private finish(task: Task, due: number, attempt: number, failed: boolean, error?: unknown): void {
+    this.running -= 1;
+    const { retry, every } = task.options;
+    if (failed && retry !== undefined && attempt < retry.attempts && !task.canceled) {
+      this.push(task, this.clock.now() + retry.backoff(attempt), due, attempt + 1);
+    } else {
+      if (failed) this.report(error, task.name); // this run has used all its attempts
+      // The next run is added only now, so a periodic task never overlaps itself, and a failure never ends its schedule.
+      if (every !== undefined && !task.canceled) this.push(task, due + every, due + every, 1);
+    }
+    this.wake();
+  }
+</pre>
+<p><code>wake</code> pops entries that are due, skipping canceled ones, until it reaches one in the future or the concurrency limit; then it arms the timer for the new top. In the test, ten 100 ms tasks due together under a limit of 3 started at 0, 0, 0, 100, 100, 100, 200, 200, 200 and 300 ms. Canceling only marks the task, and its entries are dropped when they reach the top, so canceling costs nothing.</p>
+<p><code>finish</code> holds two decisions. A failed run is pushed back with a delay from the retry policy, keeping the time it was due, so the task knows which run it is retrying. And the next run of a periodic task is added only when the current one has finished, which is what stops a task from overlapping itself. The test checks a periodic export that fails twice: the first run uses both of its attempts and is reported once, the second run fails once and succeeds on its retry, and the schedule continues.</p>
+
+<h2 id="missed">Periodic tasks that fall behind</h2>
+<p>A periodic task falls behind in two ways: a run takes longer than the period, or the process stops for a while, paused by a debugger or a busy machine, or a laptop asleep. JavaScript’s <code>setInterval</code> ignores both: it starts the next run when the period comes round, finished or not. Measured with Node’s real timers, an interval of 10 ms with an async task of 25 ms had up to three runs going at once. A nightly job that runs twice at the same time is how data gets processed twice.</p>
+<p>The scheduler never overlaps a task with itself, and when a run starts late, a policy decides what to do about the runs that fell due in the meantime: <code>catch-up</code> makes every one of them, <code>once</code> makes one run stand for all of them, and <code>skip</code> waits for the next due time.</p>
+
+<figure class="fig wide" id="fig-missed">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 304" role="img" aria-labelledby="f754t f754d">
+<title id="f754t">A task due every 10 seconds that cannot keep up</title>
+<desc id="f754d">Runs of a task due every 10 seconds, in seconds from 0 to 100. Above, each run takes 25 seconds: setInterval: 0 to 25, 10 to 35, 20 to 45, 30 to 55, 40 to 65, 50 to 75, 60 to 85, 70 to 95; catch-up: 0 to 25, 25 to 50, 50 to 75, 75 to 100; once: 0 to 25, 25 to 50, 50 to 75, 75 to 100; skip: 0 to 25, 30 to 55, 60 to 85. Below, runs take 2 seconds and the process is paused from 15 to 55 seconds: catch-up: 0 to 2, 10 to 12, 55 to 57, 57 to 59, 59 to 61, 61 to 63, 63 to 65, 70 to 72, 80 to 82, 90 to 92; once: 0 to 2, 10 to 12, 55 to 57, 60 to 62, 70 to 72, 80 to 82, 90 to 92; skip: 0 to 2, 10 to 12, 60 to 62, 70 to 72, 80 to 82, 90 to 92.</desc>
+<text class="tb" x="10" y="18">Each run takes 25 seconds</text>
+<rect class="bar store" x="372" y="8" width="12" height="10" rx="2"/>
+<text class="ts" x="388" y="17">started on time</text>
+<rect class="bar async" x="484" y="8" width="12" height="10" rx="2"/>
+<text class="ts" x="500" y="17">started late</text>
+<rect class="bar fault" x="596" y="8" width="12" height="10" rx="2"/>
+<text class="ts" x="612" y="17">overlapping runs</text>
+<line class="grid" x1="110.0" y1="30" x2="110.0" y2="170"/>
+<line class="grid" x1="169.0" y1="30" x2="169.0" y2="170"/>
+<line class="grid" x1="228.0" y1="30" x2="228.0" y2="170"/>
+<line class="grid" x1="287.0" y1="30" x2="287.0" y2="170"/>
+<line class="grid" x1="346.0" y1="30" x2="346.0" y2="170"/>
+<line class="grid" x1="405.0" y1="30" x2="405.0" y2="170"/>
+<line class="grid" x1="464.0" y1="30" x2="464.0" y2="170"/>
+<line class="grid" x1="523.0" y1="30" x2="523.0" y2="170"/>
+<line class="grid" x1="582.0" y1="30" x2="582.0" y2="170"/>
+<line class="grid" x1="641.0" y1="30" x2="641.0" y2="170"/>
+<line class="grid" x1="700.0" y1="30" x2="700.0" y2="170"/>
+<text class="ts tb" x="10" y="49.0">setInterval</text>
+<rect class="bar fault" x="110.0" y="30" width="147.5" height="8" rx="2"/>
+<rect class="bar fault" x="169.0" y="40" width="147.5" height="8" rx="2"/>
+<rect class="bar fault" x="228.0" y="50" width="147.5" height="8" rx="2"/>
+<rect class="bar fault" x="287.0" y="30" width="147.5" height="8" rx="2"/>
+<rect class="bar fault" x="346.0" y="40" width="147.5" height="8" rx="2"/>
+<rect class="bar fault" x="405.0" y="50" width="147.5" height="8" rx="2"/>
+<rect class="bar fault" x="464.0" y="30" width="147.5" height="8" rx="2"/>
+<rect class="bar fault" x="523.0" y="40" width="147.5" height="8" rx="2"/>
+<rect class="hit" x="110" y="27" width="590" height="34" data-tip="setInterval|runs (start to end, s): 0 to 25, 10 to 35, 20 to 45, 30 to 55, 40 to 65, 50 to 75, 60 to 85, 70 to 95|up to 3 at once"/>
+<text class="ts tb" x="10" y="83.0">catch-up</text>
+<rect class="bar store" x="110.0" y="70" width="147.5" height="16" rx="2"/>
+<rect class="bar async" x="257.5" y="70" width="147.5" height="16" rx="2"/>
+<rect class="bar async" x="405.0" y="70" width="147.5" height="16" rx="2"/>
+<rect class="bar async" x="552.5" y="70" width="147.5" height="16" rx="2"/>
+<rect class="hit" x="110" y="67" width="590" height="22" data-tip="catch-up|runs (start to end, s): 0 to 25, 25 to 50, 50 to 75, 75 to 100|started late: 3"/>
+<text class="ts tb" x="10" y="111.0">once</text>
+<rect class="bar store" x="110.0" y="98" width="147.5" height="16" rx="2"/>
+<rect class="bar async" x="257.5" y="98" width="147.5" height="16" rx="2"/>
+<rect class="bar store" x="405.0" y="98" width="147.5" height="16" rx="2"/>
+<rect class="bar async" x="552.5" y="98" width="147.5" height="16" rx="2"/>
+<rect class="hit" x="110" y="95" width="590" height="22" data-tip="once|runs (start to end, s): 0 to 25, 25 to 50, 50 to 75, 75 to 100|started late: 2"/>
+<text class="ts tb" x="10" y="139.0">skip</text>
+<rect class="bar store" x="110.0" y="126" width="147.5" height="16" rx="2"/>
+<rect class="bar store" x="287.0" y="126" width="147.5" height="16" rx="2"/>
+<rect class="bar store" x="464.0" y="126" width="147.5" height="16" rx="2"/>
+<rect class="hit" x="110" y="123" width="590" height="22" data-tip="skip|runs (start to end, s): 0 to 25, 30 to 55, 60 to 85|started late: 0"/>
+<text class="tb" x="10" y="176">Runs of 2 seconds; the process is paused from 15 to 55 seconds</text>
+<rect class="n sunk" x="198.5" y="184" width="236.0" height="80" rx="3"/>
+<text class="ts mid" x="316.5" y="232">paused</text>
+<line class="grid" x1="110.0" y1="184" x2="110.0" y2="264"/>
+<line class="grid" x1="169.0" y1="184" x2="169.0" y2="264"/>
+<line class="grid" x1="228.0" y1="184" x2="228.0" y2="264"/>
+<line class="grid" x1="287.0" y1="184" x2="287.0" y2="264"/>
+<line class="grid" x1="346.0" y1="184" x2="346.0" y2="264"/>
+<line class="grid" x1="405.0" y1="184" x2="405.0" y2="264"/>
+<line class="grid" x1="464.0" y1="184" x2="464.0" y2="264"/>
+<line class="grid" x1="523.0" y1="184" x2="523.0" y2="264"/>
+<line class="grid" x1="582.0" y1="184" x2="582.0" y2="264"/>
+<line class="grid" x1="641.0" y1="184" x2="641.0" y2="264"/>
+<line class="grid" x1="700.0" y1="184" x2="700.0" y2="264"/>
+<text class="ts tb" x="10" y="201.0">catch-up</text>
+<rect class="bar store" x="110.0" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="169.0" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar async" x="434.5" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar async" x="446.3" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar async" x="458.1" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar async" x="469.9" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar async" x="481.7" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="523.0" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="582.0" y="188" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="641.0" y="188" width="11.8" height="16" rx="2"/>
+<rect class="hit" x="110" y="185" width="590" height="22" data-tip="catch-up|runs (start to end, s): 0 to 2, 10 to 12, 55 to 57, 57 to 59, 59 to 61, 61 to 63, 63 to 65, 70 to 72, 80 to 82, 90 to 92|started late: 5"/>
+<text class="ts tb" x="10" y="229.0">once</text>
+<rect class="bar store" x="110.0" y="216" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="169.0" y="216" width="11.8" height="16" rx="2"/>
+<rect class="bar async" x="434.5" y="216" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="464.0" y="216" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="523.0" y="216" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="582.0" y="216" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="641.0" y="216" width="11.8" height="16" rx="2"/>
+<rect class="hit" x="110" y="213" width="590" height="22" data-tip="once|runs (start to end, s): 0 to 2, 10 to 12, 55 to 57, 60 to 62, 70 to 72, 80 to 82, 90 to 92|started late: 1"/>
+<text class="ts tb" x="10" y="257.0">skip</text>
+<rect class="bar store" x="110.0" y="244" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="169.0" y="244" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="464.0" y="244" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="523.0" y="244" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="582.0" y="244" width="11.8" height="16" rx="2"/>
+<rect class="bar store" x="641.0" y="244" width="11.8" height="16" rx="2"/>
+<rect class="hit" x="110" y="241" width="590" height="22" data-tip="skip|runs (start to end, s): 0 to 2, 10 to 12, 60 to 62, 70 to 72, 80 to 82, 90 to 92|started late: 0"/>
+<text class="ts mid" x="110.0" y="280">0</text>
+<text class="ts mid" x="169.0" y="280">10</text>
+<text class="ts mid" x="228.0" y="280">20</text>
+<text class="ts mid" x="287.0" y="280">30</text>
+<text class="ts mid" x="346.0" y="280">40</text>
+<text class="ts mid" x="405.0" y="280">50</text>
+<text class="ts mid" x="464.0" y="280">60</text>
+<text class="ts mid" x="523.0" y="280">70</text>
+<text class="ts mid" x="582.0" y="280">80</text>
+<text class="ts mid" x="641.0" y="280">90</text>
+<text class="ts mid" x="700.0" y="280">100</text>
+<text class="ts mid" x="405.0" y="296">seconds</text>
+</svg>
+</div>
+<figcaption>Drawn from the scheduler and a plain timer on the fake clock. A timer that ignores the last run lets runs pile up; the scheduler never overlaps a task with itself, and its missed-run policy decides what late means.</figcaption>
+</figure>
+
+<p>With runs of 25 seconds every 10, <code>catch-up</code> started each run further behind its due time, 15, 30 and then 45 seconds late, a backlog that never shrinks. After a 40-second pause, it made five runs back to back. <code>once</code> made one run at once and was then back on schedule; <code>skip</code> waited until 60. Which is right depends on the task: a task that sends a report for each hour must catch up, a task that refreshes a cache needs one run, and a heartbeat should skip.</p>
+
+<h2 id="retries">Retries, backoff and jitter</h2>
+<p>A failed run is retried after a delay chosen by a <code>Backoff</code>, a function from the attempt number to milliseconds.</p>
+<pre data-lang="ts" data-title="Backoff: exponential, and full jitter around it">
+// How long to wait before retry number `attempt` (counted from 1), in milliseconds.
+export type Backoff = (attempt: number) => number;
+
+export const exponential = (base: number, cap: number): Backoff => (attempt) => Math.min(cap, base * 2 ** (attempt - 1));
+
+// Full jitter: a random wait between zero and what the inner backoff says.
+export const fullJitter = (inner: Backoff, random: () => number): Backoff => (attempt) => Math.floor(random() * inner(attempt));
+</pre>
+<p>With <dfn>exponential backoff</dfn>, each wait is a constant times two to the number of attempts so far, up to a cap: here 100 ms, 200, 400 and so on to at most 10 seconds. A task that kept failing made attempts at 0, 100, 300, 700, 1,500 and 3,100 ms. Backoff gives a struggling dependency room to recover, but it does nothing about clients that failed together, because they all wait the same time and return together. <dfn>Full jitter</dfn> fixes that by waiting a random time between zero and the exponential delay, which on average halves each wait and spreads the clients out. The name comes from Marc Brooker’s comparison of jitter strategies at AWS, which found backoff without jitter both the slowest and the most work.</p>
+<p>The test reproduced the effect with the scheduler: 1,000 tasks fall due at the same moment and call one dependency that serves at most 10 calls in each 10 ms, refusing the rest at once. Each task may make 10 attempts.</p>
+
+<figure class="fig wide" id="fig-herd">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f755t f755d">
+<title id="f755t">1,000 retries in step, and the same retries with jitter</title>
+<desc id="f755d">Calls to a dependency that serves 10 calls in each 10 ms, per 10 ms over the first two seconds, from 1,000 tasks due at once that retry with exponential backoff from 100 ms. Without jitter, the retries arrive together at 100, 300, 700 and 1,500 ms: 100 of 1,000 tasks succeeded in all, the last at 32,700 ms. With full jitter the retries spread out: 1,000 succeeded, the last at 3,366 ms, and the busiest 10 ms after the start had 166 calls.</desc>
+<text class="tb" x="10" y="24">No jitter</text>
+<text class="ts end" x="700" y="24">100 of 1,000 succeeded; the last at 32.7 s</text>
+<line class="axis" x1="70" y1="126.0" x2="700" y2="126.0"/>
+<text class="ts end" x="64" y="130.0">0</text>
+<line class="grid" x1="70" y1="81.0" x2="700" y2="81.0"/>
+<text class="ts end" x="64" y="85.0">500</text>
+<line class="grid" x1="70" y1="36.0" x2="700" y2="36.0"/>
+<text class="ts end" x="64" y="40.0">1,000</text>
+<line class="axis" x1="70" y1="125.1" x2="700" y2="125.1" style="stroke-dasharray:3 3"/>
+<rect class="bar fault" x="70.0" y="36.0" width="2.6" height="90.0"/>
+<rect class="bar fault" x="101.5" y="36.9" width="2.6" height="89.1"/>
+<rect class="bar fault" x="164.5" y="37.8" width="2.6" height="88.2"/>
+<rect class="bar fault" x="290.5" y="38.7" width="2.6" height="87.3"/>
+<rect class="bar fault" x="542.5" y="39.6" width="2.6" height="86.4"/>
+<text class="tb" x="10" y="158">Full jitter</text>
+<text class="ts end" x="700" y="158">1,000 of 1,000 succeeded; the last at 3.4 s</text>
+<line class="axis" x1="70" y1="260.0" x2="700" y2="260.0"/>
+<text class="ts end" x="64" y="264.0">0</text>
+<line class="grid" x1="70" y1="215.0" x2="700" y2="215.0"/>
+<text class="ts end" x="64" y="219.0">500</text>
+<line class="grid" x1="70" y1="170.0" x2="700" y2="170.0"/>
+<text class="ts end" x="64" y="174.0">1,000</text>
+<line class="axis" x1="70" y1="259.1" x2="700" y2="259.1" style="stroke-dasharray:3 3"/>
+<rect class="bar fault" x="70.0" y="170.0" width="2.6" height="90.0"/>
+<rect class="bar fault" x="73.2" y="250.9" width="2.6" height="9.1"/>
+<rect class="bar fault" x="76.3" y="251.5" width="2.6" height="8.5"/>
+<rect class="bar fault" x="79.5" y="250.6" width="2.6" height="9.4"/>
+<rect class="bar fault" x="82.6" y="249.4" width="2.6" height="10.6"/>
+<rect class="bar fault" x="85.8" y="246.7" width="2.6" height="13.3"/>
+<rect class="bar fault" x="88.9" y="247.7" width="2.6" height="12.3"/>
+<rect class="bar fault" x="92.0" y="245.1" width="2.6" height="14.9"/>
+<rect class="bar fault" x="95.2" y="247.8" width="2.6" height="12.2"/>
+<rect class="bar fault" x="98.3" y="246.9" width="2.6" height="13.1"/>
+<rect class="bar fault" x="101.5" y="254.9" width="2.6" height="5.1"/>
+<rect class="bar fault" x="104.7" y="255.1" width="2.6" height="4.9"/>
+<rect class="bar fault" x="107.8" y="255.1" width="2.6" height="4.9"/>
+<rect class="bar fault" x="111.0" y="254.1" width="2.6" height="5.9"/>
+<rect class="bar fault" x="114.1" y="254.4" width="2.6" height="5.6"/>
+<rect class="bar fault" x="117.2" y="254.8" width="2.6" height="5.2"/>
+<rect class="bar fault" x="120.4" y="255.1" width="2.6" height="4.9"/>
+<rect class="bar fault" x="123.6" y="254.0" width="2.6" height="6.0"/>
+<rect class="bar fault" x="126.7" y="254.3" width="2.6" height="5.7"/>
+<rect class="bar fault" x="129.8" y="254.4" width="2.6" height="5.6"/>
+<rect class="bar fault" x="133.0" y="255.9" width="2.6" height="4.1"/>
+<rect class="bar fault" x="136.1" y="254.6" width="2.6" height="5.4"/>
+<rect class="bar fault" x="139.3" y="256.3" width="2.6" height="3.7"/>
+<rect class="bar fault" x="142.4" y="257.0" width="2.6" height="3.0"/>
+<rect class="bar fault" x="145.6" y="256.5" width="2.6" height="3.5"/>
+<rect class="bar fault" x="148.8" y="255.5" width="2.6" height="4.5"/>
+<rect class="bar fault" x="151.9" y="256.7" width="2.6" height="3.3"/>
+<rect class="bar fault" x="155.1" y="257.0" width="2.6" height="3.0"/>
+<rect class="bar fault" x="158.2" y="257.9" width="2.6" height="2.1"/>
+<rect class="bar fault" x="161.3" y="258.0" width="2.6" height="2.0"/>
+<rect class="bar fault" x="164.5" y="257.0" width="2.6" height="3.0"/>
+<rect class="bar fault" x="167.7" y="258.5" width="2.6" height="1.5"/>
+<rect class="bar fault" x="170.8" y="258.0" width="2.6" height="2.0"/>
+<rect class="bar fault" x="173.9" y="257.3" width="2.6" height="2.7"/>
+<rect class="bar fault" x="177.1" y="258.2" width="2.6" height="1.8"/>
+<rect class="bar fault" x="180.2" y="258.5" width="2.6" height="1.5"/>
+<rect class="bar fault" x="183.4" y="256.9" width="2.6" height="3.1"/>
+<rect class="bar fault" x="186.6" y="257.8" width="2.6" height="2.2"/>
+<rect class="bar fault" x="189.7" y="257.7" width="2.6" height="2.3"/>
+<rect class="bar fault" x="192.9" y="257.9" width="2.6" height="2.1"/>
+<rect class="bar fault" x="196.0" y="258.1" width="2.6" height="1.9"/>
+<rect class="bar fault" x="199.2" y="257.4" width="2.6" height="2.6"/>
+<rect class="bar fault" x="202.3" y="257.7" width="2.6" height="2.3"/>
+<rect class="bar fault" x="205.4" y="256.7" width="2.6" height="3.3"/>
+<rect class="bar fault" x="208.6" y="258.3" width="2.6" height="1.7"/>
+<rect class="bar fault" x="211.8" y="258.2" width="2.6" height="1.8"/>
+<rect class="bar fault" x="214.9" y="257.8" width="2.6" height="2.2"/>
+<rect class="bar fault" x="218.0" y="258.4" width="2.6" height="1.6"/>
+<rect class="bar fault" x="221.2" y="258.1" width="2.6" height="1.9"/>
+<rect class="bar fault" x="224.3" y="257.5" width="2.6" height="2.5"/>
+<rect class="bar fault" x="227.5" y="258.2" width="2.6" height="1.8"/>
+<rect class="bar fault" x="230.7" y="258.1" width="2.6" height="1.9"/>
+<rect class="bar fault" x="233.8" y="258.0" width="2.6" height="2.0"/>
+<rect class="bar fault" x="237.0" y="258.7" width="2.6" height="1.3"/>
+<rect class="bar store" x="240.1" y="259.1" width="2.6" height="0.9"/>
+<rect class="bar fault" x="243.2" y="258.4" width="2.6" height="1.6"/>
+<rect class="bar fault" x="246.4" y="258.8" width="2.6" height="1.2"/>
+<rect class="bar fault" x="249.5" y="258.7" width="2.6" height="1.3"/>
+<rect class="bar fault" x="252.7" y="258.9" width="2.6" height="1.1"/>
+<rect class="bar fault" x="255.8" y="258.9" width="2.6" height="1.1"/>
+<rect class="bar store" x="259.0" y="259.3" width="2.6" height="0.7"/>
+<rect class="bar fault" x="262.1" y="258.9" width="2.6" height="1.1"/>
+<rect class="bar store" x="265.3" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="268.4" y="259.4" width="2.6" height="0.6"/>
+<rect class="bar store" x="271.6" y="259.4" width="2.6" height="0.6"/>
+<rect class="bar store" x="274.8" y="259.3" width="2.6" height="0.7"/>
+<rect class="bar store" x="277.9" y="259.3" width="2.6" height="0.7"/>
+<rect class="bar store" x="281.1" y="259.4" width="2.6" height="0.6"/>
+<rect class="bar store" x="284.2" y="259.2" width="2.6" height="0.8"/>
+<rect class="bar store" x="287.4" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="290.5" y="259.4" width="2.6" height="0.6"/>
+<rect class="bar store" x="293.6" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="296.8" y="259.2" width="2.6" height="0.8"/>
+<rect class="bar store" x="299.9" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="303.1" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar fault" x="306.2" y="259.0" width="2.6" height="1.0"/>
+<rect class="bar store" x="309.4" y="259.3" width="2.6" height="0.7"/>
+<rect class="bar store" x="312.6" y="259.5" width="2.6" height="0.5"/>
+<rect class="bar store" x="315.7" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="318.9" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="322.0" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="325.1" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="328.3" y="259.3" width="2.6" height="0.7"/>
+<rect class="bar store" x="331.4" y="259.5" width="2.6" height="0.5"/>
+<rect class="bar fault" x="334.6" y="258.7" width="2.6" height="1.3"/>
+<rect class="bar store" x="337.8" y="259.5" width="2.6" height="0.5"/>
+<rect class="bar store" x="340.9" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="344.1" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="347.2" y="259.2" width="2.6" height="0.8"/>
+<rect class="bar store" x="350.4" y="259.5" width="2.6" height="0.5"/>
+<rect class="bar store" x="353.5" y="259.2" width="2.6" height="0.8"/>
+<rect class="bar store" x="356.7" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="359.8" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="362.9" y="259.3" width="2.6" height="0.7"/>
+<rect class="bar store" x="366.1" y="259.5" width="2.6" height="0.5"/>
+<rect class="bar store" x="369.2" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="372.4" y="259.4" width="2.6" height="0.6"/>
+<rect class="bar store" x="375.6" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="378.7" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="381.9" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="385.0" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="388.1" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="391.3" y="259.2" width="2.6" height="0.8"/>
+<rect class="bar store" x="394.4" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="397.6" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="400.8" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="403.9" y="259.5" width="2.6" height="0.5"/>
+<rect class="bar store" x="407.1" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="410.2" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="413.4" y="259.4" width="2.6" height="0.6"/>
+<rect class="bar store" x="416.5" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="419.7" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="422.8" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="425.9" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="429.1" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="432.2" y="259.5" width="2.6" height="0.5"/>
+<rect class="bar store" x="435.4" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="438.5" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="441.7" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="444.8" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="448.0" y="259.5" width="2.6" height="0.5"/>
+<rect class="bar store" x="451.1" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="454.3" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="460.6" y="259.6" width="2.6" height="0.4"/>
+<rect class="bar store" x="466.9" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="470.1" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="473.2" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="476.4" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="485.8" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="489.0" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="492.1" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="495.2" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="498.4" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="504.7" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="507.8" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="520.5" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="526.8" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="529.9" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="536.2" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="542.5" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="548.8" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="552.0" y="259.8" width="2.6" height="0.2"/>
+<rect class="bar store" x="558.2" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="564.5" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="567.7" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="583.4" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="592.9" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="596.0" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="599.2" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="621.2" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="624.4" y="259.7" width="2.6" height="0.3"/>
+<rect class="bar store" x="627.5" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="637.0" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="640.1" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="649.6" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="668.5" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="671.6" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="674.8" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="677.9" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="681.1" y="259.9" width="2.6" height="0.1"/>
+<rect class="bar store" x="696.9" y="259.8" width="2.6" height="0.2"/>
+<text class="ts mid" x="70.0" y="278">0</text>
+<text class="ts mid" x="148.8" y="278">250</text>
+<text class="ts mid" x="227.5" y="278">500</text>
+<text class="ts mid" x="306.2" y="278">750</text>
+<text class="ts mid" x="385.0" y="278">1,000</text>
+<text class="ts mid" x="463.8" y="278">1,250</text>
+<text class="ts mid" x="542.5" y="278">1,500</text>
+<text class="ts mid" x="621.2" y="278">1,750</text>
+<text class="ts mid" x="700.0" y="278">2,000</text>
+<text class="ts mid" x="385.0" y="294">milliseconds since the 1,000 tasks fell due; calls in each 10 ms, capacity 10 (dashed)</text>
+<rect class="hit" x="70" y="24" width="31.5" height="246" data-tip="0 to 100 ms|no jitter: 1,000 calls, busiest 10 ms 1000|full jitter: 2,242 calls, busiest 10 ms 1092"/>
+<rect class="hit" x="101.5" y="24" width="31.5" height="246" data-tip="100 to 200 ms|no jitter: 990 calls, busiest 10 ms 990|full jitter: 599 calls, busiest 10 ms 67"/>
+<rect class="hit" x="133" y="24" width="31.5" height="246" data-tip="200 to 300 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 384 calls, busiest 10 ms 60"/>
+<rect class="hit" x="164.5" y="24" width="31.5" height="246" data-tip="300 to 400 ms|no jitter: 980 calls, busiest 10 ms 980|full jitter: 246 calls, busiest 10 ms 34"/>
+<rect class="hit" x="196" y="24" width="31.5" height="246" data-tip="400 to 500 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 244 calls, busiest 10 ms 37"/>
+<rect class="hit" x="227.5" y="24" width="31.5" height="246" data-tip="500 to 600 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 156 calls, busiest 10 ms 22"/>
+<rect class="hit" x="259" y="24" width="31.5" height="246" data-tip="600 to 700 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 74 calls, busiest 10 ms 12"/>
+<rect class="hit" x="290.5" y="24" width="31.5" height="246" data-tip="700 to 800 ms|no jitter: 970 calls, busiest 10 ms 970|full jitter: 63 calls, busiest 10 ms 11"/>
+<rect class="hit" x="322" y="24" width="31.5" height="246" data-tip="800 to 900 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 64 calls, busiest 10 ms 14"/>
+<rect class="hit" x="353.5" y="24" width="31.5" height="246" data-tip="900 to 1,000 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 54 calls, busiest 10 ms 9"/>
+<rect class="hit" x="385" y="24" width="31.5" height="246" data-tip="1,000 to 1,100 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 46 calls, busiest 10 ms 9"/>
+<rect class="hit" x="416.5" y="24" width="31.5" height="246" data-tip="1,100 to 1,200 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 33 calls, busiest 10 ms 6"/>
+<rect class="hit" x="448" y="24" width="31.5" height="246" data-tip="1,200 to 1,300 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 21 calls, busiest 10 ms 6"/>
+<rect class="hit" x="479.5" y="24" width="31.5" height="246" data-tip="1,300 to 1,400 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 10 calls, busiest 10 ms 2"/>
+<rect class="hit" x="511" y="24" width="31.5" height="246" data-tip="1,400 to 1,500 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 4 calls, busiest 10 ms 1"/>
+<rect class="hit" x="542.5" y="24" width="31.5" height="246" data-tip="1,500 to 1,600 ms|no jitter: 960 calls, busiest 10 ms 960|full jitter: 10 calls, busiest 10 ms 3"/>
+<rect class="hit" x="574" y="24" width="31.5" height="246" data-tip="1,600 to 1,700 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 6 calls, busiest 10 ms 3"/>
+<rect class="hit" x="605.5" y="24" width="31.5" height="246" data-tip="1,700 to 1,800 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 5 calls, busiest 10 ms 3"/>
+<rect class="hit" x="637" y="24" width="31.5" height="246" data-tip="1,800 to 1,900 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 3 calls, busiest 10 ms 1"/>
+<rect class="hit" x="668.5" y="24" width="31.5" height="246" data-tip="1,900 to 2,000 ms|no jitter: 0 calls, busiest 10 ms 0|full jitter: 7 calls, busiest 10 ms 2"/>
+</svg>
+</div>
+<figcaption>From the chapter’s scheduler on a fake clock. In step, every retry lands in the same 10 ms and only 10 get through; spread by full jitter, the same retries mostly fit under the capacity.</figcaption>
+</figure>
+
+<p>Without jitter, every retry of the 900 refused tasks landed in the same 10 ms, 990 calls for 10 places, again and again: 9,550 calls in all, 100 tasks succeeded and 900 gave up after their tenth attempt at 32.7 seconds. With full jitter, all 1,000 succeeded with 4,278 calls, the last at 3.4 seconds, and the busiest 10 ms after the start had 166 calls instead of 990. With the dependency down altogether, 1,000 clients retrying five times sent all 1,000 retries into one 10 ms without jitter, and at most 151 with it.</p>
+
+<div class="widget" data-widget="backoff75">
+<h4>Retries with capped exponential backoff</h4>
+<p>When a task that keeps failing makes its last attempt, and how crowded the first retries are when many clients fail together.</p>
+<div class="controls">
+  <label>First wait, ms<input type="number" name="base" value="100" min="1" max="60000" step="10"></label>
+  <label>Longest wait, ms<input type="number" name="cap" value="10000" min="1" max="3600000" step="100"></label>
+  <label>Attempts, the first included<input type="number" name="attempts" value="10" min="2" max="30" step="1"></label>
+  <label>Clients failing together<input type="number" name="clients" value="1000" min="1" max="10000000" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 128" role="img" aria-label="The times of each attempt on a line: spreading out as the waits double, then evenly once the cap is reached; below, the same attempts with full jitter, on average at half the times."><text x="110" y="34" class="ts end">no jitter</text><line x1="120" x2="616" y1="30" y2="30" class="axis"></line><circle cx="120" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="121.5" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="124.6" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="130.6" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="142.8" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="167" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="215.6" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="312.6" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="464.3" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><circle cx="616" cy="30" r="4" class="dot" style="fill:var(--fault)"></circle><text x="110" y="70" class="ts end">full jitter, on average</text><line x1="120" x2="616" y1="66" y2="66" class="axis"></line><circle cx="120" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="120.8" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="122.3" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="125.3" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="131.4" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="143.5" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="167.8" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="216.3" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="292.2" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><circle cx="368" cy="66" r="4" class="dot" style="fill:var(--store)"></circle><text x="616" y="18" class="ts end">attempt 10 at 32.7 s</text><text x="368" y="88" class="ts mid">16.4 s</text><line x1="120" x2="616" y1="104" y2="104" class="grid"></line><text x="120" y="120" class="ts">0</text><text x="616" y="120" class="ts end">32.7 s</text><text x="368" y="120" class="ts mid">time since the first attempt</text></svg>
+<dl class="results">
+  <div><dt>Last attempt, no jitter</dt><dd data-out="last">32.7 s</dd></div>
+  <div><dt>Last attempt, full jitter on average</dt><dd data-out="jittered">16.4 s</dd></div>
+  <div><dt>First retries in one instant, no jitter</dt><dd data-out="crowd">1,000</dd></div>
+  <div><dt>First retries per 10 ms, full jitter</dt><dd data-out="spread">100</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">A task that fails every time makes its last attempt 32.7 s after its first, or about 16.4 s on average with full jitter. If 1,000 clients fail together, without jitter all of them retry in the same instant, 100 ms later; with full jitter about 100 arrive in each 10 ms of the first 100 ms.</p>
+</div>
+
+<h2 id="walk">Step 7: Walk it</h2>
+<p>Follow a nightly export, scheduled with <code>every(86_400_000, exportPhotos, { name: "export", missed: "once", retry: { attempts: 5, backoff: fullJitter(exponential(1_000, 60_000), Math.random) } })</code>.</p>
+<ol>
+  <li><code>every</code> adds an entry due in 24 hours. <code>wake</code> finds nothing due and arms the one timer for the heap’s top.</li>
+  <li>At midnight the timer fires. <code>wake</code> pops the entry; <code>start</code> sees it is on time and calls <code>exportPhotos</code>, which logs “export started” through a child logger with <code>{ job: "export" }</code>.</li>
+  <li>The storage service refuses. The run’s promise rejects, and <code>finish</code> pushes attempt 2 with a random wait of up to 1 second, keeping the same due time.</li>
+  <li>Attempt 2 succeeds. The task publishes <code>export.done</code> on the bus; the mailer’s queued subscription takes it and sends the email later, outside the task. <code>finish</code> adds the next run, 24 hours after this one was due.</li>
+  <li>If the machine was asleep at midnight and wakes at 3:00, <code>start</code> sees the next run is not yet due, so this one is late but not missed, and runs it once.</li>
+</ol>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Tasks must survive a restart</th><td>Entries move to a table with a due time, polled by the scheduler, as in <x-ref to="scheduling-and-workflows#timers"></x-ref></td><td>The policies, retries and the one-timer loop over the near future</td></tr>
+<tr><th>Several copies of the service, one run of each job</th><td>A lease or a row claimed with a conditional update before running (<x-ref to="scheduling-and-workflows#distributed-cron"></x-ref>)</td><td>The task code</td></tr>
+<tr><th>Events must reach other services</th><td>A broker behind the same <code>publish</code>, with acknowledgments and redelivery (<x-ref to="message-queues"></x-ref>)</td><td>Publishers and handlers, if handlers are idempotent</td></tr>
+<tr><th>Correlate log records across services</th><td>A trace id in the logger’s context, taken from the incoming request (<x-ref to="observability#traces"></x-ref>)</td><td>The logger: it is one more field</td></tr>
+<tr><th>Cron expressions</th><td>A function from a due time to the next one, replacing the fixed period</td><td>The heap, the timer and the missed-run policies</td></tr>
+<tr><th>Millions of timers</th><td>A timing wheel instead of a heap</td><td>The <code>Clock</code> and the scheduler’s interface</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Start from the interfaces: a sink, a filter, a format; a handler and a delivery mode; a task, a clock and a backoff. Say what each library promises when something fails: logging never throws, one subscriber cannot stop the others, a periodic task never overlaps itself. Then spend the time on what interviewers probe: what happens when the consumer is slower than the producer, and how the scheduler behaves after a pause.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>A log call that can throw</th><td>A disk full of logs fails requests that have nothing to do with logging</td><td>Catch around every sink and filter, and report once</td></tr>
+<tr><th>An unbounded buffer in front of a slow sink</th><td>Memory grows until the process dies</td><td>A bounded queue with a chosen overflow policy, and a count of what was dropped</td></tr>
+<tr><th>Formatting fields with plain <code>JSON.stringify</code></th><td>One field with a cycle or a <code>BigInt</code> throws</td><td>A replacer that handles cycles, BigInt and errors</td></tr>
+<tr><th>Async subscribers called inside <code>publish</code> without a queue</th><td>Handlers overlap and finish out of order: 68 of 100 in the test</td><td>A queue per subscriber when order matters</td></tr>
+<tr><th>Periodic work on <code>setInterval</code></th><td>Overlapping runs of the same job</td><td>Schedule the next run when this one finishes</td></tr>
+<tr><th>A timer per task</th><td>Thousands of timers, and no limit on how many run at once</td><td>A heap of entries, one timer, a concurrency limit</td></tr>
+<tr><th>Retries without jitter</th><td>Retries in step: 990 calls in one 10 ms, 900 tasks given up</td><td>Full jitter on capped exponential backoff</td></tr>
+<tr><th>Reading the real clock inside the library</th><td>Tests that wait, and fail now and then</td><td>Inject a clock; use a fake one in tests</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="behavioral-patterns"></x-ref> and <x-ref to="structural-patterns#decorator"></x-ref>: strategy, observer, chain and decorator, used where they earn their place.</li>
+  <li><x-ref to="observability#logs"></x-ref>: what structured logs are for once they leave the process.</li>
+  <li><x-ref to="message-queues#backpressure"></x-ref>: the same overflow choices between services.</li>
+  <li><x-ref to="scheduling-and-workflows"></x-ref>: durable timers, distributed cron and workflows.</li>
+  <li><x-ref to="resilience-patterns#retries"></x-ref>: retry budgets and why retries at many layers multiply.</li>
+  <li><x-ref to="errors-and-testing#doubles"></x-ref>: the fake clock as a test double.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Design a library from its variation points: each becomes a one-method interface, and the patterns follow.</li>
+  <li>Infrastructure must fail quietly. A log call never throws, one subscriber cannot stop the others, a failed task is reported and its schedule goes on.</li>
+  <li>Put a bounded queue wherever a fast producer meets a slow consumer, and choose what happens when it is full: drop newest, drop oldest, or block.</li>
+  <li>A scheduler is a min-heap of future runs and one timer for the earliest. Schedule a periodic task’s next run when the current one finishes.</li>
+  <li>Decide what a late periodic run means: catch up, run once, or skip.</li>
+  <li>Retry with capped exponential backoff and full jitter. Without jitter, clients that fail together retry together.</li>
+  <li>Inject the clock. Every result in this chapter came from a fake one, in milliseconds, the same on every run.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A filter that redacts passwords throws on an unusual record. Should the logger write the record unfiltered or drop it?</summary><p>Drop it, count it and report the failure once. Writing it unfiltered could put a password in the logs, which is worse than losing one record.</p></details>
+<details><summary>A buffered sink holds 100 records and its disk writes one a millisecond. The application logs 10 a millisecond for 100 ms. What does each overflow policy do?</summary><p>Drop newest keeps the first records and every later one that finds room: 200 of 1,000 written in the test. Drop oldest keeps the latest. Block writes all 1,000 and slows the application to the disk’s pace, about nine times longer.</p></details>
+<details><summary>Why does an async handler subscribed with synchronous delivery see messages out of order?</summary><p>Because <code>publish</code> starts the handler and returns without waiting for it, so the next message starts another run while the first is still waiting. Runs that wait less finish first. A queue per subscriber, consumed one at a time, keeps the order.</p></details>
+<details><summary>Why does the scheduler add the next run of a periodic task in <code>finish</code> instead of when the run starts?</summary><p>So that a run that takes longer than the period cannot overlap the next. The next entry does not exist until the current run is over, and a failure goes through the same path, so it does not end the schedule.</p></details>
+<details><summary>A cache refresh runs every minute. The laptop running it sleeps for an hour. Which missed-run policy fits, and what would catch-up do?</summary><p><code>once</code>: one refresh brings the cache up to date. <code>catch-up</code> would run it sixty times in a row for nothing.</p></details>
+<details><summary>With waits of 100 ms doubling to at most 10 s, when does the tenth attempt of a task that always fails happen?</summary><p>The nine waits are 100, 200, 400, 800, 1,600, 3,200, 6,400, 10,000 and 10,000 ms, so the tenth attempt is at 32,700 ms. With full jitter each wait is on average half, so about 16 seconds.</p></details>
+<details><summary>1,000 clients fail at the same moment and retry after exactly 100 ms. What happens, and what does full jitter change?</summary><p>All 1,000 arrive in the same instant, probably fail again for the same reason, and return together again. With full jitter the first retries spread over the 100 ms, about 100 in each 10 ms, and in the test all 1,000 tasks eventually succeeded instead of 100.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Marc Brooker, <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">Exponential Backoff And Jitter</a>, AWS Architecture Blog, 4 March 2015. Full jitter compared with no jitter and other variants.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/setTimeout">setTimeout()</a>. The largest delay, 2,147,483,647 ms, and immediate execution in Node.js beyond it.</li>
+</ol>
+</section>

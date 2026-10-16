@@ -1,0 +1,358 @@
+<!--meta
+{ "description": "TCP, UDP and QUIC for system design: ports and connections, reliability and head-of-line blocking, flow and congestion control, slow start, connection costs and limits, keepalives and idle timeouts, and what QUIC changes.",
+  "lede": "IP delivers single packets, sometimes. Applications want conversations. The transport layer closes that gap, and the way it does so explains connection pools, mysterious 40-millisecond delays, why the first kilobytes of a response matter most, and why the web is moving to a new transport.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="job">What the transport layer adds</h2>
+<p>The internet layer described in <x-ref to="ip-and-routing"></x-ref> makes one promise: it will try to deliver a packet to a machine. Packets can be lost, duplicated, delayed or reordered, and the machine has no way to tell which of its many programs a packet is for.</p>
+<p>The transport layer fixes the last problem first. It adds <dfn>ports</dfn>, 16-bit numbers from 0 to 65,535 that identify a program on a machine. A server program <dfn>listens</dfn> on a well-known port, such as 443 for HTTPS or 5432 for PostgreSQL. A client program is given a temporary one, an <dfn>ephemeral port</dfn>, by its operating system for each connection it opens.</p>
+<p>A connection is then identified by five values together, often called the <dfn>five-tuple</dfn>: the protocol, the source address and port, and the destination address and port.</p>
+
+<figure class="fig" id="fig-tuple">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 212" role="img" aria-labelledby="f91t f91d">
+<title id="f91t">Three connections to one server port, told apart by the five-tuple</title>
+<desc id="f91d">A server listens on port 443 at address 203.0.113.10. A laptop has two connections to it from the same address with different source ports, and a phone has one connection from a different address. All three arrive at the same server port and are distinguished by their source address and source port.</desc>
+<rect class="n" x="10" y="16" width="250" height="46" rx="6"/><text class="tb mid" x="135" y="36">Laptop, browser tab 1</text><text class="ts mid" x="135" y="53">from 198.51.100.7, port 51000</text>
+<rect class="n" x="10" y="78" width="250" height="46" rx="6"/><text class="tb mid" x="135" y="98">Laptop, browser tab 2</text><text class="ts mid" x="135" y="115">from 198.51.100.7, port 51001</text>
+<rect class="n" x="10" y="140" width="250" height="46" rx="6"/><text class="tb mid" x="135" y="160">Phone</text><text class="ts mid" x="135" y="177">from 192.0.2.44, port 51000</text>
+<rect class="n sig" x="490" y="62" width="220" height="78" rx="6"/><text class="tb mid" x="600" y="88">Server</text><text class="ts mid" x="600" y="106">203.0.113.10</text><text class="ts mid" x="600" y="122">listening on TCP port 443</text>
+<path class="e sig both" d="M260 39 490 84"/><path class="e sig both" d="M260 101H490"/><path class="e sig both" d="M260 163 490 118"/>
+<text class="ts mid" x="375" y="204">Same destination address and port for all three. The source address and port tell them apart.</text>
+</svg>
+</div>
+<figcaption>One listening port serves many connections at once. Each is a distinct combination of protocol, source address, source port, destination address and destination port.</figcaption>
+</figure>
+
+<p>This settles a common misunderstanding. A server is not limited to 65,535 connections because there are 65,535 ports. Every connection in the figure uses the same server port. What limits a server is memory and the number of open files its operating system allows, and well-tuned machines hold hundreds of thousands or millions of connections.</p>
+<p>Beyond ports, the three transports in use today differ in what else they provide.</p>
+
+<h2 id="udp">UDP: almost nothing, on purpose</h2>
+<p>The <dfn>User Datagram Protocol</dfn> adds ports and a checksum to an IP packet and stops there. Its header is eight bytes. There is no connection to set up, no acknowledgement, no retransmission and no ordering. An application hands UDP a message, called a <dfn>datagram</dfn>, and it is sent once. Whether it arrives is the application’s problem.</p>
+<p>That minimalism is the point in three situations:</p>
+<ul>
+  <li><b>One question, one answer.</b> A DNS lookup fits in one packet each way. Setting up a connection would cost more than the exchange itself, and if no answer arrives the client simply asks again.</li>
+  <li><b>Late data is worthless.</b> In a voice call, a packet of audio that arrives 300 milliseconds late cannot be played. Resending it helps nobody. It is better to skip it and keep going.</li>
+  <li><b>You want to build the rest yourself.</b> Games, video conferencing and, most importantly, QUIC put their own reliability and ordering on top of UDP, choosing exactly the guarantees they need.</li>
+</ul>
+
+<h2 id="tcp">TCP: a reliable stream</h2>
+<p>The <dfn>Transmission Control Protocol</dfn> gives an application something much more convenient: a pair of byte streams, one in each direction, where every byte written at one end comes out at the other end exactly once and in order. Most of what runs on the internet was built on that abstraction: the web until recently, email, SSH, and nearly every database protocol.</p>
+<p>TCP produces it from unreliable packets with three mechanisms.</p>
+<ul>
+  <li><b>Sequence numbers.</b> Every byte in the stream has a number. The receiver uses them to put data in order and to discard duplicates.</li>
+  <li><b>Acknowledgements.</b> The receiver continually tells the sender which byte it expects next, which confirms everything before it.</li>
+  <li><b>Retransmission.</b> If data is not acknowledged in time, or the receiver’s acknowledgements show a gap, the sender sends it again.</li>
+</ul>
+
+<h3 id="hol">The price of order: head-of-line blocking</h3>
+<p>Strict ordering has a cost that shapes the design of everything built on TCP. When one packet is lost, the packets that arrive after it cannot be given to the application, even though they are sitting in the receiver’s memory. They wait until the missing one has been resent and has arrived. This is <dfn>head-of-line blocking</dfn>.</p>
+
+<figure class="fig" id="fig-hol">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-labelledby="f92t f92d">
+<title id="f92t">Head-of-line blocking in TCP</title>
+<desc id="f92d">Five packets are sent. Packet 2 is lost. Packets 3, 4 and 5 arrive and are held in the receiver’s buffer, but only packet 1 can be delivered to the application. The others wait until packet 2 has been retransmitted.</desc>
+<text class="tb" x="10" y="38">Sent</text>
+<text class="tb" x="10" y="100">Arrived</text>
+<text class="tb" x="10" y="162">Delivered to</text><text class="tb" x="10" y="178">the application</text>
+<g>
+<g data-s="1">
+<rect class="n" x="150" y="16" width="84" height="36" rx="5"/><text class="mid" x="192" y="39">1</text>
+<rect class="n" x="246" y="16" width="84" height="36" rx="5"/><text class="mid" x="288" y="39">2</text>
+<rect class="n" x="342" y="16" width="84" height="36" rx="5"/><text class="mid" x="384" y="39">3</text>
+<rect class="n" x="438" y="16" width="84" height="36" rx="5"/><text class="mid" x="480" y="39">4</text>
+<rect class="n" x="534" y="16" width="84" height="36" rx="5"/><text class="mid" x="576" y="39">5</text>
+</g>
+<g data-s="2">
+<rect class="n" x="150" y="78" width="84" height="36" rx="5"/><text class="mid" x="192" y="101">1</text>
+<rect class="n fault" x="246" y="78" width="84" height="36" rx="5"/><text class="tb mid" x="288" y="101">2 lost</text>
+</g>
+<g data-s="3">
+<rect class="n async" x="342" y="78" width="84" height="36" rx="5"/><text class="mid" x="384" y="101">3 held</text>
+<rect class="n async" x="438" y="78" width="84" height="36" rx="5"/><text class="mid" x="480" y="101">4 held</text>
+<rect class="n async" x="534" y="78" width="84" height="36" rx="5"/><text class="mid" x="576" y="101">5 held</text>
+</g>
+<g data-s="4">
+<rect class="n" x="150" y="146" width="84" height="36" rx="5"/><text class="mid" x="192" y="169">1</text>
+<rect class="n ghost" x="246" y="146" width="372" height="36" rx="5"/><text class="ts mid" x="432" y="169">nothing more until 2 has been resent and received</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Arrived: none; Passed to the application: none; Held back: none">Five packets are sent, in order.</li>
+  <li data-state="Arrived: 1; Passed to the application: 1; Held back: none">Packet 1 arrives. Packet 2 is lost on the way.</li>
+  <li data-state="Arrived: 1, 3, 4, 5; Passed to the application: 1; Held back: 3, 4, 5">Packets 3, 4 and 5 arrive. TCP promises the application bytes in order, so it has to hold them.</li>
+  <li>The application receives packet 1 and then nothing more, until packet 2 has been sent again and arrives. The three held packets are blocked by the one ahead of them.</li>
+</ol>
+<figcaption>Head-of-line blocking. Three packets have arrived and are useless to the application until the lost one ahead of them is replaced.</figcaption>
+</figure>
+
+<p>If the stream carries one thing, such as a single file, this is harmless: the bytes after the gap could not be used anyway. It becomes a real cost when one TCP connection carries several independent conversations. That is exactly what HTTP/2 does, and it is the main reason HTTP/3 left TCP behind, as the last part of this chapter explains.</p>
+
+<h3 id="flow-congestion">Two speed limits</h3>
+<p>A sender that transmits as fast as it can will overwhelm something. TCP limits itself in two separate ways, and they are easy to confuse.</p>
+<p><dfn>Flow control</dfn> protects the receiver. The receiver advertises how much buffer space it has left, its <dfn>receive window</dfn>, and the sender never has more than that outstanding. If the receiving application reads slowly, the window shrinks and the sender slows down. This is backpressure built into the protocol: a slow consumer automatically throttles a fast producer.</p>
+<p><dfn>Congestion control</dfn> protects the network. Nobody tells the sender how much capacity the path has, and that capacity is shared with strangers. So the sender keeps its own estimate, the <dfn>congestion window</dfn>, and adjusts it by experiment: increase the rate while things go well, and cut it back sharply at signs of congestion, which traditionally means a lost packet.</p>
+
+<figure class="fig wide" id="fig-cwnd">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f93t f93d">
+<title id="f93t">A congestion window over time</title>
+<desc id="f93d">An illustrative trace of a TCP congestion window. It starts at 10 segments and doubles each round trip during slow start, reaching 80. A loss halves it to 40. It then grows slowly and steadily during congestion avoidance until another loss halves it again, producing a sawtooth.</desc>
+<line class="axis" x1="56" x2="696" y1="254.0" y2="254.0"/>
+<text class="ts end" x="48" y="258.0">0</text>
+<line class="grid" x1="56" x2="696" y1="202.9" y2="202.9"/>
+<text class="ts end" x="48" y="206.9">20</text>
+<line class="grid" x1="56" x2="696" y1="151.8" y2="151.8"/>
+<text class="ts end" x="48" y="155.8">40</text>
+<line class="grid" x1="56" x2="696" y1="100.7" y2="100.7"/>
+<text class="ts end" x="48" y="104.7">60</text>
+<line class="grid" x1="56" x2="696" y1="49.6" y2="49.6"/>
+<text class="ts end" x="48" y="53.6">80</text>
+<text class="ts mid" x="56.0" y="272">0</text>
+<text class="ts mid" x="162.7" y="272">4</text>
+<text class="ts mid" x="269.3" y="272">8</text>
+<text class="ts mid" x="376.0" y="272">12</text>
+<text class="ts mid" x="482.7" y="272">16</text>
+<text class="ts mid" x="589.3" y="272">20</text>
+<text class="ts mid" x="696.0" y="272">24</text>
+<text class="ts mid" x="376" y="294">Round trips since the connection opened</text>
+<text class="ts" x="56" y="14">Congestion window, in packets</text>
+<path class="line" d="M56.0 228.4 L82.7 202.9 L109.3 151.8 L136.0 49.6 L162.7 151.8 L189.3 146.7 L216.0 141.6 L242.7 136.4 L269.3 131.3 L296.0 126.2 L322.7 121.1 L349.3 116.0 L376.0 110.9 L402.7 105.8 L429.3 100.7 L456.0 95.6 L482.7 90.4 L509.3 172.2 L536.0 167.1 L562.7 162.0 L589.3 156.9 L616.0 151.8 L642.7 146.7 L669.3 141.6 L696.0 136.4"/>
+<circle class="dot" cx="56.0" cy="228.4" r="5"/>
+<line class="x" x1="130.0" y1="43.6" x2="142.0" y2="55.6"/>
+<line class="x" x1="142.0" y1="43.6" x2="130.0" y2="55.6"/>
+<line class="x" x1="476.7" y1="84.4" x2="488.7" y2="96.4"/>
+<line class="x" x1="488.7" y1="84.4" x2="476.7" y2="96.4"/>
+<text class="ts" x="66.0" y="244.4">starts at 10</text>
+<text class="tb" x="150.0" y="47.6">packet lost</text>
+<text class="ts" x="150.0" y="63.6">window halved</text>
+<text class="tb" x="496.7" y="88.4">packet lost</text>
+<text class="tb" x="221.3" y="208.0">slow start</text>
+<text class="ts" x="221.3" y="224.0">round trips 0 to 3: the window doubles each time</text>
+<text class="tb end" x="389.3" y="75.1">congestion avoidance</text>
+<text class="ts end" x="389.3" y="91.1">slow, steady growth</text>
+<rect class="hit" x="42.7" y="24" width="26.6" height="230" data-tip="After 0 round trips|window: 10 packets|the starting window"/>
+<rect class="hit" x="69.4" y="24" width="26.6" height="230" data-tip="After 1 round trip|window: 20 packets|slow start: doubled in one round trip"/>
+<rect class="hit" x="96.0" y="24" width="26.6" height="230" data-tip="After 2 round trips|window: 40 packets|slow start: doubled in one round trip"/>
+<rect class="hit" x="122.7" y="24" width="26.6" height="230" data-tip="After 3 round trips|window: 80 packets|slow start: doubled again, and a packet is lost"/>
+<rect class="hit" x="149.4" y="24" width="26.6" height="230" data-tip="After 4 round trips|window: 40 packets|halved after the loss"/>
+<rect class="hit" x="176.0" y="24" width="26.6" height="230" data-tip="After 5 round trips|window: 42 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="202.7" y="24" width="26.6" height="230" data-tip="After 6 round trips|window: 44 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="229.4" y="24" width="26.6" height="230" data-tip="After 7 round trips|window: 46 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="256.0" y="24" width="26.6" height="230" data-tip="After 8 round trips|window: 48 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="282.7" y="24" width="26.6" height="230" data-tip="After 9 round trips|window: 50 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="309.4" y="24" width="26.6" height="230" data-tip="After 10 round trips|window: 52 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="336.0" y="24" width="26.6" height="230" data-tip="After 11 round trips|window: 54 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="362.7" y="24" width="26.6" height="230" data-tip="After 12 round trips|window: 56 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="389.4" y="24" width="26.6" height="230" data-tip="After 13 round trips|window: 58 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="416.0" y="24" width="26.6" height="230" data-tip="After 14 round trips|window: 60 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="442.7" y="24" width="26.6" height="230" data-tip="After 15 round trips|window: 62 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="469.4" y="24" width="26.6" height="230" data-tip="After 16 round trips|window: 64 packets|a packet is lost"/>
+<rect class="hit" x="496.0" y="24" width="26.6" height="230" data-tip="After 17 round trips|window: 32 packets|halved after the loss"/>
+<rect class="hit" x="522.7" y="24" width="26.6" height="230" data-tip="After 18 round trips|window: 34 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="549.4" y="24" width="26.6" height="230" data-tip="After 19 round trips|window: 36 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="576.0" y="24" width="26.6" height="230" data-tip="After 20 round trips|window: 38 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="602.7" y="24" width="26.6" height="230" data-tip="After 21 round trips|window: 40 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="629.4" y="24" width="26.6" height="230" data-tip="After 22 round trips|window: 42 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="656.0" y="24" width="26.6" height="230" data-tip="After 23 round trips|window: 44 packets|congestion avoidance: slow, steady growth"/>
+<rect class="hit" x="682.7" y="24" width="26.6" height="230" data-tip="After 24 round trips|window: 46 packets|congestion avoidance: slow, steady growth"/>
+</svg>
+</div>
+<figcaption>An illustrative congestion window under the classic algorithm. It doubles every round trip at first, is cut when a packet is lost, and then climbs slowly. Modern algorithms differ in detail and keep the same overall shape.</figcaption>
+</figure>
+
+<p>A new connection knows nothing about the path, so it begins cautiously with a small window and doubles it every round trip. This phase is called <dfn>slow start</dfn>, a name that makes sense only in comparison with sending everything at once. When loss occurs, the window is reduced and growth becomes gradual.</p>
+<aside class="sn"><b>Which algorithm?</b>Linux uses one called CUBIC by default. Google developed another, BBR, which estimates the path’s capacity and delay directly and does not treat every lost packet as congestion. It behaves better on links with random loss, such as mobile networks. The choice is a server setting, invisible to applications.</aside>
+<p>Slow start has a consequence every web engineer should know. The initial window on modern systems is ten packets, which is about 14,600 bytes. That is all a server may send in the first round trip of a new connection. A larger response takes additional round trips while the window grows, however fast the network is.</p>
+
+<div class="widget" data-widget="slowstart">
+<h4>Round trips needed on a new connection</h4>
+<p>How long a response takes to arrive when the sender must first grow its congestion window. Assumes no packet loss and a receiver that keeps up.</p>
+<div class="controls">
+  <label>Response size, in KB<input type="number" name="size" value="100" min="0.1" step="1"></label>
+  <label>Round-trip time, in ms<input type="number" name="rtt" value="80" min="0" step="5"></label>
+  <label>Initial window, in packets<input type="number" name="iw" value="10" min="1" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 112" role="img" aria-label="The response drawn as one bar, divided into the part that arrives in each round trip. Each part is twice the size of the one before."><text x="16" y="20" class="ts">What arrives in each round trip, as a share of the 100 KB response</text><rect x="16" y="32" width="87.3" height="30" rx="3" class="n sig"></rect><text x="60.4" y="52" class="tb mid">1</text><text x="60.4" y="82" class="ts mid">14.6 KB</text><rect x="104.8" y="32" width="176" height="30" rx="3" class="n store"></rect><text x="193.5" y="52" class="tb mid">2</text><text x="193.5" y="82" class="ts mid">29.2 KB</text><rect x="282.3" y="32" width="340.2" height="30" rx="3" class="n sig"></rect><text x="453.2" y="52" class="tb mid">3</text><text x="453.2" y="82" class="ts mid">56.2 KB</text><text x="16" y="104" class="ts">Each block is one round trip. Every block is twice the size of the one before, until the response ends.</text></svg>
+<dl class="results">
+  <div><dt>Sent in the first round trip</dt><dd data-out="first">14.6 KB</dd></div>
+  <div><dt>Round trips to deliver it all</dt><dd data-out="trips">3</dd></div>
+  <div><dt>Network time</dt><dd data-out="time">240 ms</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">The sender may transmit 14.6 KB, then 29.2 KB, then 58.4 KB, doubling each round trip. A response of 100 KB therefore needs 3 round trips on a new connection, before any time the server spends thinking.</p>
+</div>
+
+<p>Three practical rules follow from this one mechanism.</p>
+<ul>
+  <li><b>Make the first 14 KB count.</b> If the HTML needed to start rendering a page fits in the first flight, the browser can begin work a full round trip earlier. This is the origin of the advice to keep critical page content small.</li>
+  <li><b>Reuse connections.</b> A connection that has been in use has already grown its window. A new one starts from the bottom. Connection reuse saves the handshake and also the slow start.</li>
+  <li><b>Expect bursts to behave differently from steady traffic.</b> A server that looks fast in a benchmark over warm connections will look slower to real users arriving on cold ones.</li>
+</ul>
+
+<h2 id="lifecycle">What a connection costs</h2>
+<p>TCP connections are not free to create, to hold or to close, and each of those costs shows up in system design.</p>
+<table>
+<thead><tr><th>Phase</th><th>What happens</th><th>Cost to design around</th></tr></thead>
+<tbody>
+<tr><th>Open</th><td>The three-way handshake, then usually a TLS handshake on top</td><td>One to three round trips before any useful data. Painful if done per request.</td></tr>
+<tr><th>Warm up</th><td>Slow start grows the congestion window</td><td>The first responses on a new connection are slower.</td></tr>
+<tr><th>Hold</th><td>Both ends keep buffers and state for the connection</td><td>Memory on the server, typically some kilobytes each, and one file descriptor.</td></tr>
+<tr><th>Idle</th><td>Nothing is sent</td><td>Devices in between may forget the connection, as the next section describes.</td></tr>
+<tr><th>Close</th><td>Each side sends a <code>FIN</code> and acknowledges the other’s</td><td>The side that closes first keeps the port reserved for about a minute afterward.</td></tr>
+</tbody>
+</table>
+<p>The response to these costs is the same everywhere: open connections once and keep using them. HTTP keeps connections alive between requests. Database drivers, HTTP clients and service meshes keep <dfn>connection pools</dfn>, a set of open connections that requests borrow and return.</p>
+<pre data-lang="ts" data-title="Reusing connections from Node.js, with every wait bounded">
+import { Agent, setGlobalDispatcher } from 'undici';
+
+setGlobalDispatcher(new Agent({
+  connections: 50,              // at most 50 open sockets per destination
+  keepAliveTimeout: 30_000,     // close a socket after 30 s idle, before anything in between drops it
+  connect: { timeout: 2_000 },  // give up on connecting after 2 s
+  headersTimeout: 5_000,        // give up if no response starts within 5 s
+  bodyTimeout: 10_000,          // give up if the response stalls for 10 s
+}));
+</pre>
+<p>Pools introduce their own limits, and two of them cause incidents regularly.</p>
+<p><b>Outbound port exhaustion.</b> Each outgoing connection needs a local ephemeral port, and toward any single destination address and port they must all differ. Linux offers about 28,000 by default. A service that opens a new connection for every call to one backend, at a high rate, can use them all, because closed connections hold their port for a while. New connections then fail with an error about addresses being unavailable. The cure is reuse.</p>
+<p><b>Pool exhaustion.</b> A pool of 20 connections serves 20 requests at a time. When the backend slows down, every connection is busy, further requests queue for a connection, and by Little’s law in <x-ref to="latency-and-throughput#littles-law">Chapter 4</x-ref> the queue grows without any change in traffic. A pool needs a size, a timeout on waiting for a connection, and monitoring of how often it is full.</p>
+
+<h2 id="traps">Three behaviors that surprise people</h2>
+
+<h3 id="idle">Idle connections that die silently</h3>
+<p>Between a client and a server sit devices that track connections: NAT gateways, firewalls, load balancers. Each remembers a connection only while it sees traffic, and removes it after an idle period. AWS’s application load balancer, for instance, closes a connection that has been idle for 60 seconds unless configured otherwise.</p>
+<p>Neither end is told. The connection looks open to both until one of them next sends something, which is then dropped or refused. The symptom is an error on the first request after a quiet period.</p>
+<p>The defenses are <dfn>keepalives</dfn>, small packets sent on an idle connection to keep it in every table along the way, and sensible ordering of timeouts: whoever reuses a connection should give up on an idle one sooner than anything downstream will drop it.</p>
+
+<h3 id="nagle">A 40-millisecond delay from nowhere</h3>
+<p>To avoid flooding the network with tiny packets, TCP by default holds back a small write for a moment if earlier data is still unacknowledged, hoping to combine it with the next one. This is <dfn>Nagle’s algorithm</dfn>. Separately, receivers delay acknowledgements briefly, hoping to send them along with data going the other way. Each rule is sensible alone. Together they can deadlock briefly: the sender waits for an acknowledgement, and the receiver waits before sending it. The result is a stall of tens of milliseconds, typically 40 on Linux, on a request made of two small writes.</p>
+<p>Interactive protocols turn Nagle’s algorithm off with a socket option called <code>TCP_NODELAY</code>, and most HTTP and database libraries do so already. It is worth knowing by name, because a latency histogram with a suspicious spike at 40 ms usually leads here.</p>
+
+<h3 id="half-open">A peer that vanished</h3>
+<p>If a machine loses power or a cable is cut, the other end receives nothing: no close, no error. A connection in that state is <dfn>half-open</dfn>. A program that is only waiting to read from it will wait forever.</p>
+<p>TCP alone does not detect this quickly. Applications must: with read timeouts on every call, and with application-level heartbeats on long-lived connections, as described for WebSockets in <x-ref to="realtime-communication"></x-ref>.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Making a network call with no timeout. Many libraries default to waiting indefinitely. Combined with half-open connections and slow dependencies, one stuck call holds a thread and a pooled connection forever, and enough of them stop the service. Every call across a network needs a connect timeout and a response timeout, chosen on purpose.</p></div>
+
+<h2 id="quic">QUIC: a transport rebuilt on UDP</h2>
+<p>By the 2010s TCP’s limits had become the web’s limits, and TCP itself had become very hard to change. It is implemented in operating system kernels, which update slowly, and in countless routers and firewalls that inspect TCP headers and drop anything unfamiliar. Engineers call this <dfn>ossification</dfn>: a protocol so widely deployed, and so widely interfered with, that it can no longer evolve.</p>
+<p><dfn>QUIC</dfn>, standardized in 2021, sidesteps the problem. It is a new reliable transport that runs on top of UDP, which networks already pass, and it encrypts almost all of its own headers so that devices in the middle cannot depend on their contents. It usually lives in the application as a library, so it can be updated as easily as the application.</p>
+
+<figure class="fig wide" id="fig-stacks">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-labelledby="f94t f94d">
+<title id="f94t">The protocol stack under HTTP/2 compared with the stack under HTTP/3</title>
+<desc id="f94d">Left: HTTP/2 runs over TLS, which runs over TCP, which runs over IP. TCP provides one ordered byte stream, reliability and congestion control, in the operating system. Right: HTTP/3 runs over QUIC, which runs over UDP and IP. QUIC provides many independent streams, reliability, congestion control and built-in TLS 1.3 encryption, in the application.</desc>
+<text class="tl" x="40" y="22">Under HTTP/1.1 and HTTP/2</text>
+<text class="tl" x="410" y="22">Under HTTP/3</text>
+<rect class="n" x="40" y="36" width="270" height="36" rx="5"/><text class="tb mid" x="175" y="59">HTTP/2</text>
+<rect class="n" x="40" y="80" width="270" height="36" rx="5"/><text class="tb mid" x="175" y="103">TLS 1.3</text>
+<rect class="n sig" x="40" y="124" width="270" height="70" rx="5"/><text class="tb mid" x="175" y="146">TCP</text><text class="ts mid" x="175" y="164">one ordered byte stream</text><text class="ts mid" x="175" y="180">reliability, congestion control</text>
+<rect class="n" x="40" y="202" width="270" height="36" rx="5"/><text class="tb mid" x="175" y="225">IP</text>
+<rect class="n" x="410" y="36" width="270" height="36" rx="5"/><text class="tb mid" x="545" y="59">HTTP/3</text>
+<rect class="n sig" x="410" y="80" width="270" height="84" rx="5"/><text class="tb mid" x="545" y="102">QUIC</text><text class="ts mid" x="545" y="120">many independent streams</text><text class="ts mid" x="545" y="136">reliability, congestion control</text><text class="ts mid" x="545" y="152">TLS 1.3 built in</text>
+<rect class="n" x="410" y="172" width="270" height="22" rx="5"/><text class="ts tb mid" x="545" y="188">UDP</text>
+<rect class="n" x="410" y="202" width="270" height="36" rx="5"/><text class="tb mid" x="545" y="225">IP</text>
+<path class="e none dash" d="M320 120H350V168H400"/>
+<text class="ts mid" x="360" y="100">application</text>
+<text class="ts mid" x="360" y="216">operating</text><text class="ts mid" x="360" y="230">system</text>
+</svg>
+</div>
+<figcaption>Where the work is done. QUIC takes over what TCP and TLS did between them, and runs in the application above a thin UDP layer.</figcaption>
+</figure>
+
+<p>Designing a transport from scratch allowed four improvements at once.</p>
+<table>
+<thead><tr><th>Change</th><th>What it fixes</th></tr></thead>
+<tbody>
+<tr><th>Streams inside the transport</th><td>A QUIC connection carries many streams, each ordered independently. A lost packet delays only the stream it belonged to. Head-of-line blocking between requests is gone.</td></tr>
+<tr><th>Encryption built in</th><td>The transport handshake and the TLS 1.3 handshake are one exchange, so a new connection is ready in one round trip, and a resumed one can send data immediately.</td></tr>
+<tr><th>Connection identifiers</th><td>A connection is named by an ID carried in each packet, not by the five-tuple. When a phone moves from Wi-Fi to mobile data and its address changes, the connection continues.</td></tr>
+<tr><th>Room to evolve</th><td>With headers encrypted and the code in user space, new versions and congestion control algorithms can be deployed without waiting for kernels or middleboxes.</td></tr>
+</tbody>
+</table>
+<p>It also has costs, which is why TCP is not going away.</p>
+<ul>
+  <li><b>More CPU per byte.</b> Kernels and network cards have decades of optimization for TCP. QUIC does more of its work in user space and encrypts every packet, and at high volume that is measurable.</li>
+  <li><b>Some networks block UDP.</b> Corporate firewalls in particular. Clients therefore keep the ability to fall back to TCP, and servers must support both.</li>
+  <li><b>Harder to observe.</b> Encrypted headers mean network tools that diagnosed TCP by watching it see far less. Diagnosis moves into the endpoints.</li>
+  <li><b>Load balancers must cooperate.</b> A layer 4 balancer that routes by five-tuple will send a migrated connection to the wrong server. QUIC-aware balancers route by connection ID.</li>
+</ul>
+<p>As a transport for the web, QUIC is past the experimental stage: in October 2026, W3Techs found HTTP/3, which runs only on QUIC, in use on 40.9% of websites. Inside data centers, where loss is rare, round trips are short and hardware offload matters, TCP remains the norm.</p>
+
+<h2 id="choosing">Choosing a transport</h2>
+<table>
+<thead><tr><th></th><th>TCP</th><th>UDP</th><th>QUIC</th></tr></thead>
+<tbody>
+<tr><th>Delivery</th><td>Reliable, in order</td><td>Best effort, unordered</td><td>Reliable and ordered per stream</td></tr>
+<tr><th>Unit</th><td>One byte stream</td><td>Individual datagrams</td><td>Many streams, plus optional datagrams</td></tr>
+<tr><th>Setup</th><td>1 round trip, plus 1 for TLS</td><td>None</td><td>1 round trip including TLS, 0 when resuming</td></tr>
+<tr><th>Encryption</th><td>Separate, with TLS</td><td>Separate, if any</td><td>Always on</td></tr>
+<tr><th>A lost packet delays</th><td>Everything on the connection</td><td>Nothing else</td><td>Only its own stream</td></tr>
+<tr><th>Survives an address change</th><td>No</td><td>Not applicable</td><td>Yes</td></tr>
+<tr><th>Runs in</th><td>The operating system</td><td>The operating system</td><td>The application, over UDP</td></tr>
+<tr><th>Typical uses</th><td>Databases, service-to-service calls, HTTP/1.1 and HTTP/2, SSH, email</td><td>DNS, voice and video, games, telemetry</td><td>HTTP/3, and increasingly DNS and media</td></tr>
+</tbody>
+</table>
+<p>In practice you rarely pick a transport directly. You pick an application protocol, and it brings its transport with it. The choice becomes yours in two situations: when you design something real-time, where the question is whether late data should be resent or dropped, and when you configure the edge of your system, where enabling HTTP/3 is usually a setting on a CDN or load balancer.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> “TCP is reliable, UDP is fast” is the answer of someone who has memorized a table. A better one names the trade: “for video calls I’d use UDP-based transport, because a late frame is useless and TCP would stall the whole stream to resend it; for the chat messages in the same app I want reliability and ordering, so TCP or a reliable QUIC stream.” If you mention HTTP/3, be ready to say what problem it solves: head-of-line blocking across requests, and setup latency.</p></div>
+
+<h2 id="design-notes">What this means for design</h2>
+<ul>
+  <li><b>Keep connections, do not make them.</b> Pool and reuse everywhere: client to edge, edge to service, service to database. Size the pools, and put a timeout on waiting for one.</li>
+  <li><b>Bound every wait.</b> Connect timeouts, response timeouts and heartbeats turn silent failures into errors you can handle.</li>
+  <li><b>Align idle timeouts.</b> The component that reuses a connection must retire idle ones before the load balancer, firewall or NAT in front of the other end does.</li>
+  <li><b>Remember the cold start.</b> New connections are slow twice over: handshakes, then slow start. After a deploy or a failover, when every pool is empty, expect a latency bump and avoid flooding a recovering backend with new connections all at once.</li>
+  <li><b>Let backpressure work.</b> TCP slows a sender when the receiver stops reading. If your service reads everything into an unbounded in-memory queue, you have defeated that mechanism and moved the overload into your own memory.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>HTTP.</b> The three HTTP versions are best understood as three ways of using these transports. See <x-ref to="http-and-tls"></x-ref>.</li>
+  <li><b>Load balancing.</b> Whether a balancer works at the transport layer or the application layer decides what it can route on. See <x-ref to="proxies-and-load-balancers"></x-ref>.</li>
+  <li><b>Queueing theory.</b> Congestion control is a distributed feedback loop over shared queues, and the same ideas reappear as backpressure and load shedding in <x-ref to="resilience-patterns"></x-ref>.</li>
+  <li><b>Distributed systems.</b> A reliable connection does not make communication reliable. A request can be delivered and the reply lost, leaving the caller unsure whether it happened. That uncertainty is the starting point of <x-ref to="idempotency-and-delivery"></x-ref>.</li>
+  <li><b>Operating systems.</b> Sockets, file descriptor limits and kernel buffers are where these protocols meet your process. Server tuning guides are mostly about these.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Ports identify programs. A connection is identified by protocol, source address and port, and destination address and port, so one server port can hold a vast number of connections.</li>
+  <li>UDP sends single datagrams with no guarantees. It suits one-shot exchanges, real-time media, and protocols that build their own reliability.</li>
+  <li>TCP provides an ordered, reliable byte stream. The cost of ordering is head-of-line blocking after a loss.</li>
+  <li>Flow control protects the receiver. Congestion control protects the network, and makes new connections start slowly: about 14 KB in the first round trip.</li>
+  <li>Connections are costly to open and warm up, so reuse them through keep-alive and pools, with sizes and timeouts set deliberately.</li>
+  <li>Idle connections are dropped silently by devices in between, and vanished peers are not detected by TCP. Use keepalives, heartbeats and timeouts.</li>
+  <li>QUIC rebuilds a reliable transport over UDP with independent streams, built-in TLS, faster setup and connection migration. It powers HTTP/3 at the edge, while TCP remains standard inside data centers.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A colleague says a server can accept at most 65,535 simultaneous connections because that is how many ports exist. What is wrong with that?</summary><p>All incoming connections use the same server port. Each is distinguished by the client’s address and port, so the number of possible connections is enormous. The real limits are memory and the operating system’s limit on open files.</p></details>
+<details><summary>A new connection has a 100 ms round-trip time and no loss. Roughly how long does the network take to deliver a 50 KB response once the request has been sent, with the default initial window?</summary><p>About 300 ms. The sender can deliver roughly 14.6 KB in the first round trip, 29.2 KB in the second and 58.4 KB in the third, so 50 KB needs three round trips. On a connection that was already warm it could arrive in one.</p></details>
+<details><summary>A dashboard polls an API through a load balancer every 90 seconds over a kept-alive connection. Every poll fails once and then succeeds on retry. What is happening?</summary><p>The load balancer closes connections idle for longer than its timeout, here probably 60 seconds. The client does not know, reuses the dead connection, and fails. Then it opens a new one, which works. Poll more often, send keepalives, or have the client discard connections idle for longer than the balancer’s limit.</p></details>
+<details><summary>Why did multiplexing many requests over one TCP connection, as HTTP/2 does, make packet loss more harmful than it was with several connections?</summary><p>With one connection, a single lost packet blocks delivery of every byte behind it, which now belongs to all the requests at once. With six separate connections, a loss stalled only the one request on that connection.</p></details>
+<details><summary>For a multiplayer game sending player positions thirty times a second, would you want lost updates retransmitted?</summary><p>No. By the time a retransmitted position arrived, newer ones would have superseded it, and holding those back to preserve order would add visible lag. Send positions unreliably and let the next update correct things. Events that must not be lost, such as a purchase, go over a reliable channel.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc9293">RFC 9293: Transmission Control Protocol</a>, 2022, <a href="https://www.rfc-editor.org/rfc/rfc768">RFC 768: User Datagram Protocol</a>, and <a href="https://www.rfc-editor.org/rfc/rfc9000">RFC 9000: QUIC</a>, 2021.</li>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc6928">RFC 6928: Increasing TCP’s Initial Window</a>. The ten-segment initial window.</li>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc9438">RFC 9438: CUBIC for Fast and Long-Distance Networks</a>.</li>
+  <li>Neal Cardwell and others, <a href="https://queue.acm.org/detail.cfm?id=3022184">“BBR: Congestion-Based Congestion Control”</a>, <i>ACM Queue</i>, 2016.</li>
+  <li>Adam Langley and others, <a href="https://dl.acm.org/doi/10.1145/3098822.3098842">“The QUIC Transport Protocol: Design and Internet-Scale Deployment”</a>, SIGCOMM 2017. Why QUIC was built and what was measured.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html">Application Load Balancers</a>. The 60-second default idle timeout.</li>
+  <li>W3Techs, <a href="https://w3techs.com/technologies/details/ce-http3">Usage statistics of HTTP/3 for websites</a>, October 2026.</li>
+  <li>Ilya Grigorik, <a href="https://hpbn.co/building-blocks-of-tcp/"><i>High Performance Browser Networking</i>, chapter 2, “Building Blocks of TCP”</a>.</li>
+  <li>undici documentation, <a href="https://github.com/nodejs/undici/blob/main/docs/docs/api/Agent.md">Agent</a>. The connection pool options used in the example.</li>
+</ol>
+</section>

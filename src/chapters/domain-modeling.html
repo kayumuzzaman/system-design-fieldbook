@@ -1,0 +1,734 @@
+<!--meta
+{ "description": "Domain modeling for working software, with tested TypeScript: finding the model in the language of the business, value objects and why money is not a number, entities, aggregates as consistency boundaries and how large to make them, repositories with optimistic versioning, domain events, bounded contexts, making invalid states impossible to construct, and when a simpler design is the right one.",
+  "lede": "The patterns of the last three chapters arrange code. This chapter is about what the code means. A domain model is the program’s own picture of the business it serves: what an order is, what may be done to it and what must never be true of it. When that picture is sharp, the rules live in one place and the rest of the program cannot break them. When it is blurred, the same rule is half-implemented in five handlers, and the database slowly fills with orders that should not exist.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">Where the rules live</h2>
+<p>The photo app has started selling paper prints. A customer builds an order from their photos, places it, and it is printed and shipped. The business has rules, as every business does: an order must contain something before it can be placed, a quantity is a whole number of at least one, an order that has been placed cannot be changed, and one that has shipped cannot be canceled.</p>
+<p>The <dfn>domain</dfn> is the area of the real world a program is about. A <dfn>domain model</dfn> is the set of types and rules in the code that represent it. The question this chapter asks of any design is: where does each rule live, and what stops code from going around it?</p>
+<p>The commonest answer in practice is “nowhere in particular”.</p>
+<pre data-lang="ts" data-title="An order as a bag of fields, with the rules in whoever touches it">
+// An "anemic" model: the order is a bag of public fields, and every rule lives in whoever touches it.
+export interface OrderRecord {
+  id: string;
+  status: string;
+  lines: { photo: string; size: string; quantity: number; unitPrice: number }[];
+  total: number;
+}
+
+// One of several places that add to an order. This one remembered two of the rules.
+export function addToOrder(order: OrderRecord, photo: string, size: string, quantity: number, unitPrice: number): void {
+  if (order.status !== "draft") throw new Error("order is not open");
+  if (quantity < 1) throw new Error("bad quantity");
+  order.lines.push({ photo, size, quantity, unitPrice });
+  order.total += quantity * unitPrice;
+}
+
+// Another place, written later by someone else. Nothing stops it.
+export function applyAdminFix(order: OrderRecord): void {
+  order.lines.push({ photo: "p9", size: "big", quantity: -2, unitPrice: 0.1 });
+  order.status = "placed";
+}
+</pre>
+<p>Every line of this compiles. After a test ran both functions, the order had a stored total of 0.9000000000000001 while its lines added up to 0.7000000000000002, a line with a quantity of −2 in a size that does not exist, and the status “placed”. Three separate problems are visible.</p>
+<ul>
+  <li><b>The rules are optional.</b> They are enforced by the functions that remembered them. The data structure itself accepts anything.</li>
+  <li><b>The types say almost nothing.</b> A status is any string, a price is any number, an identifier is any string and can be passed where a different kind of identifier was expected.</li>
+  <li><b>Derived data is stored and drifts.</b> The total is kept in a field and updated by hand, so it can disagree with the lines it summarizes.</li>
+</ul>
+<p>A model with data and no behavior is called an <dfn>anemic domain model</dfn>. The rest of the chapter rebuilds the order so that all three problems become impossible, using a vocabulary that comes from Eric Evans’s 2003 book <cite>Domain-Driven Design</cite>. The vocabulary is useful on its own, whether or not a team adopts the rest of that approach.</p>
+
+<h2 id="language">Finding the model</h2>
+<p>A model starts from how the people in the business talk. Listen to a description of the work, and sort what you hear.</p>
+<table>
+<thead><tr><th>You hear</th><th>It is probably</th><th>In the print shop</th></tr></thead>
+<tbody>
+<tr><th>A noun with a lifetime, tracked individually</th><td>An entity</td><td>An order, a customer, a photo</td></tr>
+<tr><th>A noun that only describes or measures</th><td>A value object</td><td>A price, a print size, a delivery address</td></tr>
+<tr><th>A verb</th><td>An operation on an entity</td><td>Add prints, place, cancel, ship</td></tr>
+<tr><th>“Must”, “never”, “only if”, “at most”</th><td>An invariant</td><td>An empty order cannot be placed</td></tr>
+<tr><th>“When … happens, then …”</th><td>A domain event and a reaction to it</td><td>When an order is placed, the printer is told</td></tr>
+</tbody>
+</table>
+<p>An <dfn>invariant</dfn> is a condition that must hold whenever anyone looks. Invariants are the reason to model at all: a type that has none can be a plain record.</p>
+<p>Two habits pay for themselves at this stage. Use the business’s own words as the names in the code, so that a sentence spoken in a meeting and a line in the program describe the same thing. Evans called this a <dfn>ubiquitous language</dfn>. And notice when one word is used for two different things, because that marks a boundary. The last section returns to it.</p>
+
+<h2 id="values">Value objects</h2>
+<p>A <dfn>value object</dfn> is a small object defined entirely by its contents. It has no identity of its own, it never changes after it is created, and two of them with the same contents are interchangeable. A price, a date range, a pair of coordinates and an email address are values.</p>
+<p>Money is the standard first example, because representing it as a plain number goes wrong in three ways at once: fractions of a cent appear from nowhere, currencies get added to each other, and division loses or invents cents.</p>
+<pre data-lang="ts" data-title="Money as a value object">
+export type Currency = "EUR" | "USD" | "GBP";
+
+// A value object: no identity, never changes, equal when its contents are equal, valid from the moment it exists.
+export class Money {
+  readonly cents: number;
+  readonly currency: Currency;
+
+  private constructor(cents: number, currency: Currency) {
+    this.cents = cents;
+    this.currency = currency;
+    Object.freeze(this);
+  }
+
+  static of(cents: number, currency: Currency): Money {
+    if (!Number.isSafeInteger(cents)) throw new Error(`money is a whole number of cents, got ${cents}`);
+    return new Money(cents, currency);
+  }
+  static zero(currency: Currency): Money {
+    return new Money(0, currency);
+  }
+
+  plus(other: Money): Money {
+    if (other.currency !== this.currency) throw new Error(`cannot add ${other.currency} to ${this.currency}`);
+    return Money.of(this.cents + other.cents, this.currency);
+  }
+  times(count: number): Money {
+    if (!Number.isInteger(count)) throw new Error("multiply money by a whole number");
+    return Money.of(this.cents * count, this.currency);
+  }
+  equals(other: Money): boolean {
+    return this.cents === other.cents && this.currency === other.currency;
+  }
+
+  // Divides without losing or inventing a cent: the remainder goes to the first shares.
+  split(shares: number): Money[] {
+    if (!Number.isInteger(shares) || shares < 1) throw new Error("split into at least one share");
+    const base = Math.floor(this.cents / shares);
+    const extra = this.cents - base * shares;
+    return Array.from({ length: shares }, (_, i) => Money.of(base + (i < extra ? 1 : 0), this.currency));
+  }
+
+  toString(): string {
+    return `${(this.cents / 100).toFixed(2)} ${this.currency}`;
+  }
+}
+</pre>
+<table>
+<thead><tr><th>Checked in a test</th><th>Result</th></tr></thead>
+<tbody>
+<tr><th><code>0.1 + 0.2</code> with plain numbers</th><td>0.30000000000000004</td></tr>
+<tr><th>10 cents plus 20 cents, as <code>Money</code></th><td>Equal to 30 cents</td></tr>
+<tr><th>Adding euros to dollars</th><td>Throws “cannot add USD to EUR”</td></tr>
+<tr><th><code>Money.of(9.99, "EUR")</code></th><td>Throws: money is a whole number of cents</td></tr>
+<tr><th>Assigning to <code>cents</code> on an existing value</th><td>Throws, because the object is frozen</td></tr>
+<tr><th>10.00 EUR split into three shares</th><td>3.34, 3.33 and 3.33, which add up to 10.00</td></tr>
+</tbody>
+</table>
+<p>Four properties make this more than a wrapper.</p>
+<ul>
+  <li><b>Valid or nonexistent.</b> The constructor is private and the only way in is <code>Money.of</code>, which checks. Code that receives a <code>Money</code> never needs to check it again. This is the idea summarized as “parse, don’t validate”: check once at the edge, and return a type that carries the proof.</li>
+  <li><b>Immutable.</b> <code>plus</code> returns a new value. A value that cannot change can be shared freely, including between concurrent operations (<x-ref to="concurrency-in-code#design"></x-ref>).</li>
+  <li><b>Equal by contents.</b> Two separately created 5.00 EUR objects are different objects and the same value, so comparison is a method, <code>equals</code>.</li>
+  <li><b>Behavior lives with the data.</b> The rule for splitting without losing a cent is written once, here, and not in each place that divides a bill (<x-ref to="lld-splitwise"></x-ref>).</li>
+</ul>
+<p>Not every value needs a class. A print size is one of three strings, and a union type says so exactly. An identifier can be given a <dfn>branded type</dfn>: a string to the running program, a distinct type to the compiler, so that a photo’s identifier cannot be passed where an order’s is expected. Both appear at the top of the next listing.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Primitive obsession: representing every concept as a <code>string</code> or <code>number</code>. A function with the signature <code>(string, string, number, number)</code> accepts its arguments in any order and any units. Each primitive that has rules of its own, such as an email address, a percentage or a quantity, is a candidate for a value type.</p></div>
+
+<h2 id="entities">Entities</h2>
+<p>An <dfn>entity</dfn> is an object with an identity that persists while its contents change. An order that gains a line is the same order. Two customers who happen to share a name and an address are two customers. Entities are compared by identifier, and they have a lifecycle: they are created, change through defined operations and reach final states.</p>
+<table>
+<thead><tr><th></th><th>Entity</th><th>Value object</th></tr></thead>
+<tbody>
+<tr><th>Equal when</th><td>Identifiers match</td><td>Contents match</td></tr>
+<tr><th>Changes over time</th><td>Yes, through its own methods</td><td>Never. A change produces a new value</td></tr>
+<tr><th>Question to ask</th><td>“Which one?”</td><td>“How much?” or “what kind?”</td></tr>
+<tr><th>In a database</th><td>A row with a primary key</td><td>Columns of the row that owns it</td></tr>
+</tbody>
+</table>
+<p>The same real thing can be either, depending on the domain. To the print shop an address is a value: where to send the parcel. To a postal service an address is an entity with a history.</p>
+
+<h2 id="aggregates">Aggregates</h2>
+<p>An order and its lines have rules that span both: at most fifty lines, no line without an order, a total that is the sum of the lines. If lines could be created, changed and saved independently, no single piece of code would be in a position to enforce any of that.</p>
+<p>An <dfn>aggregate</dfn> is a cluster of objects treated as one unit for the purpose of changes. One entity is its <dfn>aggregate root</dfn>. Code outside the aggregate holds references only to the root and asks the root to make every change, and the root keeps the whole cluster valid.</p>
+<pre data-lang="ts" data-title="The Order aggregate">
+// Branded identifiers: all strings at run time, different types at compile time.
+export type OrderId = string & { readonly __brand: "OrderId" };
+export type CustomerId = string & { readonly __brand: "CustomerId" };
+export type PhotoId = string & { readonly __brand: "PhotoId" };
+
+export type PrintSize = "10x15" | "13x18" | "20x30";
+export type OrderStatus = "draft" | "placed" | "shipped" | "canceled";
+
+export interface OrderLine {
+  readonly photo: PhotoId; // another aggregate, referred to by identifier only
+  readonly size: PrintSize;
+  readonly quantity: number;
+  readonly unitPrice: Money; // the price when the line was added, kept with the order
+}
+
+export type OrderEvent =
+  | { type: "OrderPlaced"; order: OrderId; customer: CustomerId; total: Money }
+  | { type: "OrderCanceled"; order: OrderId };
+
+export class DomainError extends Error {}
+
+// The aggregate root. Lines exist only inside an order and are reached only through it.
+export class Order {
+  static readonly maxLines = 50;
+  static readonly maxPerLine = 100;
+
+  readonly id: OrderId;
+  readonly customer: CustomerId;
+  readonly currency: Currency;
+  private state: OrderStatus = "draft";
+  private readonly lines: OrderLine[] = [];
+  private readonly events: OrderEvent[] = [];
+
+  constructor(id: OrderId, customer: CustomerId, currency: Currency = "EUR") {
+    this.id = id;
+    this.customer = customer;
+    this.currency = currency;
+  }
+
+  get status(): OrderStatus {
+    return this.state;
+  }
+  get items(): readonly OrderLine[] {
+    return [...this.lines];
+  }
+  // Derived every time it is asked for, so it cannot disagree with the lines.
+  get total(): Money {
+    return this.lines.reduce((sum, line) => sum.plus(line.unitPrice.times(line.quantity)), Money.zero(this.currency));
+  }
+
+  addPrints(photo: PhotoId, size: PrintSize, quantity: number, unitPrice: Money): void {
+    this.mustBeDraft("add prints to");
+    if (!Number.isInteger(quantity) || quantity < 1) throw new DomainError("quantity must be a whole number, at least 1");
+    if (unitPrice.currency !== this.currency) throw new DomainError(`this order is priced in ${this.currency}`);
+    const at = this.lines.findIndex((line) => line.photo === photo && line.size === size);
+    const existing = at >= 0 ? (this.lines[at] as OrderLine).quantity : 0;
+    if (existing + quantity > Order.maxPerLine) throw new DomainError(`at most ${Order.maxPerLine} prints of one photo in one size`);
+    if (at < 0 && this.lines.length >= Order.maxLines) throw new DomainError(`an order holds at most ${Order.maxLines} lines`);
+    const line: OrderLine = { photo, size, quantity: existing + quantity, unitPrice };
+    if (at >= 0) this.lines[at] = line;
+    else this.lines.push(line);
+  }
+
+  place(): void {
+    this.mustBeDraft("place");
+    if (this.lines.length === 0) throw new DomainError("an empty order cannot be placed");
+    this.state = "placed";
+    this.events.push({ type: "OrderPlaced", order: this.id, customer: this.customer, total: this.total });
+  }
+
+  cancel(): void {
+    if (this.state === "shipped") throw new DomainError("a shipped order cannot be canceled");
+    if (this.state === "canceled") return; // canceling twice is harmless
+    this.state = "canceled";
+    this.events.push({ type: "OrderCanceled", order: this.id });
+  }
+
+  markShipped(): void {
+    if (this.state !== "placed") throw new DomainError(`an order that is ${this.state} cannot be shipped`);
+    this.state = "shipped";
+  }
+
+  // Hands over what happened since the last call, for publishing after the order is saved.
+  pullEvents(): OrderEvent[] {
+    return this.events.splice(0);
+  }
+
+  private mustBeDraft(action: string): void {
+    if (this.state !== "draft") throw new DomainError(`cannot ${action} an order that is ${this.state}`);
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-aggregate">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 286" role="img" aria-labelledby="f631t f631d">
+<title id="f631t">The Order aggregate and what lies outside it</title>
+<desc id="f631d">A class diagram. A dashed boundary encloses three classes: Order, marked as the aggregate root, with private status and lines and the operations addPrints, place, cancel and total; OrderLine, a value object with a photo identifier, size, quantity and unit price; and Money, a value object with cents and currency. Order owns one to fifty OrderLines, and each OrderLine has a Money. Outside the boundary are two other aggregates, Customer and Photo. Order refers to Customer and OrderLine refers to Photo by identifier only, shown as dashed arrows.</desc>
+<rect class="e none" x="170" y="30" width="392" height="212" rx="10" style="fill:none;stroke-dasharray:6 5"/>
+<text class="tb" x="182" y="22">The Order aggregate: loaded, changed and saved as one unit</text>
+<rect class="n sig" x="184" y="48" width="186" height="158" rx="4"/>
+<text class="ts mid" x="277" y="64">«aggregate root»</text>
+<text class="tb mid" x="277" y="81">Order</text>
+<line class="sep sig" x1="184" y1="90" x2="370" y2="90"/>
+<text class="ts" x="192" y="106">− status</text>
+<text class="ts" x="192" y="122">− lines</text>
+<line class="sep sig" x1="184" y1="132" x2="370" y2="132"/>
+<text class="ts" x="192" y="148">+ addPrints(photo, size, n, price)</text>
+<text class="ts" x="192" y="164">+ place()</text>
+<text class="ts" x="192" y="180">+ cancel()</text>
+<text class="ts" x="192" y="196">+ total: Money</text>
+<rect class="n" x="416" y="48" width="132" height="116" rx="4"/>
+<text class="ts mid" x="482" y="64">«value object»</text>
+<text class="tb mid" x="482" y="81">OrderLine</text>
+<line class="sep" x1="416" y1="90" x2="548" y2="90"/>
+<text class="ts" x="424" y="106">photo: PhotoId</text>
+<text class="ts" x="424" y="122">size: PrintSize</text>
+<text class="ts" x="424" y="138">quantity</text>
+<text class="ts" x="424" y="154">unitPrice: Money</text>
+<rect class="n" x="416" y="176" width="132" height="68" rx="4"/>
+<text class="ts mid" x="482" y="192">«value object»</text>
+<text class="tb mid" x="482" y="209">Money</text>
+<line class="sep" x1="416" y1="218" x2="548" y2="218"/>
+<text class="ts" x="424" y="234">cents, currency</text>
+<path class="e owns" d="M370 95.4 L416 96.72"/>
+<text class="ts mid" x="393" y="89.06">1..50</text>
+<path class="e owns" d="M482 164 L482 176"/>
+<rect class="n" x="10" y="66" width="100" height="68" rx="4"/>
+<text class="ts mid" x="60" y="82">«aggregate»</text>
+<text class="tb mid" x="60" y="99">Customer</text>
+<line class="sep" x1="10" y1="108" x2="110" y2="108"/>
+<text class="ts" x="18" y="124">id: CustomerId</text>
+<rect class="n" x="620" y="66" width="90" height="68" rx="4"/>
+<text class="ts mid" x="665" y="82">«aggregate»</text>
+<text class="tb mid" x="665" y="99">Photo</text>
+<line class="sep" x1="620" y1="108" x2="710" y2="108"/>
+<text class="ts" x="628" y="124">id: PhotoId</text>
+<path class="e uses" d="M184 103.3 L110 100"/>
+<text class="ts mid" x="147" y="94.65">by id</text>
+<path class="e uses" d="M548 96.72 L620 100"/>
+<text class="ts mid" x="584" y="91.36">by id</text>
+<text class="ts" x="10" y="264">Code outside holds an Order and calls its methods. It never holds an OrderLine. References that cross</text>
+<text class="ts" x="10" y="280">the boundary are identifiers, so saving an order never drags a customer or a photo along with it.</text>
+</svg>
+</div>
+<figcaption>An aggregate is a consistency boundary. Everything inside is kept valid together by the root, and everything outside is referred to by identifier.</figcaption>
+</figure>
+
+<p>The test put the same pressure on this class that broke the first version. Ten invalid operations were attempted, including placing an empty order, quantities of 0, −1 and 1.5, a 51st line, a price in the wrong currency, a change after placing and an attempt to cancel after shipping. All ten were refused with a message in the business’s own terms. The order ended with two lines and a total of 5.75 EUR.</p>
+<p>Compare it with the anemic version point by point.</p>
+<ul>
+  <li><b>State is private and changes only through named operations.</b> There is no <code>setStatus</code>. There is <code>place()</code>, which is a thing the business does.</li>
+  <li><b>Each rule is written once</b>, beside the data it protects (<x-ref to="oop-in-typescript#encapsulation"></x-ref>).</li>
+  <li><b>The total is computed, not stored</b>, so it cannot drift.</li>
+  <li><b>The unit price is copied onto the line.</b> An order is a record of an agreement, and must not change when the price list does. In the test, the shop raised its prices after the lines were added, and the order still totaled what the customer had been shown.</li>
+  <li><b>Callers get copies.</b> <code>items</code> returns a new array, and pushing onto it left the order untouched.</li>
+</ul>
+<p>Four rules govern how aggregates relate to everything else.</p>
+<ol>
+  <li><b>Reference other aggregates by identifier.</b> A line holds a <code>PhotoId</code>, not a <code>Photo</code>. Otherwise loading an order would load its photos, and their albums, and so on without end.</li>
+  <li><b>One aggregate, one transaction.</b> Each change loads one aggregate, changes it and saves it whole. Its invariants are therefore true after every commit.</li>
+  <li><b>Between aggregates, consistency comes later.</b> When placing an order must reduce a stock of paper, that happens in reaction to an event, shortly afterward (<x-ref to="event-driven-architecture#consistency"></x-ref>).</li>
+  <li><b>Keep them small.</b> The next section explains why.</li>
+</ol>
+
+<h3 id="size">How large to make an aggregate</h3>
+<p>It is tempting to follow containment in the real world: an album contains photos, so <code>Album</code> should hold a list of <code>Photo</code> objects. The aggregate boundary is a different thing. It says what must be consistent at every instant, and therefore what is loaded, locked and saved together.</p>
+
+<figure class="fig wide" id="fig-size">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f634t f634d">
+<title id="f634t">One large aggregate, or several small ones</title>
+<desc id="f634d">Two designs for albums and photos. On the left, an Album aggregate contains all of its photos, ten thousand of them. Every upload loads and saves the whole album, and two uploads at the same moment conflict. On the right, Album is a small aggregate with a name, a cover and a count, and each Photo is its own aggregate holding the identifier of its album. An upload saves one photo and does not touch the album.</desc>
+<text class="tb" x="10" y="18">One aggregate: the album contains its photos</text>
+<text class="tb" x="380" y="18">Several: each photo is its own aggregate</text>
+<rect x="10" y="30" width="330" height="150" rx="10" style="fill:none;stroke-dasharray:6 5" class="e none"/>
+<rect class="n sig" x="24" y="44" width="110" height="46" rx="5"/>
+<text class="ts tb mid" x="79" y="64">Album</text>
+<text class="ts mid" x="79" y="80">name, cover</text>
+<rect class="n" x="160" y="44" width="150" height="34" rx="4"/>
+<rect class="n" x="168" y="52" width="150" height="34" rx="4"/>
+<rect class="n" x="176" y="60" width="150" height="34" rx="4"/>
+<rect class="n" x="184" y="68" width="150" height="34" rx="4"/>
+<text class="ts mid" x="259" y="89">Photo  × 10,000</text>
+<path class="e owns" d="M134 67H184"/>
+<text class="ts" x="10" y="200">An upload loads and saves all 10,000.</text>
+<text class="ts" x="10" y="218">Two uploads at once: one is refused and retried.</text>
+<text class="ts" x="10" y="236">“At most 10,000 photos” is easy to guarantee.</text>
+<rect x="380" y="30" width="120" height="74" rx="10" style="fill:none;stroke-dasharray:6 5" class="e none"/>
+<rect class="n sig" x="390" y="44" width="100" height="46" rx="5"/>
+<text class="ts tb mid" x="440" y="64">Album</text>
+<text class="ts mid" x="440" y="80">name, cover</text>
+<rect x="560" y="30" width="150" height="44" rx="10" style="fill:none;stroke-dasharray:6 5" class="e none"/>
+<rect class="n" x="568" y="36" width="134" height="32" rx="4"/>
+<text class="ts mid" x="635" y="56">Photo, with albumId</text>
+<path class="e uses" d="M560 52L502 60"/>
+<rect x="560" y="82" width="150" height="44" rx="10" style="fill:none;stroke-dasharray:6 5" class="e none"/>
+<rect class="n" x="568" y="88" width="134" height="32" rx="4"/>
+<text class="ts mid" x="635" y="108">Photo, with albumId</text>
+<path class="e uses" d="M560 104L502 66"/>
+<rect x="560" y="134" width="150" height="44" rx="10" style="fill:none;stroke-dasharray:6 5" class="e none"/>
+<rect class="n" x="568" y="140" width="134" height="32" rx="4"/>
+<text class="ts mid" x="635" y="160">Photo, with albumId</text>
+<path class="e uses" d="M560 156L502 72"/>
+<text class="ts mid" x="530" y="48">by id</text>
+<text class="ts" x="380" y="200">An upload saves one photo. The album is untouched.</text>
+<text class="ts" x="380" y="218">Uploads never conflict with each other.</text>
+<text class="ts" x="380" y="236">The limit needs a counter or a query, and may be</text>
+<text class="ts" x="380" y="254">briefly exceeded.</text>
+<path class="e none dash" d="M360 8V258"/>
+</svg>
+</div>
+<figcaption>The boundary decides what is guaranteed at every instant and what must be loaded and locked together. Draw it around the rule that cannot be broken, and no wider.</figcaption>
+</figure>
+
+<p>The question to ask of each candidate rule is: what happens if this is briefly untrue? If the answer is “a customer is charged for nothing” or “the same seat is sold twice”, the data involved belongs in one aggregate. If the answer is “a counter is off by one for a second”, it does not, and paying for instant consistency with every write is a poor trade.</p>
+<p>The cost of a large aggregate can be estimated. With the versioning scheme of the next section, a change fails and must be retried whenever someone else saved the same aggregate between its load and its save.</p>
+<div class="widget" data-widget="conflicts">
+<h4>How often do changes to one aggregate collide?</h4>
+<p>The chance that a change finds the aggregate already modified by someone else when it comes to save, assuming changes arrive independently of each other.</p>
+<div class="controls">
+  <label>Changes to this one aggregate, per second<input type="number" name="rate" value="0.2" min="0.0001" max="100000" step="0.0001"></label>
+  <label>Time from load to save, ms<input type="number" name="window" value="50" min="1" max="600000" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>A change collides</dt><dd data-out="chance">0.995%</dd></div>
+  <div><dt>Average attempts for each change</dt><dd data-out="tries">1.01</dd></div>
+  <div><dt>Collisions an hour</dt><dd data-out="hour">7.16</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At 0.2 changes a second to the same aggregate and 50 ms between loading and saving, about 0.01 other changes land inside each change’s window on average. A change collides 0.995% of the time. Collisions are rare, and a retry handles them without anyone noticing.</p>
+</div>
+<p>One customer’s order is changed by one person a few times a minute, and collisions are a curiosity. An album that is an aggregate of all its photos, receiving twenty uploads a second during a shared event, is a different matter: try 20 in the first field.</p>
+
+<h2 id="repositories">Repositories</h2>
+<p>A <dfn>repository</dfn> is an object that stores and retrieves whole aggregates, and presents itself as if it were a collection in memory. There is one for each aggregate root. Code that uses it never sees a table, a query or a join.</p>
+<pre data-lang="ts" data-title="A repository for orders, with an in-memory implementation">
+import { Order, type OrderId, type OrderSnapshot } from "./order.ts";
+
+// A repository looks like a collection of whole aggregates. Callers never see tables or queries.
+export interface OrderRepository {
+  get(id: OrderId): Promise<Order | null>;
+  save(order: Order): Promise<void>;
+}
+
+export class ConflictError extends Error {}
+
+// Good enough for tests, and it enforces the same rule a database implementation would:
+// a save succeeds only if nobody else has saved this order since it was loaded.
+export class InMemoryOrders implements OrderRepository {
+  private readonly rows = new Map<OrderId, { version: number; data: OrderSnapshot }>();
+  private readonly loadedAt = new WeakMap<Order, number>(); // the version each order object was read at
+
+  async get(id: OrderId): Promise<Order | null> {
+    const row = this.rows.get(id);
+    if (!row) return null;
+    const order = Order.fromSnapshot(structuredClone(row.data));
+    this.loadedAt.set(order, row.version);
+    return order;
+  }
+
+  async save(order: Order): Promise<void> {
+    const expected = this.loadedAt.get(order) ?? 0;
+    const stored = this.rows.get(order.id)?.version ?? 0;
+    if (stored !== expected) throw new ConflictError(`order ${order.id} was changed by someone else (version ${stored}, expected ${expected})`);
+    this.rows.set(order.id, { version: stored + 1, data: structuredClone(order.toSnapshot()) });
+    this.loadedAt.set(order, stored + 1);
+  }
+}
+</pre>
+<p>The interface has two methods because that is all the domain needs: get one, save one. A production implementation would map the aggregate to an <code>orders</code> table and an <code>order_lines</code> table and write both in one transaction (<x-ref to="schema-design#relationships"></x-ref>). The model does not change when that implementation is swapped in, which is the dependency inversion principle doing its job (<x-ref to="solid-principles#dip"></x-ref>).</p>
+<p>The version check deserves attention, because two requests changing the same order is a race of the kind described in <x-ref to="concurrency-in-code#races"></x-ref>. The repository turns it from a silent loss into a visible refusal.</p>
+
+<figure class="fig wide" id="fig-conflict">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f633t f633d">
+<title id="f633t">Two requests changing the same order at once</title>
+<desc id="f633d">A sequence between request A, the repository and request B. Both requests load order o9 and each receives its own copy, read at version 1. A adds a line and saves: the stored version is 1 as expected, and becomes 2. B adds a different line and saves: B expected version 1 but the store is at 2, so the save is refused with a conflict. B loads the order again, now at version 2 and containing A’s line, applies its change again and saves, making version 3 with both lines.</desc>
+<text class="tb mid" x="90" y="20">Request A</text>
+<line class="axis" x1="90" y1="28" x2="90" y2="206"/>
+<text class="tb mid" x="360" y="20">Repository</text>
+<line class="axis" x1="360" y1="28" x2="360" y2="206"/>
+<text class="tb mid" x="630" y="20">Request B</text>
+<line class="axis" x1="630" y1="28" x2="630" y2="206"/>
+<g data-s="1">
+<path class="e sig" d="M91 54H359"/>
+<text class="ts mid" x="225.0" y="48">1. get(o9): a copy at version 1</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M629 82H361"/>
+<text class="ts mid" x="495.0" y="76">2. get(o9): a copy at version 1</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M91 110H359"/>
+<text class="ts mid" x="225.0" y="104">3. save: expected 1, found 1</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M629 138H361"/>
+<text class="ts mid" x="495.0" y="132">4. save: expected 1, found 2</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M629 166H361"/>
+<text class="ts mid" x="495.0" y="160">5. get(o9) again: version 2</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M629 194H361"/>
+<text class="ts mid" x="495.0" y="188">6. save: expected 2, found 2</text>
+</g>
+<text class="ts" x="10" y="240">This is the optimistic locking of the transactions chapter, applied to a whole aggregate.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="get" data-state="Stored version: 1; lines in the stored order: 0">Request A loads the order to add four small prints. It gets its own copy, and the repository remembers that the copy was read at version 1.</li>
+  <li data-msg="get" data-state="Stored version: 1; lines in the stored order: 0">Request B loads the same order to add a large print. It gets a second, separate copy, also read at version 1.</li>
+  <li data-msg="save" data-state="Stored version: 2; lines in the stored order: 1">A changes its copy and saves. The stored version is the one A read, so the save is accepted and the version becomes 2.</li>
+  <li data-msg="save" data-state="Stored version: 2; lines in the stored order: 1">B changes its copy and saves. The stored version has moved on since B read it. Writing B’s copy would erase A’s line, so the save is refused.</li>
+  <li data-msg="get" data-state="Stored version: 2; lines in the stored order: 1">B starts over with a fresh copy, which already contains A’s line, and applies its own change to it. The order’s rules are checked again.</li>
+  <li data-msg="save" data-state="Stored version: 3; lines in the stored order: 2">This time nothing has changed in between. The save is accepted, and both lines are in the order.</li>
+</ol>
+<figcaption>A version number on the aggregate turns a silent lost update into a visible conflict that can be retried. The bigger and busier the aggregate, the more often it happens.</figcaption>
+</figure>
+
+<p>In the test, two copies of an order were loaded, the first was saved, and the second save was refused with a <code>ConflictError</code>, leaving the stored order as the first had written it. This is optimistic locking (<x-ref to="transactions#optimistic"></x-ref>) with the aggregate as its unit. In SQL it is one extra condition: <code>UPDATE orders SET …, version = version + 1 WHERE id = $1 AND version = $2</code>, and a check that one row was changed.</p>
+
+<h2 id="services">Use cases, events and services</h2>
+<p>Something has to load the aggregate, call it and save it. That code is an <dfn>application service</dfn>, also called a use case: one method for each thing a user can do. It contains the sequence and none of the rules.</p>
+<pre data-lang="ts" data-title="The service around the aggregate: load, tell, save, publish">
+export type PriceList = (size: PrintSize) => Money;
+export type Publish = (event: OrderEvent) => Promise<void>;
+
+// Every use case has the same shape: load one aggregate, tell it what to do, save it, publish what happened.
+export class OrderService {
+  private readonly orders: OrderRepository;
+  private readonly priceOf: PriceList;
+  private readonly publish: Publish;
+
+  constructor(orders: OrderRepository, priceOf: PriceList, publish: Publish) {
+    this.orders = orders;
+    this.priceOf = priceOf;
+    this.publish = publish;
+  }
+
+  addPrints(id: OrderId, photo: PhotoId, size: PrintSize, quantity: number): Promise<void> {
+    return this.change(id, (order) => order.addPrints(photo, size, quantity, this.priceOf(size)));
+  }
+
+  place(id: OrderId): Promise<void> {
+    return this.change(id, (order) => order.place());
+  }
+
+  // On a conflict the change is applied again to a fresh copy. The rules are checked again each time.
+  private async change(id: OrderId, apply: (order: Order) => void, attempts = 3): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      const order = await this.orders.get(id);
+      if (!order) throw new Error(`no order ${id}`);
+      apply(order);
+      try {
+        await this.orders.save(order);
+      } catch (error) {
+        if (error instanceof ConflictError && attempt < attempts) continue;
+        throw error;
+      }
+      for (const event of order.pullEvents()) await this.publish(event);
+      return;
+    }
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-flow">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f632t f632d">
+<title id="f632t">Placing an order: one use case passing through the layers</title>
+<desc id="f632d">A sequence between a request handler, the order service, the repository, the Order aggregate and an event publisher. The handler calls place on the service. The service asks the repository for the order and receives the whole aggregate. It calls place on the order, which checks its rules, changes its status and records an OrderPlaced event. The service saves the order through the repository, which accepts it because nobody else has changed it. The service then publishes the event and returns.</desc>
+<text class="tb mid" x="56" y="20">Handler</text>
+<line class="axis" x1="56" y1="28" x2="56" y2="206"/>
+<text class="tb mid" x="196" y="20">OrderService</text>
+<line class="axis" x1="196" y1="28" x2="196" y2="206"/>
+<text class="tb mid" x="350" y="20">Repository</text>
+<line class="axis" x1="350" y1="28" x2="350" y2="206"/>
+<text class="tb mid" x="504" y="20">Order</text>
+<line class="axis" x1="504" y1="28" x2="504" y2="206"/>
+<text class="tb mid" x="654" y="20">Publisher</text>
+<line class="axis" x1="654" y1="28" x2="654" y2="206"/>
+<g data-s="1">
+<path class="e sig" d="M57 54H195"/>
+<text class="ts mid" x="126.0" y="48">1. place(o9)</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M197 82H349"/>
+<text class="ts mid" x="273.0" y="76">2. get(o9)</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M197 110H503"/>
+<text class="ts mid" x="350.0" y="104">3. place()</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M197 138H349"/>
+<text class="ts mid" x="273.0" y="132">4. save(order)</text>
+</g>
+<g data-s="5">
+<path class="e async" d="M197 166H653"/>
+<text class="ts mid" x="425.0" y="160">5. OrderPlaced</text>
+</g>
+<g data-s="6">
+<path class="e uses" d="M195 194H57"/>
+<text class="ts mid" x="126.0" y="188">6. done</text>
+</g>
+<text class="ts" x="10" y="240">Every change to an order follows these six steps. Only the third differs from one use case to the next.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="The order: draft, stored at version 3">The handler turns an HTTP request into one call. It knows the route and the status codes, and none of the rules about orders.</li>
+  <li data-state="The order: draft, loaded at version 3">The service asks for the order and receives the whole aggregate, lines included, as one object.</li>
+  <li data-state="The order: placed in memory, not yet saved">The service tells the order what to do. The order checks that it is a draft with at least one line, becomes placed and notes an OrderPlaced event. A broken rule would throw here, before anything is saved.</li>
+  <li data-state="The order: placed, stored at version 4">The whole aggregate is written in one transaction, on condition that the stored version is still 3.</li>
+  <li data-state="The order: placed, stored at version 4">Only after the save succeeds does the service hand the recorded event to whoever delivers it to other parts of the system.</li>
+  <li>The service returns. It decided nothing about orders. Its job was the sequence: load, tell, save, publish.</li>
+</ol>
+<figcaption>The rules live in the aggregate. The service around it is a short, repetitive script, which is how it should look.</figcaption>
+</figure>
+
+<p>Two requests that added prints to the same order at the same moment were both kept in the test: one save conflicted, the service loaded a fresh copy, applied the change again and succeeded. The retry is safe because it re-runs the order’s own checks against the new state. Had the first request placed the order, the retried addition would have been refused.</p>
+<p>Three smaller ideas appear in this listing.</p>
+<ul>
+  <li><b>Domain events.</b> A <dfn>domain event</dfn> is a record that something the business cares about has happened, named in the past tense: <code>OrderPlaced</code>. The aggregate records its events as it changes, and the service publishes them after the save succeeds. The printing floor, the email sender and the billing system react to the event, and the order knows none of them (<x-ref to="behavioral-patterns#observer"></x-ref>).</li>
+  <li><b>Domain services.</b> Some logic belongs to the domain and to no single entity. Looking up the current price of a print size is not something an order should do for itself. Here it is a function, <code>PriceList</code>, passed in.</li>
+  <li><b>The gap between saving and publishing.</b> If the process stops after the save and before the publish, the order is placed and nobody is told. Closing that gap takes the outbox pattern: write the event to the same database, in the same transaction, and deliver it from there (<x-ref to="change-data-capture#outbox"></x-ref>).</li>
+</ul>
+
+<h2 id="states">States as types</h2>
+<p>The <code>Order</code> class checks its state at run time: <code>place()</code> throws if the order is not a draft. TypeScript offers a stronger option for some rules, which is to give each state its own type, carrying only the data that exists in that state.</p>
+<pre data-lang="ts" data-title="A shipped order has a tracking number. A draft has nowhere to put one">
+import type { Money } from "./money.ts";
+import type { OrderLine } from "./order.ts";
+
+// Each state carries exactly the data that exists in that state. A draft has no shipping date to get wrong.
+export type Draft = { status: "draft"; lines: OrderLine[] };
+export type Placed = { status: "placed"; lines: OrderLine[]; total: Money; placedAt: Date };
+export type Shipped = { status: "shipped"; lines: OrderLine[]; total: Money; placedAt: Date; shippedAt: Date; tracking: string };
+export type Canceled = { status: "canceled"; canceledAt: Date; reason: string };
+export type OrderState = Draft | Placed | Shipped | Canceled;
+
+// Only a placed order can be shipped, and the compiler enforces it: the parameter's type is Placed.
+export function ship(order: Placed, tracking: string, now: Date): Shipped {
+  return { ...order, status: "shipped", shippedAt: now, tracking };
+}
+
+export function describe(order: OrderState): string {
+  switch (order.status) {
+    case "draft": return `draft with ${order.lines.length} lines`;
+    case "placed": return `placed, ${order.total}`;
+    case "shipped": return `shipped, tracking ${order.tracking}`;
+    case "canceled": return `canceled: ${order.reason}`;
+  }
+}
+</pre>
+<p>With these types, calling <code>ship</code> on a draft does not compile, and neither does reading <code>shippedAt</code> from one. The test file contains both lines, each marked as an expected compile error, and the type checker confirms them on every run. The approach is often summarized as making illegal states unrepresentable: an order that is “shipped” with no shipping date cannot be written down, so no code has to defend against it.</p>
+<p>The two styles combine well. Use types for rules about shape, such as which fields exist in which state. Use methods on the aggregate for rules about values, such as “at most fifty lines”, which no type can express.</p>
+
+<h2 id="contexts">Bounded contexts</h2>
+<p>Ask three teams what a “photo” is. To the library team it has an owner, a date, albums and the people in it. To the print team it is a rectangle of pixels with a size that determines how large it can be printed. To billing it does not exist: there are invoices with line items. Each answer is right, and a single <code>Photo</code> class that tried to serve all three would be right for none.</p>
+<p>A <dfn>bounded context</dfn> is a part of a system within which one model applies and every term has one meaning. Each context has its own model, even of things that share a name.</p>
+
+<figure class="fig wide" id="fig-contexts">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f635t f635d">
+<title id="f635t">Three bounded contexts, each with its own model of a photo and a customer</title>
+<desc id="f635d">Three contexts side by side. In the Library context, a Photo has an owner, a capture date, albums and people. A User has a name and a storage plan. In the Printing context, the same photo appears as a PrintableImage with a photo identifier and pixel dimensions, and the person appears as a Recipient with a name and a delivery address. In the Billing context there is no photo at all: an order appears as an Invoice with lines and tax, and the person as a Payer with a billing country and a payment method. Printing receives a photo identifier and pixel size from Library, and Billing receives an OrderPlaced event from Printing.</desc>
+<rect class="n sunk" x="10" y="10" width="216" height="196" rx="12"/>
+<text class="tb" x="24" y="32">Library</text>
+<text class="ts" x="24" y="48">organizing and sharing</text>
+<rect class="n sig" x="22" y="60" width="192" height="40" rx="5"/>
+<text class="ts tb mid" x="118" y="77">Photo</text>
+<text class="ts mid" x="118" y="92">owner, takenAt, albums, people</text>
+<rect class="n sig" x="22" y="108" width="192" height="40" rx="5"/>
+<text class="ts tb mid" x="118" y="125">User</text>
+<text class="ts mid" x="118" y="140">name, storage plan</text>
+<rect class="n sunk" x="252" y="10" width="216" height="196" rx="12"/>
+<text class="tb" x="266" y="32">Printing</text>
+<text class="ts" x="266" y="48">selling paper prints</text>
+<rect class="n store" x="264" y="60" width="192" height="40" rx="5"/>
+<text class="ts tb mid" x="360" y="77">PrintableImage</text>
+<text class="ts mid" x="360" y="92">photoId, width, height</text>
+<rect class="n store" x="264" y="108" width="192" height="40" rx="5"/>
+<text class="ts tb mid" x="360" y="125">Recipient</text>
+<text class="ts mid" x="360" y="140">name, delivery address</text>
+<rect class="n store" x="264" y="156" width="192" height="40" rx="5"/>
+<text class="ts tb mid" x="360" y="173">Order</text>
+<text class="ts mid" x="360" y="188">lines, status, total</text>
+<rect class="n sunk" x="494" y="10" width="216" height="196" rx="12"/>
+<text class="tb" x="508" y="32">Billing</text>
+<text class="ts" x="508" y="48">taking payment</text>
+<rect class="n async" x="506" y="60" width="192" height="40" rx="5"/>
+<text class="ts tb mid" x="602" y="77">Invoice</text>
+<text class="ts mid" x="602" y="92">lines, tax, amount due</text>
+<rect class="n async" x="506" y="108" width="192" height="40" rx="5"/>
+<text class="ts tb mid" x="602" y="125">Payer</text>
+<text class="ts mid" x="602" y="140">billing country, card</text>
+<path class="e" d="M227 80H250"/>
+<path class="e" d="M469 176H492"/>
+<text class="ts" x="10" y="228">Library → Printing: a photo identifier and its pixel size.   Printing → Billing: an OrderPlaced event.</text>
+<text class="ts" x="10" y="244">One person is a User, a Recipient and a Payer. No single class has to serve all three purposes.</text>
+</svg>
+</div>
+<figcaption>A model is only consistent inside a boundary. Each context keeps the parts of “photo” and “customer” that it needs, under names that fit, and translates at its edge.</figcaption>
+</figure>
+
+<p>Contexts exchange as little as they can: identifiers and events, in an agreed format. Where one context must consume another’s model, it translates at the edge into its own terms, with an adapter (<x-ref to="structural-patterns#adapter"></x-ref>). When the other model is one you do not control, such as a payment provider’s, that translating layer is called an <dfn>anticorruption layer</dfn>, because its job is to stop foreign concepts leaking inward.</p>
+<p>Bounded contexts are the strongest available guide to where services should be divided (<x-ref to="monoliths-and-microservices#boundaries"></x-ref>). They are a way of dividing the model, not the deployment. One well-structured application can hold several contexts as modules, and for most teams that is the right place to start.</p>
+
+<h2 id="when">When not to</h2>
+<p>Everything in this chapter costs something: more types, an indirection between the handler and the data, mapping code between the model and its tables. It pays where there are real rules to protect. Much software has few.</p>
+<table>
+<thead><tr><th>The work is mostly</th><th>A fitting design</th></tr></thead>
+<tbody>
+<tr><th>Storing and showing records, with validation of single fields</th><td>Plain records and a thin layer over the database. A user’s profile settings need no aggregate</td></tr>
+<tr><th>A sequence of steps with a few conditions</th><td>A function for each operation, sometimes called a transaction script</td></tr>
+<tr><th>Rules that span several pieces of data, states with restricted moves, money, quotas, bookings</th><td>A domain model as described here</td></tr>
+<tr><th>Reports and searches over many records</th><td>Queries written directly against the database, bypassing the model. Reads do not need aggregates (<x-ref to="event-driven-architecture#cqrs"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>The value objects are the exception to this weighing. A <code>Money</code> type or a branded identifier costs a few lines and removes whole classes of mistake in any codebase, simple or not.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> A low-level design round is domain modeling against the clock. Underline the nouns and verbs in the prompt. Say which nouns are entities and which are values, and state two or three invariants out loud before drawing anything: “a spot holds at most one vehicle”, “a seat cannot be sold twice”. Then put each invariant inside exactly one class that can enforce it. That last step, naming the rule and its owner, is what distinguishes a design from a list of classes.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Public fields or a setter for every field</th><td>Any code can put the object into a state the business forbids</td><td>Private state, and methods named after what the business does</td></tr>
+<tr><th>Money as a floating-point number</th><td>Totals that are off by a fraction of a cent, and currencies mixed</td><td>Whole minor units and a currency, in a value object</td></tr>
+<tr><th>Storing a total alongside the lines it summarizes</th><td>The two disagree after the first forgotten update</td><td>Compute it, unless measurement shows a need to store it</td></tr>
+<tr><th>An aggregate drawn around everything that is related</th><td>Huge loads, constant conflicts, and one team’s change blocking another’s</td><td>The smallest cluster that a true invariant requires</td></tr>
+<tr><th>Object references from one aggregate to another</th><td>Loading one thing loads the database. Saving one saves several</td><td>Identifiers across the boundary</td></tr>
+<tr><th>Looking up the current price when an old order is displayed</th><td>Past orders change when prices do</td><td>Copy onto the order what was agreed at the time</td></tr>
+<tr><th>Business rules in handlers or in the application service</th><td>The next handler omits them</td><td>The handler translates, the service sequences, the model decides</td></tr>
+<tr><th>One shared <code>Customer</code> class for every team</th><td>A class with sixty fields, most of them irrelevant to any one use</td><td>A model for each bounded context, and translation between them</td></tr>
+<tr><th>Full aggregates, repositories and events for a settings page</th><td>Ceremony with nothing to protect</td><td>Match the design to how many rules there are</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="oop-in-typescript"></x-ref>: encapsulation and invariants in a single class.</li>
+  <li><x-ref to="uml-diagrams"></x-ref>: drawing the entities and relationships found here.</li>
+  <li><x-ref to="schema-design"></x-ref>: how entities, values and aggregates become tables.</li>
+  <li><x-ref to="transactions"></x-ref>: optimistic locking, which the repository applies to whole aggregates.</li>
+  <li><x-ref to="event-driven-architecture"></x-ref>: domain events between services, and event sourcing as another way to store an aggregate.</li>
+  <li><x-ref to="monoliths-and-microservices"></x-ref>: bounded contexts as candidate service boundaries.</li>
+  <li><x-ref to="application-architecture"></x-ref>: where the model, the services and the repositories sit in the application.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A domain model exists to protect invariants. Ask of every rule where it lives and what prevents code from going around it.</li>
+  <li>Value objects are immutable, compared by contents and valid from creation. Money is a whole number of minor units with a currency, never a float.</li>
+  <li>Entities have identity and a lifecycle, and change only through operations named after what the business does.</li>
+  <li>An aggregate is a consistency boundary with one root. Load it whole, change it through the root, save it in one transaction.</li>
+  <li>Refer to other aggregates by identifier, and keep each aggregate as small as its true invariants allow.</li>
+  <li>A repository stores and returns whole aggregates behind a collection-like interface, and a version check turns concurrent changes into visible conflicts.</li>
+  <li>Application services sequence: load, tell, save, publish. They hold no rules.</li>
+  <li>A bounded context is where one model and one vocabulary apply. The same real thing is modeled differently in each.</li>
+  <li>Use the full approach where there are rules to protect, and plain records where there are not.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Classify each as an entity or a value object in a ride-hailing system, and say why: a trip, a pickup location, a driver, a fare.</summary><p>A trip and a driver are entities: each is tracked individually over time and remains the same trip or driver as its details change. A pickup location and a fare are value objects: a pair of coordinates and an amount with a currency, defined entirely by their contents, immutable, and interchangeable with any equal value.</p></details>
+<details><summary>A bill of 100.00 is split among three people with <code>amount / 3</code> rounded to two places. What goes wrong, and how does the <code>Money</code> class in this chapter avoid it?</summary><p>Each share is 33.33, and three of them make 99.99. A cent has vanished. <code>split</code> works in whole cents: it gives each share the floor of the division and hands the leftover cents, one each, to the first shares, giving 33.34, 33.33 and 33.33. The shares always add up to the original amount.</p></details>
+<details><summary>Why does an order line hold a <code>PhotoId</code> and a copy of the unit price, where it could hold a reference to the <code>Photo</code> and look the price up when needed?</summary><p>The photo is a different aggregate. Holding the object would mean loading it with every order and risk saving changes to it by accident. An identifier keeps the boundary. The price is copied because an order records what was agreed: if it were looked up later, a change to the price list would silently alter past orders.</p></details>
+<details><summary>A team models <code>Album</code> as an aggregate containing every <code>Photo</code>, to enforce “an album holds at most 10,000 photos”. What will they observe in production, and what would you suggest?</summary><p>Every upload loads and saves the whole album, which is slow, and simultaneous uploads to one album conflict and retry. Make each photo its own aggregate holding the album’s identifier. Enforce the limit with a counter on the album updated atomically, or check it with a query and accept that it may be exceeded by a few during a burst, since nothing bad follows from 10,003 photos.</p></details>
+<details><summary>Two requests load the same order at version 4. The first adds a line and saves. The second cancels the order and saves. What happens with the repository in this chapter, and why is that better than letting the second save go through?</summary><p>The second save is refused with a conflict, because the stored version is now 5 and it expected 4. Had it gone through, it would have written its copy of the order, made before the line was added, over the first request’s change. On retry, the cancel request is applied to the current order, and the order’s own rules decide whether it is still allowed.</p></details>
+<details><summary>Where should each of these go: checking that an email address is well formed, checking that an order has at least one line before placing, sending the confirmation email, and deciding which of two warehouses ships the order?</summary><p>The email format belongs in a value object, checked when the value is created. The non-empty rule belongs in the <code>Order</code> aggregate’s <code>place</code> method. Sending the email is a reaction to the <code>OrderPlaced</code> event, outside the model. Choosing a warehouse involves orders and warehouses and belongs to neither, so it is a domain service.</p></details>
+<details><summary>The word “account” means a login to the identity team, a ledger to the finance team and a company to the sales team. What does that tell you, and what should the code do about it?</summary><p>There are three bounded contexts. Each should have its own model, ideally with a more precise name such as <code>Login</code>, <code>LedgerAccount</code> and <code>ClientCompany</code>, and they should refer to each other by identifier and translate at their edges. One shared <code>Account</code> class would accumulate the fields and rules of all three and belong to nobody.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Eric Evans, <cite>Domain-Driven Design: Tackling Complexity in the Heart of Software</cite>, Addison-Wesley, 2003. The source of entity, value object, aggregate, repository, bounded context and ubiquitous language.</li>
+  <li>Vaughn Vernon, <a href="https://www.dddcommunity.org/library/vernon_2011/">Effective Aggregate Design</a>, three essays, 2011. Small aggregates, references by identity and consistency between aggregates after the fact.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/bliki/AnemicDomainModel.html">Anemic Domain Model</a>, 2003, and <a href="https://martinfowler.com/bliki/BoundedContext.html">Bounded Context</a>, 2014.</li>
+  <li>Alexis King, <a href="https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/">Parse, don’t validate</a>, 2019. Why a check should return a more precise type.</li>
+  <li>Scott Wlaschin, <cite>Domain Modeling Made Functional</cite>, Pragmatic Bookshelf, 2018. Modeling with types, including states as types, in a functional style that carries over to TypeScript unions.</li>
+  <li>Martin Fowler, <cite>Patterns of Enterprise Application Architecture</cite>, Addison-Wesley, 2002. Transaction script, domain model, repository, and the Money pattern with its allocation of remainders.</li>
+</ol>
+</section>

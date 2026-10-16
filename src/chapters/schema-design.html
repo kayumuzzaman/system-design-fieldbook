@@ -1,0 +1,538 @@
+<!--meta
+{ "description": "Relational schema design in practice: entities and relationships, keys, normalization to third normal form, deliberate denormalization, choosing types and constraints, common modeling patterns, and how to change a schema on a live system with the expand and contract pattern.",
+  "lede": "A schema is a set of promises about what the data looks like, and every line of code that touches the database relies on them. This chapter covers how to design tables that stay correct, when to bend the rules for speed, and how to change a schema while the system is running, which is where most of the real difficulty lies.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Design for the changes you cannot see yet</h2>
+<p><x-ref to="data-models"></x-ref> argued for starting with a relational database. This chapter is about using one well. A <dfn>schema</dfn> is the definition of the tables, columns, types, keys and constraints. A good one has two properties that pull against each other: it makes wrong data hard to store, and it can be changed as the product changes.</p>
+<p>The method is short. Identify the things the system must remember, called <dfn>entities</dfn>. Give each a table. Work out how they relate. Then check the result against the queries from your access patterns.</p>
+
+<h2 id="relationships">Entities and relationships</h2>
+<p>Relationships between entities come in three shapes, and each has one standard representation.</p>
+<table>
+<thead><tr><th>Relationship</th><th>Example</th><th>How to store it</th></tr></thead>
+<tbody>
+<tr><th>One to many</th><td>A user posts many photos. Each photo has one owner.</td><td>A foreign key on the “many” side: <code>photos.owner_id</code></td></tr>
+<tr><th>Many to many</th><td>A user likes many photos. A photo is liked by many users.</td><td>A third table with one row per pair: <code>likes (user_id, photo_id)</code></td></tr>
+<tr><th>One to one</th><td>A user has one set of notification settings</td><td>Extra columns on the same table, or a second table whose primary key is also a foreign key</td></tr>
+</tbody>
+</table>
+
+<figure class="fig wide" id="fig-er">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-labelledby="f191t f191d">
+<title id="f191t">The tables of the photo app and the relationships between them</title>
+<desc id="f191d">Five tables. Users has an id, a unique username and a creation time. Photos has an id, an owner_id that refers to users, a caption and a creation time. Comments has an id, a photo_id that refers to photos, a user_id that refers to users and a body. Follows has a follower_id and a followee_id that both refer to users, and its key is the pair. Likes has a user_id and a photo_id, and its key is the pair. One user has many photos, one photo has many comments, one photo has many likes, and one user appears in many follows.</desc>
+<rect class="n sunk" x="20" y="16" width="160" height="24" rx="0"/>
+<text class="ts tb" x="27" y="32">users</text>
+<rect class="n" x="20" y="40" width="160" height="24" rx="0"/>
+<text class="ts" x="27" y="56">id  (primary key)</text>
+<rect class="n" x="20" y="64" width="160" height="24" rx="0"/>
+<text class="ts" x="27" y="80">username  (unique)</text>
+<rect class="n" x="20" y="88" width="160" height="24" rx="0"/>
+<text class="ts" x="27" y="104">created_at</text>
+<rect class="n sunk" x="280" y="16" width="160" height="24" rx="0"/>
+<text class="ts tb" x="287" y="32">photos</text>
+<rect class="n" x="280" y="40" width="160" height="24" rx="0"/>
+<text class="ts" x="287" y="56">id  (primary key)</text>
+<rect class="n" x="280" y="64" width="160" height="24" rx="0"/>
+<text class="ts" x="287" y="80">owner_id → users</text>
+<rect class="n" x="280" y="88" width="160" height="24" rx="0"/>
+<text class="ts" x="287" y="104">caption</text>
+<rect class="n" x="280" y="112" width="160" height="24" rx="0"/>
+<text class="ts" x="287" y="128">created_at</text>
+<rect class="n sunk" x="540" y="16" width="160" height="24" rx="0"/>
+<text class="ts tb" x="547" y="32">comments</text>
+<rect class="n" x="540" y="40" width="160" height="24" rx="0"/>
+<text class="ts" x="547" y="56">id  (primary key)</text>
+<rect class="n" x="540" y="64" width="160" height="24" rx="0"/>
+<text class="ts" x="547" y="80">photo_id → photos</text>
+<rect class="n" x="540" y="88" width="160" height="24" rx="0"/>
+<text class="ts" x="547" y="104">user_id → users</text>
+<rect class="n" x="540" y="112" width="160" height="24" rx="0"/>
+<text class="ts" x="547" y="128">body</text>
+<rect class="n sunk" x="20" y="170" width="160" height="24" rx="0"/>
+<text class="ts tb" x="27" y="186">follows</text>
+<rect class="n" x="20" y="194" width="160" height="24" rx="0"/>
+<text class="ts" x="27" y="210">follower_id → users</text>
+<rect class="n" x="20" y="218" width="160" height="24" rx="0"/>
+<text class="ts" x="27" y="234">followee_id → users</text>
+<rect class="n" x="20" y="242" width="160" height="24" rx="0"/>
+<text class="ts" x="27" y="258">key: both columns</text>
+<rect class="n sunk" x="540" y="170" width="160" height="24" rx="0"/>
+<text class="ts tb" x="547" y="186">likes</text>
+<rect class="n" x="540" y="194" width="160" height="24" rx="0"/>
+<text class="ts" x="547" y="210">user_id → users</text>
+<rect class="n" x="540" y="218" width="160" height="24" rx="0"/>
+<text class="ts" x="547" y="234">photo_id → photos</text>
+<rect class="n" x="540" y="242" width="160" height="24" rx="0"/>
+<text class="ts" x="547" y="258">key: both columns</text>
+<path class="e none" d="M180 52H280"/>
+<text class="ts tb" x="188" y="46">1</text>
+<text class="ts tb end" x="272" y="46">many</text>
+<text class="ts mid" x="230" y="68">posts</text>
+<path class="e none" d="M440 52H540"/>
+<text class="ts tb" x="448" y="46">1</text>
+<text class="ts tb end" x="532" y="46">many</text>
+<text class="ts mid" x="490" y="68">has</text>
+<path class="e none" d="M360 136V218H540"/>
+<text class="ts tb" x="368" y="152">1</text>
+<text class="ts tb end" x="532" y="212">many</text>
+<text class="ts mid" x="450" y="234">receives</text>
+<path class="e none" d="M100 112V170"/>
+<text class="ts tb" x="108" y="128">1</text>
+<text class="ts tb" x="108" y="164">many</text>
+
+</svg>
+</div>
+<figcaption>The photo app’s schema. Lines from comments and likes back to users are left out to keep the picture readable. The two tables at the bottom are many-to-many relationships, each stored as a table of pairs.</figcaption>
+</figure>
+
+<p>The table that represents a many-to-many relationship is called a <dfn>join table</dfn>. Its primary key is usually the pair of foreign keys, which has a useful side effect: the database itself guarantees that a user cannot like the same photo twice. Join tables often turn out to be entities in their own right. A like has a time. A follow may have a notification preference. Give them the columns they need.</p>
+
+<h2 id="keys">Choosing keys</h2>
+<p>Every table needs a primary key, and the choice is hard to change later because other tables refer to it.</p>
+<ul>
+  <li>A <dfn>natural key</dfn> is something meaningful that is already unique, such as an email address or a country code. The trouble is that meaningful things change. People change email addresses, and a key that changes must be updated in every table that refers to it.</li>
+  <li>A <dfn>surrogate key</dfn> is an identifier with no meaning, generated by the system. It never needs to change. Use one for nearly every table, and enforce the natural uniqueness with a separate unique constraint: <code>id</code> as the primary key, and <code>UNIQUE (email)</code> beside it.</li>
+</ul>
+<p>The two common kinds of surrogate key have different strengths.</p>
+<table>
+<thead><tr><th></th><th>Sequential integer</th><th>UUID</th></tr></thead>
+<tbody>
+<tr><th>Size</th><td>8 bytes</td><td>16 bytes</td></tr>
+<tr><th>Generated by</th><td>The database, one at a time</td><td>Anyone, anywhere, with no coordination</td></tr>
+<tr><th>Reveals</th><td>How many rows exist and roughly when each was made. Easy to guess neighbors.</td><td>Nothing, for random UUIDs</td></tr>
+<tr><th>Insert performance</th><td>Excellent: always at the end of the index</td><td>Poor for random version 4. Good for time-ordered version 7.</td></tr>
+<tr><th>Works across several databases</th><td>Needs care to avoid collisions</td><td>Yes</td></tr>
+</tbody>
+</table>
+<p>A sensible default is a 64-bit integer for internal tables and a time-ordered UUID (version 7) where IDs are created outside the database or shown to the outside world. Whatever you choose, do not let an ID in a URL serve as the access check. That the ID is hard to guess is no substitute for verifying that the caller may see the record (<x-ref to="authorization"></x-ref>). <x-ref to="unique-ids"></x-ref> covers generation schemes in depth.</p>
+
+<h2 id="normalization">Normalization</h2>
+<p><dfn>Normalization</dfn> is the process of arranging tables so that each fact is stored in exactly one place. The reason is easiest to see from a table that breaks the rule.</p>
+
+<figure class="fig wide" id="fig-normalize">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 312" role="img" aria-labelledby="f192t f192d">
+<title id="f192t">An orders table before and after normalization</title>
+<desc id="f192d">Before: one table with columns order id, customer, email, product, price and quantity, in which Ana’s name and email appear on three rows and the price of an A4 print on two. After: four tables. Customers holds each customer once. Products holds each product and its current price once. Orders holds each order with a customer id. Order items holds one row per product in an order, with the quantity and the price paid.</desc>
+<text class="tl" x="4" y="16">Before: one table, with facts repeated</text>
+<rect class="n sunk" x="4" y="26" width="62" height="22" rx="0"/>
+<text class="ts tb" x="11" y="41">order_id</text>
+<rect class="n sunk" x="66" y="26" width="74" height="22" rx="0"/>
+<text class="ts tb" x="73" y="41">customer</text>
+<rect class="n sunk" x="140" y="26" width="140" height="22" rx="0"/>
+<text class="ts tb" x="147" y="41">email</text>
+<rect class="n sunk" x="280" y="26" width="84" height="22" rx="0"/>
+<text class="ts tb" x="287" y="41">product</text>
+<rect class="n sunk" x="364" y="26" width="50" height="22" rx="0"/>
+<text class="ts tb" x="371" y="41">price</text>
+<rect class="n sunk" x="414" y="26" width="36" height="22" rx="0"/>
+<text class="ts tb" x="421" y="41">qty</text>
+<rect class="n" x="4" y="48" width="62" height="22" rx="0"/>
+<text class="ts" x="11" y="63">1001</text>
+<rect class="n fault" x="66" y="48" width="74" height="22" rx="0"/>
+<text class="ts" x="73" y="63">Ana</text>
+<rect class="n fault" x="140" y="48" width="140" height="22" rx="0"/>
+<text class="ts" x="147" y="63">ana@example.com</text>
+<rect class="n fault" x="280" y="48" width="84" height="22" rx="0"/>
+<text class="ts" x="287" y="63">A4 print</text>
+<rect class="n fault" x="364" y="48" width="50" height="22" rx="0"/>
+<text class="ts" x="371" y="63">12</text>
+<rect class="n" x="414" y="48" width="36" height="22" rx="0"/>
+<text class="ts" x="421" y="63">2</text>
+<rect class="n" x="4" y="70" width="62" height="22" rx="0"/>
+<text class="ts" x="11" y="85">1001</text>
+<rect class="n fault" x="66" y="70" width="74" height="22" rx="0"/>
+<text class="ts" x="73" y="85">Ana</text>
+<rect class="n fault" x="140" y="70" width="140" height="22" rx="0"/>
+<text class="ts" x="147" y="85">ana@example.com</text>
+<rect class="n" x="280" y="70" width="84" height="22" rx="0"/>
+<text class="ts" x="287" y="85">Frame</text>
+<rect class="n" x="364" y="70" width="50" height="22" rx="0"/>
+<text class="ts" x="371" y="85">30</text>
+<rect class="n" x="414" y="70" width="36" height="22" rx="0"/>
+<text class="ts" x="421" y="85">1</text>
+<rect class="n" x="4" y="92" width="62" height="22" rx="0"/>
+<text class="ts" x="11" y="107">1002</text>
+<rect class="n fault" x="66" y="92" width="74" height="22" rx="0"/>
+<text class="ts" x="73" y="107">Ana</text>
+<rect class="n fault" x="140" y="92" width="140" height="22" rx="0"/>
+<text class="ts" x="147" y="107">ana@example.com</text>
+<rect class="n fault" x="280" y="92" width="84" height="22" rx="0"/>
+<text class="ts" x="287" y="107">A4 print</text>
+<rect class="n fault" x="364" y="92" width="50" height="22" rx="0"/>
+<text class="ts" x="371" y="107">12</text>
+<rect class="n" x="414" y="92" width="36" height="22" rx="0"/>
+<text class="ts" x="421" y="107">1</text>
+<rect class="n" x="4" y="114" width="62" height="22" rx="0"/>
+<text class="ts" x="11" y="129">1003</text>
+<rect class="n" x="66" y="114" width="74" height="22" rx="0"/>
+<text class="ts" x="73" y="129">Ben</text>
+<rect class="n" x="140" y="114" width="140" height="22" rx="0"/>
+<text class="ts" x="147" y="129">ben@example.com</text>
+<rect class="n" x="280" y="114" width="84" height="22" rx="0"/>
+<text class="ts" x="287" y="129">Frame</text>
+<rect class="n" x="364" y="114" width="50" height="22" rx="0"/>
+<text class="ts" x="371" y="129">30</text>
+<rect class="n" x="414" y="114" width="36" height="22" rx="0"/>
+<text class="ts" x="421" y="129">2</text>
+<text class="ts" x="470" y="52">Ana’s email is stored three times,</text>
+<text class="ts" x="470" y="69">and the price of a print twice.</text>
+<text class="ts" x="470" y="86">Change one copy and the table</text>
+<text class="ts" x="470" y="103">disagrees with itself.</text>
+<text class="tl" x="4" y="168">After: each fact stored once</text>
+<rect class="n sunk" x="4" y="178" width="28" height="22" rx="0"/>
+<text class="ts tb" x="11" y="193">id</text>
+<rect class="n sunk" x="32" y="178" width="44" height="22" rx="0"/>
+<text class="ts tb" x="39" y="193">name</text>
+<rect class="n sunk" x="76" y="178" width="118" height="22" rx="0"/>
+<text class="ts tb" x="83" y="193">email</text>
+<rect class="n" x="4" y="200" width="28" height="22" rx="0"/>
+<text class="ts" x="11" y="215">1</text>
+<rect class="n" x="32" y="200" width="44" height="22" rx="0"/>
+<text class="ts" x="39" y="215">Ana</text>
+<rect class="n" x="76" y="200" width="118" height="22" rx="0"/>
+<text class="ts" x="83" y="215">ana@example.com</text>
+<rect class="n" x="4" y="222" width="28" height="22" rx="0"/>
+<text class="ts" x="11" y="237">2</text>
+<rect class="n" x="32" y="222" width="44" height="22" rx="0"/>
+<text class="ts" x="39" y="237">Ben</text>
+<rect class="n" x="76" y="222" width="118" height="22" rx="0"/>
+<text class="ts" x="83" y="237">ben@example.com</text>
+<rect class="n sunk" x="202" y="178" width="28" height="22" rx="0"/>
+<text class="ts tb" x="209" y="193">id</text>
+<rect class="n sunk" x="230" y="178" width="72" height="22" rx="0"/>
+<text class="ts tb" x="237" y="193">name</text>
+<rect class="n sunk" x="302" y="178" width="44" height="22" rx="0"/>
+<text class="ts tb" x="309" y="193">price</text>
+<rect class="n" x="202" y="200" width="28" height="22" rx="0"/>
+<text class="ts" x="209" y="215">7</text>
+<rect class="n" x="230" y="200" width="72" height="22" rx="0"/>
+<text class="ts" x="237" y="215">A4 print</text>
+<rect class="n" x="302" y="200" width="44" height="22" rx="0"/>
+<text class="ts" x="309" y="215">12</text>
+<rect class="n" x="202" y="222" width="28" height="22" rx="0"/>
+<text class="ts" x="209" y="237">8</text>
+<rect class="n" x="230" y="222" width="72" height="22" rx="0"/>
+<text class="ts" x="237" y="237">Frame</text>
+<rect class="n" x="302" y="222" width="44" height="22" rx="0"/>
+<text class="ts" x="309" y="237">30</text>
+<rect class="n sunk" x="354" y="178" width="44" height="22" rx="0"/>
+<text class="ts tb" x="361" y="193">id</text>
+<rect class="n sunk" x="398" y="178" width="84" height="22" rx="0"/>
+<text class="ts tb" x="405" y="193">customer_id</text>
+<rect class="n" x="354" y="200" width="44" height="22" rx="0"/>
+<text class="ts" x="361" y="215">1001</text>
+<rect class="n" x="398" y="200" width="84" height="22" rx="0"/>
+<text class="ts" x="405" y="215">1</text>
+<rect class="n" x="354" y="222" width="44" height="22" rx="0"/>
+<text class="ts" x="361" y="237">1002</text>
+<rect class="n" x="398" y="222" width="84" height="22" rx="0"/>
+<text class="ts" x="405" y="237">1</text>
+<rect class="n" x="354" y="244" width="44" height="22" rx="0"/>
+<text class="ts" x="361" y="259">1003</text>
+<rect class="n" x="398" y="244" width="84" height="22" rx="0"/>
+<text class="ts" x="405" y="259">2</text>
+<rect class="n sunk" x="490" y="178" width="58" height="22" rx="0"/>
+<text class="ts tb" x="497" y="193">order_id</text>
+<rect class="n sunk" x="548" y="178" width="70" height="22" rx="0"/>
+<text class="ts tb" x="555" y="193">product_id</text>
+<rect class="n sunk" x="618" y="178" width="34" height="22" rx="0"/>
+<text class="ts tb" x="625" y="193">qty</text>
+<rect class="n sunk" x="652" y="178" width="44" height="22" rx="0"/>
+<text class="ts tb" x="659" y="193">paid</text>
+<rect class="n" x="490" y="200" width="58" height="22" rx="0"/>
+<text class="ts" x="497" y="215">1001</text>
+<rect class="n" x="548" y="200" width="70" height="22" rx="0"/>
+<text class="ts" x="555" y="215">7</text>
+<rect class="n" x="618" y="200" width="34" height="22" rx="0"/>
+<text class="ts" x="625" y="215">2</text>
+<rect class="n" x="652" y="200" width="44" height="22" rx="0"/>
+<text class="ts" x="659" y="215">12</text>
+<rect class="n" x="490" y="222" width="58" height="22" rx="0"/>
+<text class="ts" x="497" y="237">1001</text>
+<rect class="n" x="548" y="222" width="70" height="22" rx="0"/>
+<text class="ts" x="555" y="237">8</text>
+<rect class="n" x="618" y="222" width="34" height="22" rx="0"/>
+<text class="ts" x="625" y="237">1</text>
+<rect class="n" x="652" y="222" width="44" height="22" rx="0"/>
+<text class="ts" x="659" y="237">30</text>
+<rect class="n" x="490" y="244" width="58" height="22" rx="0"/>
+<text class="ts" x="497" y="259">1002</text>
+<rect class="n" x="548" y="244" width="70" height="22" rx="0"/>
+<text class="ts" x="555" y="259">7</text>
+<rect class="n" x="618" y="244" width="34" height="22" rx="0"/>
+<text class="ts" x="625" y="259">1</text>
+<rect class="n" x="652" y="244" width="44" height="22" rx="0"/>
+<text class="ts" x="659" y="259">12</text>
+<rect class="n" x="490" y="266" width="58" height="22" rx="0"/>
+<text class="ts" x="497" y="281">1003</text>
+<rect class="n" x="548" y="266" width="70" height="22" rx="0"/>
+<text class="ts" x="555" y="281">8</text>
+<rect class="n" x="618" y="266" width="34" height="22" rx="0"/>
+<text class="ts" x="625" y="281">2</text>
+<rect class="n" x="652" y="266" width="44" height="22" rx="0"/>
+<text class="ts" x="659" y="281">30</text>
+<text class="ts mid" x="99" y="260">customers</text>
+<text class="ts mid" x="274" y="260">products</text>
+<text class="ts mid" x="418" y="282">orders</text>
+<text class="ts mid" x="593" y="304">order_items</text>
+
+</svg>
+</div>
+<figcaption>The same information before and after. In the second form there is one place to change Ana’s email and one place to change the price of a print.</figcaption>
+</figure>
+
+<p>The single wide table suffers from three problems, traditionally called anomalies:</p>
+<ul>
+  <li><b>Update anomaly.</b> Ana changes her email. Three rows must change, and if one is missed the data contradicts itself.</li>
+  <li><b>Insert anomaly.</b> A new product cannot be recorded until someone orders it, because there is no row to put it in.</li>
+  <li><b>Delete anomaly.</b> Deleting Ben’s only order erases the fact that Ben is a customer.</li>
+</ul>
+<p>The <dfn>normal forms</dfn> are a sequence of rules that remove these problems. Three are enough for practical work.</p>
+<table>
+<thead><tr><th>Form</th><th>Rule</th><th>What it rules out</th></tr></thead>
+<tbody>
+<tr><th>First (1NF)</th><td>Each column holds one value, and there are no repeating groups of columns</td><td>A <code>tags</code> column holding <code>"beach,sunset"</code>, or columns <code>phone1</code>, <code>phone2</code>, <code>phone3</code></td></tr>
+<tr><th>Second (2NF)</th><td>Every non-key column depends on the whole key, not on part of it</td><td>In a table keyed by (order, product), storing the customer’s email, which depends on the order alone</td></tr>
+<tr><th>Third (3NF)</th><td>Non-key columns depend on the key and not on each other</td><td>Storing both <code>postcode</code> and <code>city</code> on an order when the city follows from the postcode</td></tr>
+</tbody>
+</table>
+<p>An old summary covers all three: every non-key column must provide a fact about the key, the whole key, and nothing but the key. In practice, people who think in terms of entities arrive at third normal form without consulting the rules. If a table mixes facts about two different things, split it.</p>
+<aside class="sn"><b>A fact, or a copy of a fact?</b>The <code>paid</code> column in <code>order_items</code> looks like a duplicate of the product’s price. It is a different fact: what this customer was charged at the time. If the product’s price rises next month, past orders must not change. A value that records history is not redundancy, and removing it would be a bug.</aside>
+<p>Start normalized. A normalized schema is correct by construction, compact, and flexible in the queries it supports. Its cost is that reads need joins, and that is the cost the next section addresses.</p>
+
+<h2 id="denormalization">Denormalization, on purpose</h2>
+<p><dfn>Denormalization</dfn> means storing a fact in more than one place, or storing a value that could be computed, to make reads cheaper. Every feed in the photo app shows a like count beside each photo. Counting rows in <code>likes</code> for each of twenty photos on every page view is wasteful when the same number is requested thousands of times between changes. So the schema gains a <code>like_count</code> column on <code>photos</code>.</p>
+<p>That column is a second copy of information that the <code>likes</code> table already holds, and from this moment the two can disagree. Denormalization is a trade of write complexity for read speed, and it should be made knowingly. The common forms:</p>
+<table>
+<thead><tr><th>Form</th><th>Example</th><th>How it goes stale</th></tr></thead>
+<tbody>
+<tr><th>Counter or aggregate</th><td><code>photos.like_count</code>, <code>users.follower_count</code></td><td>A like is recorded and the counter update fails or is forgotten</td></tr>
+<tr><th>Copied column</th><td>The author’s username stored on each comment</td><td>The user renames and old comments keep the old name</td></tr>
+<tr><th>Precomputed result</th><td>A table holding each user’s feed, ready to read</td><td>Any change to the inputs not propagated</td></tr>
+<tr><th>Materialized view</th><td>A stored query result that the database refreshes</td><td>Stale between refreshes</td></tr>
+</tbody>
+</table>
+<p>Three rules keep it under control.</p>
+<ol>
+  <li><b>One copy is the truth.</b> Decide which, and treat the others as derived data that could be rebuilt from it. The <code>likes</code> table is the truth. The counter is a cache that happens to live in a column.</li>
+  <li><b>Choose how the copies are kept in step.</b> In the same transaction as the original write, which is always consistent and makes the write slower. Or afterward, by a background process reacting to changes, which is faster and leaves the copy briefly behind. Pick according to how wrong the value is allowed to be, and for how long.</li>
+  <li><b>Be able to repair it.</b> Have a job that recomputes derived values from the source, and run it periodically. Counters drift in every real system.</li>
+</ol>
+<p>Denormalization is the first of several techniques with the same shape: a cache (<x-ref to="caching"></x-ref>), a search index (<x-ref to="search-systems"></x-ref>) and a read model in an event-driven system (<x-ref to="event-driven-architecture"></x-ref>) are all derived copies with the same three questions attached.</p>
+
+<h2 id="types">Types and constraints</h2>
+<p>The schema is the last line of defense against bad data. Code changes weekly and has bugs. A constraint holds for every writer, forever. Some choices matter more than they look.</p>
+<ul>
+  <li><b>Money is never a floating-point number.</b> Binary floating point cannot represent most decimal fractions, so <code>0.1 + 0.2</code> gives <code>0.30000000000000004</code>. Store an integer count of the smallest unit, such as cents, or use an exact decimal type. Store the currency next to it.</li>
+  <li><b>Timestamps are stored in UTC, with a type that knows about time zones.</b> In PostgreSQL that is <code>TIMESTAMPTZ</code>. Convert to local time when displaying. A timestamp without a zone is a number whose meaning depends on which server wrote it.</li>
+  <li><b>Columns are <code>NOT NULL</code> unless absence is meaningful.</b> Every nullable column is a case that all code reading it must handle.</li>
+  <li><b>Use the database’s rules.</b> <code>UNIQUE</code> for uniqueness, foreign keys for references, <code>CHECK</code> for ranges and allowed values. <x-ref to="transactions#constraints"></x-ref> explained why checks in application code are unreliable under concurrency.</li>
+  <li><b>Use a JSON column for the part that really varies</b>, such as per-integration settings, and ordinary columns for anything you filter, join or constrain on.</li>
+  <li><b>Store files elsewhere.</b> Images and documents belong in object storage, with the object’s key in a column (<x-ref to="object-and-file-storage"></x-ref>).</li>
+  <li><b>Add <code>created_at</code> and <code>updated_at</code></b> to almost every table. You will want them during the first incident.</li>
+</ul>
+<pre data-lang="sql" data-title="A table that defends itself">
+CREATE TABLE order_items (
+  order_id    BIGINT  NOT NULL REFERENCES orders (id),
+  product_id  BIGINT  NOT NULL REFERENCES products (id),
+  quantity    INTEGER NOT NULL CHECK (quantity > 0),
+  paid_cents  BIGINT  NOT NULL CHECK (paid_cents >= 0),
+  currency    CHAR(3) NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (order_id, product_id)
+);
+</pre>
+
+<h3 id="soft-delete">Soft deletes</h3>
+<p>A <dfn>soft delete</dfn> marks a row as deleted, typically with a <code>deleted_at</code> timestamp, instead of removing it. It allows undo and preserves history, and it has costs that are easy to miss. Every query must remember to exclude deleted rows, and one that forgets shows users data they removed. Unique constraints stop working as intended, since a deleted user’s email still occupies the slot. A partial unique index over only the live rows solves that. And the data is not gone, which matters when a law gives users the right to have it erased. Use soft deletes where undo has real value, and prefer moving rows to an archive table when the goal is only to keep history.</p>
+
+<h2 id="patterns">Patterns that come up repeatedly</h2>
+<ul>
+  <li><b>Hierarchies</b>, such as comment threads or folders. The simplest form is a <code>parent_id</code> column pointing at the same table. Reading a whole subtree then needs a recursive query, which SQL supports. If subtrees are read far more often than they change, store each row’s full path as well.</li>
+  <li><b>Status and history.</b> A <code>status</code> column answers “what state is this order in?”. It cannot answer “when did it ship, and who canceled it?”. For anything that moves through states, add a table of transitions with one row per change. The status column is then a denormalized copy of the latest one.</li>
+  <li><b>One reference, several possible targets.</b> A comment might attach to a photo or to a video. A pair of columns <code>target_type</code> and <code>target_id</code> is tempting and cannot be protected by a foreign key. Alternatives are a separate nullable foreign key column for each target type with a check that exactly one is set, or a shared parent table that both photos and videos refer to.</li>
+  <li><b>Many tenants in one database.</b> Put the tenant’s ID on every table and at the front of every index, so that one customer’s queries never scan another’s rows. <x-ref to="multi-tenancy"></x-ref> covers the options.</li>
+</ul>
+
+<h2 id="migrations">Changing a schema on a live system</h2>
+<p>A schema is never finished. The hard part is that the database and the application cannot be changed at the same instant. During any deployment, old and new versions of the code run side by side for minutes (<x-ref to="deployment-strategies"></x-ref>), and a rollback puts the old code back entirely. So there is one governing rule:</p>
+<p><b>Every schema change must work with both the previous and the next version of the application.</b></p>
+<p>Renaming a column in one step breaks this at once. The old code asks for a column that no longer exists. The answer is to split every breaking change into small steps, each compatible with its neighbors. This is known as the <dfn>expand and contract</dfn> pattern.</p>
+
+<figure class="fig wide" id="fig-expand">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f193t f193d">
+<title id="f193t">Renaming a column in five compatible steps</title>
+<desc id="f193d">Step 1 adds the new column, empty. Step 2 deploys code that writes to both the old and new columns. Step 3 copies existing values into the new column in batches. Step 4 deploys code that reads the new column. Step 5 drops the old column after a waiting period. Code that reads the old column works from the start until step 4 is complete. Code that reads the new column works from step 4 onward. The two periods overlap.</desc>
+<g data-s="1">
+<rect class="n sig" x="10" y="34" width="124" height="56" rx="6"/>
+<text class="tb mid" x="72" y="58">1. Add column</text>
+<text class="ts mid" x="72" y="75">display_name, empty</text>
+</g>
+<g data-s="2">
+<path class="e" d="M134 62H154"/>
+<rect class="n sig" x="154" y="34" width="124" height="56" rx="6"/>
+<text class="tb mid" x="216" y="58">2. Write both</text>
+<text class="ts mid" x="216" y="75">deploy new code</text>
+</g>
+<g data-s="3">
+<path class="e" d="M278 62H298"/>
+<rect class="n" x="298" y="34" width="124" height="56" rx="6"/>
+<text class="tb mid" x="360" y="58">3. Backfill</text>
+<text class="ts mid" x="360" y="75">old rows, in batches</text>
+</g>
+<g data-s="4">
+<path class="e" d="M422 62H442"/>
+<rect class="n" x="442" y="34" width="124" height="56" rx="6"/>
+<text class="tb mid" x="504" y="58">4. Read new</text>
+<text class="ts mid" x="504" y="75">deploy again</text>
+</g>
+<g data-s="5">
+<path class="e" d="M566 62H586"/>
+<rect class="n store" x="586" y="34" width="124" height="56" rx="6"/>
+<text class="tb mid" x="648" y="58">5. Drop old</text>
+<text class="ts mid" x="648" y="75">after a waiting period</text>
+</g>
+<g data-s="1">
+<path class="e none" d="M10 22V16H278V22"/>
+<text class="ts mid" x="144" y="12">expand</text>
+</g>
+<g data-s="3">
+<path class="e none" d="M298 22V16H566V22"/>
+<text class="ts mid" x="432" y="12">migrate</text>
+</g>
+<g data-s="5">
+<path class="e none" d="M586 22V16H710V22"/>
+<text class="ts mid" x="648" y="12">contract</text>
+</g>
+<g data-s="1">
+<text class="ts" x="10" y="122">Code that reads the old column “name” can still run</text>
+<rect class="bar async" x="10" y="130" width="566" height="10" rx="4"/>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="164">Code that reads the new column “display_name” can run</text>
+<rect class="bar" x="442" y="172" width="268" height="10" rx="4"/>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="208">The two bars overlap. At every moment, both the previous and the next version of the application work against the schema.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Columns: name, display_name (empty); Code writes: name; Code reads: name">Add the new column, <code>display_name</code>, and leave it empty. Existing code does not know it exists and keeps working.</li>
+  <li data-msg="" data-state="Columns: name, display_name (new rows only); Code writes: both; Code reads: name">Deploy code that writes every change to both columns and still reads the old one.</li>
+  <li data-msg="" data-state="Columns: name, display_name (all rows); Code writes: both; Code reads: name">Copy the old values into the new column for the rows that already exist, in small batches so that the table is never locked for long.</li>
+  <li data-msg="" data-state="Columns: name, display_name (all rows); Code writes: both; Code reads: display_name">Deploy code that reads the new column. From here on the old column is written but no longer read.</li>
+  <li data-msg="" data-state="Columns: display_name; Code writes: display_name; Code reads: display_name">After a waiting period, stop writing the old column and drop it. At every moment both the previous and the next version of the application could run, which is what made each deployment safe.</li>
+</ol>
+<figcaption>Renaming <code>name</code> to <code>display_name</code> without downtime. It takes five steps and several deployments where a single statement would do, and no request ever fails.</figcaption>
+</figure>
+
+<p>Migrations are written as numbered scripts kept in version control and applied in order by a migration tool, so that every environment reaches the same schema by the same path. Treat them as code: review them, and test them against a copy of production-sized data.</p>
+
+<h3 id="locks">The lock problem</h3>
+<p>The second hazard is specific to large tables. Many schema changes need a brief exclusive lock on the table. The change itself may take a millisecond, and the danger is in the waiting. If a long-running query is using the table, the schema change waits behind it. Every other query on that table then queues behind the waiting schema change. A one-millisecond change behind a ten-minute report becomes a ten-minute outage of that table.</p>
+<p>The defense is to make the migration give up quickly and try again later:</p>
+<pre data-lang="sql">
+SET lock_timeout = '3s';
+ALTER TABLE photos ADD COLUMN alt_text TEXT;
+</pre>
+<p>Beyond that, each kind of change has a safe form. The table lists them for PostgreSQL. MySQL has equivalents, and for very large tables its users rely on tools such as gh-ost and pt-online-schema-change, which build a new copy of the table in the background and swap it in.</p>
+<table>
+<thead><tr><th>Change</th><th>Risk when done naively</th><th>Safe approach</th></tr></thead>
+<tbody>
+<tr><th>Add a column</th><td>Small. Fast even with a constant default.</td><td>Add it nullable, or with a constant default, under a lock timeout</td></tr>
+<tr><th>Create an index</th><td>Blocks writes to the table for the whole build</td><td><code>CREATE INDEX CONCURRENTLY</code></td></tr>
+<tr><th>Add <code>NOT NULL</code></th><td>Scans the whole table while holding an exclusive lock</td><td>Add a check constraint as <code>NOT VALID</code>, validate it separately, then set <code>NOT NULL</code></td></tr>
+<tr><th>Add a foreign key</th><td>Checks every existing row under a lock</td><td>Add it as <code>NOT VALID</code>, then <code>VALIDATE CONSTRAINT</code></td></tr>
+<tr><th>Rename a column or table</th><td>Old code breaks immediately</td><td>Expand and contract</td></tr>
+<tr><th>Change a column’s type</th><td>May rewrite the whole table under a lock</td><td>New column, write both, backfill, switch, drop</td></tr>
+<tr><th>Drop a column</th><td>Code still reading it breaks</td><td>Remove every use in code, deploy, wait, then drop</td></tr>
+<tr><th>Update every row</th><td>One huge transaction: long locks, bloated log, lagging replicas</td><td>Batches of a few thousand rows with pauses</td></tr>
+</tbody>
+</table>
+<pre data-lang="sql" data-title="Making a column required without blocking the table">
+ALTER TABLE users ADD CONSTRAINT display_name_present
+  CHECK (display_name IS NOT NULL) NOT VALID;                -- instant: applies to new writes only
+ALTER TABLE users VALIDATE CONSTRAINT display_name_present;  -- scans, without blocking writes
+ALTER TABLE users ALTER COLUMN display_name SET NOT NULL;    -- instant: the constraint proves it
+ALTER TABLE users DROP CONSTRAINT display_name_present;
+</pre>
+<pre data-lang="sql" data-title="A backfill in batches: run repeatedly until it updates no rows">
+UPDATE users SET display_name = name
+WHERE id IN (SELECT id FROM users WHERE display_name IS NULL LIMIT 5000);
+</pre>
+<div class="note production"><p><span class="label">In production.</span> Separate schema changes from code deployments. A release that needs a schema change is at least two deployments: the migration, which the current code must tolerate, and then the code that uses it. Contracting steps, such as dropping a column, should trail by days. Once a column is dropped, rolling back the application no longer works.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> When sketching tables, state the primary key, the foreign keys and the one or two indexes each query needs, and mention any deliberate denormalization with how it is kept in step: “a like_count column on photos, updated in the same transaction as the like”. If asked how you would change the schema later, “expand and contract, so old and new code both work throughout” is the answer that shows production experience.</p></div>
+
+<h2 id="beyond">Schemas outside relational databases</h2>
+<p>Databases that do not enforce a schema still have one. It lives in the code that reads the data, and the migration problem takes a different form. Old documents are not rewritten when the code changes, so every shape ever written stays in the database. Two habits help. Include a version number in each document so readers know what they are looking at. And make readers tolerant: ignore fields they do not know, and supply defaults for fields that are missing. The same discipline applies to messages on a queue and to API payloads, both of which are also read by code older or newer than the code that wrote them. <x-ref to="event-streaming"></x-ref> returns to this under the name schema evolution.</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Lists in a column</b>, such as comma-separated IDs, where a join table belongs.</li>
+  <li><b>Natural keys as primary keys</b>, followed by the day the “permanent” value changes.</li>
+  <li><b>Denormalizing first</b>, before measuring that a join is the problem.</li>
+  <li><b>Derived values with no way to recompute them.</b></li>
+  <li><b>Floating-point money and timestamps without zones.</b></li>
+  <li><b>Everything nullable</b>, and rules enforced only in application code.</li>
+  <li><b>Renaming or dropping in one step</b> on a system that deploys gradually.</li>
+  <li><b>Schema changes without a lock timeout</b> on busy tables.</li>
+  <li><b>Updating millions of rows in one transaction.</b></li>
+  <li><b>Migrations tested only on an empty database.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="indexes-and-queries"></x-ref>: the indexes a schema needs, and creating them safely.</li>
+  <li><x-ref to="transactions"></x-ref>: constraints as concurrency control.</li>
+  <li><x-ref to="caching"></x-ref> and <x-ref to="change-data-capture"></x-ref>: other derived copies and how they are kept current.</li>
+  <li><x-ref to="deployment-strategies"></x-ref>: why old and new code run at the same time.</li>
+  <li><x-ref to="domain-modeling"></x-ref>: finding the entities in the first place.</li>
+  <li><x-ref to="multi-tenancy"></x-ref>: schema choices for serving many customers.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Model entities as tables, one-to-many relationships as foreign keys and many-to-many relationships as join tables.</li>
+  <li>Use surrogate primary keys and enforce natural uniqueness with separate constraints.</li>
+  <li>Normalize first: each fact in one place. Third normal form is the practical target.</li>
+  <li>Denormalize deliberately, for measured read costs. Name the source of truth, choose how copies stay in step, and keep a way to rebuild them.</li>
+  <li>Let the schema defend the data with types, <code>NOT NULL</code>, uniqueness, foreign keys and checks.</li>
+  <li>Every schema change must be compatible with the application version before it and the one after. Breaking changes are done as expand, migrate, contract.</li>
+  <li>On large tables, use lock timeouts, concurrent index builds, unvalidated constraints and batched backfills.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A table <code>enrollments (student_id, course_id, course_title, grade)</code> has the primary key (student_id, course_id). Which normal form does it violate, and what goes wrong?</summary><p>Second normal form. The course title depends on the course alone, which is only part of the key. The title is repeated on every enrollment, so renaming a course means updating many rows and risks leaving some unchanged. Move the title to a courses table.</p></details>
+<details><summary>An order stores the price the customer paid, although the product table also has a price. Is that denormalization?</summary><p>No. The price paid is a historical fact about the order and must not change when the product’s current price does. It is a separate fact that happens to start with the same value.</p></details>
+<details><summary>You add a <code>follower_count</code> column to users. What three things should you decide at the same time?</summary><p>Which data is the source of truth, here the follows table. How the counter is kept in step, in the same transaction as each follow or asynchronously. And how to repair it when it drifts, with a job that recounts from the follows table.</p></details>
+<details><summary>Why is renaming a column in a single migration dangerous on a system that deploys without downtime?</summary><p>During the deployment both old and new code are running. The old code refers to the old name and fails as soon as the rename is applied, and if the new code has to be rolled back, the old code is broken entirely. The rename has to be split into steps where both names work for a while.</p></details>
+<details><summary>A migration that adds a column, normally instant, takes a busy table offline for several minutes. What happened?</summary><p>The change needed an exclusive lock and had to wait for a long-running query to finish. While it waited, every new query on the table queued behind it. A lock timeout on the migration would have made it give up after a few seconds so it could be retried at a better moment.</p></details>
+<details><summary>Why should a backfill of ten million rows be done in batches?</summary><p>A single statement would run as one long transaction, holding row locks throughout, generating a very large amount of log at once, delaying replicas and preventing cleanup of old row versions. Small batches keep each transaction short and let the system keep up.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>William Kent, <a href="https://www.bkent.net/Doc/simple5.htm">A Simple Guide to Five Normal Forms in Relational Database Theory</a>, Communications of the ACM, 1983. Short and readable.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/sql-altertable.html">ALTER TABLE</a>. The notes describe which changes rewrite the table and which locks they take.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY">Building Indexes Concurrently</a>.</li>
+  <li>Martin Fowler and Pramod Sadalage, <a href="https://martinfowler.com/articles/evodb.html">Evolutionary Database Design</a>. The discipline of small, versioned migrations.</li>
+  <li>Danilo Sato, <a href="https://martinfowler.com/bliki/ParallelChange.html">Parallel Change</a>. Expand and contract, described generally.</li>
+  <li>GitHub, <a href="https://github.com/github/gh-ost">gh-ost</a>, an online schema migration tool for MySQL.</li>
+  <li>K. Davis, B. Peabody and P. Leach, <a href="https://www.rfc-editor.org/rfc/rfc9562">RFC 9562: Universally Unique IDentifiers (UUIDs)</a>, 2024. Defines version 7.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/bliki/TolerantReader.html">Tolerant Reader</a>.</li>
+</ol>
+</section>

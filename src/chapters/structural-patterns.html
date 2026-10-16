@@ -1,0 +1,774 @@
+<!--meta
+{ "description": "Structural design patterns in TypeScript with tested code: adapter, decorator, proxy and facade compared as four kinds of wrapper, then composite for trees, bridge for two independent kinds of variation and flyweight for sharing immutable state, with when each is worth its indirection.",
+  "lede": "Creational patterns were about how objects come into being. Structural patterns are about how they are fitted together once they exist. Four of the seven are variations on one move, putting an object in front of another, and they are confused with each other constantly because their code looks the same. This chapter separates them by what each is for, then covers the three that are different in kind: one for trees, one for designs that vary in two directions, and one for saving memory.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">Fitting objects together</h2>
+<p>A program that follows the earlier chapters is made of small objects that know each other only through interfaces. The structural patterns are the standard ways of connecting such objects so that the whole does more than the parts, and of doing so without any part needing to be rewritten.</p>
+<table>
+<thead><tr><th>Pattern</th><th>Problem</th><th>In one sentence</th></tr></thead>
+<tbody>
+<tr><th>Adapter</th><td>Something useful has the wrong interface</td><td>Wrap it in an object that has the interface you need</td></tr>
+<tr><th>Decorator</th><td>Behavior should be added to an object without changing its class</td><td>Wrap it in an object with the same interface that does a little extra</td></tr>
+<tr><th>Proxy</th><td>Access to an object should be delayed, checked or redirected</td><td>Put a stand-in with the same interface in front of it</td></tr>
+<tr><th>Facade</th><td>A group of objects is awkward to use correctly</td><td>Offer one simple object in front of them</td></tr>
+<tr><th>Composite</th><td>Things contain things, and both should be handled alike</td><td>Give a container the same interface as its contents</td></tr>
+<tr><th>Bridge</th><td>A design varies in two independent ways</td><td>Split it into two hierarchies, one holding a reference to the other</td></tr>
+<tr><th>Flyweight</th><td>Huge numbers of objects repeat the same data</td><td>Store the repeated part once and share it</td></tr>
+</tbody>
+</table>
+<p>The first four share a shape: a class that holds a reference to another object and forwards calls to it. They are told apart by the interfaces on each side of the wrapper and by its reason for existing.</p>
+
+<figure class="fig wide" id="fig-wrappers">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 276" role="img" aria-labelledby="f601t f601d">
+<title id="f601t">Four patterns that wrap one object in another</title>
+<desc id="f601d">Four rows, each showing a caller, a wrapping object and what it wraps, with the interface used on each side. Adapter: the caller uses PhotoStore, the adapter BucketPhotoStore uses the vendor’s BucketClient. It changes the interface. Decorator: the caller uses Notifier, the decorator Retrying also uses Notifier on an EmailNotifier. Same interface, added behavior. Proxy: the caller uses Image, the proxy LazyImage stands in for the real image. Same interface, controlled access. Facade: the caller uses one method, accept, on PhotoIntake, which uses five parts. A new and simpler interface over several objects.</desc>
+<text class="tb" x="10" y="34">Adapter</text>
+<text class="ts" x="10" y="51">changes the interface</text>
+<rect class="n" x="200" y="20" width="70" height="36" rx="4"/>
+<text class="ts mid" x="235" y="42">caller</text>
+<path class="e" d="M271 38H368"/>
+<text class="ts mid" x="320" y="31">PhotoStore</text>
+<rect class="n sig" x="370" y="20" width="130" height="36" rx="4"/>
+<text class="ts tb mid" x="435" y="42">BucketPhotoStore</text>
+<path class="e" d="M501 38H578"/>
+<text class="ts mid" x="540" y="31">BucketClient</text>
+<rect class="n" x="580" y="20" width="130" height="36" rx="4"/>
+<text class="ts mid" x="645" y="42">the vendor’s client</text>
+<line class="grid" x1="10" y1="70" x2="710" y2="70"/>
+<text class="tb" x="10" y="98">Decorator</text>
+<text class="ts" x="10" y="115">same interface, more behavior</text>
+<rect class="n" x="200" y="84" width="70" height="36" rx="4"/>
+<text class="ts mid" x="235" y="106">caller</text>
+<path class="e" d="M271 102H368"/>
+<text class="ts mid" x="320" y="95">Notifier</text>
+<rect class="n sig" x="370" y="84" width="130" height="36" rx="4"/>
+<text class="ts tb mid" x="435" y="106">Retrying</text>
+<path class="e" d="M501 102H578"/>
+<text class="ts mid" x="540" y="95">Notifier</text>
+<rect class="n" x="580" y="84" width="130" height="36" rx="4"/>
+<text class="ts mid" x="645" y="106">EmailNotifier</text>
+<line class="grid" x1="10" y1="134" x2="710" y2="134"/>
+<text class="tb" x="10" y="162">Proxy</text>
+<text class="ts" x="10" y="179">same interface, controlled access</text>
+<rect class="n" x="200" y="148" width="70" height="36" rx="4"/>
+<text class="ts mid" x="235" y="170">caller</text>
+<path class="e" d="M271 166H368"/>
+<text class="ts mid" x="320" y="159">Image</text>
+<rect class="n sig" x="370" y="148" width="130" height="36" rx="4"/>
+<text class="ts tb mid" x="435" y="170">LazyImage</text>
+<path class="e" d="M501 166H578"/>
+<text class="ts mid" x="540" y="159">Image</text>
+<rect class="n" x="580" y="148" width="130" height="36" rx="4"/>
+<text class="ts mid" x="645" y="170">the real image</text>
+<line class="grid" x1="10" y1="198" x2="710" y2="198"/>
+<text class="tb" x="10" y="226">Facade</text>
+<text class="ts" x="10" y="243">one simple interface over many</text>
+<rect class="n" x="200" y="212" width="70" height="36" rx="4"/>
+<text class="ts mid" x="235" y="234">caller</text>
+<path class="e" d="M271 230H368"/>
+<text class="ts mid" x="320" y="223">accept(id, bytes)</text>
+<rect class="n sig" x="370" y="212" width="130" height="36" rx="4"/>
+<text class="ts tb mid" x="435" y="234">PhotoIntake</text>
+<path class="e" d="M501 230H578"/>
+<text class="ts mid" x="540" y="223">5 interfaces</text>
+<rect class="n" x="580" y="208" width="120" height="36" rx="4"/>
+<rect class="n" x="585" y="212" width="120" height="36" rx="4"/>
+<rect class="n" x="590" y="216" width="120" height="36" rx="4"/>
+<text class="ts mid" x="650" y="238">five parts</text>
+<text class="ts" x="10" y="270">The label on each arrow is the interface used on that side. Compare the two labels in a row to tell the patterns apart.</text>
+</svg>
+</div>
+<figcaption>The code of these four looks alike: a class holding another object and forwarding calls to it. What differs is which interface faces the caller and why the wrapper exists.</figcaption>
+</figure>
+
+<h2 id="adapter">Adapter</h2>
+<p>The photos service was written against its own <code>PhotoStore</code> interface (<x-ref to="oop-in-typescript#abstraction"></x-ref>). In production the files go to a cloud vendor whose client library has its own vocabulary: buckets, keys, bodies, and an error with a particular name when something is missing. The vendor will not change its library to suit this application, and the application should not be rewritten to suit the vendor.</p>
+<p>An <dfn>adapter</dfn> is an object that implements the interface a caller expects by translating each call into calls on an object with a different interface.</p>
+<pre data-lang="ts" data-title="Adapting a vendor’s storage client to the application’s interface">
+// The interface the rest of the photos service is written against.
+export interface PhotoStore {
+  save(id: string, bytes: Uint8Array): Promise<void>;
+  load(id: string): Promise<Uint8Array | null>;
+}
+
+// The shape of a storage vendor's client library. We did not design it and cannot change it.
+export interface BucketClient {
+  putObject(input: { Bucket: string; Key: string; Body: Uint8Array }): Promise<{ ETag: string }>;
+  getObject(input: { Bucket: string; Key: string }): Promise<{ Body: Uint8Array }>; // throws an error named "NoSuchKey"
+}
+
+// The adapter: implements our interface by translating each call into theirs.
+export class BucketPhotoStore implements PhotoStore {
+  private readonly client: BucketClient;
+  private readonly bucket: string;
+
+  constructor(client: BucketClient, bucket: string) {
+    this.client = client;
+    this.bucket = bucket;
+  }
+
+  async save(id: string, bytes: Uint8Array): Promise<void> {
+    await this.client.putObject({ Bucket: this.bucket, Key: `photos/${id}`, Body: bytes });
+  }
+
+  async load(id: string): Promise<Uint8Array | null> {
+    try {
+      return (await this.client.getObject({ Bucket: this.bucket, Key: `photos/${id}` })).Body;
+    } catch (error) {
+      if (error instanceof Error && error.name === "NoSuchKey") return null; // their "missing" becomes ours
+      throw error;
+    }
+  }
+}
+</pre>
+<p>Tested with a stand-in for the vendor’s client, the adapter stored a photo under the key <code>photos/p1</code>, returned <code>null</code> for a missing photo where the client threw, and let an unrelated error, a dropped connection, pass through unchanged.</p>
+<p>The translation is more than renaming methods. Three kinds of difference get absorbed here, and noticing all three is what makes an adapter good.</p>
+<ul>
+  <li><b>Names and shapes.</b> <code>save(id, bytes)</code> becomes <code>putObject({ Bucket, Key, Body })</code>.</li>
+  <li><b>Conventions.</b> The application says “not found” with <code>null</code>. The vendor says it with an exception. The adapter converts one into the other, and only that one.</li>
+  <li><b>Policy.</b> The key prefix <code>photos/</code> is a decision about how this application lays out its bucket. It lives in the adapter, not scattered through callers.</li>
+</ul>
+<p>The benefit is containment. Every line of the program that knows the vendor exists is in one file. Replacing the vendor, or surviving a breaking change in its library, means rewriting that file. The same idea applied between whole systems is the reason a service translates another team’s data model at its edge instead of letting it spread inward (<x-ref to="monoliths-and-microservices#boundaries"></x-ref>).</p>
+
+<h2 id="decorator">Decorator</h2>
+<p>Sending a notification sometimes fails, and should then be retried. Every send should also be logged. Neither concern belongs inside <code>EmailNotifier</code>, whose job is to talk to a mail server, and both apply equally to push messages. <x-ref to="oop-in-typescript#composition"></x-ref> showed what happens if each combination becomes a subclass.</p>
+<p>A <dfn>decorator</dfn> is an object that has the same interface as the object it wraps and adds behavior before or after passing each call along. Because the interface is the same on both sides, decorators can be stacked, and neither the caller nor the wrapped object can tell.</p>
+<pre data-lang="ts" data-title="Two decorators for any Notifier">
+export interface Notifier {
+  send(to: string, text: string): Promise<void>;
+}
+
+// Each decorator is a Notifier that holds another Notifier.
+export class Retrying implements Notifier {
+  private readonly inner: Notifier;
+  private readonly attempts: number;
+
+  constructor(inner: Notifier, attempts = 3) {
+    this.inner = inner;
+    this.attempts = attempts;
+  }
+
+  async send(to: string, text: string): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.inner.send(to, text);
+      } catch (error) {
+        if (attempt >= this.attempts) throw error;
+      }
+    }
+  }
+}
+
+export class Logging implements Notifier {
+  private readonly inner: Notifier;
+  private readonly log: (line: string) => void;
+
+  constructor(inner: Notifier, log: (line: string) => void) {
+    this.inner = inner;
+    this.log = log;
+  }
+
+  async send(to: string, text: string): Promise<void> {
+    this.log(`sending to ${to}`);
+    try {
+      await this.inner.send(to, text);
+      this.log("sent");
+    } catch (error) {
+      this.log(`failed: ${(error as Error).message}`);
+      throw error;
+    }
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-decorator">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f602t f602d">
+<title id="f602t">A call passing through two decorators</title>
+<desc id="f602d">A sequence between a caller, a Logging decorator, a Retrying decorator and an EmailNotifier. The caller calls send on the Logging decorator, which writes a log line and calls send on the Retrying decorator, which calls send on the EmailNotifier. The first attempt fails. Retrying calls again and the second attempt succeeds. The success returns through Retrying to Logging, which writes a second log line and returns to the caller.</desc>
+<text class="tb mid" x="70" y="20">Caller</text>
+<line class="axis" x1="70" y1="28" x2="70" y2="234"/>
+<text class="tb mid" x="240" y="20">Logging</text>
+<line class="axis" x1="240" y1="28" x2="240" y2="234"/>
+<text class="tb mid" x="420" y="20">Retrying</text>
+<line class="axis" x1="420" y1="28" x2="420" y2="234"/>
+<text class="tb mid" x="620" y="20">EmailNotifier</text>
+<line class="axis" x1="620" y1="28" x2="620" y2="234"/>
+<g data-s="1">
+<path class="e sig" d="M71 54H239"/>
+<text class="ts mid" x="155.0" y="48">1. send(to, text)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M241 82H419"/>
+<text class="ts mid" x="330.0" y="76">2. send(to, text)</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M421 110H619"/>
+<text class="ts mid" x="520.0" y="104">3. send(to, text)</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M619 138H421"/>
+<text class="ts mid" x="520.0" y="132">4. Error: mail server busy</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M421 166H619"/>
+<text class="ts mid" x="520.0" y="160">5. send(to, text), again</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M619 194H421"/>
+<text class="ts mid" x="520.0" y="188">6. done</text>
+</g>
+<g data-s="7">
+<path class="e uses" d="M419 222H71"/>
+<text class="ts mid" x="245.0" y="216">7. done</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Log lines written: 1; Attempts at the mail server: 0">The caller holds a Notifier and calls send. The object it holds is the outermost wrapper, which writes “sending” to the log.</li>
+  <li>Logging passes the same call to the Notifier it holds. It does not know that this one is another wrapper.</li>
+  <li data-state="Log lines written: 1; Attempts at the mail server: 1">Retrying passes the call to the Notifier it holds, the real one, and watches what happens.</li>
+  <li data-msg="Error">The mail server is busy and the call fails. The error travels back one layer and stops there.</li>
+  <li data-state="Log lines written: 1; Attempts at the mail server: 2">Retrying catches the error and calls again. Nothing outside this layer knows that anything went wrong.</li>
+  <li>This time the message is accepted.</li>
+  <li data-state="Log lines written: 2; Attempts at the mail server: 2">Success returns through Logging, which writes “sent”, to the caller. From outside, one call was made and it worked.</li>
+</ol>
+<figcaption>Each layer has one job and the same interface on both sides, so layers can be added, removed or reordered without changing any of them.</figcaption>
+</figure>
+
+<p>The order of wrapping is a design decision, and the test shows the difference. With a mail server that fails twice and then succeeds:</p>
+<table>
+<thead><tr><th>Assembled as</th><th>Attempts</th><th>What the log shows</th></tr></thead>
+<tbody>
+<tr><th><code>new Logging(new Retrying(email))</code></th><td>3</td><td>“sending”, “sent”. The retries are invisible</td></tr>
+<tr><th><code>new Retrying(new Logging(email))</code></th><td>3</td><td>“sending”, “failed”, “sending”, “failed”, “sending”, “sent”. Every attempt is recorded</td></tr>
+</tbody>
+</table>
+<p>Both are correct. Which one is wanted depends on whether the log is for users, who care that the message went, or for operators, who care that the mail server is struggling.</p>
+<p>The pattern suits what are called cross-cutting concerns: retries, timeouts, logging, metrics, caching, access checks, rate limits. Each can be written once against an interface and applied to any implementation of it. A service mesh applies the same idea to network calls between services (<x-ref to="service-communication#mesh"></x-ref>), and so does the middleware chain in a web framework.</p>
+<aside class="sn"><b>The other “decorator”</b>TypeScript and JavaScript also have a syntax called decorators, written <code>@name</code> above a class or method. It is a language feature for attaching behavior to declarations. It was named after this pattern and serves similar purposes, but it is a different mechanism, and nothing in this chapter depends on it.</aside>
+
+<h2 id="proxy">Proxy</h2>
+<p>A <dfn>proxy</dfn> is an object that stands in for another, with the same interface, so that it can control access to it. In code it is nearly indistinguishable from a decorator. The difference is intent. A decorator adds to what the object does. A proxy decides whether, when or where the real object gets involved.</p>
+<table>
+<thead><tr><th>Kind</th><th>What it controls</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>Lazy, or virtual</th><td>When the real object is created or loaded</td><td>An image that fetches its pixels only when first displayed</td></tr>
+<tr><th>Protection</th><td>Whether the caller is allowed</td><td>A reader that checks permission before every load (<x-ref to="authorization"></x-ref>)</td></tr>
+<tr><th>Remote</th><td>Where the real object is</td><td>A local object whose methods make network calls to a service, such as a generated gRPC client (<x-ref to="api-styles#grpc"></x-ref>)</td></tr>
+<tr><th>Caching</th><td>Whether the real object needs to be asked again</td><td>A store that remembers recent answers (<x-ref to="caching#aside"></x-ref>)</td></tr>
+</tbody>
+</table>
+<pre data-lang="ts" data-title="A lazy proxy and a protection proxy">
+export interface Image {
+  readonly id: string;
+  pixels(): Promise<Uint8Array>;
+}
+
+// A proxy that puts off loading until somebody asks, and loads only once.
+export class LazyImage implements Image {
+  readonly id: string;
+  private readonly load: (id: string) => Promise<Uint8Array>;
+  private loaded: Promise<Uint8Array> | undefined;
+
+  constructor(id: string, load: (id: string) => Promise<Uint8Array>) {
+    this.id = id;
+    this.load = load;
+  }
+
+  pixels(): Promise<Uint8Array> {
+    this.loaded ??= this.load(this.id);
+    return this.loaded;
+  }
+}
+
+export interface PhotoReader {
+  load(id: string): Promise<Uint8Array | null>;
+}
+
+// A proxy that decides whether the call may go through at all.
+export class GuardedReader implements PhotoReader {
+  private readonly inner: PhotoReader;
+  private readonly user: string;
+  private readonly maySee: (user: string, id: string) => boolean;
+
+  constructor(inner: PhotoReader, user: string, maySee: (user: string, id: string) => boolean) {
+    this.inner = inner;
+    this.user = user;
+    this.maySee = maySee;
+  }
+
+  async load(id: string): Promise<Uint8Array | null> {
+    if (!this.maySee(this.user, id)) return null; // the same answer as "no such photo"
+    return this.inner.load(id);
+  }
+}
+</pre>
+<p>In the test, an album view created a hundred <code>LazyImage</code> objects and loaded nothing. Asking one of them for its pixels three times, twice at the same moment, caused one load. That works because the proxy remembers the promise, the same technique as in <x-ref to="creational-patterns#async-singleton"></x-ref>. The guarded reader returned <code>null</code> for a photo Ben may not see, exactly as it does for a photo that does not exist.</p>
+<p>A remote proxy deserves a warning. It makes a network call look like a method call, and a network call can be slow, can fail halfway and can be repeated, none of which a method call does. The convenience is real, and the differences have to be handled somewhere (<x-ref to="distributed-fundamentals"></x-ref>).</p>
+
+<h2 id="facade">Facade</h2>
+<p>Accepting a new photo involves five parts of the media subsystem: scan the file, read when it was taken, store the original, make and store a thumbnail, and add it to the search index. The order matters. Three different callers need to do it: the upload handler, the bulk importer and the mobile sync.</p>
+<p>A <dfn>facade</dfn> is a single object that offers a simple interface to a group of objects, for the tasks callers most often need.</p>
+<pre data-lang="ts" data-title="One method in front of five parts">
+// The facade: one call for the thing nearly every caller wants.
+export class PhotoIntake {
+  private readonly scanner: Scanner;
+  private readonly metadata: MetadataReader;
+  private readonly thumbnails: Thumbnailer;
+  private readonly files: Files;
+  private readonly index: SearchIndex;
+
+  constructor(scanner: Scanner, metadata: MetadataReader, thumbnails: Thumbnailer, files: Files, index: SearchIndex) {
+    this.scanner = scanner;
+    this.metadata = metadata;
+    this.thumbnails = thumbnails;
+    this.files = files;
+    this.index = index;
+  }
+
+  accept(id: string, bytes: Uint8Array): void {
+    if (!this.scanner.isSafe(bytes)) throw new Error("the file failed the safety scan");
+    const takenAt = this.metadata.takenAt(bytes);
+    this.files.put(`original/${id}`, bytes);
+    this.files.put(`thumb/${id}`, this.thumbnails.make(bytes, 200));
+    this.index.add(id, takenAt);
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-facade">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f603t f603d">
+<title id="f603t">Five parts used directly, and through a facade</title>
+<desc id="f603d">On the left, three different callers each call some or all of five parts: Scanner, MetadataReader, Thumbnailer, Files and SearchIndex, with lines crossing in every direction. On the right, the same three callers each call one object, PhotoIntake, which calls the five parts in the right order.</desc>
+<text class="tb" x="10" y="18">Without: every caller knows the parts and the order</text>
+<text class="tb" x="380" y="18">With: callers know one method</text>
+<rect class="n" x="10" y="52" width="110" height="32" rx="4"/>
+<text class="ts mid" x="65" y="72">Upload handler</text>
+<path class="e" d="M121 68L228 50"/>
+<path class="e" d="M121 68L228 90"/>
+<path class="e" d="M121 68L228 130"/>
+<path class="e" d="M121 68L228 210"/>
+<rect class="n" x="380" y="52" width="100" height="32" rx="4"/>
+<text class="ts mid" x="430" y="72">Upload handler</text>
+<path class="e" d="M481 68L518 130"/>
+<rect class="n" x="10" y="114" width="110" height="32" rx="4"/>
+<text class="ts mid" x="65" y="134">Importer</text>
+<path class="e" d="M121 130L228 50"/>
+<path class="e" d="M121 130L228 90"/>
+<path class="e" d="M121 130L228 170"/>
+<path class="e" d="M121 130L228 210"/>
+<rect class="n" x="380" y="114" width="100" height="32" rx="4"/>
+<text class="ts mid" x="430" y="134">Importer</text>
+<path class="e" d="M481 130L518 130"/>
+<rect class="n" x="10" y="176" width="110" height="32" rx="4"/>
+<text class="ts mid" x="65" y="196">Mobile sync</text>
+<path class="e" d="M121 192L228 50"/>
+<path class="e" d="M121 192L228 130"/>
+<path class="e" d="M121 192L228 170"/>
+<path class="e" d="M121 192L228 210"/>
+<rect class="n" x="380" y="176" width="100" height="32" rx="4"/>
+<text class="ts mid" x="430" y="196">Mobile sync</text>
+<path class="e" d="M481 192L518 130"/>
+<rect class="n" x="230" y="36" width="120" height="28" rx="4"/>
+<text class="ts mid" x="290" y="54">Scanner</text>
+<rect class="n" x="610" y="36" width="100" height="28" rx="4"/>
+<text class="ts mid" x="660" y="54">Scanner</text>
+<path class="e" d="M581 130L608 50"/>
+<rect class="n" x="230" y="76" width="120" height="28" rx="4"/>
+<text class="ts mid" x="290" y="94">MetadataReader</text>
+<rect class="n" x="610" y="76" width="100" height="28" rx="4"/>
+<text class="ts mid" x="660" y="94">MetadataReader</text>
+<path class="e" d="M581 130L608 90"/>
+<rect class="n" x="230" y="116" width="120" height="28" rx="4"/>
+<text class="ts mid" x="290" y="134">Thumbnailer</text>
+<rect class="n" x="610" y="116" width="100" height="28" rx="4"/>
+<text class="ts mid" x="660" y="134">Thumbnailer</text>
+<path class="e" d="M581 130L608 130"/>
+<rect class="n" x="230" y="156" width="120" height="28" rx="4"/>
+<text class="ts mid" x="290" y="174">Files</text>
+<rect class="n" x="610" y="156" width="100" height="28" rx="4"/>
+<text class="ts mid" x="660" y="174">Files</text>
+<path class="e" d="M581 130L608 170"/>
+<rect class="n" x="230" y="196" width="120" height="28" rx="4"/>
+<text class="ts mid" x="290" y="214">SearchIndex</text>
+<rect class="n" x="610" y="196" width="100" height="28" rx="4"/>
+<text class="ts mid" x="660" y="214">SearchIndex</text>
+<path class="e" d="M581 130L608 210"/>
+<rect class="n sig" x="520" y="106" width="60" height="48" rx="4"/>
+<text class="ts tb mid" x="550" y="126">Photo</text>
+<text class="ts tb mid" x="550" y="142">Intake</text>
+<path class="e none dash" d="M365 10V244"/>
+</svg>
+</div>
+<figcaption>A facade does not hide the parts or forbid using them. It gives the common case one obvious entry point.</figcaption>
+</figure>
+
+<p>In the test, one call to <code>accept</code> produced six calls on the parts, in the right order, and a file that failed the scan produced one call and stopped. Each of the three callers is now one line, and the rule “scan before storing” exists in one place.</p>
+<p>A facade differs from the other wrappers in two ways. It fronts several objects, not one. And it defines a new interface instead of matching an existing one. It also does not lock anything away: a caller with an unusual need can still use the parts directly. When a facade starts to grow a method for every caller’s special case, it has stopped being a simplification and has become the <code>Manager</code> class that the single responsibility principle warns about.</p>
+<p>The same idea one level up is the API gateway, which presents one front door to many services (<x-ref to="proxies-and-load-balancers#api-gateway"></x-ref>).</p>
+
+<h2 id="composite">Composite</h2>
+<p>Users of the photo app organize photos into folders, and folders into folders. The interface shows a size and a photo count beside everything, whether it is a single photo or a folder with ten levels inside it.</p>
+<p>The code that draws that list should not have to ask what kind of thing each row is. The <dfn>composite</dfn> pattern arranges objects in a tree and gives the containers the same interface as the individual items, so that a caller can treat one item and a whole subtree alike.</p>
+<pre data-lang="ts" data-title="A photo and a folder behind one interface">
+// One interface for a single photo and for a folder of things.
+export interface LibraryItem {
+  readonly name: string;
+  photoCount(): number;
+  bytes(): number;
+}
+
+export class PhotoItem implements LibraryItem {
+  readonly name: string;
+  private readonly size: number;
+
+  constructor(name: string, size: number) {
+    this.name = name;
+    this.size = size;
+  }
+  photoCount(): number {
+    return 1;
+  }
+  bytes(): number {
+    return this.size;
+  }
+}
+
+export class Folder implements LibraryItem {
+  readonly name: string;
+  private readonly children: LibraryItem[] = [];
+
+  constructor(name: string) {
+    this.name = name;
+  }
+
+  add(item: LibraryItem): this {
+    if (item === this || (item instanceof Folder && item.contains(this))) throw new Error("a folder cannot contain itself");
+    this.children.push(item);
+    return this;
+  }
+  contains(item: LibraryItem): boolean {
+    return this.children.some((child) => child === item || (child instanceof Folder && child.contains(item)));
+  }
+
+  // A folder answers by asking each child the same question. It does not care what kind each child is.
+  photoCount(): number {
+    return this.children.reduce((sum, child) => sum + child.photoCount(), 0);
+  }
+  bytes(): number {
+    return this.children.reduce((sum, child) => sum + child.bytes(), 0);
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-composite">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 254" role="img" aria-labelledby="f604t f604d">
+<title id="f604t">A folder answering a question by asking its children</title>
+<desc id="f604d">A tree. The folder Trips contains the folder Lisbon, the folder Rome and the photo map.png of 1 megabyte. Lisbon contains three photos of 4, 5 and 3 megabytes. Rome contains two photos of 6 and 2 megabytes. Asked for its size, Trips asks each of its three children. Lisbon asks its photos and answers 12. Rome asks its photos and answers 8. The photo answers 1. Trips adds them and answers 21 megabytes.</desc>
+<rect class="n sig" x="300" y="12" width="120" height="38" rx="5"/>
+<text class="ts tb mid" x="360.0" y="28">Trips</text>
+<text class="ts mid" x="360.0" y="43">a folder</text>
+<rect class="n sig" x="110" y="96" width="120" height="38" rx="5"/>
+<text class="ts tb mid" x="170.0" y="112">Lisbon</text>
+<text class="ts mid" x="170.0" y="127">a folder</text>
+<rect class="n sig" x="400" y="96" width="120" height="38" rx="5"/>
+<text class="ts tb mid" x="460.0" y="112">Rome</text>
+<text class="ts mid" x="460.0" y="127">a folder</text>
+<rect class="n " x="590" y="96" width="110" height="38" rx="5"/>
+<text class="ts tb mid" x="645.0" y="112">map.png</text>
+<text class="ts mid" x="645.0" y="127">1 MB</text>
+<rect class="n " x="10" y="184" width="84" height="38" rx="5"/>
+<text class="ts tb mid" x="52.0" y="200">tram.jpg</text>
+<text class="ts mid" x="52.0" y="215">4 MB</text>
+<rect class="n " x="100" y="184" width="84" height="38" rx="5"/>
+<text class="ts tb mid" x="142.0" y="200">castle.jpg</text>
+<text class="ts mid" x="142.0" y="215">5 MB</text>
+<rect class="n " x="190" y="184" width="84" height="38" rx="5"/>
+<text class="ts tb mid" x="232.0" y="200">river.jpg</text>
+<text class="ts mid" x="232.0" y="215">3 MB</text>
+<rect class="n " x="380" y="184" width="84" height="38" rx="5"/>
+<text class="ts tb mid" x="422.0" y="200">forum.jpg</text>
+<text class="ts mid" x="422.0" y="215">6 MB</text>
+<rect class="n " x="470" y="184" width="84" height="38" rx="5"/>
+<text class="ts tb mid" x="512.0" y="200">cat.jpg</text>
+<text class="ts mid" x="512.0" y="215">2 MB</text>
+<g data-s="1">
+<path class="e sig" d="M360 51L170 94"/>
+<path class="e sig" d="M360 51L460 94"/>
+<path class="e sig" d="M360 51L645 94"/>
+<text class="ts" x="430" y="36">bytes()?</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M170 135L52 182"/>
+<path class="e sig" d="M170 135L142 182"/>
+<path class="e sig" d="M170 135L232 182"/>
+</g>
+<g class="hide" data-s="2">
+<text class="ts tb" x="240" y="120">= 12 MB</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M460 135L422 182"/>
+<path class="e sig" d="M460 135L512 182"/>
+</g>
+<g class="hide" data-s="3">
+<text class="ts tb" x="530" y="120">= 8 MB</text>
+</g>
+<g class="hide" data-s="4">
+<text class="ts tb end" x="288" y="36">= 21 MB</text>
+</g>
+<text class="ts" x="10" y="246">The caller wrote one line: trips.bytes(). It would be the same line for a single photo.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="bytes()?" data-state="Answers in so far: none">The caller asks the top folder for its size. A folder has no size of its own, so it asks each of its children the same question.</li>
+  <li data-msg="bytes()?" data-state="Answers in so far: Lisbon 12 MB">Lisbon is a folder too, so it does the same with its three children. Each photo answers with its own size, and Lisbon adds them up.</li>
+  <li data-msg="bytes()?" data-state="Answers in so far: Lisbon 12 MB, Rome 8 MB">Rome does likewise with its two photos.</li>
+  <li data-msg="none" data-state="Answers in so far: Lisbon 12, Rome 8, map.png 1, so Trips 21 MB">The third child is a plain photo and answers at once. Trips adds the three answers. It never checked which children were folders and which were photos.</li>
+</ol>
+<figcaption>A composite lets a whole tree be used through the interface of a single item. The recursion is in the data, not in the caller.</figcaption>
+</figure>
+
+<p>A folder of two folders and a loose photo reported 6 photos and 21 MB, and its two inner folders reported 12 MB and 8 MB, all through the same two methods. The caller’s code contains no loop and no test for folders.</p>
+<p>Two practical points come with any tree.</p>
+<ul>
+  <li><b>Prevent cycles when adding.</b> A folder placed inside one of its own descendants would make every recursive method run forever. <code>add</code> refuses it, and the test confirmed that adding a folder to itself or to its own child throws.</li>
+  <li><b>Watch the depth and the cost.</b> Each call walks the whole subtree. For a tree with millions of nodes that is asked for its size on every page view, the totals should be stored at each folder and updated when contents change, which trades a cheap read for a more careful write.</li>
+</ul>
+<p>The pattern appears wherever structure is recursive: files and directories, the elements of a page, groups that contain groups in a permission system, and expressions made of smaller expressions.</p>
+
+<h2 id="bridge">Bridge</h2>
+<p>Notifications vary in two ways that have nothing to do with each other. There are kinds of notice: an album was shared, a weekly digest. And there are channels: email, push. A class for each pairing gives four classes now and nine after one more of each.</p>
+<p>The <dfn>bridge</dfn> pattern separates a design that varies along two independent lines into two hierarchies, and connects them by giving objects of one a reference to an object of the other.</p>
+<pre data-lang="ts" data-title="What a notice says, separated from how it travels">
+// One side: how a message travels.
+export interface Channel {
+  deliver(to: string, title: string, body: string): string;
+}
+export const email: Channel = { deliver: (to, title, body) => `email to ${to}: [${title}] ${body}` };
+export const push: Channel = { deliver: (to, title, body) => `push to ${to}: ${title}: ${body.slice(0, 30)}` };
+
+// The other side: what the message says. Each notice holds a channel and does not care which.
+export abstract class Notice {
+  protected readonly channel: Channel;
+  constructor(channel: Channel) {
+    this.channel = channel;
+  }
+  abstract send(to: string): string;
+}
+
+export class ShareNotice extends Notice {
+  private readonly by: string;
+  private readonly album: string;
+  constructor(channel: Channel, by: string, album: string) {
+    super(channel);
+    this.by = by;
+    this.album = album;
+  }
+  send(to: string): string {
+    return this.channel.deliver(to, "New shared album", `${this.by} shared the album ${this.album} with you`);
+  }
+}
+
+export class DigestNotice extends Notice {
+  private readonly newPhotos: number;
+  constructor(channel: Channel, newPhotos: number) {
+    super(channel);
+    this.newPhotos = newPhotos;
+  }
+  send(to: string): string {
+    return this.channel.deliver(to, "Your week in photos", `${this.newPhotos} new photos in albums you follow`);
+  }
+}
+</pre>
+<p>Both kinds of notice were sent through both channels in the test. Adding a text-message channel is one new object, and every existing notice can use it. Adding a “comment” notice is one new class, and it works on every channel. Kinds and channels now add up where they used to multiply, which is the arithmetic of the calculator in <x-ref to="oop-in-typescript#composition"></x-ref>.</p>
+<p>Bridge is the pattern people find hardest to recognize, because its code is ordinary composition. It differs from its neighbors in when it is applied and why.</p>
+<table>
+<thead><tr><th></th><th>Bridge</th><th>Adapter</th></tr></thead>
+<tbody>
+<tr><th>When</th><td>Designed in from the start</td><td>Added afterward</td></tr>
+<tr><th>Why</th><td>To let two things you own vary independently</td><td>To make something you do not own fit</td></tr>
+</tbody>
+</table>
+
+<h2 id="flyweight">Flyweight</h2>
+<p>Each photo records the camera that took it: maker, model, lens and sensor. A library of a million photos was taken with perhaps fifty cameras. If every photo record carries its own camera object, the same fifty descriptions are stored twenty thousand times each.</p>
+<p>The <dfn>flyweight</dfn> pattern stores state that many objects have in common once, in a shared immutable object, and gives each of the many objects a reference to it.</p>
+<pre data-lang="ts" data-title="One shared object for each distinct camera">
+export type Camera = Readonly<{ make: string; model: string; lens: string; sensor: string }>;
+
+const cameras = new Map<string, Camera>();
+
+// Returns the one shared object for this camera, creating it the first time it is asked for.
+export function cameraFor(make: string, model: string, lens: string, sensor: string): Camera {
+  const key = `${make}|${model}|${lens}|${sensor}`;
+  let camera = cameras.get(key);
+  if (!camera) {
+    camera = Object.freeze({ make, model, lens, sensor }); // frozen: it is shared, so nobody may change it
+    cameras.set(key, camera);
+  }
+  return camera;
+}
+
+export function distinctCameras(): number {
+  return cameras.size;
+}
+</pre>
+
+<figure class="fig wide" id="fig-flyweight">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f605t f605d">
+<title id="f605t">A million photo records sharing fifty camera descriptions</title>
+<desc id="f605d">On the left, a column of photo records, standing for a million of them. Each holds an identifier and a reference to a camera. On the right, three camera description objects, standing for fifty. Many photo records point at each camera object. Below: measured in a test, a million records each with its own camera object used 104 megabytes, and a million records sharing fifty frozen camera objects used 48 megabytes.</desc>
+<text class="tb" x="10" y="18">1,000,000 photo records</text>
+<text class="tb" x="470" y="18">50 camera descriptions, frozen</text>
+<rect class="n store" x="470" y="30" width="240" height="44" rx="4"/>
+<text class="ts tb mid" x="590" y="48">Maker 1, Model X1</text>
+<text class="ts mid" x="590" y="64">24-70mm, full frame</text>
+<rect class="n store" x="470" y="90" width="240" height="44" rx="4"/>
+<text class="ts tb mid" x="590" y="108">Maker 2, Model X7</text>
+<text class="ts mid" x="590" y="124">35mm, full frame</text>
+<rect class="n store" x="470" y="150" width="240" height="44" rx="4"/>
+<text class="ts tb mid" x="590" y="168">Maker 5, Model X12</text>
+<text class="ts mid" x="590" y="184">18-55mm, crop</text>
+<rect class="n" x="10" y="32" width="150" height="16" rx="3"/>
+<text class="ts" x="18" y="44">photo 1: id, camera →</text>
+<path class="e" d="M161 40C300 40 340 52 468 52"/>
+<rect class="n" x="10" y="52" width="150" height="16" rx="3"/>
+<text class="ts" x="18" y="64">photo 2: id, camera →</text>
+<path class="e" d="M161 60C300 60 340 52 468 52"/>
+<rect class="n" x="10" y="72" width="150" height="16" rx="3"/>
+<text class="ts" x="18" y="84">photo 3: id, camera →</text>
+<path class="e" d="M161 80C300 80 340 112 468 112"/>
+<rect class="n" x="10" y="92" width="150" height="16" rx="3"/>
+<text class="ts" x="18" y="104">photo 4: id, camera →</text>
+<path class="e" d="M161 100C300 100 340 52 468 52"/>
+<rect class="n" x="10" y="112" width="150" height="16" rx="3"/>
+<text class="ts" x="18" y="124">photo 5: id, camera →</text>
+<path class="e" d="M161 120C300 120 340 172 468 172"/>
+<rect class="n" x="10" y="132" width="150" height="16" rx="3"/>
+<text class="ts" x="18" y="144">photo 6: id, camera →</text>
+<path class="e" d="M161 140C300 140 340 112 468 112"/>
+<rect class="n" x="10" y="152" width="150" height="16" rx="3"/>
+<text class="ts" x="18" y="164">photo 7: id, camera →</text>
+<path class="e" d="M161 160C300 160 340 52 468 52"/>
+<rect class="n" x="10" y="172" width="150" height="16" rx="3"/>
+<text class="ts" x="18" y="184">photo 8: id, camera →</text>
+<path class="e" d="M161 180C300 180 340 172 468 172"/>
+<text class="ts mid" x="85" y="206">…and 999,992 more</text>
+<text class="ts" x="200" y="206">Measured: 104 MB with a camera object in every record, 48 MB with the fifty shared.</text>
+</svg>
+</div>
+<figcaption>The shared objects must be immutable. If one record could edit “its” camera, it would edit the camera of twenty thousand others.</figcaption>
+</figure>
+
+<p>Measured on Node.js 22, a million small records that each held their own four-field camera object occupied 104 MB of heap. The same million records sharing fifty frozen camera objects occupied 48 MB. Each private copy had been costing 56 bytes, a million times over.</p>
+
+<div class="widget" data-widget="sharing">
+<h4>Memory used by a repeated part, stored in every object or shared</h4>
+<p>What sharing saves, given how many objects there are and how many distinct values they hold.</p>
+<div class="controls">
+  <label>Objects<input type="number" name="objects" value="1000000" min="1" max="10000000000" step="1"></label>
+  <label>Distinct values of the shared part<input type="number" name="distinct" value="50" min="1" max="10000000000" step="1"></label>
+  <label>Size of the shared part, bytes<input type="number" name="part" value="56" min="1" max="1000000" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>A copy in every object</dt><dd data-out="own">56 MB</dd></div>
+  <div><dt>Shared</dt><dd data-out="shared">2.8 kB</dd></div>
+  <div><dt>Saved</dt><dd data-out="saved">56 MB</dd></div>
+  <div><dt>Objects for each shared part</dt><dd data-out="each">20 thousand</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">1 million objects that each carry their own copy of a 56-byte part use 56 MB for those parts. If only 50 distinct values exist, sharing them takes 2.8 kB and saves 56 MB. Each shared part serves about 20 thousand objects, which is the condition that makes the pattern pay.</p>
+</div>
+
+<p>Two conditions make the pattern safe and worthwhile.</p>
+<ul>
+  <li><b>The shared part must never change.</b> The camera objects are frozen, and the test confirmed that assigning to one throws. If a record could edit “its” camera, it would be editing the camera of every other record that shares it.</li>
+  <li><b>There must be far fewer distinct values than objects.</b> With the ratio at twenty thousand to one, sharing removes nearly all of the cost. As the ratio approaches one, the lookup table costs more than it saves.</li>
+</ul>
+<p>The language already does this for you in one case: identical string literals are generally stored once. The pattern is the same idea applied by hand to larger values. It is an optimization, and like every optimization it should follow a measurement, not precede one.</p>
+
+<h2 id="choosing">Telling them apart</h2>
+<table>
+<thead><tr><th>You have</th><th>You want</th><th>Pattern</th><th>Do not use it when</th></tr></thead>
+<tbody>
+<tr><th>A library with the wrong interface</th><td>To use it through your own interface</td><td>Adapter</td><td>You control both sides and can change one of them</td></tr>
+<tr><th>An object behind an interface</th><td>Retries, logging, metrics or caching around it</td><td>Decorator</td><td>Only one class will ever need the behavior. Put it in the class</td></tr>
+<tr><th>An object that is costly, restricted or far away</th><td>To delay, check or redirect access</td><td>Proxy</td><td>The stand-in would hide costs the caller needs to know about</td></tr>
+<tr><th>Several objects that must be used in a set order</th><td>One call for the common task</td><td>Facade</td><td>There is only one caller. A function is enough</td></tr>
+<tr><th>A tree</th><td>To treat a branch like a leaf</td><td>Composite</td><td>Leaves and containers do not share any meaningful operations</td></tr>
+<tr><th>Two independent kinds of variation</th><td>To add to either without touching the other</td><td>Bridge</td><td>One of the two has, and will have, a single form</td></tr>
+<tr><th>Millions of objects repeating the same data</th><td>Less memory</td><td>Flyweight</td><td>You have not measured, or the shared data must change</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Structural patterns appear in low-level design answers mostly without their names. A parking lot with floors that contain rows that contain spots is a composite. A payment provider’s client behind your own <code>PaymentGateway</code> interface is an adapter. “Rate limiting and logging wrap the handler” is a decorator. Use the name once, to show you know it, and spend the time on why the wrapper sits where it does.</p></div>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Wrapping for its own sake. Each wrapper is a place where a call can be delayed, fail or be misunderstood, and a stack of six of them makes a simple question, “what happens when I call send?”, into an investigation. Add a layer when it removes a real duplication or isolates a real boundary, and assemble the stack in one visible place so that it can be read.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>A vendor’s types and errors used throughout the application</th><td>Replacing or upgrading the vendor touches every file</td><td>One adapter. Nothing else imports the vendor’s library</td></tr>
+<tr><th>An adapter that renames methods and passes the vendor’s errors and conventions through</th><td>Callers still depend on the vendor’s behavior</td><td>Translate conventions too: missing values, errors, units</td></tr>
+<tr><th>Retry, logging and caching written inside every implementation</th><td>The same code in each, slightly different</td><td>Decorators written once against the interface</td></tr>
+<tr><th>Decorators assembled in arbitrary order</th><td>Retries that are not logged, caches that hold errors, checks that run after the work</td><td>Decide the order deliberately and assemble in one place</td></tr>
+<tr><th>A facade with a method for every caller’s special case</th><td>A class that everything depends on and everyone edits</td><td>Keep it to the common tasks, and let unusual callers use the parts</td></tr>
+<tr><th>A tree that can contain itself</th><td>Recursion that never ends</td><td>Refuse cycles when adding</td></tr>
+<tr><th>A class for every pairing of two independent choices</th><td>The count multiplies with every addition</td><td>Two small hierarchies and a reference between them</td></tr>
+<tr><th>Shared objects that can be modified</th><td>A change through one owner appears in thousands of others</td><td>Freeze whatever is shared</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="oop-in-typescript"></x-ref>: composition over inheritance, which every pattern in this chapter applies.</li>
+  <li><x-ref to="creational-patterns"></x-ref>: factories and the composition root, where wrappers are assembled.</li>
+  <li><x-ref to="behavioral-patterns"></x-ref>: strategy and chain of responsibility, close relatives of bridge and decorator.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: retries, timeouts and circuit breakers, which are usually applied as decorators.</li>
+  <li><x-ref to="caching"></x-ref>: the caching proxy at the scale of a system.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref>: proxies and gateways between machines.</li>
+  <li><x-ref to="application-architecture"></x-ref>: adapters as the outer ring of an application.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Adapter, decorator, proxy and facade all put one object in front of another. Tell them apart by the interfaces on each side and the reason for the wrapper.</li>
+  <li>An adapter gives something foreign the interface you need, and translates its conventions as well as its names.</li>
+  <li>A decorator keeps the interface and adds behavior. Decorators stack, and their order changes what happens.</li>
+  <li>A proxy keeps the interface and controls access: later, only if allowed, somewhere else, or not again.</li>
+  <li>A facade offers one simple entry point to several objects without hiding them.</li>
+  <li>A composite gives a container the interface of its contents, so trees can be used like single items. Guard against cycles.</li>
+  <li>A bridge splits two independent kinds of variation so that they add up and do not multiply.</li>
+  <li>A flyweight shares immutable data among many objects. Measure first, and freeze what is shared.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A class holds a <code>PaymentProvider</code> and implements <code>PaymentProvider</code>, adding a timeout to every call. Another holds a vendor’s <code>StripeClient</code> and implements your <code>PaymentProvider</code>. Name each pattern and say how you can tell.</summary><p>The first is a decorator: the same interface on both sides, with behavior added. The second is an adapter: the interface it presents differs from the interface of what it holds, and its purpose is translation. The structure of the code is the same in both, a field and forwarding methods. The interfaces and the intent decide the name.</p></details>
+<details><summary>The vendor’s client throws an error named <code>NoSuchKey</code> for a missing object, and your interface returns <code>null</code> for a missing photo. Where should the conversion happen, and what should happen to other errors?</summary><p>In the adapter, and only for that specific error. Catch it, check that it is the “missing” error and return <code>null</code>. Any other error, such as a timeout or a permission failure, must be rethrown, because turning it into <code>null</code> would tell callers that a photo does not exist when in fact the store could not be reached.</p></details>
+<details><summary>A notifier is wrapped as <code>new Retrying(new Logging(email))</code>. The mail server fails twice and then succeeds. How many lines does the log contain, and how many with the wrappers the other way round?</summary><p>Six: “sending” and “failed” for each of the two failures, then “sending” and “sent”. The logging wrapper is inside the retries, so it sees every attempt. As <code>new Logging(new Retrying(email))</code> there are two lines, “sending” and “sent”, because the logging wrapper is outside and sees a single call that eventually succeeded.</p></details>
+<details><summary>What distinguishes a proxy from a decorator if both have the same interface as the object they wrap?</summary><p>Purpose. A decorator adds to the behavior of a call that goes ahead. A proxy governs the call itself: whether it happens (protection), when the real object comes into existence (lazy), where it is carried out (remote) or whether it needs to happen again (caching). In practice the line is blurry, and a caching wrapper is called either.</p></details>
+<details><summary>Why is a facade not a violation of the single responsibility principle, and when does it become one?</summary><p>A facade has one responsibility: coordinating the parts for a common task, in the right order. It does not do the scanning or the storing itself. It becomes a problem when it accumulates methods for unrelated tasks or special cases of individual callers, at which point several groups have reasons to change it and everything depends on it.</p></details>
+<details><summary>In a composite of folders and photos, what does <code>new Folder("empty").bytes()</code> return, and why does the code need no special case for it?</summary><p>Zero. <code>bytes</code> adds up the answers of the children starting from zero, and with no children the sum is the starting value. This is typical of composites: the empty container and the single item are handled by the same code as a deep tree.</p></details>
+<details><summary>A game has 500,000 trees on a map. Each has a position, and one of eight species with its own texture and shape data of about 2 MB. Apply the flyweight pattern and estimate the saving.</summary><p>Split each tree into what differs, its position, and what is shared, the species data. Store eight immutable species objects and give each tree a reference to one. Without sharing, the species data alone would be 500,000 × 2 MB, a million megabytes. Shared, it is 16 MB, plus a few bytes for each tree’s position and reference.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Erich Gamma, Richard Helm, Ralph Johnson and John Vlissides, <cite>Design Patterns: Elements of Reusable Object-Oriented Software</cite>, Addison-Wesley, 1994. Chapter 4 covers the seven structural patterns.</li>
+  <li>Eric Freeman and Elisabeth Robson, <cite>Head First Design Patterns</cite>, 2nd edition, O’Reilly, 2020. Especially clear on decorator, adapter and facade.</li>
+  <li>Refactoring.Guru, <a href="https://refactoring.guru/design-patterns/structural-patterns">Structural Design Patterns</a>. Each pattern with diagrams and TypeScript examples.</li>
+  <li>Eric Evans, <cite>Domain-Driven Design</cite>, Addison-Wesley, 2003. The anticorruption layer: adapters and facades between systems.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Proxy">Proxy</a>. JavaScript’s built-in object for intercepting operations on another object.</li>
+</ol>
+</section>

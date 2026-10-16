@@ -1,0 +1,681 @@
+<!--meta
+{ "description": "A Dynamo-style key-value store designed with the method of chapter 76: requirements and estimates for 100 TB and a million operations a second, a ring with virtual nodes and its measured unevenness, quorums measured for staleness and latency with replicas slow or down, sloppy quorums and hinted handoff through a partition, Merkle-tree repair measured in bytes, version vectors against last write wins, failures, growth, and how Dynamo, DynamoDB and Cassandra differ.",
+  "lede": "Earlier chapters explained the parts one at a time: consistent hashing, quorums, hinted handoff, Merkle trees, vector clocks. This chapter assembles them into one store that stays writable through failures, and then measures the claims each part makes: how even a ring is, how often a quorum read is stale, what a partition costs, and how many bytes a repair needs.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a distributed key-value store. Clients put and get values by key. It must hold far more data than one machine, keep working when machines fail, and accept writes even during a network partition.</p></div>
+<p>The interface is two operations, and every hard part is underneath them. Keys must be spread over machines so that adding one moves little data. Each key needs copies on several machines, and those copies will disagree whenever a write misses one of them. The system must decide, for every read, how many copies to ask, and must repair the copies that fell behind without comparing everything with everything. The mechanisms are in <x-ref to="partitioning"></x-ref>, <x-ref to="replication#leaderless"></x-ref> and <x-ref to="consistency-models#tunable"></x-ref>; this chapter puts them together and measures them.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th><code>get(key)</code>, <code>put(key, value)</code> and <code>delete(key)</code>, values up to 1 MB</th><td>In scope</td></tr>
+<tr><th>The number of copies to wait for, chosen for each request</th><td>In scope</td></tr>
+<tr><th>Concurrent writes kept rather than silently dropped, for data such as shopping carts</th><td>In scope</td></tr>
+<tr><th>Range scans, secondary indexes, transactions over several keys, several regions</th><td>Out of scope. The last is a follow-up question</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>100 TB of data before copies, values of 1 KB on average: 100 billion keys. 1 million operations a second at peak, 70% of them reads</td></tr>
+<tr><th>Latency</th><td>99% of operations within 10 ms, inside one region</td></tr>
+<tr><th>Availability</th><td>Writes accepted while any node that could hold the key is reachable</td></tr>
+<tr><th>Durability</th><td>No acknowledged write lost when one node or one disk fails</td></tr>
+<tr><th>Consistency</th><td>Chosen per request. By default a read sees every write acknowledged before it began</td></tr>
+</tbody>
+</table>
+<p>The availability line is the one that makes this a Dynamo-style store. A store that may refuse writes during a partition can use a leader for each key range and consensus, as <x-ref to="replication#consensus-replication"></x-ref> describes, and many do. Asking for writes during a partition rules that out and brings conflicts in.</p>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">stored      100 TB × 3 copies = 300 TB                    ÷ 4 TB a node = 75 nodes
+operations  reads 700,000 × 2 copies asked + writes 300,000 × 3 copies = 2.3 million a second
+per node    2.3 million ÷ 75 ≈ 31,000 operations a second, about 31 MB/s at 1 KB each
+memory      100 billion × 3 ÷ 75 = 4 billion keys a node × 10 bits of Bloom filter ≈ 5 GB a node
+rebuild     4 TB at 1 GB/s into a replacement node ≈ 67 minutes, if enough nodes can send</div>
+<p>The 4 TB a node and the 1 GB/s a new node can absorb are assumptions; 10 bits a key gives a Bloom filter about a 1% false-positive rate (<x-ref to="probabilistic-structures#bloom-sizing"></x-ref>). The numbers say three things. The store is sized by disk, not by operations: 31,000 a second is comfortable for one machine with SSDs. Every node needs gigabytes of memory for filters alone. And the time to rebuild a failed node depends on how many other nodes hold copies of its data, which is decided by how keys are placed. The calculator places them.</p>
+
+<div class="widget wide" data-widget="ring79">
+<h4>The ring</h4>
+<p>Places nodes on a ring by hashing their names, as the chapter’s code does, and measures what that placement means.</p>
+<div class="controls">
+  <label>Data before copies, TB<input type="number" name="data" value="100" min="1" max="100000" step="1"></label>
+  <label>Copies of each key<input type="number" name="copies" value="3" min="1" max="7" step="1"></label>
+  <label>Data a node holds on average, TB<input type="number" name="pernode" value="4" min="0.1" max="1000" step="0.1"></label>
+  <label>Tokens per node<input type="number" name="tokens" value="16" min="1" max="512" step="1"></label>
+  <label>Rebuild stream from each node, MB/s<input type="number" name="stream" value="100" min="1" max="100000" step="10"></label>
+  <label>What a new node can absorb, MB/s<input type="number" name="ingest" value="1000" min="1" max="100000" step="10"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 170" role="img" aria-label="An area of the data each node holds, largest first, as a multiple of the average, with a dashed line at the average and a dot at the fullest node."><text x="10" y="12" class="ts">Data on each node, largest first, as a multiple of the average</text><line x1="50" y1="130" x2="600" y2="130" class="grid" style=""></line><text x="44" y="134" class="ts end">0×</text><line x1="50" y1="76" x2="600" y2="76" class="axis" style="stroke-dasharray:4 3"></line><text x="44" y="80" class="ts end">1×</text><line x1="50" y1="22" x2="600" y2="22" class="grid" style=""></line><text x="44" y="26" class="ts end">2×</text><path d="M50 130 L50 50.3 L57.3 50.3 L57.3 57.2 L64.7 57.2 L64.7 60.1 L72 60.1 L72 61.1 L79.3 61.1 L79.3 63.8 L86.7 63.8 L86.7 64.6 L94 64.6 L94 64.8 L101.3 64.8 L101.3 65.3 L108.7 65.3 L108.7 65.8 L116 65.8 L116 66.1 L123.3 66.1 L123.3 67.1 L130.7 67.1 L130.7 67.1 L138 67.1 L138 68 L145.3 68 L145.3 68 L152.7 68 L152.7 68.4 L160 68.4 L160 68.6 L167.3 68.6 L167.3 68.9 L174.7 68.9 L174.7 69.1 L182 69.1 L182 69.8 L189.3 69.8 L189.3 70 L196.7 70 L196.7 70.2 L204 70.2 L204 70.5 L211.3 70.5 L211.3 71.6 L218.7 71.6 L218.7 71.8 L226 71.8 L226 72.3 L233.3 72.3 L233.3 72.3 L240.7 72.3 L240.7 73.8 L248 73.8 L248 74.1 L255.3 74.1 L255.3 74.2 L262.7 74.2 L262.7 74.3 L270 74.3 L270 74.3 L277.3 74.3 L277.3 74.8 L284.7 74.8 L284.7 75 L292 75 L292 75.1 L299.3 75.1 L299.3 75.9 L306.7 75.9 L306.7 76 L314 76 L314 76.1 L321.3 76.1 L321.3 76.2 L328.7 76.2 L328.7 76.3 L336 76.3 L336 76.6 L343.3 76.6 L343.3 77.1 L350.7 77.1 L350.7 77.3 L358 77.3 L358 77.9 L365.3 77.9 L365.3 78.1 L372.7 78.1 L372.7 78.1 L380 78.1 L380 78.4 L387.3 78.4 L387.3 78.6 L394.7 78.6 L394.7 79 L402 79 L402 79.5 L409.3 79.5 L409.3 79.6 L416.7 79.6 L416.7 80.1 L424 80.1 L424 80.1 L431.3 80.1 L431.3 80.8 L438.7 80.8 L438.7 81.9 L446 81.9 L446 81.9 L453.3 81.9 L453.3 82 L460.7 82 L460.7 83.1 L468 83.1 L468 84.5 L475.3 84.5 L475.3 84.5 L482.7 84.5 L482.7 84.6 L490 84.6 L490 84.8 L497.3 84.8 L497.3 84.8 L504.7 84.8 L504.7 85.6 L512 85.6 L512 85.9 L519.3 85.9 L519.3 85.9 L526.7 85.9 L526.7 86.5 L534 86.5 L534 86.6 L541.3 86.6 L541.3 86.8 L548.7 86.8 L548.7 87.2 L556 87.2 L556 87.3 L563.3 87.3 L563.3 87.7 L570.7 87.7 L570.7 87.7 L578 87.7 L578 87.7 L585.3 87.7 L585.3 90.3 L592.7 90.3 L592.7 92.5 L600 92.5 L600 130Z" class="bar store"></path><circle cx="53.7" cy="43.3" r="4" class="dot"></circle><text x="63.7" y="47.3" class="ts tb">fullest node: 1.48×</text><text x="50" y="148" class="ts">75 nodes with 16 tokens each, placed by hashing their names, 3 copies of every key.</text><text x="50" y="164" class="ts">The dashed line is the average.</text></svg>
+<dl class="results">
+  <div><dt>Nodes</dt><dd data-out="nodes">75 nodes, 4 TB each on average</dd></div>
+  <div><dt>Fullest node</dt><dd data-out="fullest">5.9 TB, 1.48 times the average</dd></div>
+  <div><dt>Rebuilding one node</dt><dd data-out="rebuild">75.8 min, from 48 nodes</dd></div>
+  <div><dt>Pairs of nodes that share a key</dt><dd data-out="pairs">59.5%</dd></div>
+  <div><dt>Moved when a node joins</dt><dd data-out="join">3.95 TB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">300 TB in all needs 75 nodes of 4 TB on average, but the fullest holds 1.48 times the average, so disks must be sized for it or tokens placed with care. A failed node is rebuilt from 48 nodes in about 75.8 min. 59.5% of pairs of nodes hold a copy of some key together: two failures at once that hit such a pair leave those keys with one copy.</p>
+</div>
+<p>At the defaults the fullest of 75 nodes holds 1.48 times the average, 5.9 TB on a disk planned for 4. Step 6a measures why, and what the number of tokens trades against it.</p>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Reads return a context; writes send it back">
+GET /kv/cart:ana?r=2
+→ 200 OK
+  { "values": [ ["socks"], ["socks", "tea"] ], "context": "b3M6MSx0ZTox" }
+
+PUT /kv/cart:ana?w=2
+  { "value": ["socks", "tea", "pens"], "context": "b3M6MSx0ZTox" }
+→ 204 No Content
+
+DELETE /kv/cart:ana?w=2      (context required, as for a put)
+→ 204 No Content
+GET /kv/cart:bob?r=2         → 404 Not Found
+PUT /kv/cart:ana?w=3         → 503 Service Unavailable: 2 of 3 copies reachable
+</pre>
+<ul>
+  <li><b>Context.</b> A read returns an opaque context, the merged version vectors of what it saw, and a write must send it back. That is how the store knows which earlier versions a write replaces and which it is concurrent with (step 6d).</li>
+  <li><b>Several values.</b> A read can return more than one value when writes were concurrent. The client merges them and writes the result with the context, which replaces them all.</li>
+  <li><b>Per-request quorums.</b> <code>r</code> and <code>w</code> choose how many copies to wait for. A request that cannot reach enough copies fails with 503, and a write that failed may still have been stored on the copies it reached (step 6b).</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Where</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A key’s value, version vector, and a tombstone flag for deletes</th><td>On each of its three nodes, in a log-structured engine: commit log, memtable, sorted files with Bloom filters (<x-ref to="storage-engines#lsm"></x-ref>)</td><td>Writes are appends, the fastest thing a disk does. Reads check the filters and skip most files</td></tr>
+<tr><th>The ring: each node’s tokens</th><td>On every node, spread by gossip (<x-ref to="membership-and-coordination#gossip"></x-ref>)</td><td>Any node can coordinate any request without asking a central service</td></tr>
+<tr><th>Hints: writes held for a node that was down</th><td>On the stand-in node, in a separate store</td><td>Delivered when the owner returns, then deleted</td></tr>
+<tr><th>A Merkle tree for each key range</th><td>On each node holding that range</td><td>Built for repair, compared with the other copies’ trees</td></tr>
+</tbody>
+</table>
+<p>A delete cannot remove the key, because a copy that missed the delete would later hand the old value back during repair. It writes a tombstone instead (<x-ref to="storage-engines#lsm"></x-ref>), which must be kept longer than the longest time a copy can go unrepaired.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 380" role="img" aria-labelledby="f791t f791d">
+<title id="f791t">The ring, a key’s replicas, and inside one node</title>
+<desc id="f791d">Left: eight nodes, A to H, on a ring. A key hashes to a point between A and B, so its replicas are the next three nodes clockwise, B, C and D, and E is the stand-in if one of them is down. A client sends the request to node A, which coordinates: it forwards to B, C and D and waits for W or R of them. Nodes learn the ring and who is down by gossip. Right: one node’s storage: a commit log, a sorted table in memory, files on disk each with a Bloom filter, hints held for other nodes, and a Merkle tree for each key range.</desc>
+<circle class="n sunk" cx="215" cy="205" r="135" style="fill:none"/>
+<circle class="n " cx="215.0" cy="70.0" r="17"/>
+<text class="tb mid" x="215.0" y="75.0">A</text>
+<circle class="n store" cx="310.5" cy="109.5" r="17"/>
+<text class="tb mid" x="310.5" y="114.5">B</text>
+<circle class="n store" cx="350.0" cy="205.0" r="17"/>
+<text class="tb mid" x="350.0" y="210.0">C</text>
+<circle class="n store" cx="310.5" cy="300.5" r="17"/>
+<text class="tb mid" x="310.5" y="305.5">D</text>
+<circle class="n async" cx="215.0" cy="340.0" r="17"/>
+<text class="tb mid" x="215.0" y="345.0">E</text>
+<circle class="n " cx="119.5" cy="300.5" r="17"/>
+<text class="tb mid" x="119.5" y="305.5">F</text>
+<circle class="n " cx="80.0" cy="205.0" r="17"/>
+<text class="tb mid" x="80.0" y="210.0">G</text>
+<circle class="n " cx="119.5" cy="109.5" r="17"/>
+<text class="tb mid" x="119.5" y="114.5">H</text>
+<circle class="dot" style="fill:var(--fault)" cx="265.6" cy="79.8" r="5"/>
+<text class="ts" x="273.6" y="69.8">key k hashes here</text>
+<rect class="n" x="10" y="18" width="92" height="40" rx="6"/>
+<text class="tb mid" x="56" y="42.5">Client</text>
+<path class="e sig" d="M102 38L199.0 63.0"/>
+<text class="ts" x="120" y="32">put k</text>
+<path class="e sig" d="M231.6 76.9L292.9 102.3"/>
+<path class="e sig" d="M227.7 82.7L336.6 191.6"/>
+<path class="e sig" d="M221.9 86.6L303.2 282.9"/>
+<text class="ts mid" x="215" y="197">A coordinates:</text>
+<text class="ts mid" x="215" y="213">replicas B, C, D</text>
+<text class="ts mid" x="215" y="229">wait for W or R</text>
+<text class="ts" x="239.0" y="344.0">E: stand-in, with a hint</text>
+<text class="ts" x="10" y="368">Nodes learn the ring, and who is down, by gossip.</text>
+<rect class="n" x="440" y="18" width="270" height="340" rx="8"/>
+<text class="tb mid" x="575" y="40">Inside one node</text>
+<rect class="n store" x="456" y="54" width="238" height="50" rx="6"/>
+<text class="tb mid" x="575" y="75">Commit log</text>
+<text class="ts mid" x="575" y="92">appended, then acknowledged</text>
+<rect class="n" x="456" y="112" width="238" height="50" rx="6"/>
+<text class="tb mid" x="575" y="133">Memtable</text>
+<text class="ts mid" x="575" y="150">sorted, in memory</text>
+<rect class="n store" x="456" y="170" width="238" height="50" rx="6"/>
+<text class="tb mid" x="575" y="191">SSTables on disk</text>
+<text class="ts mid" x="575" y="208">each with a Bloom filter</text>
+<rect class="n async" x="456" y="228" width="238" height="50" rx="6"/>
+<text class="tb mid" x="575" y="249">Hints</text>
+<text class="ts mid" x="575" y="266">writes held for other nodes</text>
+<rect class="n" x="456" y="286" width="238" height="50" rx="6"/>
+<text class="tb mid" x="575" y="307">Merkle trees</text>
+<text class="ts mid" x="575" y="324">one per key range</text>
+<path class="e sig" d="M575 104V112"/>
+<path class="e sig" d="M575 162V170"/>
+</svg>
+</div>
+<figcaption>Every node is equal: any can coordinate, and the ring decides which three hold each key. Inside, each node is the log-structured engine of the storage chapter.</figcaption>
+</figure>
+
+<p>A key’s <dfn>preference list</dfn> is the list of nodes that should hold it: the first three distinct nodes clockwise from its position on the ring, followed by the nodes after them, which stand in when one of the three is down. Any node can coordinate a request, usually one the client library already knows holds the key. The coordinator sends the request to the key’s replicas and answers once enough have replied. A client library that knows the ring sends each request straight to one of the key’s replicas and saves a network hop; any other node would forward it.</p>
+<p>Inside a replica, a write is appended to the commit log, flushed to disk, and inserted into the memtable before the replica confirms it. A read looks in the memtable and then in the sorted files from newest to oldest, and each file’s Bloom filter answers “certainly not here” for most of them without a disk read. The node keeps the newest version it finds, or all of them if they are siblings.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 520" role="img" aria-labelledby="f792t f792d">
+<title id="f792t">A write while one replica is down, and a read that repairs</title>
+<desc id="f792d">Two sequences between a client, the coordinator A, replicas B, C and D, and the stand-in E. Writing with D down: A sends the write to B and C and, in place of D, to E with a hint; B and C confirm, so with W equal to 2 the client gets success; later E delivers the hint to D. Reading: A asks B, C and D; D and B answer first, D with the old version 6 and B with version 7; A returns version 7 to the client and writes it back to D.</desc>
+<text class="tb" x="10" y="16">Writing version 7 of k while D is down</text>
+<g data-scene="write">
+<text class="tb mid" x="46" y="40">Client</text>
+<line class="axis" x1="46" y1="48" x2="46" y2="262"/>
+<text class="tb mid" x="170" y="40">A, coordinator</text>
+<line class="axis" x1="170" y1="48" x2="170" y2="262"/>
+<text class="tb mid" x="300" y="40">B</text>
+<line class="axis" x1="300" y1="48" x2="300" y2="262"/>
+<text class="tb mid" x="410" y="40">C</text>
+<line class="axis" x1="410" y1="48" x2="410" y2="262"/>
+<text class="tb mid" x="520" y="40">D</text>
+<line class="axis" x1="520" y1="48" x2="520" y2="262"/>
+<text class="tb mid" x="640" y="40">E</text>
+<line class="axis" x1="640" y1="48" x2="640" y2="262"/>
+<g data-s="1">
+<path class="e sig" d="M47 72H169"/>
+<text class="ts mid" x="108.0" y="66">1. put k = v7</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M171 99H299"/>
+<text class="ts mid" x="235.0" y="93">2. v7</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M171 126H409"/>
+<text class="ts mid" x="290.0" y="120">v7</text>
+</g>
+<g data-s="3">
+<path class="e async" d="M171 153H639"/>
+<text class="ts mid" x="405.0" y="147">3. v7, hint: for D</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M299 180H171"/>
+<text class="ts mid" x="235.0" y="174">4. ok</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M169 207H47"/>
+<text class="ts mid" x="108.0" y="201">5. ok</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M639 234H521"/>
+<text class="ts mid" x="580.0" y="228">6. hinted v7, later</text>
+</g>
+</g>
+<path class="e none dash" d="M10 276H710"/>
+<text class="tb" x="10" y="296">Reading k before the hint arrived</text>
+<g data-scene="read">
+<text class="tb mid" x="46" y="320">Client</text>
+<line class="axis" x1="46" y1="328" x2="46" y2="514"/>
+<text class="tb mid" x="170" y="320">A, coordinator</text>
+<line class="axis" x1="170" y1="328" x2="170" y2="514"/>
+<text class="tb mid" x="300" y="320">B</text>
+<line class="axis" x1="300" y1="328" x2="300" y2="514"/>
+<text class="tb mid" x="410" y="320">C</text>
+<line class="axis" x1="410" y1="328" x2="410" y2="514"/>
+<text class="tb mid" x="520" y="320">D</text>
+<line class="axis" x1="520" y1="328" x2="520" y2="514"/>
+<text class="tb mid" x="640" y="320">E</text>
+<line class="axis" x1="640" y1="328" x2="640" y2="514"/>
+<g data-s="1">
+<path class="e sig" d="M47 352H169"/>
+<text class="ts mid" x="108.0" y="346">1. get k</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M171 378H299"/>
+<text class="ts mid" x="235.0" y="372">2. get</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M171 404H519"/>
+<text class="ts mid" x="345.0" y="398">get</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M519 430H171"/>
+<text class="ts mid" x="345.0" y="424">3. v6</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M299 456H171"/>
+<text class="ts mid" x="235.0" y="450">4. v7</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M169 482H47"/>
+<text class="ts mid" x="108.0" y="476">5. v7</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M171 508H519"/>
+<text class="ts mid" x="345.0" y="502">6. repair: v7</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="write" data-label="Write">
+  <li data-msg="put" data-state="B: v6; C: v6; D: v6, down; E holds: nothing">The client sends the write to any node. A coordinates it.</li>
+  <li data-msg="v7" data-state="B: v7; C: v6; D: v6, down; E holds: nothing">A sends the write to the key’s replicas that gossip says are up.</li>
+  <li data-msg="hint" data-state="B: v7; C: v7; D: v6, down; E holds: v7 for D">D is down, so the next node on the ring, E, takes D’s copy with a note saying whose it is.</li>
+  <li data-msg="ok" data-state="B: v7; C: v7; D: v6, down; E holds: v7 for D">B confirms, and C does too. Two confirmations meet W = 2.</li>
+  <li data-msg="ok" data-state="B: v7; C: v7; D: v6, down; E holds: v7 for D">The client is told the write succeeded, with one home replica missing.</li>
+  <li data-msg="hint" data-state="B: v7; C: v7; D: v7; E holds: nothing">When gossip shows D up again, E hands over the hint and deletes it.</li>
+</ol>
+<ol class="steps" data-scene="read" data-label="Read">
+  <li data-msg="get" data-state="B: v7; C: v7; D: v6">A read for the same key, before D has its hint.</li>
+  <li data-msg="get" data-state="B: v7; C: v7; D: v6">A asks all three replicas and will answer after R = 2 replies.</li>
+  <li data-msg="v6" data-state="B: v7; C: v7; D: v6">D answers first, with the version it had before it went down.</li>
+  <li data-msg="v7" data-state="B: v7; C: v7; D: v6">B answers with version 7. Two replies: the newest of them is v7.</li>
+  <li data-msg="v7" data-state="B: v7; C: v7; D: v6">The client gets version 7. The overlap of W and R guaranteed one fresh reply.</li>
+  <li data-msg="v7" data-state="B: v7; C: v7; D: v7">A writes version 7 back to D. Read repair fixes the keys that are read.</li>
+</ol>
+<figcaption>A sloppy quorum keeps writes available with a replica down; the hint, read repair and anti-entropy bring the replica back in line.</figcaption>
+</figure>
+
+<h2 id="placement">Step 6a: Placing keys on the ring</h2>
+<p><x-ref to="partitioning#consistent-hashing"></x-ref> explained why virtual nodes help. The chapter’s code measures how much, by computing exactly what share of all data each of 100 nodes holds when each key has three copies.</p>
+
+<figure class="fig wide" id="fig-spread">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f793t f793d">
+<title id="f793t">How evenly a ring spreads data</title>
+<desc id="f793d">The data held by the fullest and the emptiest of 100 nodes, as a multiple of the average, against tokens per node, with three copies of every key. Fullest: 1 tokens 2.34, 4 tokens 2.19, 16 tokens 1.42, 64 tokens 1.15, 256 tokens 1.13. Emptiest: 1 tokens 0.18, 4 tokens 0.34, 16 tokens 0.69, 64 tokens 0.80, 256 tokens 0.90.</desc>
+<text class="tb" x="10" y="18">Data on the fullest and emptiest of 100 nodes, as a multiple of the average</text>
+<line class="grid" x1="70" y1="230.0" x2="560" y2="230.0"/>
+<text class="ts end" x="62" y="234.0">0×</text>
+<line class="grid" x1="70" y1="190.8" x2="560" y2="190.8"/>
+<text class="ts end" x="62" y="194.8">0.5×</text>
+<line class="axis" x1="70" y1="151.6" x2="560" y2="151.6" style="stroke-dasharray:4 3"/>
+<text class="ts end" x="62" y="155.6">1×</text>
+<line class="grid" x1="70" y1="112.4" x2="560" y2="112.4"/>
+<text class="ts end" x="62" y="116.4">1.5×</text>
+<line class="grid" x1="70" y1="73.2" x2="560" y2="73.2"/>
+<text class="ts end" x="62" y="77.2">2×</text>
+<line class="grid" x1="70" y1="34.0" x2="560" y2="34.0"/>
+<text class="ts end" x="62" y="38.0">2.5×</text>
+<text class="ts mid" x="70.0" y="248">1</text>
+<text class="ts mid" x="192.5" y="248">4</text>
+<text class="ts mid" x="315.0" y="248">16</text>
+<text class="ts mid" x="437.5" y="248">64</text>
+<text class="ts mid" x="560.0" y="248">256</text>
+<text class="ts mid" x="315.0" y="270">Tokens per node (log scale)</text>
+<path class="line" style="stroke:var(--fault)" d="M70.0 46.8 L192.5 58.2 L315.0 118.9 L437.5 139.7 L560.0 141.6"/>
+<circle class="dot" style="fill:var(--fault)" cx="70.0" cy="46.8" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="192.5" cy="58.2" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="315.0" cy="118.9" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="437.5" cy="139.7" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="560.0" cy="141.6" r="3.5"/>
+<text class="ts" x="568" y="145.6">fullest node</text>
+<path class="line" style="stroke:var(--sig)" d="M70.0 215.7 L192.5 203.5 L315.0 175.9 L437.5 167.4 L560.0 159.4"/>
+<circle class="dot" style="fill:var(--sig)" cx="70.0" cy="215.7" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="192.5" cy="203.5" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="315.0" cy="175.9" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="437.5" cy="167.4" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="560.0" cy="159.4" r="3.5"/>
+<text class="ts" x="568" y="163.4">emptiest node</text>
+<text class="ts" x="76" y="145.6">average</text>
+<rect class="hit" x="70" y="34" width="61.25" height="196" data-tip="1 tokens per node|fullest 2.34×, emptiest 0.18× the average|a failed node is copied from 4 nodes|4.0% of node pairs share a key"/>
+<rect class="hit" x="131.25" y="34" width="122.5" height="196" data-tip="4 tokens per node|fullest 2.19×, emptiest 0.34× the average|a failed node is copied from 16 nodes|15.2% of node pairs share a key"/>
+<rect class="hit" x="253.75" y="34" width="122.5" height="196" data-tip="16 tokens per node|fullest 1.42×, emptiest 0.69× the average|a failed node is copied from 52 nodes|48.5% of node pairs share a key"/>
+<rect class="hit" x="376.25" y="34" width="122.5" height="196" data-tip="64 tokens per node|fullest 1.15×, emptiest 0.80× the average|a failed node is copied from 91 nodes|92.5% of node pairs share a key"/>
+<rect class="hit" x="498.75" y="34" width="61.25" height="196" data-tip="256 tokens per node|fullest 1.13×, emptiest 0.90× the average|a failed node is copied from 99 nodes|100.0% of node pairs share a key"/>
+</svg>
+</div>
+<figcaption>Computed exactly from the ring for 100 nodes placed by hashing their names. With one token the fullest node holds 2.3 times the average; with 256, 1.13 times.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Tokens per node</th><th>Fullest node</th><th>Emptiest node</th><th>Nodes a failed node is rebuilt from</th><th>Pairs of nodes that share some key</th></tr></thead>
+<tbody>
+<tr><th>1</th><td>2.34 × average</td><td>0.18 ×</td><td>4</td><td>4.0%</td></tr>
+<tr><th>16</th><td>1.42 ×</td><td>0.69 ×</td><td>52</td><td>48.5%</td></tr>
+<tr><th>256</th><td>1.13 ×</td><td>0.90 ×</td><td>99</td><td>100%</td></tr>
+</tbody>
+</table>
+<p>More tokens make the ring more even and spread a rebuild over more nodes, so that it is limited by what the new node can absorb rather than by what a few neighbors can send; the calculator above turns that into hours. A node joining took about 1% of the data in every case, as consistent hashing promises. The last column is the cost. With one token, two nodes fail “together” for some key only if they are neighbors on the ring: 4% of pairs. With 256 tokens every pair of nodes shares some key range, so any two nodes failing at once leave some keys with one copy and no quorum of two. Cassandra reduced its default from 256 tokens to 16 in version 4.0 for this reason and for faster repairs, and added an allocator that places the 16 tokens deliberately rather than by hash, which removes most of the unevenness shown above. Dynamo’s paper reached a similar end by another road: fixed, equal-sized partitions handed out to nodes.</p>
+<p>Adding capacity follows from the same numbers. A node joining the default ring of the calculator takes 3.95 TB, about one 76th of what is stored, from the nodes whose ranges its 16 tokens split. At 1 GB/s that is about 66 minutes of streaming, during which those nodes serve their normal traffic as well; operators add nodes one at a time and throttle the streams.</p>
+
+<h2 id="quorums">Step 6b: Quorums when replicas are slow or down</h2>
+<p>The overlap rule of <x-ref to="replication#leaderless"></x-ref> says that W + R greater than N rules out stale reads. The simulation tests it with a key written every 10 ms and read 1,000 times a second, over a network where each message takes a fraction of a millisecond and 1% are delayed by 20 ms, as by a pause on the receiving node. A read is stale if it returns a version older than the newest write already confirmed when the read began.</p>
+<table>
+<thead><tr><th>W, R</th><th>Stale reads</th><th>99th percentile write</th><th>99th percentile read</th><th>With one of three replicas down</th></tr></thead>
+<tbody>
+<tr><th>1, 1</th><td>1.11%</td><td>1.00 ms</td><td>1.00 ms</td><td>0.73% stale</td></tr>
+<tr><th>2, 1</th><td>0.96%</td><td>1.40 ms</td><td>1.00 ms</td><td>Writes at 99th percentile 20.9 ms</td></tr>
+<tr><th>1, 2</th><td>0.02%</td><td>1.00 ms</td><td>1.40 ms</td><td>Reads at 99th percentile 21.0 ms</td></tr>
+<tr><th>2, 2</th><td>none</td><td>1.40 ms</td><td>1.40 ms</td><td>Both at 99th percentile about 21 ms</td></tr>
+<tr><th>3, 1</th><td>none</td><td>21.0 ms</td><td>1.00 ms</td><td>Every write fails</td></tr>
+<tr><th>1, 3</th><td>none</td><td>1.00 ms</td><td>21.0 ms</td><td>Every read fails</td></tr>
+</tbody>
+</table>
+<p>The overlap rule held: every configuration with W + R greater than 3 returned no stale reads. The latency columns show the other reason for asking all three replicas and waiting for two. Waiting for all three meets the slowest one on every request, and 1% of requests then take 21 ms. Waiting for two of three lets the fastest two answer and hides the slow one, which keeps the 99th percentile at 1.4 ms. With one replica down there is nothing left to hide behind: W = 2 must wait for both survivors, and the slow message reaches the 99th percentile. A failed node costs latency before it costs availability. The store’s default is Dynamo’s common setting, N = 3, W = 2, R = 2.</p>
+<p>A strict quorum stops working when two of a key’s three replicas are unreachable. A sloppy quorum sends the write to the next healthy nodes on the preference list instead, with a hint naming the intended owner (<x-ref to="replication#repair"></x-ref>). The simulation cut two of three replicas off for 30 seconds, with 1,000 keys written 200 times a second and read 1,000 times a second, a failure detector that noticed after 2 seconds, and hints delivered 10 seconds after the replicas returned.</p>
+
+<figure class="fig wide" id="fig-partition">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-labelledby="f794t f794d">
+<title id="f794t">Two of three replicas cut off for 30 seconds</title>
+<desc id="f794d">Two timelines over 70 seconds. Two of a key range’s three home replicas are cut off from second 10 to second 40; hints are delivered at second 52. Left, the share of writes accepted each second: with a strict quorum it falls to zero during the cut; with a sloppy quorum it stays at 100% after the first two seconds. Right, the share of reads that returned an older version than the newest confirmed write, with a sloppy quorum: 5.0% during the cut, 14.9% between the healing and the hints without read repair, 2.8% with it, and none after the hints arrived.</desc>
+<text class="tb" x="30" y="16">Writes accepted</text>
+<rect class="n sunk" x="108.6" y="44" width="115.7" height="176" rx="0"/>
+<text class="ts mid" x="166.4" y="38">cut off</text>
+<path class="e none dash" d="M270.6 44V220"/>
+<text class="ts" x="274.6" y="38">hints</text>
+<line class="grid" x1="70" y1="220.0" x2="340" y2="220.0"/>
+<text class="ts end" x="64" y="224.0">0%</text>
+<line class="grid" x1="70" y1="143.5" x2="340" y2="143.5"/>
+<text class="ts end" x="64" y="147.5">50%</text>
+<line class="grid" x1="70" y1="67.0" x2="340" y2="67.0"/>
+<text class="ts end" x="64" y="71.0">100%</text>
+<text class="ts mid" x="70.0" y="236">0</text>
+<text class="ts mid" x="108.6" y="236">10</text>
+<text class="ts mid" x="224.3" y="236">40</text>
+<text class="ts mid" x="340.0" y="236">70 s</text>
+<path class="line" style="stroke:var(--fault)" d="M71.9 67.0 L75.8 67.0 L79.6 67.0 L83.5 67.0 L87.4 67.0 L91.2 67.0 L95.1 67.0 L98.9 67.0 L102.8 67.0 L106.6 67.0 L110.5 220.0 L114.4 220.0 L118.2 220.0 L122.1 220.0 L125.9 220.0 L129.8 220.0 L133.6 220.0 L137.5 220.0 L141.4 220.0 L145.2 220.0 L149.1 220.0 L152.9 220.0 L156.8 220.0 L160.6 220.0 L164.5 220.0 L168.4 220.0 L172.2 220.0 L176.1 220.0 L179.9 220.0 L183.8 220.0 L187.6 220.0 L191.5 220.0 L195.4 220.0 L199.2 220.0 L203.1 220.0 L206.9 220.0 L210.8 220.0 L214.6 220.0 L218.5 220.0 L222.4 220.0 L226.2 67.0 L230.1 67.0 L233.9 67.0 L237.8 67.0 L241.6 67.0 L245.5 67.0 L249.4 67.0 L253.2 67.0 L257.1 67.0 L260.9 67.0 L264.8 67.0 L268.6 67.0 L272.5 67.0 L276.4 67.0 L280.2 67.0 L284.1 67.0 L287.9 67.0 L291.8 67.0 L295.6 67.0 L299.5 67.0 L303.4 67.0 L307.2 67.0 L311.1 67.0 L314.9 67.0 L318.8 67.0 L322.6 67.0 L326.5 67.0 L330.4 67.0 L334.2 67.0 L338.1 67.0"/>
+<path class="line" style="stroke:var(--store)" d="M71.9 67.0 L75.8 67.0 L79.6 67.0 L83.5 67.0 L87.4 67.0 L91.2 67.0 L95.1 67.0 L98.9 67.0 L102.8 67.0 L106.6 67.0 L110.5 220.0 L114.4 220.0 L118.2 67.0 L122.1 67.0 L125.9 67.0 L129.8 67.0 L133.6 67.0 L137.5 67.0 L141.4 67.0 L145.2 67.0 L149.1 67.0 L152.9 67.0 L156.8 67.0 L160.6 67.0 L164.5 67.0 L168.4 67.0 L172.2 67.0 L176.1 67.0 L179.9 67.0 L183.8 67.0 L187.6 67.0 L191.5 67.0 L195.4 67.0 L199.2 67.0 L203.1 67.0 L206.9 67.0 L210.8 67.0 L214.6 67.0 L218.5 67.0 L222.4 67.0 L226.2 67.0 L230.1 67.0 L233.9 67.0 L237.8 67.0 L241.6 67.0 L245.5 67.0 L249.4 67.0 L253.2 67.0 L257.1 67.0 L260.9 67.0 L264.8 67.0 L268.6 67.0 L272.5 67.0 L276.4 67.0 L280.2 67.0 L284.1 67.0 L287.9 67.0 L291.8 67.0 L295.6 67.0 L299.5 67.0 L303.4 67.0 L307.2 67.0 L311.1 67.0 L314.9 67.0 L318.8 67.0 L322.6 67.0 L326.5 67.0 L330.4 67.0 L334.2 67.0 L338.1 67.0"/>
+<text class="ts mid" x="166.4" y="83.0">sloppy quorum</text>
+<text class="ts mid" x="166.4" y="214.0">strict quorum</text>
+<text class="tb" x="390" y="16">Reads that were stale, sloppy quorum</text>
+<rect class="n sunk" x="468.6" y="44" width="115.7" height="176" rx="0"/>
+<text class="ts mid" x="526.4" y="38">cut off</text>
+<path class="e none dash" d="M630.6 44V220"/>
+<text class="ts" x="634.6" y="38">hints</text>
+<line class="grid" x1="430" y1="220.0" x2="700" y2="220.0"/>
+<text class="ts end" x="424" y="224.0">0%</text>
+<line class="grid" x1="430" y1="173.3" x2="700" y2="173.3"/>
+<text class="ts end" x="424" y="177.3">10%</text>
+<line class="grid" x1="430" y1="126.7" x2="700" y2="126.7"/>
+<text class="ts end" x="424" y="130.7">20%</text>
+<line class="grid" x1="430" y1="80.0" x2="700" y2="80.0"/>
+<text class="ts end" x="424" y="84.0">30%</text>
+<text class="ts mid" x="430.0" y="236">0</text>
+<text class="ts mid" x="468.6" y="236">10</text>
+<text class="ts mid" x="584.3" y="236">40</text>
+<text class="ts mid" x="700.0" y="236">70 s</text>
+<path class="line" style="stroke:var(--fault)" d="M431.9 220.0 L435.8 220.0 L439.6 220.0 L443.5 220.0 L447.4 220.0 L451.2 220.0 L455.1 220.0 L458.9 220.0 L462.8 220.0 L466.6 220.0 L470.5 220.0 L474.4 220.0 L478.2 97.5 L482.1 126.0 L485.9 135.1 L489.8 151.1 L493.6 168.0 L497.5 179.0 L501.4 184.5 L505.2 183.9 L509.1 196.2 L512.9 204.9 L516.8 202.9 L520.6 204.7 L524.5 206.1 L528.4 212.3 L532.2 214.9 L536.1 213.1 L539.9 212.0 L543.8 215.9 L547.6 218.5 L551.5 218.1 L555.4 219.6 L559.2 219.5 L563.1 219.1 L566.9 218.6 L570.8 218.5 L574.6 219.6 L578.5 219.5 L582.4 219.1 L586.2 220.0 L590.1 220.0 L593.9 67.0 L597.8 99.4 L601.6 118.3 L605.5 144.5 L609.4 161.8 L613.2 170.2 L617.1 169.5 L620.9 180.2 L624.8 192.8 L628.6 192.7 L632.5 220.0 L636.4 220.0 L640.2 220.0 L644.1 220.0 L647.9 220.0 L651.8 220.0 L655.6 220.0 L659.5 220.0 L663.4 220.0 L667.2 220.0 L671.1 220.0 L674.9 220.0 L678.8 220.0 L682.6 220.0 L686.5 220.0 L690.4 220.0 L694.2 220.0 L698.1 220.0"/>
+<path class="line" style="stroke:var(--store)" d="M431.9 220.0 L435.8 220.0 L439.6 220.0 L443.5 220.0 L447.4 220.0 L451.2 220.0 L455.1 220.0 L458.9 220.0 L462.8 220.0 L466.6 220.0 L470.5 220.0 L474.4 220.0 L478.2 89.3 L482.1 107.3 L485.9 140.3 L489.8 155.3 L493.6 163.1 L497.5 171.7 L501.4 185.4 L505.2 189.1 L509.1 200.6 L512.9 202.1 L516.8 202.9 L520.6 203.3 L524.5 209.3 L528.4 211.9 L532.2 212.6 L536.1 211.3 L539.9 213.0 L543.8 217.3 L547.6 219.0 L551.5 218.1 L555.4 217.8 L559.2 218.1 L563.1 218.2 L566.9 219.1 L570.8 220.0 L574.6 220.0 L578.5 220.0 L582.4 219.5 L586.2 220.0 L590.1 220.0 L593.9 123.5 L597.8 192.4 L601.6 211.7 L605.5 216.2 L609.4 218.6 L613.2 220.0 L617.1 220.0 L620.9 220.0 L624.8 220.0 L628.6 220.0 L632.5 220.0 L636.4 220.0 L640.2 220.0 L644.1 220.0 L647.9 220.0 L651.8 220.0 L655.6 220.0 L659.5 220.0 L663.4 220.0 L667.2 220.0 L671.1 220.0 L674.9 220.0 L678.8 220.0 L682.6 220.0 L686.5 220.0 L690.4 220.0 L694.2 220.0 L698.1 220.0"/>
+<text class="ts" x="598.0" y="71.0">no read repair</text>
+<text class="ts" x="598.0" y="137.5">read repair</text>
+<rect class="hit" x="70" y="44" width="3.85714" height="176" data-tip="second 0|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="430" y="44" width="3.85714" height="176" data-tip="second 0|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="73.8571" y="44" width="3.85714" height="176" data-tip="second 1|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="433.857" y="44" width="3.85714" height="176" data-tip="second 1|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="77.7143" y="44" width="3.85714" height="176" data-tip="second 2|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="437.714" y="44" width="3.85714" height="176" data-tip="second 2|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="81.5714" y="44" width="3.85714" height="176" data-tip="second 3|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="441.571" y="44" width="3.85714" height="176" data-tip="second 3|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="85.4286" y="44" width="3.85714" height="176" data-tip="second 4|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="445.429" y="44" width="3.85714" height="176" data-tip="second 4|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="89.2857" y="44" width="3.85714" height="176" data-tip="second 5|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="449.286" y="44" width="3.85714" height="176" data-tip="second 5|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="93.1429" y="44" width="3.85714" height="176" data-tip="second 6|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="453.143" y="44" width="3.85714" height="176" data-tip="second 6|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="97" y="44" width="3.85714" height="176" data-tip="second 7|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="457" y="44" width="3.85714" height="176" data-tip="second 7|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="100.857" y="44" width="3.85714" height="176" data-tip="second 8|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="460.857" y="44" width="3.85714" height="176" data-tip="second 8|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="104.714" y="44" width="3.85714" height="176" data-tip="second 9|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="464.714" y="44" width="3.85714" height="176" data-tip="second 9|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="108.571" y="44" width="3.85714" height="176" data-tip="second 10|strict: 0% of writes accepted|sloppy: 0% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="468.571" y="44" width="3.85714" height="176" data-tip="second 10|strict: 0% of writes accepted|sloppy: 0% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="112.429" y="44" width="3.85714" height="176" data-tip="second 11|strict: 0% of writes accepted|sloppy: 0% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="472.429" y="44" width="3.85714" height="176" data-tip="second 11|strict: 0% of writes accepted|sloppy: 0% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="116.286" y="44" width="3.85714" height="176" data-tip="second 12|strict: 0% of writes accepted|sloppy: 100% accepted, 26.3% of reads stale|sloppy with read repair: 28.0% stale"/>
+<rect class="hit" x="476.286" y="44" width="3.85714" height="176" data-tip="second 12|strict: 0% of writes accepted|sloppy: 100% accepted, 26.3% of reads stale|sloppy with read repair: 28.0% stale"/>
+<rect class="hit" x="120.143" y="44" width="3.85714" height="176" data-tip="second 13|strict: 0% of writes accepted|sloppy: 100% accepted, 20.1% of reads stale|sloppy with read repair: 24.1% stale"/>
+<rect class="hit" x="480.143" y="44" width="3.85714" height="176" data-tip="second 13|strict: 0% of writes accepted|sloppy: 100% accepted, 20.1% of reads stale|sloppy with read repair: 24.1% stale"/>
+<rect class="hit" x="124" y="44" width="3.85714" height="176" data-tip="second 14|strict: 0% of writes accepted|sloppy: 100% accepted, 18.2% of reads stale|sloppy with read repair: 17.1% stale"/>
+<rect class="hit" x="484" y="44" width="3.85714" height="176" data-tip="second 14|strict: 0% of writes accepted|sloppy: 100% accepted, 18.2% of reads stale|sloppy with read repair: 17.1% stale"/>
+<rect class="hit" x="127.857" y="44" width="3.85714" height="176" data-tip="second 15|strict: 0% of writes accepted|sloppy: 100% accepted, 14.8% of reads stale|sloppy with read repair: 13.9% stale"/>
+<rect class="hit" x="487.857" y="44" width="3.85714" height="176" data-tip="second 15|strict: 0% of writes accepted|sloppy: 100% accepted, 14.8% of reads stale|sloppy with read repair: 13.9% stale"/>
+<rect class="hit" x="131.714" y="44" width="3.85714" height="176" data-tip="second 16|strict: 0% of writes accepted|sloppy: 100% accepted, 11.1% of reads stale|sloppy with read repair: 12.2% stale"/>
+<rect class="hit" x="491.714" y="44" width="3.85714" height="176" data-tip="second 16|strict: 0% of writes accepted|sloppy: 100% accepted, 11.1% of reads stale|sloppy with read repair: 12.2% stale"/>
+<rect class="hit" x="135.571" y="44" width="3.85714" height="176" data-tip="second 17|strict: 0% of writes accepted|sloppy: 100% accepted, 8.8% of reads stale|sloppy with read repair: 10.3% stale"/>
+<rect class="hit" x="495.571" y="44" width="3.85714" height="176" data-tip="second 17|strict: 0% of writes accepted|sloppy: 100% accepted, 8.8% of reads stale|sloppy with read repair: 10.3% stale"/>
+<rect class="hit" x="139.429" y="44" width="3.85714" height="176" data-tip="second 18|strict: 0% of writes accepted|sloppy: 100% accepted, 7.6% of reads stale|sloppy with read repair: 7.4% stale"/>
+<rect class="hit" x="499.429" y="44" width="3.85714" height="176" data-tip="second 18|strict: 0% of writes accepted|sloppy: 100% accepted, 7.6% of reads stale|sloppy with read repair: 7.4% stale"/>
+<rect class="hit" x="143.286" y="44" width="3.85714" height="176" data-tip="second 19|strict: 0% of writes accepted|sloppy: 100% accepted, 7.7% of reads stale|sloppy with read repair: 6.6% stale"/>
+<rect class="hit" x="503.286" y="44" width="3.85714" height="176" data-tip="second 19|strict: 0% of writes accepted|sloppy: 100% accepted, 7.7% of reads stale|sloppy with read repair: 6.6% stale"/>
+<rect class="hit" x="147.143" y="44" width="3.85714" height="176" data-tip="second 20|strict: 0% of writes accepted|sloppy: 100% accepted, 5.1% of reads stale|sloppy with read repair: 4.2% stale"/>
+<rect class="hit" x="507.143" y="44" width="3.85714" height="176" data-tip="second 20|strict: 0% of writes accepted|sloppy: 100% accepted, 5.1% of reads stale|sloppy with read repair: 4.2% stale"/>
+<rect class="hit" x="151" y="44" width="3.85714" height="176" data-tip="second 21|strict: 0% of writes accepted|sloppy: 100% accepted, 3.2% of reads stale|sloppy with read repair: 3.8% stale"/>
+<rect class="hit" x="511" y="44" width="3.85714" height="176" data-tip="second 21|strict: 0% of writes accepted|sloppy: 100% accepted, 3.2% of reads stale|sloppy with read repair: 3.8% stale"/>
+<rect class="hit" x="154.857" y="44" width="3.85714" height="176" data-tip="second 22|strict: 0% of writes accepted|sloppy: 100% accepted, 3.7% of reads stale|sloppy with read repair: 3.7% stale"/>
+<rect class="hit" x="514.857" y="44" width="3.85714" height="176" data-tip="second 22|strict: 0% of writes accepted|sloppy: 100% accepted, 3.7% of reads stale|sloppy with read repair: 3.7% stale"/>
+<rect class="hit" x="158.714" y="44" width="3.85714" height="176" data-tip="second 23|strict: 0% of writes accepted|sloppy: 100% accepted, 3.3% of reads stale|sloppy with read repair: 3.6% stale"/>
+<rect class="hit" x="518.714" y="44" width="3.85714" height="176" data-tip="second 23|strict: 0% of writes accepted|sloppy: 100% accepted, 3.3% of reads stale|sloppy with read repair: 3.6% stale"/>
+<rect class="hit" x="162.571" y="44" width="3.85714" height="176" data-tip="second 24|strict: 0% of writes accepted|sloppy: 100% accepted, 3.0% of reads stale|sloppy with read repair: 2.3% stale"/>
+<rect class="hit" x="522.571" y="44" width="3.85714" height="176" data-tip="second 24|strict: 0% of writes accepted|sloppy: 100% accepted, 3.0% of reads stale|sloppy with read repair: 2.3% stale"/>
+<rect class="hit" x="166.429" y="44" width="3.85714" height="176" data-tip="second 25|strict: 0% of writes accepted|sloppy: 100% accepted, 1.7% of reads stale|sloppy with read repair: 1.7% stale"/>
+<rect class="hit" x="526.429" y="44" width="3.85714" height="176" data-tip="second 25|strict: 0% of writes accepted|sloppy: 100% accepted, 1.7% of reads stale|sloppy with read repair: 1.7% stale"/>
+<rect class="hit" x="170.286" y="44" width="3.85714" height="176" data-tip="second 26|strict: 0% of writes accepted|sloppy: 100% accepted, 1.1% of reads stale|sloppy with read repair: 1.6% stale"/>
+<rect class="hit" x="530.286" y="44" width="3.85714" height="176" data-tip="second 26|strict: 0% of writes accepted|sloppy: 100% accepted, 1.1% of reads stale|sloppy with read repair: 1.6% stale"/>
+<rect class="hit" x="174.143" y="44" width="3.85714" height="176" data-tip="second 27|strict: 0% of writes accepted|sloppy: 100% accepted, 1.5% of reads stale|sloppy with read repair: 1.9% stale"/>
+<rect class="hit" x="534.143" y="44" width="3.85714" height="176" data-tip="second 27|strict: 0% of writes accepted|sloppy: 100% accepted, 1.5% of reads stale|sloppy with read repair: 1.9% stale"/>
+<rect class="hit" x="178" y="44" width="3.85714" height="176" data-tip="second 28|strict: 0% of writes accepted|sloppy: 100% accepted, 1.7% of reads stale|sloppy with read repair: 1.5% stale"/>
+<rect class="hit" x="538" y="44" width="3.85714" height="176" data-tip="second 28|strict: 0% of writes accepted|sloppy: 100% accepted, 1.7% of reads stale|sloppy with read repair: 1.5% stale"/>
+<rect class="hit" x="181.857" y="44" width="3.85714" height="176" data-tip="second 29|strict: 0% of writes accepted|sloppy: 100% accepted, 0.9% of reads stale|sloppy with read repair: 0.6% stale"/>
+<rect class="hit" x="541.857" y="44" width="3.85714" height="176" data-tip="second 29|strict: 0% of writes accepted|sloppy: 100% accepted, 0.9% of reads stale|sloppy with read repair: 0.6% stale"/>
+<rect class="hit" x="185.714" y="44" width="3.85714" height="176" data-tip="second 30|strict: 0% of writes accepted|sloppy: 100% accepted, 0.3% of reads stale|sloppy with read repair: 0.2% stale"/>
+<rect class="hit" x="545.714" y="44" width="3.85714" height="176" data-tip="second 30|strict: 0% of writes accepted|sloppy: 100% accepted, 0.3% of reads stale|sloppy with read repair: 0.2% stale"/>
+<rect class="hit" x="189.571" y="44" width="3.85714" height="176" data-tip="second 31|strict: 0% of writes accepted|sloppy: 100% accepted, 0.4% of reads stale|sloppy with read repair: 0.4% stale"/>
+<rect class="hit" x="549.571" y="44" width="3.85714" height="176" data-tip="second 31|strict: 0% of writes accepted|sloppy: 100% accepted, 0.4% of reads stale|sloppy with read repair: 0.4% stale"/>
+<rect class="hit" x="193.429" y="44" width="3.85714" height="176" data-tip="second 32|strict: 0% of writes accepted|sloppy: 100% accepted, 0.1% of reads stale|sloppy with read repair: 0.5% stale"/>
+<rect class="hit" x="553.429" y="44" width="3.85714" height="176" data-tip="second 32|strict: 0% of writes accepted|sloppy: 100% accepted, 0.1% of reads stale|sloppy with read repair: 0.5% stale"/>
+<rect class="hit" x="197.286" y="44" width="3.85714" height="176" data-tip="second 33|strict: 0% of writes accepted|sloppy: 100% accepted, 0.1% of reads stale|sloppy with read repair: 0.4% stale"/>
+<rect class="hit" x="557.286" y="44" width="3.85714" height="176" data-tip="second 33|strict: 0% of writes accepted|sloppy: 100% accepted, 0.1% of reads stale|sloppy with read repair: 0.4% stale"/>
+<rect class="hit" x="201.143" y="44" width="3.85714" height="176" data-tip="second 34|strict: 0% of writes accepted|sloppy: 100% accepted, 0.2% of reads stale|sloppy with read repair: 0.4% stale"/>
+<rect class="hit" x="561.143" y="44" width="3.85714" height="176" data-tip="second 34|strict: 0% of writes accepted|sloppy: 100% accepted, 0.2% of reads stale|sloppy with read repair: 0.4% stale"/>
+<rect class="hit" x="205" y="44" width="3.85714" height="176" data-tip="second 35|strict: 0% of writes accepted|sloppy: 100% accepted, 0.3% of reads stale|sloppy with read repair: 0.2% stale"/>
+<rect class="hit" x="565" y="44" width="3.85714" height="176" data-tip="second 35|strict: 0% of writes accepted|sloppy: 100% accepted, 0.3% of reads stale|sloppy with read repair: 0.2% stale"/>
+<rect class="hit" x="208.857" y="44" width="3.85714" height="176" data-tip="second 36|strict: 0% of writes accepted|sloppy: 100% accepted, 0.3% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="568.857" y="44" width="3.85714" height="176" data-tip="second 36|strict: 0% of writes accepted|sloppy: 100% accepted, 0.3% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="212.714" y="44" width="3.85714" height="176" data-tip="second 37|strict: 0% of writes accepted|sloppy: 100% accepted, 0.1% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="572.714" y="44" width="3.85714" height="176" data-tip="second 37|strict: 0% of writes accepted|sloppy: 100% accepted, 0.1% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="216.571" y="44" width="3.85714" height="176" data-tip="second 38|strict: 0% of writes accepted|sloppy: 100% accepted, 0.1% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="576.571" y="44" width="3.85714" height="176" data-tip="second 38|strict: 0% of writes accepted|sloppy: 100% accepted, 0.1% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="220.429" y="44" width="3.85714" height="176" data-tip="second 39|strict: 0% of writes accepted|sloppy: 100% accepted, 0.2% of reads stale|sloppy with read repair: 0.1% stale"/>
+<rect class="hit" x="580.429" y="44" width="3.85714" height="176" data-tip="second 39|strict: 0% of writes accepted|sloppy: 100% accepted, 0.2% of reads stale|sloppy with read repair: 0.1% stale"/>
+<rect class="hit" x="224.286" y="44" width="3.85714" height="176" data-tip="second 40|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="584.286" y="44" width="3.85714" height="176" data-tip="second 40|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="228.143" y="44" width="3.85714" height="176" data-tip="second 41|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="588.143" y="44" width="3.85714" height="176" data-tip="second 41|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="232" y="44" width="3.85714" height="176" data-tip="second 42|strict: 100% of writes accepted|sloppy: 100% accepted, 32.8% of reads stale|sloppy with read repair: 20.7% stale"/>
+<rect class="hit" x="592" y="44" width="3.85714" height="176" data-tip="second 42|strict: 100% of writes accepted|sloppy: 100% accepted, 32.8% of reads stale|sloppy with read repair: 20.7% stale"/>
+<rect class="hit" x="235.857" y="44" width="3.85714" height="176" data-tip="second 43|strict: 100% of writes accepted|sloppy: 100% accepted, 25.8% of reads stale|sloppy with read repair: 5.9% stale"/>
+<rect class="hit" x="595.857" y="44" width="3.85714" height="176" data-tip="second 43|strict: 100% of writes accepted|sloppy: 100% accepted, 25.8% of reads stale|sloppy with read repair: 5.9% stale"/>
+<rect class="hit" x="239.714" y="44" width="3.85714" height="176" data-tip="second 44|strict: 100% of writes accepted|sloppy: 100% accepted, 21.8% of reads stale|sloppy with read repair: 1.8% stale"/>
+<rect class="hit" x="599.714" y="44" width="3.85714" height="176" data-tip="second 44|strict: 100% of writes accepted|sloppy: 100% accepted, 21.8% of reads stale|sloppy with read repair: 1.8% stale"/>
+<rect class="hit" x="243.571" y="44" width="3.85714" height="176" data-tip="second 45|strict: 100% of writes accepted|sloppy: 100% accepted, 16.2% of reads stale|sloppy with read repair: 0.8% stale"/>
+<rect class="hit" x="603.571" y="44" width="3.85714" height="176" data-tip="second 45|strict: 100% of writes accepted|sloppy: 100% accepted, 16.2% of reads stale|sloppy with read repair: 0.8% stale"/>
+<rect class="hit" x="247.429" y="44" width="3.85714" height="176" data-tip="second 46|strict: 100% of writes accepted|sloppy: 100% accepted, 12.5% of reads stale|sloppy with read repair: 0.3% stale"/>
+<rect class="hit" x="607.429" y="44" width="3.85714" height="176" data-tip="second 46|strict: 100% of writes accepted|sloppy: 100% accepted, 12.5% of reads stale|sloppy with read repair: 0.3% stale"/>
+<rect class="hit" x="251.286" y="44" width="3.85714" height="176" data-tip="second 47|strict: 100% of writes accepted|sloppy: 100% accepted, 10.7% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="611.286" y="44" width="3.85714" height="176" data-tip="second 47|strict: 100% of writes accepted|sloppy: 100% accepted, 10.7% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="255.143" y="44" width="3.85714" height="176" data-tip="second 48|strict: 100% of writes accepted|sloppy: 100% accepted, 10.8% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="615.143" y="44" width="3.85714" height="176" data-tip="second 48|strict: 100% of writes accepted|sloppy: 100% accepted, 10.8% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="259" y="44" width="3.85714" height="176" data-tip="second 49|strict: 100% of writes accepted|sloppy: 100% accepted, 8.5% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="619" y="44" width="3.85714" height="176" data-tip="second 49|strict: 100% of writes accepted|sloppy: 100% accepted, 8.5% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="262.857" y="44" width="3.85714" height="176" data-tip="second 50|strict: 100% of writes accepted|sloppy: 100% accepted, 5.8% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="622.857" y="44" width="3.85714" height="176" data-tip="second 50|strict: 100% of writes accepted|sloppy: 100% accepted, 5.8% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="266.714" y="44" width="3.85714" height="176" data-tip="second 51|strict: 100% of writes accepted|sloppy: 100% accepted, 5.8% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="626.714" y="44" width="3.85714" height="176" data-tip="second 51|strict: 100% of writes accepted|sloppy: 100% accepted, 5.8% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="270.571" y="44" width="3.85714" height="176" data-tip="second 52|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="630.571" y="44" width="3.85714" height="176" data-tip="second 52|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="274.429" y="44" width="3.85714" height="176" data-tip="second 53|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="634.429" y="44" width="3.85714" height="176" data-tip="second 53|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="278.286" y="44" width="3.85714" height="176" data-tip="second 54|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="638.286" y="44" width="3.85714" height="176" data-tip="second 54|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="282.143" y="44" width="3.85714" height="176" data-tip="second 55|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="642.143" y="44" width="3.85714" height="176" data-tip="second 55|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="286" y="44" width="3.85714" height="176" data-tip="second 56|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="646" y="44" width="3.85714" height="176" data-tip="second 56|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="289.857" y="44" width="3.85714" height="176" data-tip="second 57|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="649.857" y="44" width="3.85714" height="176" data-tip="second 57|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="293.714" y="44" width="3.85714" height="176" data-tip="second 58|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="653.714" y="44" width="3.85714" height="176" data-tip="second 58|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="297.571" y="44" width="3.85714" height="176" data-tip="second 59|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="657.571" y="44" width="3.85714" height="176" data-tip="second 59|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="301.429" y="44" width="3.85714" height="176" data-tip="second 60|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="661.429" y="44" width="3.85714" height="176" data-tip="second 60|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="305.286" y="44" width="3.85714" height="176" data-tip="second 61|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="665.286" y="44" width="3.85714" height="176" data-tip="second 61|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="309.143" y="44" width="3.85714" height="176" data-tip="second 62|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="669.143" y="44" width="3.85714" height="176" data-tip="second 62|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="313" y="44" width="3.85714" height="176" data-tip="second 63|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="673" y="44" width="3.85714" height="176" data-tip="second 63|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="316.857" y="44" width="3.85714" height="176" data-tip="second 64|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="676.857" y="44" width="3.85714" height="176" data-tip="second 64|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="320.714" y="44" width="3.85714" height="176" data-tip="second 65|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="680.714" y="44" width="3.85714" height="176" data-tip="second 65|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="324.571" y="44" width="3.85714" height="176" data-tip="second 66|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="684.571" y="44" width="3.85714" height="176" data-tip="second 66|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="328.429" y="44" width="3.85714" height="176" data-tip="second 67|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="688.429" y="44" width="3.85714" height="176" data-tip="second 67|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="332.286" y="44" width="3.85714" height="176" data-tip="second 68|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="692.286" y="44" width="3.85714" height="176" data-tip="second 68|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="336.143" y="44" width="3.85714" height="176" data-tip="second 69|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+<rect class="hit" x="696.143" y="44" width="3.85714" height="176" data-tip="second 69|strict: 100% of writes accepted|sloppy: 100% accepted, 0.0% of reads stale|sloppy with read repair: 0.0% stale"/>
+</svg>
+</div>
+<figcaption>Simulated: 1,000 keys, N = 3, W = 2, R = 2. The sloppy quorum stayed writable; the price was stale reads, from stand-ins during the cut and from the returning replicas after it.</figcaption>
+</figure>
+
+<p>The strict quorum accepted no writes and answered no reads during the cut. The sloppy quorum accepted all of them once the detector had noticed, and paid twice. During the cut, a read answered by the two stand-ins found nothing for keys not written since the cut began: 5.0% of reads were stale, most in the first seconds. After the healing, reads went back to the home replicas, two of which had missed 30 seconds of writes, and 14.9% of reads were stale until the hints arrived; with read repair, 2.8%. A sloppy quorum keeps the store writable by giving up the overlap guarantee for a while. One more measured effect: a write reported to the client as failed was not undone on the replicas it reached, and with the strict quorum 3,337 later reads returned such a write. A failed write in this design means “not confirmed”, never “not stored”, which is why clients retry with the same value.</p>
+<p>The sloppy quorum depends on the failure detector. During the 2 seconds before it noticed, the coordinator still sent writes to the unreachable home replicas, and every write failed, sloppy or not. It is the detector, tuned as in <x-ref to="membership-and-coordination#phi"></x-ref>, that decides how quickly writes route around a failure; the quorum rule only decides what happens after.</p>
+
+<h2 id="repair">Step 6c: Repair</h2>
+<p>Hints and read repair fix what was written during a failure and what is read afterward. Anything else, a lost hint or a key nobody reads, waits for anti-entropy: the copies of each key range compare Merkle trees, as <x-ref to="replication#repair"></x-ref> showed, and exchange only the keys under hashes that differ. The simulation compared two copies of a million keys, counting what crosses the network in both directions.</p>
+<table>
+<thead><tr><th>Keys that differ</th><th>Tree of 2<sup>16</sup> leaves</th><th>Tree of 2<sup>20</sup> leaves</th><th>Every key’s hash</th></tr></thead>
+<tbody>
+<tr><th>1</th><td>33 hashes, 18 keys: 3.6 KB</td><td>41 hashes, 3 keys: 2.9 KB</td><td>40 MB</td></tr>
+<tr><th>10</th><td>257 hashes, 170 keys: 30 KB</td><td>337 hashes, 24 keys: 23 KB</td><td>40 MB</td></tr>
+<tr><th>1,000</th><td>12,329 hashes, 16,197 keys: 2.1 MB</td><td>20,313 hashes, 1,931 keys: 1.5 MB</td><td>40 MB</td></tr>
+</tbody>
+</table>
+<p>For a few differences, the trees cut the exchange by four orders of magnitude. The depth is a trade: deeper trees send fewer keys but more hashes and take more memory, and a shallow tree of 256 leaves sent 3.1 MB to find 10 differences, because each differing leaf holds about 3,900 keys. Two operational facts follow. A tree is valid only for the data it was built from, so nodes rebuild them, which reads the whole range from disk; repairs are scheduled, not continuous. Reading 4 TB at 500 MB/s, a rate a node might spare without hurting live traffic, takes over two hours, so a full repair of every range is spread over days. And the repair interval sets how long tombstones must be kept: a copy that missed a delete and is repaired after the tombstone has gone would bring the value back.</p>
+
+<h2 id="conflicts">Step 6d: Concurrent writes</h2>
+<p>With writes accepted on either side of a partition, or simply by two coordinators at once, a key can receive two writes that did not see each other. The store must either pick one or keep both. Picking by timestamp, last write wins, depends on clocks (<x-ref to="distributed-fundamentals#skew"></x-ref>). Keeping both needs to know which writes saw which: each version carries a version vector, the vector clock of <x-ref to="distributed-fundamentals#logical"></x-ref> applied to one key, and a write replaces exactly the versions its context had seen. Versions that neither replaces the other are <dfn>siblings</dfn>, returned together on the next read for the client to merge.</p>
+<pre data-lang="ts" data-title="Siblings: a write replaces only what its context had seen">
+export class SiblingRegister {
+  private siblings: { vv: VersionVector; items: ReadonlySet<string> }[] = [];
+
+  read(): { items: Set<string>; context: VersionVector } {
+    const items = new Set<string>();
+    let context: VersionVector = {};
+    for (const s of this.siblings) {
+      for (const i of s.items) items.add(i);
+      context = mergeVectors(context, s.vv);
+    }
+    return { items, context };
+  }
+  // A write carries the context it read. It replaces exactly the siblings that context had seen.
+  write(writer: string, context: VersionVector, items: ReadonlySet<string>): void {
+    const vv = { ...context, [writer]: (context[writer] ?? 0) + 1 };
+    this.siblings = this.siblings.filter((s) => !descends(vv, s.vv));
+    this.siblings.push({ vv, items });
+  }
+  get count(): number {
+    return this.siblings.length;
+  }
+}
+</pre>
+<p>The simulation ran Dynamo’s example: two clients adding items to one shopping cart, each reading the cart and writing it back a few milliseconds later, 500 items each, with clocks 30 ms fast and 20 ms slow. Last write wins kept 630 of the 1,000 items. In 358 cases the write that came later in real time lost, because the other client’s clock ran ahead. Version vectors kept all 1,000, with never more than two siblings at once. The cost is moved to the client, which must know how to merge: a union for a cart, which can bring back an item that one side deleted. Dynamo’s paper reports that in 24 hours of its cart service, 99.94% of requests saw exactly one version, so the merge code runs rarely but must be right.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>One node</th><td>Slower tail latency for its keys</td><td>Quorums of two of three carry on. Hints collect for it. If it does not return, a replacement is rebuilt from the other copies</td></tr>
+<tr><th>One disk, silently corrupting data</th><td>Nothing, if detected</td><td>Checksums on each file catch it on read; the copy is rebuilt from the others</td></tr>
+<tr><th>Two of a key’s three nodes</th><td>Writes still accepted; reads may be stale afterward</td><td>Sloppy quorum and hints, then read repair and anti-entropy</td></tr>
+<tr><th>A network partition</th><td>Both sides accept writes</td><td>Concurrent versions become siblings, merged on the next read</td></tr>
+<tr><th>A stand-in fails while holding hints</th><td>Nothing at once</td><td>Those writes reach their owners at the next anti-entropy repair</td></tr>
+<tr><th>One key is far busier than the rest</th><td>Its three nodes are slow</td><td>A cache in front for reads; for writes, split the key in the application (<x-ref to="partitioning#hot-keys"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>At ten times the data, 750 nodes: the ring and the protocol are unchanged, and gossip still converges in a few rounds (<x-ref to="membership-and-coordination#gossip-carries"></x-ref>). What changes is how often something is broken: with 750 machines, failures are routine rather than rare, so rebuilds and repairs must be automatic and throttled so that they do not starve live traffic. At a hundred times, and across regions, each region keeps its own ring and copies, writes in each region are accepted locally, and siblings from different regions are merged the same way as siblings from a partition.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Dynamo</b>, described by Amazon in 2007, used consistent hashing with virtual nodes and later equal-sized partitions, (N, R, W) commonly set to (3, 2, 2), sloppy quorums with hinted handoff, Merkle trees for each key range, and vector clocks truncated after about 10 entries. Its services were measured at the 99.9th percentile, for example 300 ms at 500 requests a second.</li>
+  <li><b>DynamoDB</b> shares the name and little of the design. Its 2022 paper describes replication groups that use Multi-Paxos to elect a leader, which alone serves writes and strongly consistent reads; any replica can serve eventually consistent reads. During Prime Day 2021 it peaked at 89.2 million requests a second.</li>
+  <li><b>Cassandra</b> places data on a ring of tokens, as Dynamo did. Version 4.0 changed the default from 256 tokens per node to 16, with a token allocator aware of the replication factor, because many tokens slowed repairs and made availability degrade earlier.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“Some reads must be strongly consistent”</th><td>A leader per key range with consensus for those keys, as DynamoDB does, or R and W of the whole replica set; quorums alone are not linearizable under failures (<x-ref to="consistency-models#linearizability"></x-ref>)</td><td>The ring, the storage engine</td></tr>
+<tr><th>“Support range scans”</th><td>Keys placed by range instead of by hash, so neighbors stay together, with splitting of hot ranges (<x-ref to="partitioning#range"></x-ref>)</td><td>Replication and repair</td></tr>
+<tr><th>“Values expire after a time”</th><td>A time to live on each write, written into the value and dropped during compaction</td><td>Everything else</td></tr>
+<tr><th>“Run in three regions”</th><td>A ring in each region, writes accepted locally, replication between regions in the background, siblings merged</td><td>The API</td></tr>
+<tr><th>“Increment a counter”</th><td>A counter that merges, with a count for each node that wrote, summed on read, because siblings of plain numbers cannot be merged correctly</td><td>The ring, the quorums</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Ask early whether writes must be accepted during a partition; the answer decides between this design and a leader per range. Then draw the ring, the preference list and one write with a node down, because that one picture shows placement, quorums and hinted handoff together. Spend the deep dives on quorum arithmetic with failures and on what happens to conflicting writes, and mention Merkle-tree repair and tombstones before the time runs out.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>One token per node, placed by hash</th><td>The fullest node holds more than twice the average</td><td>Several tokens per node, or tokens placed by an allocator</td></tr>
+<tr><th>Hundreds of tokens per node</th><td>Every pair of nodes shares a key, so any double failure loses a quorum somewhere</td><td>Tens of tokens, placed with care</td></tr>
+<tr><th>W = N for durability</th><td>Every write waits for the slowest replica, and fails when one is down</td><td>W = 2 of 3, with hints and repair</td></tr>
+<tr><th>Treating a failed write as not stored</th><td>The value reappears in later reads</td><td>Treat failure as “unknown” and retry the same write</td></tr>
+<tr><th>Last write wins for data that is merged, such as carts</th><td>Updates silently lost, more often when clocks drift</td><td>Version vectors and siblings, or a data type that merges</td></tr>
+<tr><th>Deleting a key outright</th><td>A stale copy brings it back during repair</td><td>Tombstones kept longer than the repair interval</td></tr>
+<tr><th>Relying on read repair alone</th><td>Keys nobody reads stay inconsistent forever</td><td>Scheduled anti-entropy with Merkle trees</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="partitioning"></x-ref>: consistent hashing and virtual nodes.</li>
+  <li><x-ref to="replication"></x-ref>: leaderless replication, hinted handoff, read repair and Merkle trees.</li>
+  <li><x-ref to="consistency-models"></x-ref>: what quorums do and do not guarantee.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: clocks, last write wins and vector clocks.</li>
+  <li><x-ref to="membership-and-coordination"></x-ref>: gossip and failure detection.</li>
+  <li><x-ref to="storage-engines"></x-ref>: the engine inside each node.</li>
+  <li><x-ref to="hld-object-storage"></x-ref>: a store for large objects, built on similar placement ideas.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A Dynamo-style store follows from one requirement: accept writes during a partition. Without it, a leader per range is simpler.</li>
+  <li>The store is sized by disk; the time to rebuild a node depends on how many nodes share its data.</li>
+  <li>With one token per node placed by hash, the fullest of 100 nodes held 2.3 times the average; with 16, 1.4; with 256, 1.13. More tokens also make every pair of nodes share some key.</li>
+  <li>W + R greater than N gave no stale reads in the simulation; asking all three replicas and waiting for two also hides a slow one.</li>
+  <li>A sloppy quorum kept writes available through a partition and paid with stale reads during it and afterward, until hints and read repair caught up.</li>
+  <li>A write that fails is not undone: failure means unconfirmed.</li>
+  <li>Merkle trees found a few differences among a million keys with kilobytes instead of 40 MB.</li>
+  <li>Last write wins lost 37% of the items in the cart simulation; version vectors kept them all as siblings for the client to merge.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Which single requirement leads to this design instead of a leader per key range?</summary><p>Accepting writes while a network partition separates the replicas. A leader-based design must refuse writes on the side without the leader; a leaderless one with sloppy quorums accepts them and resolves the conflicts later.</p></details>
+<details><summary>Why does a store with 256 tokens per node rebuild a failed node faster than one with a single token?</summary><p>With 256 tokens the failed node’s data is spread over ranges whose other copies sit on almost every other node, 99 of 100 in the simulation, so all of them can send in parallel. With one token only a few neighbors hold copies, 4 in the simulation, and the rebuild is limited by their combined speed.</p></details>
+<details><summary>With N = 3, why choose W = 2 and R = 2 over W = 3 and R = 1, when both overlap?</summary><p>W = 3 waits for the slowest replica on every write and fails whenever one replica is down. In the simulation its 99th percentile write took 21 ms against 1.4 ms, and with one replica down every write failed. Two of three tolerates a slow or failed replica on both paths.</p></details>
+<details><summary>A sloppy quorum accepted every write during a partition. What did it give up?</summary><p>The overlap guarantee. During the partition, reads answered by stand-ins missed older keys: 5.0% were stale. When the home replicas returned, reads that reached them found old versions: 14.9% were stale until the hints were delivered, 2.8% with read repair.</p></details>
+<details><summary>A client is told its write failed. Can a later read return that value?</summary><p>Yes. The write may have reached one replica before the coordinator gave up, and nothing removes it. In the strict-quorum simulation, 3,337 reads returned such writes. The client should treat the outcome as unknown and retry the same write.</p></details>
+<details><summary>Why must a tombstone be kept longer than the repair interval?</summary><p>A copy that missed the delete still holds the value. If the tombstone has been purged by the time anti-entropy compares the copies, the old value looks like data the others are missing and is copied back.</p></details>
+<details><summary>Why can the shopping cart not use last write wins?</summary><p>Two concurrent additions are two writes that did not see each other, and last write wins keeps only one of them, chosen by clocks that may be wrong. In the simulation it kept 630 of 1,000 items. Version vectors detect that the writes are concurrent and keep both for the client to merge.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Giuseppe DeCandia and others, <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">“Dynamo: Amazon’s Highly Available Key-value Store”</a>, SOSP 2007. The design this chapter follows.</li>
+  <li>Mostafa Elhemali and others, <a href="https://www.usenix.org/conference/atc22/presentation/vig">“Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service”</a>, USENIX ATC 2022. With Marc Brooker’s <a href="https://brooker.co.za/blog/2022/07/12/dynamodb.html">notes on the paper</a>.</li>
+  <li>Anthony Grasso, <a href="https://thelastpickle.com/blog/2021/01/29/impacts-of-changing-the-number-of-vnodes.html">“The Impacts of Changing the Number of VNodes in Apache Cassandra”</a>, The Last Pickle, 29 January 2021.</li>
+  <li>Apache Cassandra, <a href="https://cassandra.apache.org/doc/latest/getting-started/production.html">“Production recommendations”</a>, on tokens, peers and availability, checked October 2026.</li>
+</ol>
+</section>

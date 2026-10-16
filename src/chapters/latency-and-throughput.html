@@ -1,0 +1,357 @@
+<!--meta
+{ "description": "Latency and throughput explained for system design: response time, percentiles such as p50, p95 and p99, tail latency and fan-out, queueing and utilization, Little's law, batching trade-offs, and how to measure and reduce latency.",
+  "lede": "Speed has two measures that are easy to confuse: how long one request takes, and how many requests are served per second. This chapter defines both, shows why averages hide the requests that matter, and explains why a server slows down long before it is full.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="two-measures">Two measures of speed</h2>
+<p>Picture a road between two towns. One question you can ask is how long a single car takes to drive it. Another is how many cars arrive at the far end every hour. The two are related, and they are different measurements with different units. A narrow mountain road may be quick for the one car that has it to itself and still carry very few cars per hour.</p>
+<p>Systems have the same two measures.</p>
+<ul>
+  <li><dfn>Latency</dfn> is the time one operation takes, measured in milliseconds. When the operation is a whole request as the client experiences it, from sending to receiving the answer, the more precise term is <dfn>response time</dfn>. Most people use the two words interchangeably, and so does this book unless the difference matters.</li>
+  <li><dfn>Throughput</dfn> is the amount of work completed per unit of time: requests per second, messages per second, megabytes per second.</li>
+</ul>
+<p>A third word causes confusion. <dfn>Bandwidth</dfn> is the maximum rate a link can carry, the number of lanes on the road. Throughput is what actually gets through, and it can never exceed bandwidth. More lanes do not shorten the drive for a lone car, and more bandwidth does not reduce the latency of a small request.</p>
+
+<h3>What response time is made of</h3>
+<p>A response time is a sum, and the first step in improving one is to find its largest part.</p>
+
+<figure class="fig" id="fig-anatomy">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 114" role="img" aria-labelledby="f41t f41d">
+<title id="f41t">The parts of one response time</title>
+<desc id="f41d">A response time laid out as a bar with four segments in order: network travel to the server, waiting in a queue, service time while the server works, and network travel back. Only the service time is work. The rest is waiting.</desc>
+<rect class="bar mute" x="20" y="44" width="118" height="26"/>
+<rect class="bar async" x="140" y="44" width="178" height="26"/>
+<rect class="bar" x="320" y="44" width="258" height="26"/>
+<rect class="bar mute" x="580" y="44" width="120" height="26"/>
+<text class="tb" x="20" y="34">Network, there</text>
+<text class="tb" x="140" y="34">Waiting in a queue</text>
+<text class="tb" x="320" y="34">Service time</text>
+<text class="tb" x="580" y="34">Network, back</text>
+<text class="ts" x="20" y="88">distance and</text><text class="ts" x="20" y="103">connection setup</text>
+<text class="ts" x="140" y="88">for a free worker, a lock,</text><text class="ts" x="140" y="103">a database connection</text>
+<text class="ts" x="320" y="88">CPU work, plus time spent in calls</text><text class="ts" x="320" y="103">to databases and other services</text>
+<text class="ts" x="580" y="88">grows with the size</text><text class="ts" x="580" y="103">of the response</text>
+</svg>
+</div>
+<figcaption>One response time, split into its parts. Only the blue segment is work. The purple segment, waiting, is close to zero on an idle system and is the part that explodes under load.</figcaption>
+</figure>
+
+<p><x-ref to="journey-of-a-request">The previous chapter</x-ref> dealt with the two gray segments. This chapter is mostly about the other two, and about the fact that the service time of one component contains the full response times of everything it calls.</p>
+
+<h2 id="percentiles">Why the average misleads</h2>
+<p>Ask how fast a service is and the usual answer is an average: “about 120 milliseconds”. That number is nearly useless, and understanding why is one of the more valuable things in this chapter.</p>
+<p>Response times are not clustered evenly around a middle value. Most requests are quick, and a minority take much longer because they hit a cache miss, a garbage-collection pause, a lock held by another request, or a retried network packet. Plotted as a histogram, the shape has a tall hump on the left and a long thin tail to the right.</p>
+
+<figure class="fig wide" id="fig-histogram">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-labelledby="f42t f42d">
+<title id="f42t">A typical distribution of response times</title>
+<desc id="f42d">A histogram of response times for an illustrative service. Most requests take between 50 and 150 milliseconds, and a long tail extends past 400 milliseconds. The median is 100 milliseconds, the mean 120, the 95th percentile 268 and the 99th percentile 404.</desc>
+<line class="axis" x1="56" x2="700" y1="286.0" y2="286.0"/>
+<text class="ts end" x="48" y="290.0">0%</text>
+<line class="grid" x1="56" x2="700" y1="230.0" y2="230.0"/>
+<text class="ts end" x="48" y="234.0">5%</text>
+<line class="grid" x1="56" x2="700" y1="174.0" y2="174.0"/>
+<text class="ts end" x="48" y="178.0">10%</text>
+<line class="grid" x1="56" x2="700" y1="118.0" y2="118.0"/>
+<text class="ts end" x="48" y="122.0">15%</text>
+<line class="grid" x1="56" x2="700" y1="62.0" y2="62.0"/>
+<text class="ts end" x="48" y="66.0">20%</text>
+<text class="ts mid" x="56.0" y="304">0</text>
+<text class="ts mid" x="163.3" y="304">100</text>
+<text class="ts mid" x="270.7" y="304">200</text>
+<text class="ts mid" x="378.0" y="304">300</text>
+<text class="ts mid" x="485.3" y="304">400</text>
+<text class="ts mid" x="592.7" y="304">500</text>
+<text class="ts mid" x="700.0" y="304">600</text>
+<text class="ts mid" x="378" y="324">Response time in milliseconds</text>
+<path class="bar" d="M57.0 286V278.3q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M83.8 286V162.8q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M110.7 286V75.2q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M137.5 286V83.7q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M164.3 286V127.6q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M191.2 286V172.0q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M218.0 286V207.0q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M244.8 286V232.3q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M271.7 286V250.0q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M298.5 286V262.1q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M325.3 286V270.4q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M352.2 286V276.2q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M379.0 286V280.1q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M405.8 286V282.9q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M432.7 286V284.8q0 -4.0 4.0 -4.0h16.8q4.0 0 4.0 4.0V286z"></path>
+<path class="bar" d="M459.5 286V286.0q0 -3.8 3.8 -3.8h17.3q3.8 0 3.8 3.8V286z"></path>
+<path class="bar" d="M486.3 286V286.0q0 -2.8 2.8 -2.8h19.3q2.8 0 2.8 2.8V286z"></path>
+<path class="bar" d="M513.2 286V286.0q0 -2.1 2.1 -2.1h20.7q2.1 0 2.1 2.1V286z"></path>
+<path class="bar" d="M540.0 286V286.0q0 -1.6 1.6 -1.6h21.7q1.6 0 1.6 1.6V286z"></path>
+<path class="bar" d="M566.8 286V286.0q0 -1.2 1.2 -1.2h22.5q1.2 0 1.2 1.2V286z"></path>
+<path class="bar" d="M593.7 286V286.0q0 -0.9 0.9 -0.9h23.0q0.9 0 0.9 0.9V286z"></path>
+<path class="bar" d="M620.5 286V286.0q0 -0.7 0.7 -0.7h23.5q0.7 0 0.7 0.7V286z"></path>
+<path class="bar" d="M647.3 286V286.0q0 -0.5 0.5 -0.5h23.8q0.5 0 0.5 0.5V286z"></path>
+<line style="stroke:var(--ink-2);stroke-width:1.2;stroke-dasharray:3 3" x1="163.3" x2="163.3" y1="12" y2="286"/>
+<text class="tb end" x="156.3" y="24">median (p50)</text>
+<text class="ts end" x="156.3" y="40">100 ms</text>
+<line style="stroke:var(--ink-2);stroke-width:1.2;stroke-dasharray:3 3" x1="184.5" x2="184.5" y1="12" y2="286"/>
+<text class="tb" x="191.5" y="24">mean</text>
+<text class="ts" x="191.5" y="40">120 ms</text>
+<line style="stroke:var(--ink-2);stroke-width:1.2;stroke-dasharray:3 3" x1="344.0" x2="344.0" y1="12" y2="286"/>
+<text class="tb" x="351.0" y="24">p95</text>
+<text class="ts" x="351.0" y="40">268 ms</text>
+<line style="stroke:var(--ink-2);stroke-width:1.2;stroke-dasharray:3 3" x1="489.4" x2="489.4" y1="12" y2="286"/>
+<text class="tb" x="496.4" y="24">p99</text>
+<text class="ts" x="496.4" y="40">404 ms</text>
+<rect class="hit" x="56.5" y="62" width="26.8" height="224" data-tip="0 to 25 ms|1.0% of requests"/>
+<rect class="hit" x="83.3" y="62" width="26.8" height="224" data-tip="25 to 50 ms|11.4% of requests"/>
+<rect class="hit" x="110.2" y="62" width="26.8" height="224" data-tip="50 to 75 ms|19.2% of requests"/>
+<rect class="hit" x="137.0" y="62" width="26.8" height="224" data-tip="75 to 100 ms|18.4% of requests"/>
+<rect class="hit" x="163.8" y="62" width="26.8" height="224" data-tip="100 to 125 ms|14.5% of requests"/>
+<rect class="hit" x="190.7" y="62" width="26.8" height="224" data-tip="125 to 150 ms|10.5% of requests"/>
+<rect class="hit" x="217.5" y="62" width="26.8" height="224" data-tip="150 to 175 ms|7.4% of requests"/>
+<rect class="hit" x="244.3" y="62" width="26.8" height="224" data-tip="175 to 200 ms|5.1% of requests"/>
+<rect class="hit" x="271.2" y="62" width="26.8" height="224" data-tip="200 to 225 ms|3.6% of requests"/>
+<rect class="hit" x="298.0" y="62" width="26.8" height="224" data-tip="225 to 250 ms|2.5% of requests"/>
+<rect class="hit" x="324.8" y="62" width="26.8" height="224" data-tip="250 to 275 ms|1.7% of requests"/>
+<rect class="hit" x="351.7" y="62" width="26.8" height="224" data-tip="275 to 300 ms|1.2% of requests"/>
+<rect class="hit" x="378.5" y="62" width="26.8" height="224" data-tip="300 to 325 ms|0.9% of requests"/>
+<rect class="hit" x="405.3" y="62" width="26.8" height="224" data-tip="325 to 350 ms|0.6% of requests"/>
+<rect class="hit" x="432.2" y="62" width="26.8" height="224" data-tip="350 to 375 ms|0.5% of requests"/>
+<rect class="hit" x="459.0" y="62" width="26.8" height="224" data-tip="375 to 400 ms|0.3% of requests"/>
+<rect class="hit" x="485.8" y="62" width="26.8" height="224" data-tip="400 to 425 ms|0.2% of requests"/>
+<rect class="hit" x="512.7" y="62" width="26.8" height="224" data-tip="425 to 450 ms|0.2% of requests"/>
+<rect class="hit" x="539.5" y="62" width="26.8" height="224" data-tip="450 to 475 ms|0.1% of requests"/>
+<rect class="hit" x="566.3" y="62" width="26.8" height="224" data-tip="475 to 500 ms|0.1% of requests"/>
+<rect class="hit" x="593.2" y="62" width="26.8" height="224" data-tip="500 to 525 ms|0.1% of requests"/>
+<rect class="hit" x="620.0" y="62" width="26.8" height="224" data-tip="525 to 550 ms|0.1% of requests"/>
+<rect class="hit" x="646.8" y="62" width="26.8" height="224" data-tip="550 to 575 ms|under 0.05% of requests"/>
+</svg>
+</div>
+<figcaption>Response times of an illustrative service, as the share of requests in each 25 ms band. The mean of 120 ms describes almost no one: 62% of requests are faster than it, and the slowest 1% take more than three times as long.</figcaption>
+</figure>
+
+<p>The mean in <x-fig to="fig-histogram"></x-fig> is 120 ms. It is pulled to the right by the tail, so most requests are faster than it, and it says nothing about how bad the slow ones are. Two services with the same mean can feel completely different.</p>
+<p><dfn>Percentiles</dfn> describe the shape directly. Sort all the response times from fastest to slowest. The value a given percentage of the way along is that percentile.</p>
+<table>
+<thead><tr><th>Percentile</th><th>Written</th><th>In the figure</th><th>What it tells you</th></tr></thead>
+<tbody>
+<tr><th>50th, the median</th><td>p50</td><td class="r">100 ms</td><td>The typical request. Half are faster, half slower.</td></tr>
+<tr><th>95th</th><td>p95</td><td class="r">268 ms</td><td>1 request in 20 is slower than this.</td></tr>
+<tr><th>99th</th><td>p99</td><td class="r">404 ms</td><td>1 request in 100 is slower than this.</td></tr>
+<tr><th>99.9th</th><td>p99.9</td><td class="r">639 ms</td><td>1 request in 1,000. The far tail, where timeouts and retries live.</td></tr>
+</tbody>
+</table>
+<p>The high percentiles are called the <dfn>tail latency</dfn>, and there are three reasons to care about a slow 1%.</p>
+<p>First, 1% of requests is far more than 1% of users. Someone who loads 100 pages in a session will, on average, meet the p99 once. Second, the slowest requests often belong to your most valuable users, because the customer with the most data, the longest order history or the most followers is the one whose queries do the most work. Third, as the next section shows, the tail of one service becomes the ordinary case of the service that calls it.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Averaging percentiles. If server A has a p99 of 200 ms and server B has a p99 of 800 ms, the p99 of the pair is not 500 ms. It depends on how many requests each served and on the full shape of both distributions. To combine measurements, merge the underlying histograms and compute the percentile from the result. Monitoring systems that store histograms can do this, and those that store only precomputed percentiles cannot.</p></div>
+
+<h2 id="tail-at-scale">The tail at scale</h2>
+<p>Few requests are answered by one server. A page is usually assembled by a service that calls several others, each of which may call more. This is <dfn>fan-out</dfn>, and it has an uncomfortable effect on the tail.</p>
+
+<figure class="fig" id="fig-fanout">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f43t f43d">
+<title id="f43t">One slow backend delays the whole request</title>
+<desc id="f43d">A client calls a front-end service, which calls five backends in parallel. Four answer in 10 milliseconds and one takes one second. The front-end cannot respond until the slowest has answered, so the client waits one second.</desc>
+<rect class="n" x="10" y="88" width="92" height="50" rx="6"/><text class="tb mid" x="56" y="118">Client</text>
+<rect class="n sig" x="180" y="88" width="130" height="50" rx="6"/><text class="tb mid" x="245" y="110">Front-end service</text><text class="ts mid" x="245" y="127">waits for all five</text>
+<path class="e sig" d="M102 113H180"/>
+<text class="ts mid" x="141" y="104">1 request</text>
+<text class="ts mid tb" x="141" y="134">waits 1 s</text>
+<g>
+<rect class="n" x="470" y="8" width="130" height="34" rx="6"/><text class="mid" x="535" y="30">Profile</text><text class="ts" x="612" y="30">10 ms</text>
+<rect class="n" x="470" y="52" width="130" height="34" rx="6"/><text class="mid" x="535" y="74">Follows</text><text class="ts" x="612" y="74">10 ms</text>
+<rect class="n fault" x="470" y="96" width="130" height="34" rx="6"/><text class="tb mid" x="535" y="118">Recommendations</text><text class="tb" x="612" y="118">1,000 ms</text>
+<rect class="n" x="470" y="140" width="130" height="34" rx="6"/><text class="mid" x="535" y="162">Notifications</text><text class="ts" x="612" y="162">10 ms</text>
+<rect class="n" x="470" y="184" width="130" height="34" rx="6"/><text class="mid" x="535" y="206">Ads</text><text class="ts" x="612" y="206">10 ms</text>
+</g>
+<path class="e sig" d="M310 100 470 26"/>
+<path class="e sig" d="M310 107 470 69"/>
+<path class="e fault" d="M310 113H470"/>
+<path class="e sig" d="M310 119 470 157"/>
+<path class="e sig" d="M310 126 470 200"/>
+</svg>
+</div>
+<figcaption>Fan-out. A request that needs every backend is as slow as the slowest one, so a rare delay in any single backend becomes a common delay for the caller.</figcaption>
+</figure>
+
+<p>Suppose each backend is fast 99% of the time, meaning its own p99 is acceptable and only 1 call in 100 is slow. A request that needs all of them is fast only if every call is fast. With independent calls, that probability is 0.99 multiplied by itself once per call:</p>
+<div class="formula">chance that at least one of N calls is slow = 1 − 0.99<sup>N</sup>
+
+N = 1     1.0%
+N = 10    9.6%
+N = 100  63.4%</div>
+<p>With a hundred backend calls, nearly two-thirds of user requests experience what each backend considers a one-in-a-hundred event. Jeffrey Dean and Luiz André Barroso described this effect at Google in a 2013 paper, “The Tail at Scale”, which is the standard reference on the subject.</p>
+
+<div class="widget" data-widget="fanout">
+<h4>Fan-out and the tail</h4>
+<p>How often does a user request hit at least one slow backend call?</p>
+<div class="controls">
+  <label>Backend calls per request <output data-out="calls">20</output><input type="range" name="calls" min="1" max="200" value="20" step="1"></label>
+  <label>A call counts as slow beyond the backend’s
+    <select name="percentile"><option value="95">p95, 1 call in 20</option><option value="99" selected>p99, 1 call in 100</option><option value="99.9">p99.9, 1 call in 1,000</option></select>
+  </label>
+</div>
+<svg viewBox="0 0 100 6" preserveAspectRatio="none" style="height:14px" aria-hidden="true"><rect x="0" y="0" width="100" height="6" style="fill:var(--sunk)"/><rect data-bar x="0" y="0" width="18.2%" height="6" style="fill:var(--fault)"/></svg>
+<dl class="results">
+  <div><dt>Requests that hit a slow call</dt><dd data-out="slow">18.2%</dd></div>
+  <div><dt>Requests where every call is fast</dt><dd data-out="fast">81.8%</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">With 20 backend calls per request, about 18.2% of user requests wait on at least one call that is slower than the backend’s own p99.</p>
+</div>
+
+<p>The defenses follow from the arithmetic. Each gets a fuller treatment in <x-ref to="resilience-patterns"></x-ref>.</p>
+<ul>
+  <li><b>Call fewer things.</b> Every dependency removed from the path removes its tail as well.</li>
+  <li><b>Set a timeout on every call.</b> A call with no timeout can hold a request for as long as the slowest thing downstream cares to take.</li>
+  <li><b>Make parts optional.</b> If recommendations have not answered in 150 ms, render the page without them. A complete page late is usually worse than a nearly complete page on time.</li>
+  <li><b>Hedge.</b> Send the same read to two replicas, or send a second copy if the first has not answered by its p95, and use whichever returns first. This cuts the tail sharply for a small amount of extra load. It is safe only for operations that can be repeated without side effects.</li>
+  <li><b>Hold backends to a stricter target than the page.</b> If a page that makes 20 calls is to be fast 99% of the time, each backend has to be fast about 99.95% of the time.</li>
+</ul>
+
+<h2 id="perception">How fast is fast enough</h2>
+<p>Targets should come from what people notice. Three thresholds, published by Robert Miller in 1968 and popularized for interface design by Jakob Nielsen, have held up for decades:</p>
+<table>
+<thead><tr><th>Delay</th><th>How it feels</th><th>Implication</th></tr></thead>
+<tbody>
+<tr><th>Up to about 100 ms</th><td>Instant. The system seems to react directly to the action.</td><td>The target for typing, dragging and tapping.</td></tr>
+<tr><th>Up to about 1 second</th><td>Noticeable, and the user’s train of thought is not broken.</td><td>The target for navigating to a new page or view.</td></tr>
+<tr><th>Up to about 10 seconds</th><td>The limit of attention. Beyond it people switch to something else.</td><td>Show progress, or do the work in the background and notify.</td></tr>
+</tbody>
+</table>
+<p>A latency target is then written as a percentile, a threshold and a place of measurement: “99% of feed requests complete within 300 ms, measured at the load balancer over 30 days”. Each of those three parts is needed. Without the percentile it is an average, without the threshold it is a wish, and without the measuring point two teams will each believe they met it. <x-ref to="availability-and-reliability"></x-ref> turns such statements into formal objectives.</p>
+<aside class="sn"><b>Does speed matter commercially?</b>Many companies have reported that slower pages reduce sales and engagement, and the direction of the effect is not in doubt. The specific figures that circulate, such as a fixed percentage of revenue lost per 100 ms, come from individual experiments at particular companies years ago. Treat them as illustrations and measure the effect on your own product.</aside>
+
+<h2 id="saturation">Throughput and the cost of being busy</h2>
+<p>Now to the second measure. A server that needs 20 ms of work per request can, in principle, complete 50 requests per second on one worker. It is tempting to conclude that it will serve 49 requests per second comfortably. It will not, and the reason is queueing.</p>
+<p>Requests do not arrive evenly spaced. They come in clumps and gaps. When two arrive close together, the second waits for the first. On a lightly loaded server such collisions are rare and brief. As the load rises, the server is more often busy when a request arrives, the queue is more often already occupied, and each waiting request delays the ones behind it.</p>
+<p><dfn>Utilization</dfn> is the fraction of time the server is busy: the arrival rate divided by the rate it can serve. For the simplest model of a queue, with one server and randomly timed arrivals, the average response time is the service time divided by the idle fraction:</p>
+<div class="formula">average response time = service time ÷ (1 − utilization)</div>
+
+<div class="widget" data-widget="utilization">
+<h4>Response time against utilization</h4>
+<p>Drag the slider to load the server. The curve shows response time as a multiple of the bare service time.</p>
+<div class="controls">
+  <label>Utilization <output data-out="rho">70%</output><input type="range" name="rho" min="0" max="95" value="70" step="1"></label>
+  <label>Service time per request, in ms<input type="number" name="service" value="20" min="0" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 310" role="img" aria-label="Curve of average response time, as a multiple of service time, against utilization. It is nearly flat up to about 50 percent, bends upward around 70 to 80 percent, and rises steeply toward 100 percent."><line x1="48" x2="624" y1="260" y2="260" class="axis"></line><text x="40" y="264" class="ts end">0</text><line x1="48" x2="624" y1="199" y2="199" class="grid"></line><text x="40" y="203" class="ts end">5×</text><line x1="48" x2="624" y1="138" y2="138" class="grid"></line><text x="40" y="142" class="ts end">10×</text><line x1="48" x2="624" y1="77" y2="77" class="grid"></line><text x="40" y="81" class="ts end">15×</text><line x1="48" x2="624" y1="16" y2="16" class="grid"></line><text x="40" y="20" class="ts end">20×</text><text x="48" y="277" class="ts mid">0%</text><text x="163.2" y="277" class="ts mid">20%</text><text x="278.4" y="277" class="ts mid">40%</text><text x="393.59999999999997" y="277" class="ts mid">60%</text><text x="508.8" y="277" class="ts mid">80%</text><text x="624" y="277" class="ts mid">100%</text><text x="336" y="302" class="ts mid">Utilization of the server</text><path d="M48.0 247.8L50.9 247.7L53.8 247.7L56.6 247.6L59.5 247.6L62.4 247.5L65.3 247.4L68.2 247.4L71.0 247.3L73.9 247.2L76.8 247.2L79.7 247.1L82.6 247.0L85.4 247.0L88.3 246.9L91.2 246.8L94.1 246.7L97.0 246.7L99.8 246.6L102.7 246.5L105.6 246.4L108.5 246.4L111.4 246.3L114.2 246.2L117.1 246.1L120.0 246.1L122.9 246.0L125.8 245.9L128.6 245.8L131.5 245.7L134.4 245.6L137.3 245.6L140.2 245.5L143.0 245.4L145.9 245.3L148.8 245.2L151.7 245.1L154.6 245.0L157.4 244.9L160.3 244.8L163.2 244.8L166.1 244.7L169.0 244.6L171.8 244.5L174.7 244.4L177.6 244.3L180.5 244.2L183.4 244.1L186.2 243.9L189.1 243.8L192.0 243.7L194.9 243.6L197.8 243.5L200.6 243.4L203.5 243.3L206.4 243.2L209.3 243.1L212.2 242.9L215.0 242.8L217.9 242.7L220.8 242.6L223.7 242.4L226.6 242.3L229.4 242.2L232.3 242.1L235.2 241.9L238.1 241.8L241.0 241.7L243.8 241.5L246.7 241.4L249.6 241.2L252.5 241.1L255.4 240.9L258.2 240.8L261.1 240.6L264.0 240.5L266.9 240.3L269.8 240.2L272.6 240.0L275.5 239.8L278.4 239.7L281.3 239.5L284.2 239.3L287.0 239.1L289.9 239.0L292.8 238.8L295.7 238.6L298.6 238.4L301.4 238.2L304.3 238.0L307.2 237.8L310.1 237.6L313.0 237.4L315.8 237.2L318.7 237.0L321.6 236.8L324.5 236.5L327.4 236.3L330.2 236.1L333.1 235.8L336.0 235.6L338.9 235.4L341.8 235.1L344.6 234.8L347.5 234.6L350.4 234.3L353.3 234.0L356.2 233.8L359.0 233.5L361.9 233.2L364.8 232.9L367.7 232.6L370.6 232.3L373.4 232.0L376.3 231.6L379.2 231.3L382.1 231.0L385.0 230.6L387.8 230.2L390.7 229.9L393.6 229.5L396.5 229.1L399.4 228.7L402.2 228.3L405.1 227.9L408.0 227.5L410.9 227.0L413.8 226.6L416.6 226.1L419.5 225.6L422.4 225.1L425.3 224.6L428.2 224.1L431.0 223.6L433.9 223.0L436.8 222.5L439.7 221.9L442.6 221.3L445.4 220.6L448.3 220.0L451.2 219.3L454.1 218.6L457.0 217.9L459.8 217.2L462.7 216.4L465.6 215.6L468.5 214.8L471.4 214.0L474.2 213.1L477.1 212.2L480.0 211.2L482.9 210.2L485.8 209.2L488.6 208.1L491.5 207.0L494.4 205.8L497.3 204.5L500.2 203.3L503.0 201.9L505.9 200.5L508.8 199.0L511.7 197.4L514.6 195.8L517.4 194.1L520.3 192.2L523.2 190.3L526.1 188.2L529.0 186.1L531.8 183.7L534.7 181.3L537.6 178.7L540.5 175.9L543.4 172.9L546.2 169.6L549.1 166.2L552.0 162.4L554.9 158.3L557.8 153.9L560.6 149.1L563.5 143.8L566.4 138.0L569.3 131.6L572.2 124.4L575.0 116.5L577.9 107.5L580.8 97.3L583.7 85.7L586.6 72.3L589.4 56.7L592.3 38.2L595.2 16.0" class="line"></path><line class="grid" y1="16" y2="260" x1="451.2" x2="451.2"></line><circle r="5.5" class="dot" cx="451.2" cy="219.33333333333334"></circle><text class="tb end" x="441.2" y="207.33333333333334">3.33×</text></svg>
+<dl class="results">
+  <div><dt>Response time multiple</dt><dd data-out="mult">3.33×</dd></div>
+  <div><dt>Average response time</dt><dd data-out="response">66.7 ms</dd></div>
+  <div><dt>Of which waiting</dt><dd data-out="waiting">46.7 ms</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Queueing is now a visible share of the response time, but the curve is still gentle. Many teams aim to run in this range.</p>
+</div>
+
+<table>
+<thead><tr><th>Utilization</th><th>Response time, as a multiple of service time</th><th>With 20 ms of service time</th></tr></thead>
+<tbody>
+<tr><td class="r">10%</td><td class="r">1.1×</td><td class="r">22 ms</td></tr>
+<tr><td class="r">50%</td><td class="r">2×</td><td class="r">40 ms</td></tr>
+<tr><td class="r">70%</td><td class="r">3.3×</td><td class="r">67 ms</td></tr>
+<tr><td class="r">80%</td><td class="r">5×</td><td class="r">100 ms</td></tr>
+<tr><td class="r">90%</td><td class="r">10×</td><td class="r">200 ms</td></tr>
+<tr><td class="r">95%</td><td class="r">20×</td><td class="r">400 ms</td></tr>
+</tbody>
+</table>
+<p>The shape of this curve is one of the most important facts in system design. Going from 50% to 80% utilization gets you 60% more throughput and costs two and a half times the response time. Going from 90% to 95% gets you about 5% more throughput and doubles it again. Near the limit, a small burst of traffic produces a large jump in latency, and the tail grows faster than the average.</p>
+<aside class="sn"><b>How exact is the formula?</b>It is the result for the M/M/1 queue of queueing theory, which assumes one server and fully random arrival and service times. Real services have many workers and less randomness, which pushes the bend to the right: a pool of 16 workers stays responsive at higher utilization than a single worker does. The bend never disappears, and it is always sharper than intuition suggests.</aside>
+<p>Three practical rules follow.</p>
+<ul>
+  <li><b>Spare capacity is what keeps latency low.</b> A fleet running at 50 to 70% of its limit at peak is correctly sized. One running at 95% is a single retry storm away from an outage.</li>
+  <li><b>Scale before the bend.</b> Autoscaling rules that add servers at 60 or 70% CPU exist because of this curve. Waiting for 90% means adding capacity after users have already felt it.</li>
+  <li><b>Bound every queue.</b> A queue that can grow without limit turns overload into ever-rising latency for everyone. A queue with a limit turns it into fast rejections for some, which callers can handle. This is the idea behind <dfn>load shedding</dfn> and <dfn>backpressure</dfn>.</li>
+</ul>
+
+<h3 id="littles-law">Little’s law: how slowness becomes an outage</h3>
+<p>One more relationship ties the two measures together. In any stable system, the average number of requests in progress equals the arrival rate times the average time each one spends inside:</p>
+<div class="formula">requests in progress = arrival rate × response time</div>
+<p>This is <dfn>Little’s law</dfn>, proved by John Little in 1961, and it holds whatever the distribution of arrivals or service times. Its use is in sizing anything that is held for the duration of a request: threads, memory, database connections.</p>
+<p>A service receives 200 requests per second and answers in 50 ms. On average 200 × 0.05 = 10 requests are in progress, and a pool of 20 database connections is plenty. Now the database slows down and the response time rises to 2 seconds. The arrival rate has not changed, yet 200 × 2 = 400 requests are in progress. The connection pool, the thread pool and perhaps the server’s memory are exhausted. New requests cannot even start, health checks time out, and the load balancer removes the server, which pushes its share of traffic onto its neighbors.</p>
+<p>That sequence is how most outages unfold. Nothing crashed. Something became slow, and slowness multiplied the amount of work in progress until a limit was reached. It is the reason this book treats a slow dependency as more dangerous than a dead one: a dead dependency fails fast, and a slow one holds your resources while it fails.</p>
+
+<h2 id="trade">Trading one measure for the other</h2>
+<p>Latency and throughput can often be exchanged, and the main currency is <dfn>batching</dfn>. Doing work in groups spreads a fixed cost over many items, so more gets done per second, and each item waits for its group to fill.</p>
+<table>
+<thead><tr><th>Where</th><th>The batch</th><th>Gain in throughput</th><th>Cost in latency</th></tr></thead>
+<tbody>
+<tr><td>Database commits</td><td>Flush many transactions to disk in one write</td><td>Far more commits per second from the same disk</td><td>Each commit waits a few milliseconds for the group</td></tr>
+<tr><td>Message producers</td><td>Collect messages for a few milliseconds before sending</td><td>Fewer, larger network requests and better compression</td><td>The collection delay, on every message</td></tr>
+<tr><td>Network sends</td><td>Hold small writes until a full packet is ready</td><td>Fewer tiny packets</td><td>Small interactive messages are delayed</td></tr>
+<tr><td>Bulk APIs</td><td>One request carrying 500 items</td><td>One round trip instead of 500</td><td>The first item is not processed until the whole request arrives</td></tr>
+</tbody>
+</table>
+<p>The choice depends on what the work is for. Analytics events can sit in a batch for five seconds and nobody will know. A keystroke in a collaborative editor cannot wait fifty milliseconds. Many systems split their traffic along this line and run an <dfn>online</dfn> path tuned for latency beside an <dfn>offline</dfn> or batch path tuned for throughput.</p>
+
+<h2 id="reduce">Where latency comes from, and how to remove it</h2>
+<p>Almost every performance technique in the rest of this book is one of six moves. When a system is slow, find the largest segment of the response time and ask which of these applies to it.</p>
+<table>
+<thead><tr><th>Move</th><th>Examples</th><th>Covered in</th></tr></thead>
+<tbody>
+<tr><th>Do not do the work</th><td>Cache the result, return <code>304 Not Modified</code>, precompute the answer</td><td><x-ref to="caching"></x-ref></td></tr>
+<tr><th>Do less work</th><td>Add an index, select only the fields needed, paginate, compress</td><td><x-ref to="indexes-and-queries"></x-ref></td></tr>
+<tr><th>Do it closer</th><td>CDN, edge servers, regional replicas</td><td><x-ref to="cdn-and-edge"></x-ref></td></tr>
+<tr><th>Do it at the same time</th><td>Call independent backends in parallel instead of one after another</td><td><x-ref to="concurrency-in-code"></x-ref></td></tr>
+<tr><th>Do it later</th><td>Queue the slow part and answer the user now</td><td><x-ref to="message-queues"></x-ref></td></tr>
+<tr><th>Stop waiting</th><td>Reuse connections, set timeouts, hedge requests, shed load</td><td><x-ref to="resilience-patterns"></x-ref></td></tr>
+</tbody>
+</table>
+<p>Parallelism deserves one caution. Calling five backends at once makes the response time the slowest of the five instead of their sum, which is a large gain. It does not reduce the total work, and it widens the fan-out, so the tail arithmetic from earlier in the chapter applies in full.</p>
+
+<h2 id="measuring">Measuring it properly</h2>
+<p>You cannot improve what you measure badly, and latency is easy to measure badly.</p>
+<ul>
+  <li><b>Record a distribution.</b> Store histograms or raw timings and report p50, p95 and p99. An average on a dashboard hides exactly the events you most need to see.</li>
+  <li><b>Measure where the user is.</b> The server’s own timer starts after the request has crossed the network and waited in any queue in front of the application. A server can report 20 ms while the user waits two seconds. Measure at the client or the edge as well, and compare.</li>
+  <li><b>Measure errors beside latency.</b> A service that fails instantly looks wonderfully fast. Track latency for successful and failed requests separately.</li>
+  <li><b>Break it down.</b> A single number tells you there is a problem. A trace that shows the time spent in each downstream call tells you where it is. This is the purpose of distributed tracing, covered in <x-ref to="observability"></x-ref>.</li>
+  <li><b>Test at realistic load.</b> Latency at 5% utilization predicts nothing about latency at 70%. Use the curve above to decide what load a test must reach.</li>
+</ul>
+<aside class="sn"><b>Coordinated omission</b>Many load-testing tools send a request, wait for the answer, then send the next. If the server stalls for five seconds, the tool sends nothing during the stall and records one slow request, where real users would have sent hundreds that all waited. The result badly understates the tail. Gil Tene named this problem and it is worth knowing before trusting any benchmark. Tools that send at a fixed rate regardless of responses avoid it.</aside>
+<div class="note interview"><p><span class="label">In an interview.</span> When asked how you would make something faster, resist listing technologies. Say which part of the response time you think dominates and why, then pick the move that addresses it: “this is a read of data that rarely changes, so the service time is mostly a database query we could avoid with a cache; the trade-off is staleness, which is acceptable for profile data for a minute or so.” Mention the percentile you are targeting. Saying “p99” where others say “average” is a small signal that you have operated a real system.</p></div>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>Queueing theory.</b> The utilization curve and Little’s law come from a branch of mathematics developed for telephone exchanges in the early 1900s. It applies unchanged to thread pools, checkout lines and hospital beds.</li>
+  <li><b>Scalability.</b> Adding servers moves each one back down the curve. <x-ref to="scalability"></x-ref> is about making that possible.</li>
+  <li><b>Reliability.</b> Timeouts, bounded queues and load shedding are latency tools and availability tools at once. See <x-ref to="availability-and-reliability"></x-ref>.</li>
+  <li><b>Low-level design.</b> Much tail latency is created in code: a lock held during a network call, an unbounded in-memory queue, a synchronous call in a hot loop. <x-ref to="concurrency-in-code"></x-ref> covers these.</li>
+  <li><b>User experience.</b> Perceived speed can be improved without changing real latency, through skeleton screens, optimistic updates and progress indicators. That is interface design, and it complements everything here.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Latency is the time for one request. Throughput is requests completed per second. Bandwidth is only the ceiling on throughput.</li>
+  <li>Response time is network time plus waiting plus service time. Under load, waiting is the part that grows.</li>
+  <li>Report percentiles. The mean hides the tail, and the tail is what users remember.</li>
+  <li>With fan-out, a rare slow call in each backend becomes a common slow request for the caller: with 100 calls, a 1% event affects 63% of requests.</li>
+  <li>Response time rises sharply as utilization approaches 100%. Keep headroom, scale before the bend and bound every queue.</li>
+  <li>Requests in progress equal arrival rate times response time. A slow dependency fills every pool that is held per request.</li>
+  <li>Batching buys throughput with latency. Choose per workload.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A dashboard shows an average response time of 80 ms, and users complain the app is slow. What do you check first?</summary><p>The percentiles, and where the measurement is taken. A mean of 80 ms is compatible with a p99 of several seconds. And if the 80 ms is measured inside the application server, it leaves out network time and any queueing in front of the application.</p></details>
+<details><summary>A page makes 30 backend calls in parallel. Each backend has a p99 of 100 ms. Roughly what fraction of page loads will include at least one call slower than 100 ms?</summary><p>1 − 0.99<sup>30</sup>, which is about 26%. Roughly one page load in four, even though each backend is slow only one time in a hundred.</p></details>
+<details><summary>Your servers run at 85% CPU at peak, and finance asks why you want more of them when 15% is unused. What is the answer?</summary><p>That response time is roughly proportional to 1 ÷ (1 − utilization). At 85% the simple model already gives almost seven times the service time, and a small traffic spike or the loss of one server pushes the rest toward 95% and beyond, where latency multiplies again. The unused 15% is what absorbs bursts and failures.</p></details>
+<details><summary>A service handles 500 requests per second with a 40 ms response time. How many requests are in progress on average? What happens to that number if a dependency slows the response time to 1 second?</summary><p>By Little’s law, 500 × 0.04 = 20 in progress. At 1 second it becomes 500 in progress, with no change in traffic. Any pool sized for the normal case, such as 50 database connections, is exhausted.</p></details>
+<details><summary>When is it wrong to hedge a request by sending it twice?</summary><p>When repeating it has an effect: charging a card, sending an email, incrementing a counter. Hedging is safe for reads and for writes that are designed to be repeatable. <x-ref to="idempotency-and-delivery"></x-ref> covers how to make them so.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Jeffrey Dean and Luiz André Barroso, <a href="https://research.google/pubs/the-tail-at-scale/">“The Tail at Scale”</a>, <i>Communications of the ACM</i>, February 2013.</li>
+  <li>Jakob Nielsen, <a href="https://www.nngroup.com/articles/response-times-3-important-limits/">“Response Times: The 3 Important Limits”</a>, Nielsen Norman Group, drawing on Robert B. Miller, “Response time in man-computer conversational transactions”, 1968.</li>
+  <li>John D. C. Little, “A Proof for the Queuing Formula: L = λW”, <i>Operations Research</i>, 1961.</li>
+  <li>Gil Tene, “How NOT to Measure Latency”, conference talk, 2015. The origin of the term “coordinated omission”.</li>
+  <li>Brendan Gregg, <i>Systems Performance</i> (Addison-Wesley). Methodology for finding where time goes.</li>
+  <li>Betsy Beyer and others (editors), <a href="https://sre.google/sre-book/monitoring-distributed-systems/"><i>Site Reliability Engineering</i>, chapter 6, “Monitoring Distributed Systems”</a> (O’Reilly). Latency as one of the four signals to monitor.</li>
+</ol>
+</section>

@@ -1,0 +1,642 @@
+<!--meta
+{ "description": "Authorization explained for system design: object-level, function-level and property-level checks, deny by default, access control lists, role-based, attribute-based and relationship-based access control, Cedar policies, Zanzibar-style permission services and the new enemy problem, decision points, privileged access and how to test access control.",
+  "lede": "Knowing who the caller is settles nothing about what they may do. Authorization is the decision, made on every request, about whether this caller may perform this action on this object. It is the control most often found broken in real systems, because a missing check changes nothing for honest users. This chapter covers where the checks belong, the models for expressing who may do what, and how large systems make millions of such decisions a second.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Allowed to do what?</h2>
+<p>Ana is signed in to the photo app. That fact was established in <x-ref to="authentication"></x-ref>, and it answers none of the questions the system now has to ask. May she open this album? Delete that photo? See who else it is shared with? Read a photo that belongs to Ben?</p>
+<p><dfn>Authorization</dfn> is the decision whether a given caller may perform a given action on a given object. Every such decision has the same three parts.</p>
+<table>
+<thead><tr><th>Part</th><th>Question</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><th>Principal</th><td>Who is asking?</td><td>The user Ana, the tags service, a support agent acting for a customer</td></tr>
+<tr><th>Action</th><td>What do they want to do?</td><td>View, edit, delete, share, export</td></tr>
+<tr><th>Resource</th><td>To which object?</td><td>Photo 871, the Lisbon album, Ben’s account</td></tr>
+</tbody>
+</table>
+<p>The third part is the one that gets forgotten. Here is the most common serious flaw in web applications, in five steps.</p>
+
+<figure class="fig wide" id="fig-bola">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 404" role="img" aria-labelledby="f531t f531d">
+<title id="f531t">The same request with and without an object-level check</title>
+<desc id="f531d">Two sequences between Ana’s browser, the photos API and the database. In the first, Ana opens her own photo 871, then changes the address to 872. The API confirms only that somebody is signed in, looks photo 872 up by its identifier and returns Ben’s private photo. In the second, the query includes the caller, the database finds no row that Ana may see, and the API answers 404.</desc>
+<text class="tb" x="10" y="16">Without an object-level check</text>
+<g data-scene="missing">
+<text class="tb mid" x="110" y="36">Ana’s browser</text>
+<line class="axis" x1="110" y1="44" x2="110" y2="188"/>
+<text class="tb mid" x="360" y="36">Photos API</text>
+<line class="axis" x1="360" y1="44" x2="360" y2="188"/>
+<text class="tb mid" x="610" y="36">Database</text>
+<line class="axis" x1="610" y1="44" x2="610" y2="188"/>
+<g data-s="1">
+<path class="e sig" d="M111 70H359"/>
+<text class="ts mid" x="235.0" y="64">1. GET /photos/871</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M111 97H359"/>
+<text class="ts mid" x="235.0" y="91">2. GET /photos/872</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M361 124H609"/>
+<text class="ts mid" x="485.0" y="118">3. WHERE id = 872</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M609 151H361"/>
+<text class="ts mid" x="485.0" y="145">4. the row for 872</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M359 178H111"/>
+<text class="ts mid" x="235.0" y="172">5. 200: Ben’s private photo</text>
+</g>
+</g>
+<path class="e none dash" d="M10 204H710"/>
+<text class="tb" x="10" y="224">With one</text>
+<g data-scene="present">
+<text class="tb mid" x="110" y="244">Ana’s browser</text>
+<line class="axis" x1="110" y1="252" x2="110" y2="370"/>
+<text class="tb mid" x="360" y="244">Photos API</text>
+<line class="axis" x1="360" y1="252" x2="360" y2="370"/>
+<text class="tb mid" x="610" y="244">Database</text>
+<line class="axis" x1="610" y1="252" x2="610" y2="370"/>
+<g data-s="1">
+<path class="e fault" d="M111 278H359"/>
+<text class="ts mid" x="235.0" y="272">1. GET /photos/872</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M361 305H609"/>
+<text class="ts mid" x="485.0" y="299">2. WHERE id = 872 AND Ana may see it</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M609 332H361"/>
+<text class="ts mid" x="485.0" y="326">3. no rows</text>
+</g>
+<g data-s="4">
+<path class="e" d="M359 359H111"/>
+<text class="ts mid" x="235.0" y="353">4. 404 Not Found</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="missing" data-label="Without the check">
+  <li data-state="Ana has seen: her own photo 871">Ana opens one of her own photos. Her session is valid, and the API returns it.</li>
+  <li>Then she changes one digit in the address. Nothing about the request looks unusual.</li>
+  <li>The API checks that somebody is signed in. It does not ask whether this photo is hers, and looks it up by identifier alone.</li>
+  <li data-msg="photo 872">The database returns the row. It was asked for photo 872 and has no idea who wants it.</li>
+  <li data-msg="Ben’s private photo" data-state="Ana has seen: her own photo, and Ben’s private one">The API returns Ben’s private photo to Ana. Counting upward from here would return everyone’s.</li>
+</ol>
+<ol class="steps" data-scene="present" data-label="With the check">
+  <li data-state="Ana has seen: her own photo 871">The same request, against an API that checks the object.</li>
+  <li data-msg="id 872, for Ana">The caller is now part of the question. The query asks for photo 872 only if Ana owns it or it is shared with her.</li>
+  <li>No such row exists, so nothing of Ben’s is ever loaded into the API’s memory.</li>
+  <li data-state="Ana has seen: her own photo 871">The API answers exactly as it would for a photo that does not exist, so the reply does not confirm that 872 is real.</li>
+</ol>
+<figcaption>The missing check is invisible in normal use, which is why it is the most common serious flaw in web applications. Every user who only opens their own photos sees a working product.</figcaption>
+</figure>
+
+<p>The flaw is called <dfn>broken object level authorization</dfn>: an operation checks that the caller is signed in and allowed to use it, and never checks that the particular object belongs to them. It heads the OWASP list of API security risks, and the wider category of broken access control is first in the OWASP Top 10 for 2025. It is common for a plain reason. Nothing fails when the check is missing. Every test in which users open their own photos passes.</p>
+<div class="note production"><p><span class="label">In production.</span> In May 2019 the title insurer First American Financial was found to be serving about 885 million documents, going back to 2003 and including bank account numbers and tax records, to anyone who had a link to one of them. Changing a digit in the link returned the next customer’s file, and no sign-in was required. A real estate developer noticed it and, getting no answer from the company, took it to a journalist.</p></div>
+<p>A random, unguessable identifier would have slowed that down. It would not have fixed it: identifiers leak through logs, shared links and browser histories, and knowing a name must never be the same as having permission (<x-ref to="unique-ids#security"></x-ref>).</p>
+
+<h2 id="levels">Three levels of check</h2>
+<p>One request can need three separate decisions, and each has its own way of going missing.</p>
+
+<figure class="fig wide" id="fig-levels">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f532t f532d">
+<title id="f532t">Three levels at which a request must be authorized</title>
+<desc id="f532d">A request to change photo 872, setting a caption and an owner, passes three checks in turn. Function level: may this user call this operation at all? Editing photos is open to any signed-in user. Object level: may they do it to this object? Photo 872 belongs to Ben, so no. Property level: which fields may they read or write? The caption may be changed, the owner never. Under each is the name of the failure when the check is missing.</desc>
+<text class="tb" x="10" y="18">PATCH /photos/872   { "caption": "Lisbon", "owner_id": "ana" }</text>
+<rect class="n sig" x="10" y="34" width="220" height="104" rx="6"/>
+<text class="tb" x="22" y="54">1. Function</text>
+<text class="ts" x="22" y="72">May this user call</text>
+<text class="ts" x="22" y="88">this operation at all?</text>
+<text class="ts" x="22" y="110">Editing photos: any</text>
+<text class="ts" x="22" y="126">signed-in user may.</text>
+<path class="e" d="M231 86H249"/>
+<text class="ts" x="10" y="160">If missing: an ordinary user</text>
+<text class="ts" x="10" y="176">reaches an administrator’s</text>
+<text class="ts" x="10" y="192">operation.</text>
+<rect class="n fault" x="250" y="34" width="220" height="104" rx="6"/>
+<text class="tb" x="262" y="54">2. Object</text>
+<text class="ts" x="262" y="72">May they do it</text>
+<text class="ts" x="262" y="88">to this object?</text>
+<text class="ts" x="262" y="110">Photo 872 is Ben’s:</text>
+<text class="ts" x="262" y="126">Ana may not.</text>
+<path class="e" d="M471 86H489"/>
+<text class="ts" x="250" y="160">If missing: change the</text>
+<text class="ts" x="250" y="176">identifier, get somebody</text>
+<text class="ts" x="250" y="192">else’s data.</text>
+<rect class="n sig" x="490" y="34" width="220" height="104" rx="6"/>
+<text class="tb" x="502" y="54">3. Property</text>
+<text class="ts" x="502" y="72">Which fields may they</text>
+<text class="ts" x="502" y="88">read or write?</text>
+<text class="ts" x="502" y="110">caption: yes.</text>
+<text class="ts" x="502" y="126">owner_id: never.</text>
+<text class="ts" x="490" y="160">If missing: set a field the</text>
+<text class="ts" x="490" y="176">form did not show, or receive</text>
+<text class="ts" x="490" y="192">one that should be hidden.</text>
+<text class="ts" x="10" y="222">A request is allowed only if it passes all three. Most frameworks give you the first and leave the other two to you.</text>
+</svg>
+</div>
+<figcaption>Authentication and a role check on the route cover the first level only. The second and third depend on the data, so they cannot be decided before it is known which object is involved.</figcaption>
+</figure>
+
+<p>The property level deserves a word, because it hides in convenience. <dfn>Mass assignment</dfn> is what happens when a handler copies every field of a request body onto a stored object: a caller adds <code>"owner_id"</code> or <code>"is_admin"</code> to the request, and the field is saved along with the legitimate ones. The same level applies to output. A handler that returns the whole database row sends the client fields that the page never shows and the user should never see. Name the fields that may be written and the fields that may be returned. Do not rely on a list of exceptions.</p>
+
+<h3 id="in-the-query">Put the caller in the query</h3>
+<p>The surest way to make the object-level check is to make it impossible to load an object without it.</p>
+<pre data-lang="ts" data-title="An object-level check that cannot be skipped">
+type Photo = { id: string; ownerId: string; url: string };
+type Db = { query(sql: string, params: unknown[]): Photo[] };
+
+class NotFound extends Error {}
+
+// Wrong: fetches by ID alone. Anyone who is signed in can read any photo by changing the number.
+export function getPhotoUnsafe(db: Db, _userId: string, photoId: string): Photo {
+  const [photo] = db.query("SELECT * FROM photos WHERE id = $1", [photoId]);
+  if (!photo) throw new NotFound();
+  return photo;
+}
+
+// Right: the caller's identity is part of the query, so a row the caller may not see is never loaded.
+export function getPhoto(db: Db, userId: string, photoId: string): Photo {
+  const [photo] = db.query(
+    `SELECT p.* FROM photos p
+      WHERE p.id = $1
+        AND (p.owner_id = $2
+             OR EXISTS (SELECT 1 FROM shares s WHERE s.photo_id = p.id AND s.user_id = $2))`,
+    [photoId, userId],
+  );
+  if (!photo) throw new NotFound(); // the same answer for "does not exist" and "not yours"
+  return photo;
+}
+</pre>
+<p>Run against PostgreSQL with two photos and one share, the second query returned photo 871 to its owner and to the user it was shared with, and no row at all to anyone else. Three details matter.</p>
+<ul>
+  <li><b>Check, then fetch, in one step.</b> Loading the row first and comparing afterward works until somebody adds a code path that forgets the comparison.</li>
+  <li><b>Answer 404, not 403, for objects the caller may not know about.</b> “Forbidden” confirms that photo 872 exists. Use 403 when the caller can already see the object and is refused one action on it.</li>
+  <li><b>Lists are checks too.</b> A search or a feed must build the permission into its query, as this one does. Fetching a page of rows and then removing the ones the caller may not see leaks through counts and timing, and returns pages of uneven length (<x-ref to="indexes-and-queries#pagination"></x-ref>).</li>
+</ul>
+<p>The tenant boundary in a shared database is the same idea one level up, and the database can enforce it as a second lock (<x-ref to="multi-tenancy#rls"></x-ref>).</p>
+
+<h3 id="principles">Four rules that hold in every model</h3>
+<ul>
+  <li><dfn>Deny by default</dfn> means that a request is refused unless a rule explicitly allows it. A new endpoint with no rule attached must fail closed, not open.</li>
+  <li><dfn>Least privilege</dfn> means giving each user and each service only the access its work requires, for only as long as it is required.</li>
+  <li><b>Decide on the server, on every request.</b> A hidden button is a courtesy to the user. It is not a control, because the request can be sent without the button.</li>
+  <li><b>Decide in one place.</b> A rule copied into forty handlers will be wrong in one of them.</li>
+</ul>
+
+<h2 id="models">Models for who may do what</h2>
+<p>The checks need rules, and rules need a shape. Four shapes are in common use. They are not rivals so much as tools for different questions, and most systems of any size use more than one.</p>
+<table>
+<thead><tr><th>Model</th><th>Access is decided by</th><th>Natural for</th><th>Strains when</th></tr></thead>
+<tbody>
+<tr><th>Access control list</th><td>A list on each object naming who may do what</td><td>A few objects with individual owners</td><td>There are millions of objects, or a rule must change for all of them</td></tr>
+<tr><th>Role-based (RBAC)</th><td>The roles a user holds</td><td>Staff tools, where a job implies a set of actions</td><td>Access depends on which object, not only which kind</td></tr>
+<tr><th>Attribute-based (ABAC)</th><td>Rules over properties of the user, the object and the moment</td><td>Conditions: same region, office hours, data classification</td><td>Nobody can say who has access without evaluating every rule</td></tr>
+<tr><th>Relationship-based (ReBAC)</th><td>Paths between the user and the object in a graph of facts</td><td>Sharing, folders, teams, anything nested</td><td>Rules depend on context that is not a relationship</td></tr>
+</tbody>
+</table>
+<p>An <dfn>access control list</dfn>, or ACL, is the oldest form: each object carries a list of principals and what each may do. File permissions are ACLs, and so is the <code>shares</code> table in the query above.</p>
+
+<h3 id="rbac">Roles</h3>
+<p>In <dfn>role-based access control</dfn>, permissions are attached to roles, and users are given roles. Nobody is granted a permission directly. Changing what moderators may do is one edit, and removing someone’s access is removing a role.</p>
+<pre data-lang="ts" data-title="Roles as named bundles of permissions">
+type Permission = "photo:view" | "photo:delete" | "report:review" | "user:suspend" | "billing:refund";
+
+// Roles are named bundles of permissions. Code checks permissions, never role names.
+const ROLES: Record<string, Permission[]> = {
+  support: ["photo:view"],
+  moderator: ["photo:view", "photo:delete", "report:review", "user:suspend"],
+  billing: ["billing:refund"],
+};
+
+export function can(user: { roles: string[] }, permission: Permission): boolean {
+  return user.roles.some((role) => ROLES[role]?.includes(permission) ?? false);
+}
+</pre>
+<p>The one rule worth memorizing is in the comment. Code asks <code>can(user, "photo:delete")</code>, never <code>user.role === "moderator"</code>. The day a second role needs to delete photos, the first form needs a line of configuration and the second needs a search through the whole codebase.</p>
+<p>Roles answer “what kind of thing may this person do?”. They cannot answer “to which objects?”. The usual attempt to make them is a role for each combination, which is known as <dfn>role explosion</dfn>: the number of roles grows as the product of everything a role is asked to encode.</p>
+
+<div class="widget" data-widget="roles">
+<h4>Roles needed when a role has to encode where and for whom</h4>
+<p>The count of roles if each combination of job, region and team is a separate role.</p>
+<div class="controls">
+  <label>Job functions<input type="number" name="jobs" value="6" min="1" max="200" step="1"></label>
+  <label>Regions<input type="number" name="regions" value="5" min="1" max="200" step="1"></label>
+  <label>Teams or product lines<input type="number" name="teams" value="12" min="1" max="2000" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Roles, one for each combination</dt><dd data-out="combined">360</dd></div>
+  <div><dt>Roles, if a role says only the job</dt><dd data-out="plain">6</dd></div>
+  <div><dt>Attributes compared instead</dt><dd data-out="attributes">2</dd></div>
+  <div><dt>Reduction</dt><dd data-out="ratio">60×</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">If a role has to say what someone does, where and for which team, every combination needs its own: 6 × 5 × 12 = 360 roles to create, assign and review. Keeping 6 roles and comparing two attributes of the user with the same attributes of the object does the same job, and a new region or team needs no new role.</p>
+</div>
+
+<h3 id="abac">Attributes and policies</h3>
+<p>In <dfn>attribute-based access control</dfn>, a decision is computed by rules over attributes: of the principal, of the resource, of the action and of the circumstances, such as the time or the network. The rules are written as policies in a language made for the purpose, kept apart from application code, reviewed and versioned like code.</p>
+<p>These four policies are written in Cedar, an open-source policy language. They were evaluated with the Cedar engine against the nine requests in the table that follows.</p>
+<pre data-lang="text" data-title="Four policies for the photo app, in Cedar">
+// 1. Owners may do anything with their own photos.
+permit (principal, action, resource is Photo)
+when { resource.owner == principal };
+
+// 2. Members of a group that an album is shared with may view its photos.
+permit (principal, action == Action::"view", resource is Photo)
+when { principal in resource.album.sharedWith };
+
+// 3. Support staff may view a photo while its owner has a support case open,
+//    and only from the office network.
+permit (principal in Role::"support", action == Action::"view", resource is Photo)
+when { resource.owner.openCase && context.network == "office" };
+
+// 4. A photo under legal hold can be deleted by nobody. A forbid always wins.
+forbid (principal, action == Action::"delete", resource is Photo)
+when { resource.legalHold };
+</pre>
+<table>
+<thead><tr><th>Request</th><th>Decision</th><th>Because</th></tr></thead>
+<tbody>
+<tr><th>Ana views or deletes her photo 871</th><td>Allow</td><td>Policy 1: she is the owner</td></tr>
+<tr><th>Ben views photo 871</th><td>Deny</td><td>No policy permits it</td></tr>
+<tr><th>Chi, in the family group, views 871</th><td>Allow</td><td>Policy 2: the album is shared with her group</td></tr>
+<tr><th>Chi deletes 871</th><td>Deny</td><td>Policy 2 covers viewing only</td></tr>
+<tr><th>Dee, support staff, views 871 from the office</th><td>Allow</td><td>Policy 3: Ana has a case open</td></tr>
+<tr><th>Dee views 871 from home</th><td>Deny</td><td>Policy 3’s condition on the network fails</td></tr>
+<tr><th>Ana deletes her photo 900, under legal hold</th><td>Deny</td><td>Policy 4 forbids, and a forbid overrides any permit</td></tr>
+<tr><th>Ana views photo 900</th><td>Allow</td><td>Policy 1. The hold forbids deleting only</td></tr>
+</tbody>
+</table>
+<p>Two properties of the engine did the work, and both are worth insisting on in any policy system. Nothing is allowed unless some policy permits it, so the two plain denials needed no rule. And an explicit forbid always wins, so a guardrail such as the legal hold cannot be undone by a permit written later by someone who had not heard of it.</p>
+<p>The cost of this power is legibility. “Who can see photo 871?” has no stored answer. It can only be computed, by evaluating every policy against every user. Keep policies few, and test them as code.</p>
+
+<h3 id="rebac">Relationships</h3>
+<p>Sharing is the hard case for roles and attributes alike. Ana shares an album with her family group. Chi is in the group. The album holds four hundred photos. Whether Chi may see one of them depends on a chain of facts, none of which mentions Chi and the photo together.</p>
+<p>In <dfn>relationship-based access control</dfn>, permissions follow from relationships between things, stored as small facts and combined by rules: an owner of a photo may view it, and so may a viewer of the album that contains it. Each fact is a triple of an object, a relation and a subject.</p>
+
+<figure class="fig wide" id="fig-rebac">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f533t f533d">
+<title id="f533t">Answering a permission check by walking relationships</title>
+<desc id="f533d">A graph of stored facts. Photo 871 has owner user Ana and parent album Lisbon. Album Lisbon has as viewers the members of group family. Group family has member user Chi. To decide whether Chi may view photo 871, the check tries the owner, which is Ana and not Chi, then follows parent to the album, viewer to the group, and member to Chi, and answers yes. User Ben is connected to nothing and would be refused.</desc>
+<text class="tb" x="10" y="18">May user:chi view photo:871?</text>
+<rect class="n sig" x="20" y="110" width="120" height="44" rx="6"/>
+<text class="tb mid" x="80" y="136.5">photo:871</text>
+<rect class="n" x="20" y="36" width="120" height="40" rx="6"/>
+<text class="tb mid" x="80" y="60.5">user:ana</text>
+<rect class="n store" x="215" y="110" width="120" height="44" rx="6"/>
+<text class="tb mid" x="275" y="136.5">album:lisbon</text>
+<rect class="n store" x="410" y="110" width="120" height="44" rx="6"/>
+<text class="tb mid" x="470" y="136.5">group:family</text>
+<rect class="n sig" x="605" y="110" width="105" height="44" rx="6"/>
+<text class="tb mid" x="657.5" y="136.5">user:chi</text>
+<rect class="n ghost" x="605" y="186" width="105" height="40" rx="6"/>
+<text class="tb mid" x="657.5" y="210.5">user:ben</text>
+<text class="ts end" x="595" y="210">no path leads here: refused</text>
+<g data-s="1">
+<path class="e" d="M80 109V78"/>
+<text class="ts" x="87" y="97">owner</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M141 132H213"/>
+<text class="ts mid" x="177" y="125">parent</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M336 132H408"/>
+<text class="ts mid" x="372" y="125">viewer</text>
+<text class="ts mid" x="372" y="170">every member of</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M531 132H603"/>
+<text class="ts mid" x="567" y="125">member</text>
+<text class="tb mid" x="657" y="96">allowed</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="owner?" data-state="Now asking: is Chi the owner of photo:871? No; Facts read: 1">The check starts at the photo. A viewer of a photo is its owner, or a viewer of the album it is in. The owner is Ana, not Chi, so that branch ends.</li>
+  <li data-msg="parent?" data-state="Now asking: is Chi a viewer of album:lisbon?; Facts read: 2">The other branch follows the photo’s parent. The question becomes whether Chi is a viewer of the album.</li>
+  <li data-msg="viewer?" data-state="Now asking: is Chi a member of group:family?; Facts read: 3">The album’s viewers are not listed one by one. One fact says: every member of the family group. The question moves again.</li>
+  <li data-msg="member?" data-state="Now asking: nothing more. Chi is allowed; Facts read: 4">A stored fact says Chi is a member. A path exists from the photo to Chi, so the answer is yes. For Ben the walk finds nothing, and the answer is no.</li>
+</ol>
+<figcaption>Four small facts answer the question, and none of them mentions Chi and the photo together. Adding Chi to the group gave access to every album shared with it, at once.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Relationship facts and a check that walks them">
+// One fact: <subject> has <relation> to <object>. A subject is a user, or "everyone with a relation to another object".
+type Tuple = { object: string; relation: string; subject: string };
+
+const tuples: Tuple[] = [
+  { object: "photo:871", relation: "owner", subject: "user:ana" },
+  { object: "photo:871", relation: "parent", subject: "album:lisbon" },
+  { object: "album:lisbon", relation: "viewer", subject: "group:family#member" },
+  { object: "group:family", relation: "member", subject: "user:chi" },
+];
+
+// The model: how a relation can follow from other relations.
+const RULES: Record<string, (object: string) => Array<[string, string]>> = {
+  // viewer of a photo: its owner, or anyone who is a viewer of the album it is in
+  "photo.viewer": (photo) => [[photo, "owner"], ...parents(photo).map((album): [string, string] => [album, "viewer"])],
+};
+
+const parents = (object: string) => tuples.filter((t) => t.object === object && t.relation === "parent").map((t) => t.subject);
+
+export function check(user: string, relation: string, object: string, depth = 0): boolean {
+  if (depth > 10) return false; // a cycle in the data must not hang the check
+  for (const t of tuples) {
+    if (t.object !== object || t.relation !== relation) continue;
+    if (t.subject === user) return true; // a direct fact
+    const [group, groupRelation] = t.subject.split("#"); // "everyone who is a member of group:family"
+    if (groupRelation && check(user, groupRelation, group, depth + 1)) return true;
+  }
+  const rule = RULES[`${object.split(":")[0]}.${relation}`];
+  return rule ? rule(object).some(([o, r]) => check(user, r, o, depth + 1)) : false;
+}
+</pre>
+<p>Run as written, <code>check("user:chi", "viewer", "photo:871")</code> is true, the same check for Ana is true through ownership, and for Ben it is false. The shape has three consequences.</p>
+<ul>
+  <li><b>Granting is writing one fact.</b> Adding Chi to the group gave her every album shared with it. Removing that one fact takes them all away.</li>
+  <li><b>The cost of a check is the length of the path</b>, and deep nesting of folders and groups makes it longer. Real systems cap the depth and cache intermediate answers.</li>
+  <li><b>The reverse question is harder.</b> “May Chi see this photo?” walks from one object. “Which photos may Chi see?”, the question behind every list and search, has to walk from the user outward. Purpose-built systems offer it as a separate operation.</li>
+</ul>
+<p>A sensible progression for a product: ownership in the query from the first day, roles for staff, relationships once users can share or nest things, and policies over attributes for the conditions that are about context. Each layer is added when its question appears, and the earlier ones stay.</p>
+
+<h2 id="zanzibar">Permissions as a service</h2>
+<p>Once several services need the same answers, the facts and the rules move into a service of their own. The reference design is Zanzibar, which Google described in 2019 and which stands behind sharing in its consumer products. It stores relationship facts like the ones above and answers checks against them. The paper reports trillions of stored facts, millions of checks a second, 95% of them answered in under 10 milliseconds, and availability above 99.999% over three years.</p>
+<p>Those numbers set the requirements for anything in this role. A permission check sits on the path of every request, so the service must be faster and more available than everything that calls it. Several open-source systems follow the design, among them OpenFGA, a Cloud Native Computing Foundation project since 2022, and SpiceDB. Policy engines such as Open Policy Agent and Cedar fill the same position for rules written as policies.</p>
+
+<h3 id="new-enemy">Stale permissions and the new enemy</h3>
+<p>Permission data is replicated like any other, and a replica can be behind (<x-ref to="replication#lag"></x-ref>). For most checks a fraction of a second of staleness is harmless. One case is not. The Zanzibar paper calls it the <dfn>new enemy problem</dfn>: a check that applies old permissions to new content, so that someone who has just been removed sees something added after their removal.</p>
+
+<figure class="fig wide" id="fig-enemy">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 470" role="img" aria-labelledby="f534t f534d">
+<title id="f534t">A permission check against stale data, and one that states how fresh it must be</title>
+<desc id="f534d">Two sequences between Ana, Ben, the photos API and the permission service. In the first, Ana removes Ben from an album and then adds photo 950. Ben requests photo 950. The API’s check is answered by a replica that has not yet received the removal, the answer is yes, and Ben sees a photo added after he was removed. In the second, the API obtained a token when photo 950 was added and sends it with the check. The permission service answers from data at least that fresh, the answer is no, and Ben receives 404.</desc>
+<text class="tb" x="10" y="16">A check answered from stale data</text>
+<g data-scene="stale">
+<text class="tb mid" x="70" y="36">Ana</text>
+<line class="axis" x1="70" y1="44" x2="70" y2="216"/>
+<text class="tb mid" x="230" y="36">Ben</text>
+<line class="axis" x1="230" y1="44" x2="230" y2="216"/>
+<text class="tb mid" x="440" y="36">Photos API</text>
+<line class="axis" x1="440" y1="44" x2="440" y2="216"/>
+<text class="tb mid" x="640" y="36">Permission service</text>
+<line class="axis" x1="640" y1="44" x2="640" y2="216"/>
+<g data-s="1">
+<path class="e sig" d="M71 70H639"/>
+<text class="ts mid" x="355.0" y="64">1. remove Ben from the album</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M71 97H439"/>
+<text class="ts mid" x="255.0" y="91">2. add photo 950 to the album</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M231 124H439"/>
+<text class="ts mid" x="335.0" y="118">3. GET /photos/950</text>
+</g>
+<g data-s="4">
+<path class="e" d="M441 151H639"/>
+<text class="ts mid" x="540.0" y="145">4. may Ben view 950?</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M639 178H441"/>
+<text class="ts mid" x="540.0" y="172">5. yes</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M439 205H231"/>
+<text class="ts mid" x="335.0" y="199">200: photo 950</text>
+</g>
+</g>
+<path class="e none dash" d="M10 232H710"/>
+<text class="tb" x="10" y="252">A check that says how fresh the answer must be</text>
+<g data-scene="fresh">
+<text class="tb mid" x="70" y="272">Ana</text>
+<line class="axis" x1="70" y1="280" x2="70" y2="452"/>
+<text class="tb mid" x="230" y="272">Ben</text>
+<line class="axis" x1="230" y1="280" x2="230" y2="452"/>
+<text class="tb mid" x="440" y="272">Photos API</text>
+<line class="axis" x1="440" y1="280" x2="440" y2="452"/>
+<text class="tb mid" x="640" y="272">Permission service</text>
+<line class="axis" x1="640" y1="280" x2="640" y2="452"/>
+<g data-s="1">
+<path class="e sig" d="M71 306H439"/>
+<text class="ts mid" x="255.0" y="300">1. add photo 950 to the album</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M441 333H639"/>
+<text class="ts mid" x="540.0" y="327">2. give me a token for “now”</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M231 360H439"/>
+<text class="ts mid" x="335.0" y="354">3. GET /photos/950</text>
+</g>
+<g data-s="4">
+<path class="e" d="M441 387H639"/>
+<text class="ts mid" x="540.0" y="381">4. may Ben view 950, as of T or later?</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M639 414H441"/>
+<text class="ts mid" x="540.0" y="408">5. no</text>
+</g>
+<g data-s="5">
+<path class="e" d="M439 441H231"/>
+<text class="ts mid" x="335.0" y="435">404 Not Found</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="stale" data-label="Stale data">
+  <li data-msg="remove Ben" data-state="Newest permissions: Ben removed; This check read: nothing yet">Ana removes Ben from her Lisbon album. The change is written and begins to spread to the permission service’s replicas.</li>
+  <li data-msg="add photo 950">A moment later she adds a photo she would not have shared with him.</li>
+  <li>Ben, whose app still shows the album, asks for the new photo.</li>
+  <li>The API asks the permission service. The question lands on a replica that has not yet received the removal.</li>
+  <li data-state="Newest permissions: Ben removed; This check read: a replica where Ben is still a viewer">That replica answers from what it has: Ben is a viewer of the album, and photo 950 is in it.</li>
+</ol>
+<ol class="steps" data-scene="fresh" data-label="A freshness token">
+  <li data-msg="add photo 950" data-state="Newest permissions: Ben removed; This check read: nothing yet">Ana has removed Ben and now adds photo 950, as before.</li>
+  <li data-msg="a token for now?">While saving the photo, the API asks the permission service for a token that stands for the current state of permissions, and stores it with the photo.</li>
+  <li>Ben asks for the new photo.</li>
+  <li data-msg="check, at least T">The API sends the photo’s token with the question. A replica that has not reached T must catch up or pass the question on.</li>
+  <li data-state="Newest permissions: Ben removed; This check read: data at least as new as the photo">Answered from data that includes the removal, the check fails. Old photos may be checked against slightly old data. A new photo never is.</li>
+</ol>
+<figcaption>Permissions are data, and replicated data can be stale. What must never happen is new content being judged by permissions older than the content.</figcaption>
+</figure>
+
+<p>Zanzibar’s answer is neither to make every check strongly consistent, which would be slow everywhere, nor to accept staleness blindly. When content changes, the application obtains a token that stands for that moment and stores it with the content. Every later check for that content carries the token, and the permission service answers from data at least that fresh. It is the same bargain as the session guarantees in <x-ref to="consistency-models#session"></x-ref>: pay for freshness exactly where an anomaly would be visible.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Caching permission decisions without thinking about revocation. A cached “yes” is a grant that outlives its removal by the cache’s lifetime. Cache briefly, key the cache on everything the decision depended on, and decide in advance how long a removed user may keep access, because that number is now a property of your system.</p></div>
+
+<h2 id="architecture">Where the decision is made</h2>
+<p>Two roles are worth separating, whatever the model. The <dfn>policy enforcement point</dfn> is the code that stops a request and asks. The <dfn>policy decision point</dfn> is the component that answers. The enforcement point stays in the service, next to the action it guards. The decision point can live in several places.</p>
+
+<figure class="fig wide" id="fig-pdp">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f535t f535d">
+<title id="f535t">One decision, from the request to the log</title>
+<desc id="f535d">A sequence between a client, a service, a decision point and its store of policies and facts. Chi asks the service to delete photo 871. The service asks the decision point whether user Chi may delete photo 871. The decision point evaluates its policies against the facts: Chi can view the photo through a shared album and nothing permits deleting. It answers deny. The service returns 403 and records the decision.</desc>
+<text class="tb mid" x="80" y="20">Chi’s browser</text>
+<line class="axis" x1="80" y1="28" x2="80" y2="208"/>
+<text class="tb mid" x="270" y="20">Photos service</text>
+<line class="axis" x1="270" y1="28" x2="270" y2="208"/>
+<text class="tb mid" x="470" y="20">Decision point</text>
+<line class="axis" x1="470" y1="28" x2="470" y2="208"/>
+<text class="tb mid" x="650" y="20">Policies and facts</text>
+<line class="axis" x1="650" y1="28" x2="650" y2="208"/>
+<g data-s="1">
+<path class="e fault" d="M81 54H269"/>
+<text class="ts mid" x="175.0" y="48">1. DELETE /photos/871</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M271 82H469"/>
+<text class="ts mid" x="370.0" y="76">2. may user:chi delete photo:871?</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M471 110H649"/>
+<text class="ts mid" x="560.0" y="104">3. load what applies</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n fault" x="303.7" y="124" width="158.3" height="22" rx="4"/>
+<text class="ts mid" x="382.85" y="139">4. no policy permits it</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M469 166H271"/>
+<text class="ts mid" x="370.0" y="160">5. deny</text>
+</g>
+<g data-s="6">
+<path class="e" d="M269 194H81"/>
+<text class="ts mid" x="175.0" y="188">6. 403 Forbidden</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Decision: none yet; Decision log: empty">Chi, who can view photo 871 through a shared album, tries to delete it.</li>
+  <li data-msg="chi, delete, photo:871">The service does not decide. Before doing anything, it asks one question in a standard form: who, which action, which object.</li>
+  <li data-msg="policies, facts">The decision point gathers the policies that mention this kind of action and the facts they need: the owner, the album, Chi’s groups and roles.</li>
+  <li data-msg="none" data-state="Decision: deny, because nothing permits; Decision log: empty">It evaluates them. Chi is a viewer, and no policy lets a viewer delete. Nothing permits, so the answer is deny. No rule had to forbid it.</li>
+  <li>The answer goes back with the reason, which is for the log and not for the caller.</li>
+  <li data-state="Decision: deny, because nothing permits; Decision log: chi, delete, photo:871, deny, policies v42">The service refuses and records who asked for what, the answer, and which version of the policies gave it.</li>
+</ol>
+<figcaption>Keeping the question, the decision and the record in one path means there is one place to test, one place to change a rule and one place to look afterward.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Decision made</th><th>Latency</th><th>Fits</th><th>Watch for</th></tr></thead>
+<tbody>
+<tr><th>In the service’s own code</th><td>None added</td><td>One service, simple rules, ownership in the query</td><td>The same rule drifting apart in several services</td></tr>
+<tr><th>By a policy engine running beside each service</th><td>Well under a millisecond</td><td>Policies shared across many services, evaluated on local data</td><td>Getting current facts to every copy of the engine</td></tr>
+<tr><th>By a central permission service</th><td>A network call, a few milliseconds</td><td>Relationship data shared by many products</td><td>It is now on the path of every request</td></tr>
+</tbody>
+</table>
+<p>Whichever it is, two decisions have to be made about failure. A decision point that cannot be reached means deny, not allow: failing open turns an outage into a breach. And because that makes the decision point a dependency of everything, it needs the timeouts, replicas and fallbacks of <x-ref to="resilience-patterns#timeouts"></x-ref>.</p>
+<p>What about the token? It is tempting to put roles and permissions in the access token so that no lookup is needed. Coarse, slow-changing facts can go there: which tenant, whether the caller is staff. Anything that must take effect quickly when removed should be looked up, because a token keeps saying what was true when it was issued (<x-ref to="authentication#session-or-token"></x-ref>). An OAuth scope is a third thing again: a limit on the client, not a permission of the user (<x-ref to="oauth-and-sso#scopes"></x-ref>).</p>
+
+<h2 id="privileged">Privileged access</h2>
+<p>The users with the most access are your own staff and your own services, and the rules for them are where least privilege is hardest to keep.</p>
+<table>
+<thead><tr><th>Practice</th><th>What it means</th></tr></thead>
+<tbody>
+<tr><th>No standing access</th><td>Engineers do not hold production permissions all the time. They request them for a stated reason and a limited period, and the grant expires by itself</td></tr>
+<tr><th><dfn>Separation of duties</dfn></th><td>A sensitive action needs two different people: one cannot both request a refund and approve it, or both write a change and deploy it alone</td></tr>
+<tr><th>Impersonation with a trail</th><td>When support staff must see what a customer sees, the session is marked as impersonated, limited in what it can do, shown to the customer afterward, and logged under the staff member’s own name</td></tr>
+<tr><th>Break-glass access</th><td>An emergency path exists, and using it pages someone and is reviewed the next day</td></tr>
+<tr><th>Scoped service credentials</th><td>The tags service can read tags and nothing else. A compromised service should be worth only what that service legitimately does</td></tr>
+</tbody>
+</table>
+<p>All of it depends on a record. An authorization log states who asked for what, what was decided, and which version of the rules decided it. It is what lets you answer, after an incident, the question that matters most: what did that account reach? Keep it apart from ordinary application logs, and where the people it records cannot edit it (<x-ref to="observability#logs"></x-ref>).</p>
+
+<h2 id="testing">Testing access control</h2>
+<p>Ordinary tests confirm that permitted things work. Authorization bugs are permitted things that should not work, and no feature test looks for those. They need tests of their own.</p>
+<ul>
+  <li><b>A matrix.</b> For every operation, every kind of caller: owner, another user, a user from another tenant, an anonymous caller, each staff role. State the expected answer for each cell and generate the tests from the table. The interesting cells are the refusals.</li>
+  <li><b>Two accounts, always.</b> Every test of reading or changing an object is repeated as a second user who should be refused. This one habit catches the flaw in <x-fig to="fig-bola"></x-fig>.</li>
+  <li><b>A build that fails closed.</b> Make it impossible to register an endpoint without declaring its rule, and fail the build for one that has none. Then a forgotten check is a broken build and not a quiet hole.</li>
+  <li><b>Policies under test.</b> Policies are code. The table of nine requests earlier in this chapter is a test suite, and it should run on every change to the policies.</li>
+</ul>
+
+<h2 id="design">Choosing for a real system</h2>
+<table>
+<thead><tr><th>Question in the photo app</th><th>Mechanism</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Is this photo the caller’s, or shared with them?</th><td>Ownership and shares in the query at first. Relationship facts in a permission service once albums, groups and nesting arrive</td><td>The answer depends on the object, and on chains of sharing</td></tr>
+<tr><th>Which tenant’s data is this?</th><td>A tenant key on every row, enforced again by the database</td><td>The boundary with the highest cost of failure</td></tr>
+<tr><th>What may staff do?</th><td>Roles mapped to permissions, granted for a limited time</td><td>A job implies a set of actions</td></tr>
+<tr><th>May support view this customer’s photo now?</th><td>A policy over attributes: an open case, the office network</td><td>The answer depends on circumstances</td></tr>
+<tr><th>May Printly read photos for Ana?</th><td>The scope on its token, then all of the above for Ana herself</td><td>A scope limits the client and never widens the user</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> When a design has users and data that belongs to them, say where the object-level check lives before you are asked. “Every query is scoped by owner or tenant, staff actions go through roles, and sharing is a relationship check” is enough. If the system has sharing and nesting at scale, name the permission service as a component, and say what happens to requests when it is slow or down.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Checking that a caller is signed in, and not that the object is theirs</th><td>Any user reads any record by changing an identifier</td><td>The caller in every query, and a second-user test for every operation</td></tr>
+<tr><th>Relying on identifiers being hard to guess</th><td>A leaked link is a leaked record</td><td>A permission check, whatever the identifier looks like</td></tr>
+<tr><th>Hiding a button and calling it access control</th><td>The request works when sent directly</td><td>Enforce on the server</td></tr>
+<tr><th>Saving every field of the request body</th><td>Callers set fields such as the owner or an admin flag</td><td>An explicit list of writable fields</td></tr>
+<tr><th>Testing role names in code</th><td>Every change of responsibilities is a code change, and some are missed</td><td>Check permissions. Map roles to permissions in one place</td></tr>
+<tr><th>A role for every combination of job, region and team</th><td>Hundreds of roles nobody can review</td><td>A few roles, and attributes or relationships for the rest</td></tr>
+<tr><th>Allowing when the decision point is unreachable</th><td>An outage becomes a breach</td><td>Deny, and engineer the decision point for availability</td></tr>
+<tr><th>Long-lived caches of decisions, or permissions baked into long-lived tokens</th><td>Removed users keep access</td><td>Short lifetimes, and a stated limit on how long revocation may take</td></tr>
+<tr><th>Standing administrator access for everyone on the team</th><td>One stolen laptop is the whole system</td><td>Access on request, for a period, with a record</td></tr>
+<tr><th>No record of decisions</th><td>After an incident, nobody can say what was reached</td><td>An authorization log kept apart from the people it records</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="authentication"></x-ref> and <x-ref to="oauth-and-sso"></x-ref>: establishing the principal, and what a scope does and does not decide.</li>
+  <li><x-ref to="unique-ids"></x-ref>: why an identifier is never a permission.</li>
+  <li><x-ref to="multi-tenancy"></x-ref>: the tenant boundary, and row-level security as a second lock.</li>
+  <li><x-ref to="consistency-models"></x-ref> and <x-ref to="replication"></x-ref>: stale reads, which is what the new enemy problem is.</li>
+  <li><x-ref to="specialized-databases#graph"></x-ref>: the graph model behind relationship checks.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: keeping a decision point that everything depends on available.</li>
+  <li><x-ref to="threats-and-defenses"></x-ref>: broken access control among the other common attacks.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Authorization decides whether this principal may perform this action on this object. The object is the part most often left unchecked.</li>
+  <li>A request can need three checks: the operation, the object and the individual fields. Frameworks supply the first.</li>
+  <li>Put the caller in the query, so that a row the caller may not see is never loaded. Lists and searches are checks too.</li>
+  <li>Deny by default, grant the least that works, decide on the server and in one place.</li>
+  <li>Roles suit staff and jobs. Policies over attributes suit conditions. Relationships suit sharing and nesting. Real systems combine them.</li>
+  <li>Check permissions, not role names, and let a forbid override any permit.</li>
+  <li>A permission service is on the path of every request and must be faster and more available than its callers. When it cannot answer, the answer is no.</li>
+  <li>Permissions are replicated data. New content must never be judged by permissions older than the content.</li>
+  <li>Test refusals deliberately, with a second account and a matrix, and keep a record of every decision.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>An endpoint returns an invoice for <code>GET /invoices/1041</code>. It verifies the session and that the user’s role may view invoices. What is missing, and how would you both fix and test it?</summary><p>The object-level check: nothing confirms that invoice 1041 belongs to the caller or their tenant, so any user can read any invoice by changing the number. Fix it by including the caller’s tenant or user in the query that loads the invoice, and return 404 when no row matches. Test it by requesting the invoice as a second user who should not see it and asserting the refusal.</p></details>
+<details><summary>Why is 404 often a better answer than 403 when a user requests an object they may not access?</summary><p>403 confirms that the object exists, which lets a caller map out valid identifiers and learn that, for example, a particular account or document is real. 404 gives the same answer as for an object that does not exist. 403 is appropriate when the caller can already see the object and is being refused a specific action on it.</p></details>
+<details><summary>A request body for updating a profile includes <code>"role": "admin"</code> alongside the display name. Under what design does this succeed, and which level of check does it break?</summary><p>It succeeds when the handler copies every field of the body onto the stored user, which is mass assignment. The function-level and object-level checks both pass, because the user may edit their own profile. The property-level check is the one missing: only an explicit list of fields, such as the display name, should be writable through that operation.</p></details>
+<details><summary>A company has 6 job functions, 5 regions and 12 teams, and creates one role for each combination. How many roles is that, and what is the alternative?</summary><p>360 roles. The alternative is to keep six roles for the job functions and to compare the user’s region and team with the object’s region and team as attributes in a policy, or to model team membership as a relationship. A new region or team then needs no new roles.</p></details>
+<details><summary>In a policy engine where nothing is allowed unless permitted and an explicit forbid overrides any permit, a photo is under legal hold and its owner tries to delete it. One policy permits owners to do anything with their photos. What is the decision, and why is this ordering of rules useful?</summary><p>Deny. The owner policy permits the deletion, but the legal-hold policy forbids it, and a forbid wins. The ordering is useful because guardrails stay in force regardless of what permits are added later: someone writing a new permit cannot accidentally undo a restriction they did not know about.</p></details>
+<details><summary>Ana removes Ben from an album and then adds a photo. Ben’s request for the new photo is allowed. Explain how, and how a freshness token prevents it.</summary><p>The permission check was answered by a replica that had not yet received Ben’s removal, so it evaluated the new photo against the old membership. This is the new enemy problem. With a token obtained when the photo was added and stored with it, every check for that photo requires data at least as fresh as that moment, which necessarily includes the earlier removal.</p></details>
+<details><summary>The central permission service is unreachable for thirty seconds. What should services do with requests during that time, and what should have been done beforehand?</summary><p>Refuse the ones that need a decision. Allowing would turn an outage into unauthorized access. Beforehand, the permission service should have replicas, tight timeouts and callers that can use a recent cached decision for a short, deliberately chosen time, because it is a dependency of every request.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>OWASP, <a href="https://top10.owasp.org/2025/">OWASP Top 10:2025</a>. Broken access control is first.</li>
+  <li>OWASP, <a href="https://api-security.owasp.org/editions/2023/en/0x11-t10/">OWASP API Security Top 10, 2023</a>. Broken object level, object property level and function level authorization.</li>
+  <li>OWASP, <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html">Authorization Cheat Sheet</a>.</li>
+  <li>Ruoming Pang and others, <a href="https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/">Zanzibar: Google’s Consistent, Global Authorization System</a>, USENIX ATC 2019. The relationship model, the new enemy problem and the reported scale.</li>
+  <li>Ravi Sandhu, Edward Coyne, Hal Feinstein and Charles Youman, “Role-Based Access Control Models”, <cite>IEEE Computer</cite>, 1996.</li>
+  <li>Vincent Hu and others, <a href="https://csrc.nist.gov/pubs/sp/800/162/upd2/final">NIST Special Publication 800-162: Guide to Attribute Based Access Control Definition and Considerations</a>, 2014.</li>
+  <li><a href="https://www.cedarpolicy.com/">Cedar</a>, the policy language used for the examples, <a href="https://openfga.dev/">OpenFGA</a> and <a href="https://www.openpolicyagent.org/">Open Policy Agent</a>.</li>
+  <li>Brian Krebs, <a href="https://krebsonsecurity.com/2019/05/first-american-financial-corp-leaked-hundreds-of-millions-of-title-insurance-records/">First American Financial Corp. Leaked Hundreds of Millions of Title Insurance Records</a>, May 2019.</li>
+</ol>
+</section>

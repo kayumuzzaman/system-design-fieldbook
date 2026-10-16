@@ -1,0 +1,664 @@
+<!--meta
+{ "description": "How servers push data to clients: short polling, long polling, server-sent events, WebSockets, WebTransport, WebRTC, webhooks and mobile push, with the cost of each and how to scale millions of persistent connections.",
+  "lede": "HTTP lets a client ask and a server answer. Chat, live scores, notifications and collaborative editing all need the reverse: the server has something to say and the client has not asked. This chapter covers every common way to do that, what each one costs, and what changes when a server must hold a million open connections.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="problem">The server cannot speak first</h2>
+<p>Everything in <x-ref to="http-and-tls"></x-ref> follows one pattern: the client sends a request and the server sends a response. The server never starts the exchange. In most cases it could not even if it wanted to, because the client sits behind NAT and firewalls that only allow connections going out (<x-ref to="ip-and-routing#nat"></x-ref>).</p>
+<p>That is a poor fit for anything where news originates on the server. When Ben comments on Ana’s photo, the server knows at once and Ana’s phone does not. There are only two ways out. Either the client keeps asking, or the client opens a connection and leaves it open so the server has a path to send on. Every technique in this chapter is a variation on one of those two.</p>
+<p>Before choosing a technique, decide how fresh the data has to be. “Real time” in this chapter means soft real time: fast enough that a person perceives it as immediate, with no hard deadline. The requirement varies by two orders of magnitude between features, and the cheaper techniques are good enough more often than people expect.</p>
+<table>
+<thead><tr><th>Feature</th><th>Delay people tolerate</th><th>Direction of data</th></tr></thead>
+<tbody>
+<tr><th>Dashboard, order status, build status</th><td>5 to 60 seconds</td><td>Server to client</td></tr>
+<tr><th>Notifications, live scores, feeds</th><td>1 to 5 seconds</td><td>Server to client</td></tr>
+<tr><th>Chat, typing indicators, presence</th><td>Under 1 second</td><td>Both ways</td></tr>
+<tr><th>Shared cursors, collaborative editing</th><td>About 100 ms</td><td>Both ways, frequent</td></tr>
+<tr><th>Voice, video, fast games</th><td>Tens of milliseconds, and late data is useless</td><td>Both ways, continuous</td></tr>
+</tbody>
+</table>
+<p>These are working figures for design, not measured thresholds. The two columns together pick the technique: the first tells you how much machinery is justified, and the second tells you whether a one-way channel is enough.</p>
+
+<figure class="fig wide" id="fig-patterns">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f121t f121d">
+<title id="f121t">Four ways for a browser to receive news from a server, drawn as timelines</title>
+<desc id="f121d">Four panels with time running downward. Two events happen on the server at the same moments in each panel. With short polling the client asks four times at fixed intervals, two answers are empty, and each event waits for the next poll. With long polling the server holds each request open and answers at the moment an event happens, after which the client asks again. With server-sent events the client asks once and the server sends each event down the open response. With WebSocket, after an upgrade handshake, both sides send messages whenever they like over one open connection.</desc>
+<g data-scene="short">
+<text class="tb mid" x="90" y="18">Short polling</text>
+<text class="ts mid" x="38" y="42">client</text>
+<text class="ts mid" x="142" y="42">server</text>
+<line class="axis" x1="38" y1="52" x2="38" y2="250"/>
+<line class="axis" x1="142" y1="52" x2="142" y2="250"/>
+<g data-s="2">
+<circle class="fill-async" cx="155" cy="95" r="5"/>
+</g>
+<g data-s="5">
+<circle class="fill-async" cx="155" cy="185" r="5"/>
+</g>
+<g data-s="1">
+<path class="e" d="M39 64H141"/>
+<path class="e dash" d="M141 74H39"/>
+</g>
+<g data-s="3">
+<path class="e" d="M39 114H141"/>
+<path class="e sig" d="M141 124H39"/>
+</g>
+<g data-s="4">
+<path class="e" d="M39 164H141"/>
+<path class="e dash" d="M141 174H39"/>
+</g>
+<g data-s="5">
+<path class="e" d="M39 214H141"/>
+<path class="e sig" d="M141 224H39"/>
+</g>
+</g>
+<g data-scene="long">
+<text class="tb mid" x="270" y="18">Long polling</text>
+<text class="ts mid" x="218" y="42">client</text>
+<text class="ts mid" x="322" y="42">server</text>
+<g data-s="1">
+<rect x="218" y="64" width="104" height="31" fill="var(--sig-tint)"/>
+</g>
+<g data-s="3">
+<rect x="218" y="105" width="104" height="80" fill="var(--sig-tint)"/>
+</g>
+<g data-s="5">
+<rect x="218" y="195" width="104" height="55" fill="var(--sig-tint)"/>
+</g>
+<line class="axis" x1="218" y1="52" x2="218" y2="250"/>
+<line class="axis" x1="322" y1="52" x2="322" y2="250"/>
+<g data-s="2">
+<circle class="fill-async" cx="335" cy="95" r="5"/>
+</g>
+<g data-s="4">
+<circle class="fill-async" cx="335" cy="185" r="5"/>
+</g>
+<g data-s="1">
+<path class="e" d="M219 64H321"/>
+</g>
+<g data-s="2">
+<path class="e sig" d="M321 95H219"/>
+</g>
+<g data-s="3">
+<path class="e" d="M219 105H321"/>
+</g>
+<g data-s="4">
+<path class="e sig" d="M321 185H219"/>
+</g>
+<g data-s="5">
+<path class="e" d="M219 195H321"/>
+</g>
+</g>
+<g data-scene="sse">
+<text class="tb mid" x="450" y="18">Server-sent events</text>
+<text class="ts mid" x="398" y="42">client</text>
+<text class="ts mid" x="502" y="42">server</text>
+<g data-s="1">
+<rect x="398" y="64" width="104" height="186" fill="var(--sig-tint)"/>
+</g>
+<line class="axis" x1="398" y1="52" x2="398" y2="250"/>
+<line class="axis" x1="502" y1="52" x2="502" y2="250"/>
+<g data-s="2">
+<circle class="fill-async" cx="515" cy="95" r="5"/>
+</g>
+<g data-s="3">
+<circle class="fill-async" cx="515" cy="185" r="5"/>
+</g>
+<g data-s="1">
+<path class="e" d="M399 64H501"/>
+</g>
+<g data-s="2">
+<path class="e sig" d="M501 95H399"/>
+</g>
+<g data-s="3">
+<path class="e sig" d="M501 185H399"/>
+</g>
+</g>
+<g data-scene="ws">
+<text class="tb mid" x="630" y="18">WebSocket</text>
+<text class="ts mid" x="578" y="42">client</text>
+<text class="ts mid" x="682" y="42">server</text>
+<g data-s="1">
+<rect x="578" y="74" width="104" height="176" fill="var(--sig-tint)"/>
+</g>
+<line class="axis" x1="578" y1="52" x2="578" y2="250"/>
+<line class="axis" x1="682" y1="52" x2="682" y2="250"/>
+<g data-s="2">
+<circle class="fill-async" cx="695" cy="95" r="5"/>
+</g>
+<g data-s="4">
+<circle class="fill-async" cx="695" cy="185" r="5"/>
+</g>
+<g data-s="1">
+<path class="e" d="M579 64H681"/>
+<path class="e" d="M681 74H579"/>
+</g>
+<g data-s="2">
+<path class="e sig" d="M681 95H579"/>
+</g>
+<g data-s="4">
+<path class="e sig" d="M681 185H579"/>
+</g>
+<g data-s="3">
+<path class="e sig" d="M579 130H681"/>
+</g>
+<g data-s="5">
+<path class="e sig" d="M579 215H681"/>
+</g>
+</g>
+<line class="grid" x1="180" y1="8" x2="180" y2="250"/>
+<line class="grid" x1="360" y1="8" x2="360" y2="250"/>
+<line class="grid" x1="540" y1="8" x2="540" y2="250"/>
+<circle class="fill-async" cx="14" cy="272" r="5"/>
+<text class="ts" x="25" y="276">something happens on the server</text>
+<rect x="232" y="265" width="20" height="14" fill="var(--sig-tint)"/>
+<text class="ts" x="258" y="276">connection held open</text>
+<path class="e sig" d="M400 272H430"/>
+<text class="ts" x="437" y="276">carries data</text>
+<path class="e dash" d="M528 272H558"/>
+<text class="ts" x="565" y="276">response with nothing new</text>
+
+</svg>
+</div>
+<ol class="steps" data-scene="short" data-label="Short polling">
+  <li data-msg="anything new?|no" data-state="Requests made: 1; Events received: 0; Events waiting: 0">The client asks whether there is anything new. There is not, and the server says so at once.</li>
+  <li data-state="Requests made: 1; Events received: 0; Events waiting: 1">Something happens on the server. Nobody is asking at that moment, so the news waits.</li>
+  <li data-msg="anything new?|event 1" data-state="Requests made: 2; Events received: 1; Events waiting: 0">The next poll picks it up. The news is late by up to the gap between polls.</li>
+  <li data-msg="anything new?|no" data-state="Requests made: 3; Events received: 1; Events waiting: 0">Another poll finds nothing new. Most polls are like this one: a request spent to learn nothing.</li>
+  <li data-msg="anything new?|event 2" data-state="Requests made: 4; Events received: 2; Events waiting: 0">A second event happens and waits again for the poll that follows.</li>
+</ol>
+<ol class="steps" data-scene="long" data-label="Long polling">
+  <li data-msg="anything new?" data-state="Requests made: 1; Events received: 0">The client asks, and the server holds the request open instead of answering.</li>
+  <li data-msg="event 1" data-state="Requests made: 1; Events received: 1">The moment something happens, the server answers the waiting request with it.</li>
+  <li data-msg="anything new?" data-state="Requests made: 2; Events received: 1">The client asks again straight away, and the server holds that request too.</li>
+  <li data-msg="event 2" data-state="Requests made: 2; Events received: 2">The second event is delivered the moment it happens.</li>
+  <li data-msg="anything new?" data-state="Requests made: 3; Events received: 2">The client asks once more. Delivery is prompt, but every event costs a full request and response.</li>
+</ol>
+<ol class="steps" data-scene="sse" data-label="Server-sent events">
+  <li data-msg="subscribe" data-state="Requests made: 1; Events received: 0">The client makes one request, and the server keeps the response open.</li>
+  <li data-msg="event 1" data-state="Requests made: 1; Events received: 1">When something happens, the server writes it down the open response.</li>
+  <li data-msg="event 2" data-state="Requests made: 1; Events received: 2">The next event travels down the same response. Data flows one way only, from server to client.</li>
+</ol>
+<ol class="steps" data-scene="ws" data-label="WebSocket">
+  <li data-msg="upgrade|agreed" data-state="Connections opened: 1; Events received: 0; Messages sent: 0">The client asks to upgrade the connection, the server agrees, and the connection stays open.</li>
+  <li data-msg="event" data-state="Connections opened: 1; Events received: 1; Messages sent: 0">The server sends an event as soon as it happens.</li>
+  <li data-msg="message" data-state="Connections opened: 1; Events received: 1; Messages sent: 1">The client can send on the same connection at any time.</li>
+  <li data-msg="event" data-state="Connections opened: 1; Events received: 2; Messages sent: 1">Another event arrives from the server.</li>
+  <li data-msg="message" data-state="Connections opened: 1; Events received: 2; Messages sent: 2">The client sends again. Either side may speak whenever it likes, which is what chat and games need.</li>
+</ol>
+<figcaption>The same two events delivered four ways. Short polling makes each event wait for the next question. The other three hold a connection open so the event can leave the moment it happens. Only WebSocket also carries messages from the client on that connection.</figcaption>
+</figure>
+
+<h2 id="short-polling">Short polling</h2>
+<p>The simplest approach is to ask on a timer: every few seconds the client sends an ordinary request, “anything new since I last asked?”, and the server answers at once, usually with “no”.</p>
+<p>It needs nothing special. Any HTTP server, load balancer and cache handles it, the server keeps no per-client state, and a client that vanishes costs nothing. The price is paid in two places.</p>
+<ul>
+  <li><b>Delay.</b> An event waits for the next poll. With a 5-second interval the average wait is 2.5 seconds and the worst is 5.</li>
+  <li><b>Wasted work.</b> Most answers are empty. With 100,000 clients polling every 5 seconds the server handles 20,000 requests per second around the clock. If each user has something new about once a minute, 11 polls out of 12 return nothing.</li>
+</ul>
+<p>Shortening the interval reduces the delay and raises the waste in exact proportion. That trade is the whole design space of polling.</p>
+<p>Two refinements make it cheaper. First, make the poll a conditional request: the client sends the <code>ETag</code> it last saw and the server answers <code>304 Not Modified</code> with no body when nothing changed (<x-ref to="http-and-tls#caching"></x-ref>). Second, if the answer is the same for many users, such as a match score, let a CDN cache it for a second or two. Then a million viewers cost the origin about one request per second per edge location instead of a million.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Polling is a respectable answer when updates are infrequent, a delay of several seconds is acceptable, or the data is shared and cacheable. Saying “polling every 10 seconds is enough here, and it keeps the servers stateless” shows more judgment than reaching for WebSockets by reflex.</p></div>
+
+<h2 id="long-polling">Long polling</h2>
+<p><dfn>Long polling</dfn> keeps the request-response shape and changes one thing: when the server has nothing new, it does not answer. It holds the request open until something happens or a timeout expires. The client asks again as soon as it gets an answer.</p>
+<p>Delivery is now immediate, and empty responses happen only once per timeout instead of once per interval. For years this was how chat worked on the web, and it remains the fallback when nothing better gets through a network.</p>
+<p>It is harder than it looks, for three reasons.</p>
+<ul>
+  <li><b>The server now holds state.</b> Each waiting request occupies a connection and some memory, and something must wake the right request when an event arrives. A server built around one thread per request cannot hold tens of thousands of these.</li>
+  <li><b>Timeouts must be coordinated.</b> Every proxy and load balancer on the path closes connections it considers idle. AWS’s Application Load Balancer, for example, does so after 60 seconds by default. The server’s hold time must be shorter than the shortest of these, so 25 to 30 seconds is typical.</li>
+  <li><b>Events can fall in the gap.</b> Between receiving one answer and sending the next request, the client is not listening. The client must therefore say where it got to (“give me everything after event 4101”) and the server must keep recent events long enough to replay them.</li>
+</ul>
+<p>The third point applies to every technique that follows. A connection can always drop, so a design that only works while the connection stays up is incomplete.</p>
+
+<h2 id="sse">Server-sent events</h2>
+<p><dfn>Server-sent events</dfn> (SSE) take long polling one step further: the server answers once and never finishes. The response has the type <code>text/event-stream</code>, and the server writes a small block of text to it each time something happens. It is plain HTTP, so it passes through the same infrastructure as any other response.</p>
+<pre data-lang="text" data-title="An event stream as it appears on the wire">
+retry: 5000
+
+id: 4101
+event: like
+data: {"photoId": 871, "by": "ben"}
+
+: keep-alive
+
+id: 4102
+event: comment
+data: {"photoId": 871, "text": "Great shot"}
+</pre>
+<p>Each event is a few <code>field: value</code> lines ended by a blank line. A line starting with a colon is a comment, which servers send every 15 to 30 seconds so that intermediaries do not see an idle connection.</p>
+<p>The browser side is a built-in object called <code>EventSource</code>, and it does two useful things without being asked. It reconnects when the connection drops, after the delay given by <code>retry</code>. And on reconnecting it sends a <code>Last-Event-ID</code> header containing the last <code>id</code> it saw, so the server can resume from the right place. The gap problem from long polling is solved by the protocol.</p>
+<pre data-lang="ts" data-title="A minimal SSE endpoint in Node, and the browser code that reads it">
+import { createServer, type ServerResponse } from "node:http";
+
+const clients = new Set<ServerResponse>();
+
+createServer((req, res) => {
+  if (req.url !== "/events") { res.writeHead(404).end(); return; }
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",          // ask nginx to pass bytes through at once
+  });
+  res.write("retry: 5000\n\n");
+  clients.add(res);
+  req.on("close", () => clients.delete(res));
+}).listen(8080);
+
+export function publish(id: number, type: string, data: unknown) {
+  const frame = `id: ${id}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) res.write(frame);
+}
+
+setInterval(() => { for (const res of clients) res.write(": keep-alive\n\n"); }, 20_000);
+
+// In the browser:
+const source = new EventSource("/events");
+source.addEventListener("like", (e) => showLike(JSON.parse(e.data)));
+</pre>
+<p>A real endpoint would also read <code>Last-Event-ID</code> and replay what the client missed. The limits of SSE are these:</p>
+<ul>
+  <li><b>One direction only.</b> The client sends data with ordinary requests on the side. For notifications, feeds, progress bars and tickers, that is all you need.</li>
+  <li><b>Text only.</b> Binary data has to be encoded as text, which makes it about a third larger.</li>
+  <li><b>Six connections on HTTP/1.1.</b> Browsers open at most six connections per site over HTTP/1.1, and each event stream uses one for as long as it lives, so a user with several tabs open can exhaust them. Over HTTP/2 and HTTP/3 a stream is one of many on a shared connection (100 at once by default) and the problem goes away.</li>
+  <li><b>No custom headers from <code>EventSource</code>.</b> It sends cookies but cannot add an <code>Authorization</code> header. Reading the same stream format with <code>fetch</code> removes that limit, at the cost of writing the reconnection logic yourself.</li>
+</ul>
+<aside class="sn"><b>Why AI chat apps stream this way</b>When a language model writes an answer a few words at a time, the application needs to send each piece to the browser as it is produced. That is one-way, text, and over ordinary HTTP, which is exactly what SSE was built for. Most model APIs stream their output in the event-stream format. <x-ref to="llm-application-architecture"></x-ref> returns to this.</aside>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> An event stream that works on a laptop and delivers nothing in production until the connection closes is almost always being buffered. A proxy or a compression step in the path is collecting the response to send it in one piece. Turn off response buffering for that route, and if you compress the stream, flush after every event.</p></div>
+
+<h2 id="websocket">WebSocket</h2>
+<p>A <dfn>WebSocket</dfn> is a long-lived connection on which either side can send a message at any time. It starts as an HTTP request asking to switch protocols. If the server agrees, the same TCP connection stops speaking HTTP and carries WebSocket messages from then on.</p>
+<pre data-lang="http" data-title="The upgrade handshake">
+GET /feed HTTP/1.1
+Host: rt.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+</pre>
+<p>Starting as HTTP is what lets WebSockets use ports 80 and 443 and pass through infrastructure built for the web. After the <code>101</code> response, messages travel in <dfn>frames</dfn> with only a few bytes of overhead each, and a message can be text or binary. The URL scheme is <code>ws://</code>, or <code>wss://</code> over TLS, and in practice you should always use the second. Besides the privacy, older proxies that do not understand the upgrade tend to break unencrypted WebSockets and leave encrypted ones alone because they cannot see inside.</p>
+<p>A WebSocket gives you far less than HTTP does. It is a pipe for messages, and everything else is yours to design:</p>
+<ul>
+  <li><b>No request and response.</b> If you want replies matched to requests, you add a message ID and match them yourself.</li>
+  <li><b>No status codes, caching, or content negotiation.</b> You define the message format and the errors.</li>
+  <li><b>No automatic reconnection.</b> Your client code must notice the drop, wait, reconnect and catch up.</li>
+  <li><b>No headers from the browser.</b> The browser API cannot set an <code>Authorization</code> header. Cookies are sent, so cookie sessions work, but then the server must check the <code>Origin</code> header, or any website the user visits can open a socket using their cookies. The alternative is to send a short-lived token as the first message.</li>
+  <li><b>No backpressure in the standard browser API.</b> If the server sends faster than a client can read, data piles up in buffers. The server has to watch for slow clients and decide what to do about them.</li>
+</ul>
+<p>Libraries such as Socket.IO fill some of these gaps with reconnection, acknowledgements and named rooms. They do it by defining their own protocol on top, so both ends must use the same library. A plain WebSocket client cannot talk to a Socket.IO server.</p>
+
+<h3 id="heartbeats">Detecting dead connections</h3>
+<p>As <x-ref to="transport-protocols#traps"></x-ref> explained, a TCP connection whose other end has vanished can look healthy for a long time. A phone that drives into a tunnel sends no goodbye. A server holding many connections must find the dead ones, or it will slowly fill with them. The WebSocket protocol has <dfn>ping</dfn> and <dfn>pong</dfn> frames for this purpose: the server pings on a timer, a live client answers automatically, and a client that missed the last ping is dropped.</p>
+<pre data-lang="ts" data-title="Server-side heartbeat with the ws library">
+import { WebSocketServer, type WebSocket } from "ws";
+
+const wss = new WebSocketServer({ port: 8080 });
+const alive = new WeakMap<WebSocket, boolean>();
+
+wss.on("connection", (ws) => {
+  alive.set(ws, true);
+  ws.on("pong", () => alive.set(ws, true));
+});
+
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (!alive.get(ws)) { ws.terminate(); continue; }   // no pong since the last ping
+    alive.set(ws, false);
+    ws.ping();
+  }
+}, 30_000);
+</pre>
+<p>The interval does double duty. It must be shorter than the idle timeout of every load balancer and NAT device in the path, so the traffic also keeps the connection from being closed as idle. Heartbeats are not free at scale: a million connections pinged every 30 seconds is about 33,000 pings per second of pure overhead, and on phones each one wakes the radio. Longer intervals save battery and detect failure more slowly.</p>
+
+<h3 id="reconnect">Reconnecting without a stampede</h3>
+<p>The client’s half of the bargain is to reconnect, and how it does so matters more than it seems. When a server holding 500,000 connections restarts, 500,000 clients notice within the same second. If they all reconnect immediately, the surviving servers receive half a million TLS handshakes at once, some fail under the load, and their clients join the crowd. The fix is the same as for any retry: wait a random amount of time, and wait longer after each failure.</p>
+<pre data-lang="ts" data-title="Reconnect with exponential backoff, full jitter, and resume">
+function connect(attempt = 0, lastSeq = 0): void {
+  const ws = new WebSocket(`wss://rt.example.com/feed?after=${lastSeq}`);
+
+  ws.onopen = () => { attempt = 0; };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    lastSeq = msg.seq;                                  // remember how far we got
+    render(msg);
+  };
+
+  ws.onclose = () => {
+    const ceiling = Math.min(30_000, 1_000 * 2 ** attempt);
+    const delay = Math.random() * ceiling;              // anywhere from 0 to the ceiling
+    setTimeout(() => connect(attempt + 1, lastSeq), delay);
+  };
+}
+</pre>
+<p>Spread evenly over 30 seconds, a million reconnections arrive at about 33,000 per second instead of a million in one. The <code>after</code> parameter does the job that <code>Last-Event-ID</code> does in SSE: the server replays whatever the client missed while it was away. <x-ref to="resilience-patterns"></x-ref> covers backoff and jitter in general.</p>
+
+<h3 id="ws-versions">WebSockets on HTTP/2 and HTTP/3</h3>
+<p>The handshake above is HTTP/1.1, and it takes over a whole TCP connection. Later standards (RFC 8441 for HTTP/2 and RFC 9220 for HTTP/3) let a WebSocket run as one stream on a connection shared with ordinary requests. Support varies between browsers, servers and proxies, so do not design around it. Assume one TCP connection per WebSocket when you plan capacity.</p>
+
+<h2 id="webtransport">WebTransport</h2>
+<p><dfn>WebTransport</dfn> is the newest option. It runs over HTTP/3, and so over QUIC (<x-ref to="transport-protocols#quic"></x-ref>), and it exposes what QUIC can do that TCP cannot:</p>
+<ul>
+  <li><b>Many independent streams</b> on one connection. A lost packet delays only the stream it belonged to, so one slow message does not hold up the rest. A WebSocket is a single ordered stream, with the head-of-line blocking that implies.</li>
+  <li><b>Datagrams</b>, which are small messages sent without any guarantee of arrival or order. For a player’s position in a game or a cursor on a shared canvas, the newest value replaces the old one, and retransmitting a stale one is wasted effort.</li>
+</ul>
+<p>It became usable across all major browsers in March 2026, when Safari 26.4 shipped it. That is recent. Server libraries, proxies and managed load balancers are still catching up, and some networks block UDP altogether. For now, treat WebTransport as an upgrade for applications that need datagrams or independent streams, and keep a WebSocket fallback. For ordinary chat and notifications it offers little that a WebSocket does not.</p>
+
+<h2 id="webrtc">WebRTC: when the data should not pass through you</h2>
+<p>For voice and video, the path through a server is itself the problem. Every extra hop adds delay, and a server relaying video for every call needs a great deal of bandwidth. <dfn>WebRTC</dfn> (web real-time communication) lets two browsers or apps send audio, video and arbitrary data straight to each other over UDP, encrypted, with the codecs and loss handling built into the browser.</p>
+
+<figure class="fig wide" id="fig-webrtc">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 216" role="img" aria-labelledby="f122t f122d">
+<title id="f122t">The parts of a WebRTC connection</title>
+<desc id="f122d">Two peers each talk to a signaling server, which passes session descriptions and network candidates between them. Media then flows directly between the two peers. Both peers also contact STUN and TURN servers, which help them discover a workable path and relay the media if no direct path exists.</desc>
+<rect class="n" x="295" y="12" width="130" height="52" rx="6"/><text class="tb mid" x="360" y="35">Signaling server</text><text class="ts mid" x="360" y="52">your own code</text>
+<rect class="n" x="10" y="104" width="130" height="88" rx="6"/><text class="tb mid" x="75" y="152">Peer A</text>
+<rect class="n" x="580" y="104" width="130" height="88" rx="6"/><text class="tb mid" x="645" y="152">Peer B</text>
+<path class="e both" d="M75 104V38H295"/><text class="ts" x="88" y="30">offer, answer, candidates</text>
+<path class="e both" d="M645 104V38H425"/><text class="ts end" x="632" y="30">relayed to the other peer</text>
+<path class="e store both" d="M140 126H580"/><text class="ts mid" x="360" y="117">audio, video and data, sent directly when a path exists</text>
+<rect class="n ghost" x="270" y="150" width="180" height="50" rx="6"/><text class="tb mid" x="360" y="172">STUN and TURN servers</text><text class="ts mid" x="360" y="189">find a path, or relay</text>
+<path class="e dash both" d="M140 176H270"/><path class="e dash both" d="M580 176H450"/>
+</svg>
+</div>
+<figcaption>WebRTC separates setting up a call from carrying it. Your servers introduce the two peers. The media then takes the shortest path it can find, and falls back to a relay only when it must.</figcaption>
+</figure>
+
+<p>The difficulty is that neither peer can simply connect to the other, since both are usually behind NAT. Three pieces solve that:</p>
+<ul>
+  <li><b>Signaling.</b> Before they can talk directly, the peers must exchange descriptions of what they support and where they might be reachable. WebRTC does not define how. You carry these messages over any channel you already have, usually a WebSocket to your own server.</li>
+  <li><b>STUN.</b> A small public server that tells a peer what its address looks like from the outside, so it can offer that address to the other side.</li>
+  <li><b>TURN.</b> A relay for the cases where no direct path can be made, typically behind strict corporate firewalls. A relayed call is the expensive case, because all its media passes through your server and you pay for the bandwidth. Plan capacity for a minority of calls to need it.</li>
+</ul>
+<p>The procedure that tries candidate paths and picks one that works is called ICE. Direct connections suit calls between two people. In a group call each participant would have to upload their video once for every other participant, and a home or mobile uplink runs out after a handful. Group calls therefore use a server after all: a <dfn>selective forwarding unit</dfn> (SFU) receives one stream from each participant and forwards it to the others without decoding it, choosing a lower-quality version for those on weak connections. <x-ref to="hld-video-streaming"></x-ref> looks at media delivery in more depth.</p>
+
+<h2 id="webhooks">Webhooks: push between servers</h2>
+<p>Everything so far assumed a client that cannot be reached. When the receiver is a server with a public address, pushing is simple: the sender makes an HTTP request to it. A <dfn>webhook</dfn> is that arrangement turned into a product feature. You give a provider a URL, and the provider sends a <code>POST</code> to it whenever something happens: a payment succeeds, a commit is pushed, a delivery fails. It replaces polling the provider’s API to ask whether anything changed.</p>
+
+<figure class="fig wide" id="fig-webhook">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f123t f123d">
+<title id="f123t">Receiving a webhook safely, and the provider’s retries</title>
+<desc id="f123d">A provider sends a signed POST to your endpoint. The endpoint verifies the signature, stores the event on a queue and replies with a 200 status quickly. A worker takes the event from the queue and does the real work. Below, a timeline shows the provider retrying a failed delivery after 5 seconds, 5 minutes and 30 minutes, with the fourth attempt succeeding. Every attempt carries the same event ID.</desc>
+<rect class="n" x="10" y="24" width="120" height="60" rx="6"/>
+<text class="tb mid" x="70" y="50">Provider</text>
+<text class="ts mid" x="70" y="67">a payment succeeds</text>
+<rect class="n sig" x="270" y="24" width="150" height="60" rx="6"/>
+<text class="tb mid" x="345" y="50">Your endpoint</text>
+<text class="ts mid" x="345" y="67">verify, enqueue, reply</text>
+<rect class="n async" x="480" y="24" width="84" height="60" rx="6"/>
+<text class="tb mid" x="522" y="59">Queue</text>
+<rect class="n" x="620" y="24" width="90" height="60" rx="6"/>
+<text class="tb mid" x="665" y="50">Worker</text>
+<text class="ts mid" x="665" y="67">the real work</text>
+<g data-s="1">
+<path class="e sig" d="M130 42H270"/>
+<text class="ts mid" x="200" y="34">signed POST</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M270 68H130"/>
+<text class="ts mid" x="200" y="84">200, quickly</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M420 54H480"/>
+</g>
+<g data-s="4">
+<path class="e async" d="M564 54H620"/>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="128">If the endpoint is down or slow, the provider tries again, waiting longer each time:</text>
+<rect class="n fault" x="10" y="146" width="110" height="46" rx="6"/>
+<text class="tb mid" x="65" y="166">Attempt 1</text>
+<text class="ts mid" x="65" y="182">timed out</text>
+</g>
+<g data-s="6">
+<rect class="n fault" x="206" y="146" width="110" height="46" rx="6"/>
+<text class="tb mid" x="261" y="166">Attempt 2</text>
+<text class="ts mid" x="261" y="182">503</text>
+</g>
+<g data-s="7">
+<rect class="n fault" x="402" y="146" width="110" height="46" rx="6"/>
+<text class="tb mid" x="457" y="166">Attempt 3</text>
+<text class="ts mid" x="457" y="182">503</text>
+</g>
+<g data-s="8">
+<rect class="n store" x="598" y="146" width="112" height="46" rx="6"/>
+<text class="tb mid" x="654" y="166">Attempt 4</text>
+<text class="ts mid" x="654" y="182">200, done</text>
+</g>
+<g data-s="6">
+<path class="e" d="M120 169H206"/>
+<text class="ts mid" x="163" y="161">5 s</text>
+</g>
+<g data-s="7">
+<path class="e" d="M316 169H402"/>
+<text class="ts mid" x="359" y="161">5 min</text>
+</g>
+<g data-s="8">
+<path class="e" d="M512 169H598"/>
+<text class="ts mid" x="555" y="161">30 min</text>
+<text class="ts" x="10" y="226">Every attempt carries the same event ID, so the receiver can recognize a repeat and ignore it.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>A payment succeeds at the provider, which sends your endpoint a signed POST describing the event.</li>
+  <li data-msg="event">The endpoint checks the signature and puts the event on a queue. It does nothing slow.</li>
+  <li data-msg="200">It replies 200 within moments, so the provider knows the event arrived.</li>
+  <li data-msg="event">A worker takes the event from the queue and does the real work at its own pace.</li>
+  <li>Now suppose your endpoint is down. The provider’s first attempt times out.</li>
+  <li data-msg="wait 5 s">It tries again after 5 seconds and receives a 503.</li>
+  <li data-msg="wait 5 min">It waits 5 minutes and tries again, with the same result.</li>
+  <li data-msg="wait 30 min">After a further 30 minutes the attempt succeeds. Every attempt carried the same event ID, so the receiver can recognize a repeat and ignore it.</li>
+</ol>
+<figcaption>The receiving side of a webhook. Reply fast and do the work later. Expect each event to arrive more than once, and occasionally out of order.</figcaption>
+</figure>
+
+<p>A webhook endpoint is a public URL that accepts instructions from the internet, so it has to be built defensively. Four rules cover most of it.</p>
+<ol>
+  <li><b>Verify the signature.</b> Anyone can send a <code>POST</code> to your URL. The provider signs each request with a secret you share, and you recompute the signature before believing a word of the body. Sign and verify the raw bytes, because parsing the JSON and serializing it again changes the bytes and breaks the check.</li>
+  <li><b>Check the timestamp.</b> A signed request captured today could be sent again next month. Including the time in the signed data and rejecting anything older than a few minutes closes that door.</li>
+  <li><b>Reply quickly, work later.</b> Providers wait only a few seconds for an answer. If your handler does slow work first, a busy moment causes timeouts, the provider retries, and the retries add load to a system that is already struggling. Verify, put the event on a queue (<x-ref to="message-queues"></x-ref>), and return <code>200</code>.</li>
+  <li><b>Expect duplicates and disorder.</b> Retries mean the same event can arrive twice, and events can overtake each other. Record the IDs of events you have processed and skip repeats. For ordering, either compare a version or timestamp inside the event, or treat the webhook as a hint and fetch the current state from the provider’s API.</li>
+</ol>
+<p>The fourth rule is delivery “at least once”, which is the subject of <x-ref to="idempotency-and-delivery"></x-ref>. The signature scheme below follows the Standard Webhooks specification, an open convention used by a growing number of providers. Others, such as Stripe and GitHub, use their own header names with the same underlying idea.</p>
+<pre data-lang="ts" data-title="Verifying a webhook signature">
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const TOLERANCE_SECONDS = 5 * 60;
+
+export function verifyWebhook(
+  rawBody: string,
+  headers: Record<string, string | undefined>,
+  secret: Buffer,
+): boolean {
+  const id = headers["webhook-id"];
+  const timestamp = headers["webhook-timestamp"];
+  const signatures = headers["webhook-signature"];
+  if (!id || !timestamp || !signatures) return false;
+
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!(age <= TOLERANCE_SECONDS)) return false;        // also rejects a non-numeric timestamp
+
+  const expected = createHmac("sha256", secret)
+    .update(`${id}.${timestamp}.${rawBody}`)
+    .digest();
+
+  // The header may hold several signatures while a secret is being rotated.
+  return signatures.split(" ").some((entry) => {
+    const [version, value] = entry.split(",");
+    if (version !== "v1" || !value) return false;
+    const given = Buffer.from(value, "base64");
+    return given.length === expected.length && timingSafeEqual(given, expected);
+  });
+}
+</pre>
+<p>The comparison uses <code>timingSafeEqual</code> instead of <code>===</code> because an ordinary comparison stops at the first byte that differs, and the time it takes can leak how much of a forged signature was right. <x-ref to="cryptography-in-practice"></x-ref> explains HMAC.</p>
+<p>If you are the one <em>sending</em> webhooks, the obligations reverse. You need a queue of deliveries, retries with backoff that continue for days, a way for customers to see and replay failed deliveries, and automatic disabling of endpoints that have been dead for a long time. You also need to remember that you are making requests to URLs chosen by strangers. A customer who registers <code>http://10.0.0.5/admin</code> as their webhook URL is asking your servers to call something inside your own network. This attack is called server-side request forgery, and <x-ref to="threats-and-defenses"></x-ref> covers the defenses.</p>
+
+<h2 id="push">Mobile and web push</h2>
+<p>A phone app that is not on screen cannot hold a connection open. The operating system suspends it to save battery. To reach it, you go through the platform: Apple Push Notification service (APNs) for Apple devices, Firebase Cloud Messaging (FCM) for Android, and the Web Push standard for browsers. Each device keeps a single connection open to its platform’s servers, shared by every app on it. Your server sends a message to the platform, addressed with a <dfn>device token</dfn> that the app obtained and registered with you, and the platform delivers it.</p>
+<p>Three properties shape how you use push.</p>
+<ul>
+  <li><b>It is best effort.</b> Delivery is not guaranteed and not timed. If a device is offline, the platform may keep only the most recent message for it, and users can switch notifications off entirely.</li>
+  <li><b>Payloads are small.</b> Both APNs and FCM limit a message to about 4 KB.</li>
+  <li><b>Tokens change.</b> Reinstalling the app or restoring a phone produces a new token, and the old one starts returning errors. Your token table needs pruning based on those errors.</li>
+</ul>
+<p>The first two lead to one pattern: treat a push as a tap on the shoulder. It says “there is something new”, and the app fetches the real data from your API when it wakes. The data of record lives on your servers, and a lost push costs only some delay. <x-ref to="hld-notifications"></x-ref> designs a full notification system around this.</p>
+
+<h2 id="choosing">Choosing</h2>
+<table>
+<thead><tr><th></th><th>Direction</th><th>Delay</th><th>Server holds a connection</th><th>Reconnect and resume</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><th>Short polling</th><td>Client asks</td><td>Up to the interval</td><td>No</td><td>Not needed</td><td>Infrequent or cacheable updates</td></tr>
+<tr><th>Long polling</th><td>Server to client</td><td>Immediate</td><td>Yes, per request</td><td>You build it</td><td>Fallback when streams are blocked</td></tr>
+<tr><th>SSE</th><td>Server to client</td><td>Immediate</td><td>Yes</td><td>Built in</td><td>Feeds, notifications, progress, AI output</td></tr>
+<tr><th>WebSocket</th><td>Both</td><td>Immediate</td><td>Yes</td><td>You build it</td><td>Chat, collaboration, anything interactive</td></tr>
+<tr><th>WebTransport</th><td>Both, with datagrams</td><td>Immediate</td><td>Yes</td><td>You build it</td><td>Games, live media, many parallel streams</td></tr>
+<tr><th>WebRTC</th><td>Peer to peer</td><td>Lowest</td><td>Only for signaling and relay</td><td>Built in, partly</td><td>Voice and video calls</td></tr>
+<tr><th>Webhook</th><td>Server to server</td><td>Seconds, with retries</td><td>No</td><td>Sender retries</td><td>Notifying other companies’ systems</td></tr>
+<tr><th>Mobile push</th><td>Server to device</td><td>Usually seconds, no promise</td><td>No, the platform does</td><td>Platform, best effort</td><td>Reaching an app that is not running</td></tr>
+</tbody>
+</table>
+<p>A short procedure covers most decisions:</p>
+<ol>
+  <li>If a delay of several seconds is acceptable, or the data is shared by many users and can be cached, <b>poll</b>.</li>
+  <li>If only the server needs to push, use <b>SSE</b>. It is the least machinery that delivers immediately.</li>
+  <li>If the client also sends frequently, or you need binary messages, use a <b>WebSocket</b>.</li>
+  <li>If late data is worthless, as in fast games and live media, look at <b>WebTransport</b> or <b>WebRTC</b>.</li>
+  <li>If the receiver is another server, use a <b>webhook</b>. If it is an app that may not be running, use <b>push</b> as well as whatever you use while it is open.</li>
+</ol>
+<p>Real products combine several. A chat app typically uses a WebSocket while it is open, push notifications when it is not, an ordinary HTTP API to load history, and webhooks to notify integrations.</p>
+
+<h2 id="scaling">Scaling persistent connections</h2>
+<p>The techniques from long polling onward share one property that changes the architecture: the server holds a connection for each client, for minutes or hours. <x-ref to="scalability#stateless"></x-ref> argued that stateless servers are easy to scale because any server can handle any request. A server holding connections is the opposite. A message for Ana can only be delivered by the one machine that holds Ana’s connection.</p>
+
+<h3 id="per-server">How many connections fit on one server</h3>
+<p>More than intuition suggests. An idle connection consumes memory and almost no CPU. A server is not limited to 65,535 connections by port numbers either: that limit applies to connections between one pair of addresses, and each client has a different address, so the limit that matters is memory and file descriptors. If each connection costs about 10 KB across kernel buffers and application state, a million of them need about 10 GB. WhatsApp reported more than 2 million connections on a single server as long ago as January 2012.</p>
+<p>What you can hold and what you should hold are different numbers. The practical limits are these:</p>
+<ul>
+  <li><b>Work per message, not idle count.</b> A million quiet connections are cheap. A million connections each receiving ten messages a second is ten million writes a second.</li>
+  <li><b>Blast radius.</b> When a server holding a million connections fails, a million clients reconnect at once. Many deployments cap each server well below its capacity for this reason.</li>
+  <li><b>Operating system settings.</b> Defaults for open files and socket buffers are far too low and need raising.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> Measure the memory cost per connection for your own stack before sizing anything. It varies by more than a factor of ten between runtimes and libraries, and with settings such as per-connection compression, which can add tens of kilobytes to each one.</p></div>
+
+<h3 id="gateway">The gateway tier and the backplane</h3>
+<p>The standard structure splits the system in two. A tier of <dfn>connection gateways</dfn> does nothing but hold connections, authenticate them and move bytes. The application logic stays in ordinary stateless services behind them. The remaining problem is routing: when a service wants to tell Ben something, how does the message reach the gateway that holds Ben’s connection?</p>
+
+<figure class="fig wide" id="fig-gateway">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-labelledby="f124t f124d">
+<title id="f124t">A gateway tier with a publish and subscribe backplane</title>
+<desc id="f124d">Three clients connect through a load balancer to three gateway servers, each of which holds some of the connections. All gateways subscribe to a publish and subscribe backplane. A chat service writes each message to a message store and then publishes it to the backplane, which delivers it to every gateway holding a member of the conversation.</desc>
+<rect class="n" x="10" y="38" width="64" height="32" rx="5"/><text class="ts mid" x="42" y="59">Ana</text>
+<rect class="n" x="10" y="116" width="64" height="32" rx="5"/><text class="ts mid" x="42" y="137">Ben</text>
+<rect class="n" x="10" y="194" width="64" height="32" rx="5"/><text class="ts mid" x="42" y="215">Chi</text>
+<rect class="n" x="112" y="102" width="88" height="60" rx="6"/><text class="tb mid" x="156" y="128">Load</text><text class="tb mid" x="156" y="145">balancer</text>
+<path class="e sig both" d="M74 56 112 114"/><path class="e sig both" d="M74 132H112"/><path class="e sig both" d="M74 208 112 150"/>
+<rect class="n sig" x="260" y="24" width="130" height="56" rx="6"/><text class="tb mid" x="325" y="48">Gateway 1</text><text class="ts mid" x="325" y="65">holds Ana and Chi</text>
+<rect class="n sig" x="260" y="104" width="130" height="56" rx="6"/><text class="tb mid" x="325" y="128">Gateway 2</text><text class="ts mid" x="325" y="145">holds Ben</text>
+<rect class="n sig" x="260" y="184" width="130" height="56" rx="6"/><text class="tb mid" x="325" y="208">Gateway 3</text><text class="ts mid" x="325" y="225">holds others</text>
+<path class="e sig both" d="M200 116 260 54"/><path class="e sig both" d="M200 132H260"/><path class="e sig both" d="M200 148 260 210"/>
+<rect class="n async" x="440" y="24" width="110" height="216" rx="6"/><text class="tb mid" x="495" y="120">Pub/sub</text><text class="tb mid" x="495" y="137">backplane</text><text class="ts mid" x="495" y="160">one topic per</text><text class="ts mid" x="495" y="175">conversation</text>
+<path class="e async both" d="M390 52H440"/><path class="e async both" d="M390 132H440"/><path class="e async both" d="M390 212H440"/>
+<rect class="n" x="600" y="36" width="110" height="56" rx="6"/><text class="tb mid" x="655" y="60">Chat service</text><text class="ts mid" x="655" y="77">stateless</text>
+<rect class="n store" x="600" y="152" width="110" height="56" rx="6"/><text class="tb mid" x="655" y="176">Message store</text><text class="ts mid" x="655" y="193">the record</text>
+<path class="e async" d="M600 64H550"/><text class="ts mid" x="575" y="56">publish</text>
+<path class="e store" d="M655 92V152"/><text class="ts end" x="647" y="126">store first</text>
+</svg>
+</div>
+<figcaption>Gateways hold the connections, and a backplane connects them. A gateway passes Ana’s outgoing message to the chat service as an ordinary request. The service stores it, then publishes it, and each gateway that holds a member of the conversation writes it to that member’s connection.</figcaption>
+</figure>
+
+<p>There are two common answers, and large systems often use both.</p>
+<ul>
+  <li><b>Publish and subscribe.</b> Each gateway subscribes, on a shared message bus, to the topics its connected users care about: one per conversation, document or user. A service publishes to the topic, and the bus delivers to every gateway that subscribed. Services never need to know which gateway holds whom. Redis pub/sub and NATS are common choices for the bus.</li>
+  <li><b>A connection registry.</b> A fast shared store maps each user to the gateway holding their connection, written on connect and removed on disconnect. A service looks up the gateway and sends to it directly. This is more efficient for messages aimed at one user, and it needs care around stale entries when a gateway dies without cleaning up.</li>
+</ul>
+<p>Slack’s published design is a clear example. Gateway servers in several regions hold the WebSockets and each user’s subscriptions. Behind them, channel servers each own a subset of channels, assigned by consistent hashing on the channel ID (<x-ref to="partitioning"></x-ref> explains the technique). A message goes to the channel server for its channel, which sends it to every gateway with a subscriber. Slack states that this delivers messages worldwide in about 500 ms.</p>
+
+<h3 id="not-a-queue">A connection is not a queue</h3>
+<p>The most important design rule in this chapter is this: never let the live connection be the only place a message exists. Connections drop, phones go into pockets, and gateways restart. If the server sends a message into a socket and forgets it, any of those events loses the message.</p>
+<p>The dependable pattern is the one in <x-fig to="fig-gateway"></x-fig>. Write the message to durable storage first, and give it a sequence number within its conversation. Then push it over the connection as an optimization. When a client connects or reconnects it says “I have everything up to 4101”, and the server sends the rest from storage. With that in place, the push path can fail in any way it likes and the result is only delay. The sequence number also lets the client detect a gap and put messages in the right order, which the network alone does not guarantee once several servers are involved. <x-ref to="hld-chat"></x-ref> builds a complete system this way.</p>
+
+<h3 id="operations">Operating a connection tier</h3>
+<p>Long-lived connections break several habits formed on request-response systems.</p>
+<ul>
+  <li><b>Load balancing happens once.</b> A load balancer chooses a server when the connection opens and has no say afterward. After you add servers, the new ones stay empty until clients reconnect. Balance on the number of open connections, not on request counts, and see <x-ref to="proxies-and-load-balancers"></x-ref> for the options.</li>
+  <li><b>Deployments disconnect people.</b> Replacing a gateway closes every connection on it. Drain gradually: stop accepting new connections, then close the existing ones in small batches over several minutes so their reconnections are spread out.</li>
+  <li><b>Slow consumers need a policy.</b> A client on a poor connection reads more slowly than you write. Unbounded per-connection buffers will eventually exhaust the gateway’s memory. Put a limit on each buffer and decide what happens at the limit: drop the oldest messages, merge updates so that only the latest state is sent, or close the connection and let the client resynchronize.</li>
+  <li><b>Fan-out can dwarf input.</b> One message to a room of 100,000 people becomes 100,000 writes. For very large audiences, batch updates and send them at a fixed rate, or move that audience to polling a cached endpoint.</li>
+  <li><b>Presence is expensive.</b> “Who is online” changes every time anyone connects or disconnects, and each change interests many people. Send presence only for the users someone is currently looking at, and tolerate it being a few seconds stale.</li>
+  <li><b>Authorization does not end at the handshake.</b> A connection authenticated an hour ago may belong to a user who has since been removed from the conversation. Check permissions when subscribing to each topic, and have a way to close connections when access is revoked or a token expires.</li>
+</ul>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Choosing WebSockets by default.</b> If only the server pushes, SSE gives you reconnection, resumption and ordinary HTTP infrastructure for free. If a few seconds of delay is fine, polling gives you stateless servers.</li>
+  <li><b>No resume protocol.</b> A client that reconnects and simply starts listening again has silently lost everything sent while it was away.</li>
+  <li><b>Reconnecting immediately and without jitter.</b> It turns every brief outage into a self-inflicted flood.</li>
+  <li><b>No heartbeat, or one longer than the idle timeout.</b> Connections are closed by intermediaries, or dead ones accumulate on the server.</li>
+  <li><b>Doing slow work inside a webhook handler.</b> Timeouts cause retries, and retries cause more timeouts.</li>
+  <li><b>Trusting a webhook body without verifying its signature.</b> The URL is public, and anyone can send to it.</li>
+  <li><b>Treating a push notification as delivery.</b> It may arrive late or never. The app must be able to fetch everything it needs from the API.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="transport-protocols"></x-ref>: idle timeouts, half-open connections and QUIC streams sit underneath everything here.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref>: balancing and draining long-lived connections.</li>
+  <li><x-ref to="message-queues"></x-ref> and <x-ref to="event-streaming"></x-ref>: the backplane behind the gateways, and the queue behind a webhook endpoint.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: why duplicates are unavoidable and how to make them harmless.</li>
+  <li><x-ref to="hld-chat"></x-ref>, <x-ref to="hld-notifications"></x-ref> and <x-ref to="hld-collaborative-editing"></x-ref>: complete designs built on these techniques.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A server cannot start a conversation with a browser or app. Either the client keeps asking, or it opens a connection and holds it.</li>
+  <li>Decide the tolerable delay first. Polling with conditional requests is stateless and is enough for many features.</li>
+  <li>Server-sent events are the simplest immediate push from server to client, with reconnection and resumption built in.</li>
+  <li>A WebSocket carries messages both ways over one connection and gives you nothing else. Heartbeats, reconnection with jitter, resumption and backpressure are yours to build.</li>
+  <li>WebTransport adds independent streams and unreliable datagrams over HTTP/3. WebRTC sends media directly between peers.</li>
+  <li>Webhooks push between servers. Verify the signature, reply fast, queue the work, and expect duplicates.</li>
+  <li>Persistent connections make servers stateful. Separate a gateway tier that holds connections from stateless services, and connect them with pub/sub or a registry.</li>
+  <li>Store first, then push. The connection is a fast path for delivery and is never the record.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A sports site shows the same live score to two million viewers, and a delay of two seconds is acceptable. What would you use?</summary><p>Polling a cacheable endpoint. Every viewer sees the same data, so a CDN can cache the response for one or two seconds and the origin answers roughly once per second per edge location. Holding two million connections open would be far more expensive and would add nothing the requirement asks for.</p></details>
+<details><summary>Your event stream works locally but in production the browser receives nothing for a minute and then everything at once. What is the likely cause?</summary><p>Something between the server and the browser is buffering the response: a reverse proxy with response buffering enabled, or compression that waits for more data before flushing. Disable buffering for that route and flush after each event.</p></details>
+<details><summary>Why should a WebSocket client add randomness to its reconnection delay?</summary><p>When a server fails, all of its clients notice at the same moment. Without randomness they all reconnect at the same moment too, and again after each identical backoff, which can overload the remaining servers. Random delays spread the reconnections over time.</p></details>
+<details><summary>A payment provider sends your endpoint the same “payment succeeded” event twice. Is something broken?</summary><p>No. Providers retry when they do not receive a timely success response, so duplicates are normal. The handler should record the event ID after processing it and skip any event whose ID it has already seen.</p></details>
+<details><summary>A user sends a chat message while the recipient’s phone is in a tunnel. Describe how the recipient still gets it.</summary><p>The service wrote the message to durable storage with a sequence number before trying to push it. The push fails or goes nowhere. When the phone reconnects it tells the server the last sequence number it has, and the server sends everything after that from storage. If the app is not open, a push notification prompts it to fetch.</p></details>
+<details><summary>You add ten gateway servers to a tier of ten, and an hour later the new ones hold almost no connections. Why?</summary><p>A load balancer only places a connection when it is opened. Existing connections stay where they are, so new servers fill only as clients reconnect. To rebalance, close connections on the old servers gradually.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>WHATWG, <a href="https://html.spec.whatwg.org/multipage/server-sent-events.html">HTML Living Standard: Server-sent events</a>. The event stream format and the reconnection rules.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events">Using server-sent events</a>. Includes the six-connection limit over HTTP/1.1.</li>
+  <li>I. Fette and A. Melnikov, <a href="https://www.rfc-editor.org/rfc/rfc6455">RFC 6455: The WebSocket Protocol</a>, 2011. Also <a href="https://www.rfc-editor.org/rfc/rfc8441">RFC 8441</a> and <a href="https://www.rfc-editor.org/rfc/rfc9220">RFC 9220</a> for WebSockets over HTTP/2 and HTTP/3.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API">WebTransport API</a>. Browser support table, checked October 2026.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Protocols">Introduction to WebRTC protocols</a>. ICE, STUN, TURN and session descriptions.</li>
+  <li><a href="https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md">Standard Webhooks specification</a>. The header names, signature scheme and retry guidance used in this chapter.</li>
+  <li>Sameera Thangudu, <a href="https://slack.engineering/real-time-messaging/">Real-time Messaging</a>, Slack Engineering, April 2023. Gateway servers, channel servers and consistent hashing.</li>
+  <li>WhatsApp, <a href="https://blog.whatsapp.com/1-million-is-so-2011">1 million is so 2011</a>, January 2012. More than 2 million TCP connections on one server.</li>
+  <li>Marc Brooker, <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">Exponential Backoff and Jitter</a>, AWS Architecture Blog, 2015. Compares ways of adding randomness to retry delays, including the “full jitter” used in this chapter.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html">Application Load Balancers</a>. The 60-second default idle timeout.</li>
+</ol>
+</section>

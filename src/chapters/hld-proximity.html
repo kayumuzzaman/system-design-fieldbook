@@ -1,0 +1,629 @@
+<!--meta
+{ "description": "A high-level design of two location features: finding places near a point, with geohash cells, coverings and quadtrees measured against a full scan, and sharing live locations with nearby friends, with WebSocket servers, a location cache with expiry and a publish and subscribe channel per user. Requirements, estimates, APIs, data, failures and scale for both.",
+  "lede": "“Cafés within two kilometers” and “which of my friends are nearby right now” sound like the same question. They are opposite problems. Places hardly move and are searched constantly, so the work is an index that turns a circle on a map into a few cheap lookups. Friends move all the time and nobody searches for them, so the work is pushing each move to the few people who care. This chapter designs both, and measures how many places each kind of index has to look at to answer one search.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design two features of a location app. Nearby places: given a position and a radius, return the businesses inside it, nearest first, optionally of one category. Nearby friends: users who opt in see which of their friends are within 8 km, with the distance, updated as people move.</p></div>
+<p>Nearness is two-dimensional, and ordinary indexes sort by one value, so the first problem is turning “within 2 km of here” into something a database or a key-value store can look up quickly. The second problem has almost no search in it. A million people move every few seconds, and each move matters to a handful of friends, so it is a fan-out problem like a chat system’s, with positions instead of messages. In the terms of <x-ref to="hld-method"></x-ref>, the first is a read-heavy indexing problem and the second a write-heavy push problem, and recognizing which is which is most of the interview.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Places within a radius of up to 20 km, nearest first, filtered by category, paged</th><td>Yes</td></tr>
+<tr><th>Place details; owners add and edit their places, visible by the next day</th><td>Yes</td></tr>
+<tr><th>Friends who opted in and are within 8 km, with distance and when last seen</th><td>Yes</td></tr>
+<tr><th>Friends’ positions updated within a few seconds of them moving</th><td>Yes</td></tr>
+<tr><th>Maps, routes and travel times</th><td>No: <x-ref to="hld-maps"></x-ref></td></tr>
+<tr><th>Matching riders to moving drivers</th><td>No: <x-ref to="hld-ride-hailing"></x-ref></td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Places</th><th>Friends</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>100 million daily users, 5 searches each; 200 million places</td><td>100 million users of the feature; 10% online at the peak</td></tr>
+<tr><th>Latency</th><td>Under 100 ms for 99% of searches</td><td>A move shown to friends within a few seconds</td></tr>
+<tr><th>Availability</th><td>99.99%: search is the front door</td><td>99.9%: the feature can degrade to “last seen”</td></tr>
+<tr><th>Consistency</th><td>Edits visible within a day</td><td>Only the latest position matters; a lost update is replaced by the next</td></tr>
+<tr><th>Privacy</th><td>Public data</td><td>Opt-in on both sides; positions kept briefly; distance, not address</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">places, searches: 100 million × 5 ÷ 86,400 s ≈ 5,800 a second, about 17,400 at a peak of three times that<br>
+places, data: 200 million × about 1 KB = 200 GB of details; the spatial index needs only an id and a cell, about 16 bytes each: 3.2 GB<br>
+friends, connections: 100 million × 10% = 10 million open WebSockets at the peak<br>
+friends, updates: 10 million ÷ one update every 30 s ≈ 333,000 a second<br>
+friends, deliveries: 200 friends × 10% online = 20 per update ⇒ about 6.7 million a second<br>
+friends, location cache: 10 million × about 100 bytes = 1 GB</div>
+<p>The two halves come out differently (<x-ref to="estimation#method"></x-ref>). Places are a read problem with a small index: 3.2 GB fits in the memory of every server, so the search can run against an in-memory index replicated as many times as the read rate needs, with the details in an ordinary database with read replicas. Friends are a write and fan-out problem: hundreds of thousands of updates a second, multiplied twentyfold, through ten million connections (<x-ref to="realtime-communication#scaling"></x-ref>). Nothing in it is a search.</p>
+
+<div class="widget" data-widget="nearby89">
+<h4>Load of nearby friends</h4>
+<p>Connections, location updates and the messages they fan out to, at the peak.</p>
+<div class="controls">
+  <label>Users of the feature, millions<input type="number" name="users" value="100" min="0.01" max="5000" step="1"></label>
+  <label>Online at the peak, %<input type="number" name="online" value="10" min="0" max="100" step="1"></label>
+  <label>Friends sharing with each user<input type="number" name="friends" value="200" min="0" max="5000" step="10"></label>
+  <label>Seconds between updates<input type="number" name="interval" value="30" min="1" max="3600" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Open connections</dt><dd data-out="connections">10 million</dd></div>
+  <div><dt>Updates a second</dt><dd data-out="updates">333 thousand</dd></div>
+  <div><dt>Deliveries a second</dt><dd data-out="deliveries">6.67 million</dd></div>
+  <div><dt>Location cache</dt><dd data-out="cache">1 GB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">10 million phones online send 333 thousand updates a second. Each goes to about 20 online friends, so the publish and subscribe tier carries 6.67 million deliveries a second. Halving how often phones send halves both numbers; halving the friends who see each update halves only the second.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Nearby places">
+GET /v1/places/nearby?lat=40.012&lon=10.021&radius=2000&category=cafe&limit=20
+
+200 OK
+{ "places": [ { "id": "p-81733", "name": "Corner Café", "distance_m": 140, "rating": 4.6 }, … ],
+  "next": "eyJyIjoyMDAwLCJhZnRlciI6Mjk…" }
+
+GET /v1/places/p-81733                   → the details
+PUT /v1/places/p-81733                   → owners only; searchable with the change by the next day
+</pre>
+<pre data-lang="http" data-title="Nearby friends, over one WebSocket">
+GET /v1/friends/live   (Upgrade: websocket)
+
+client → { "type": "location", "lat": 40.012, "lon": 10.021, "at": "2026-10-12T09:14:05Z" }
+server → { "type": "friend", "id": "ana", "distance_m": 1800, "at": "2026-10-12T09:14:03Z" }
+server → { "type": "gone", "id": "chi" }          ← moved out of range, or stopped sharing
+</pre>
+<p>A search returns distances, not raw coordinates of everything nearby, and pages by an opaque cursor (<x-ref to="api-styles#pagination"></x-ref>). The friends channel is a stream in both directions; the client sends its position every 30 seconds while the app is open and stops in the background. The server sends a distance rather than a friend’s exact position, which keeps the default private; showing a precise position is a separate, explicit choice by the person sharing it.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>Place</th><td>place id</td><td>Name, category, address, latitude, longitude, hours, rating</td><td>Relational, with read replicas (<x-ref to="replication#leader-follower"></x-ref>)</td></tr>
+<tr><th>Spatial index</th><td>geohash, then place id</td><td>Which places are in which cell</td><td>In memory on every search server, rebuilt from the database; or a table with a B-tree on the cell</td></tr>
+<tr><th>Current location</th><td>user id</td><td>Latitude, longitude, time; expires 10 minutes after the last update</td><td>An in-memory key-value store (<x-ref to="caching"></x-ref>)</td></tr>
+<tr><th>Location history</th><td>user id, then time</td><td>Past positions, kept for a limited period if the user allows it</td><td>A wide-column store, append only (<x-ref to="data-models#wide-column"></x-ref>)</td></tr>
+<tr><th>Sharing settings</th><td>user id</td><td>Whether sharing is on, and with whom</td><td>Relational, with the social graph</td></tr>
+</tbody>
+</table>
+<p>The expiry on the current location is what makes the cache correct without any cleanup. A phone that dies, loses signal or closes the app simply stops renewing its key, and after ten minutes its owner stops appearing to friends, which is exactly the meaning of “nearby now”.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-labelledby="f891t f891d">
+<title id="f891t">Two designs: nearby places and nearby friends</title>
+<desc id="f891d">Top: nearby places. Clients search through a stateless location service that reads a geospatial index held in memory and replicated; a business service writes place details to a primary database, whose replicas serve reads, and the index is rebuilt from the database. Bottom: nearby friends. Clients keep a WebSocket connection to a tier of socket servers. Each location update is written to a location cache with an expiry and published on the user’s channel in a publish and subscribe cluster; socket servers subscribed to that channel on behalf of the user’s friends check the distance and forward it. Updates are also appended to a location history store for later use.</desc>
+<text class="tb" x="10" y="16">Nearby places: many reads, few writes, data that rarely moves</text>
+<rect class="n " x="10" y="32" width="100" height="52" rx="6"/>
+<text class="tb mid" x="60.0" y="55.0">Clients</text>
+<text class="ts mid" x="60.0" y="72.0">search</text>
+<rect class="n sig" x="170" y="32" width="150" height="52" rx="6"/>
+<text class="tb mid" x="245.0" y="55.0">Location service</text>
+<text class="ts mid" x="245.0" y="72.0">stateless</text>
+<rect class="n store" x="380" y="32" width="150" height="52" rx="6"/>
+<text class="tb mid" x="455.0" y="55.0">Geo index</text>
+<text class="ts mid" x="455.0" y="72.0">in memory, replicas</text>
+<rect class="n sig" x="170" y="106" width="150" height="44" rx="6"/>
+<text class="tb mid" x="245.0" y="125.0">Business service</text>
+<text class="ts mid" x="245.0" y="142.0">owners’ edits</text>
+<rect class="n store" x="380" y="106" width="150" height="44" rx="6"/>
+<text class="tb mid" x="455.0" y="125.0">Places database</text>
+<text class="ts mid" x="455.0" y="142.0">primary, replicas</text>
+<path class="e sig both" d="M110 58H170"/>
+<text class="ts mid" x="140" y="52">nearby?</text>
+<path class="e sig both" d="M320 58H380"/>
+<path class="e store" d="M320 128H380"/>
+<path class="e async" d="M560 128H600V58H530"/>
+<text class="ts" x="608" y="96">rebuilt</text>
+<text class="ts" x="608" y="110">from it</text>
+<path class="e none dash" d="M10 168H710"/>
+<text class="tb" x="10" y="192">Nearby friends: every user moves, every update goes to online friends</text>
+<rect class="n " x="10" y="210" width="100" height="52" rx="6"/>
+<text class="tb mid" x="60.0" y="233.0">Phones</text>
+<text class="ts mid" x="60.0" y="250.0">WebSocket</text>
+<rect class="n sig" x="170" y="210" width="150" height="52" rx="6"/>
+<text class="tb mid" x="245.0" y="233.0">Socket servers</text>
+<text class="ts mid" x="245.0" y="250.0">hold connections</text>
+<rect class="n async" x="380" y="210" width="150" height="52" rx="6"/>
+<text class="tb mid" x="455.0" y="233.0">Pub/sub</text>
+<text class="ts mid" x="455.0" y="250.0">a channel per user</text>
+<rect class="n store" x="170" y="280" width="150" height="40" rx="6"/>
+<text class="tb mid" x="245.0" y="297.0">Location cache</text>
+<text class="ts mid" x="245.0" y="314.0">expires in 10 min</text>
+<rect class="n store" x="380" y="280" width="150" height="40" rx="6"/>
+<text class="tb mid" x="455.0" y="297.0">Location history</text>
+<text class="ts mid" x="455.0" y="314.0">append only</text>
+<path class="e sig both" d="M110 236H170"/>
+<text class="ts mid" x="140" y="230">location</text>
+<path class="e async both" d="M320 236H380"/>
+<text class="ts mid" x="350" y="230">pub, sub</text>
+<path class="e store" d="M245 262V280"/>
+<path class="e async" d="M320 300H380"/>
+</svg>
+</div>
+<figcaption>The two halves share a map and little else. Places change rarely and are read constantly; friends’ locations change every few seconds and are pushed, not searched.</figcaption>
+</figure>
+
+<p><b>Nearby places.</b> A search goes to a stateless location service, which works out which cells of the spatial index can contain places within the radius, reads the place ids in those cells, computes the true distance of each, keeps those inside the circle, and sorts them. Details for the page of results come from a cache in front of the places database. Because places change rarely, the index can be rebuilt every night, or kept current from the database’s change stream (<x-ref to="change-data-capture"></x-ref>), and every search server holds a full copy. The read rate decides only how many copies there are.</p>
+<p><b>Nearby friends.</b> Each phone holds a WebSocket to one of many socket servers. A location update is written to the location cache and published on the user’s own channel in a publish and subscribe cluster (<x-ref to="message-queues#models"></x-ref>). A socket server subscribes to the channels of the online friends of each user it holds, and filters by distance before sending anything down.</p>
+
+<figure class="fig wide" id="fig-friends">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 276" role="img" aria-labelledby="f895t f895d">
+<title id="f895t">Ben comes online, then Ana moves</title>
+<desc id="f895d">A sequence between Ana’s phone, socket server A, the location cache, the publish and subscribe cluster, socket server B and Ben’s phone. Ben opens a WebSocket to server B, which reads his online friends’ last locations from the cache and subscribes to their channels. Ana’s phone sends a location to server A, which stores it in the cache with a ten-minute expiry and publishes it on Ana’s channel. The cluster delivers it to server B, which computes the distance to Ben, 1.8 km, within the 8 km limit, and sends it to Ben.</desc>
+<text class="tb mid" x="40" y="20">Ana</text>
+<line class="axis" x1="40" y1="28" x2="40" y2="264"/>
+<text class="tb mid" x="170" y="20">Server A</text>
+<line class="axis" x1="170" y1="28" x2="170" y2="264"/>
+<text class="tb mid" x="300" y="20">Cache</text>
+<line class="axis" x1="300" y1="28" x2="300" y2="264"/>
+<text class="tb mid" x="430" y="20">Pub/sub</text>
+<line class="axis" x1="430" y1="28" x2="430" y2="264"/>
+<text class="tb mid" x="560" y="20">Server B</text>
+<line class="axis" x1="560" y1="28" x2="560" y2="264"/>
+<text class="tb mid" x="680" y="20">Ben</text>
+<line class="axis" x1="680" y1="28" x2="680" y2="264"/>
+<g data-s="1">
+<path class="e sig" d="M679 56H561"/>
+<text class="ts mid" x="620.0" y="50">1. open WebSocket</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M559 84H301"/>
+<text class="ts mid" x="430.0" y="78">2. friends’ last locations</text>
+</g>
+<g data-s="3">
+<path class="e async" d="M559 112H431"/>
+<text class="ts mid" x="495.0" y="106">3. subscribe: ana, chi, …</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M41 140H169"/>
+<text class="ts mid" x="105.0" y="134">4. location</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M171 168H299"/>
+<text class="ts mid" x="235.0" y="162">5. set, expires in 10 min</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M171 196H429"/>
+<text class="ts mid" x="300.0" y="190">6. publish on “ana”</text>
+</g>
+<g data-s="7">
+<path class="e async" d="M431 224H559"/>
+<text class="ts mid" x="495.0" y="218">7. ana: 40.012, 10.021</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M561 252H679"/>
+<text class="ts mid" x="620.0" y="246">8. Ana is 1.8 km away</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="connect" data-state="Server B subscribed to: nothing">Ben opens the app. His phone connects to whichever socket server the load balancer picks.</li>
+  <li data-msg="GET ×50">The server reads the cached locations of Ben’s friends who share with him. Missing keys are friends who are offline.</li>
+  <li data-msg="SUBSCRIBE" data-state="Server B subscribed to: ana, chi and others">It subscribes to the channel of each friend who is online, on Ben’s behalf.</li>
+  <li data-msg="40.012, 10.021">Thirty seconds after her last update, Ana’s phone sends her position.</li>
+  <li data-msg="SET ana">The latest location is stored with an expiry, so a phone that goes quiet stops appearing.</li>
+  <li data-msg="PUBLISH">It publishes the update on Ana’s channel, without knowing who listens.</li>
+  <li data-msg="ana">Every server holding one of Ana’s online friends receives it.</li>
+  <li data-msg="1.8 km" data-state="Ben sees: Ana, 1.8 km">Server B computes the distance to Ben. It is within the 8 km limit, so it is sent; a friend in another city would be dropped here.</li>
+</ol>
+<figcaption>Updates are pushed through a channel per user. The distance check happens at the subscriber’s server, which knows where its own user is.</figcaption>
+</figure>
+
+<h2 id="geohash">Step 6a: Turning a circle into lookups</h2>
+<p>The common trick, introduced in <x-ref to="specialized-databases#cells"></x-ref>, is to divide the map into cells with names that an ordinary index can store. A <dfn>geohash</dfn> is such a name: the world is halved by longitude, then by latitude, then by longitude again, each halving adding one bit for the side the point is on, and every five bits written as one character. Gustavo Niemeyer published it in 2008 and put it in the public domain.</p>
+
+<figure class="fig wide" id="fig-geohash">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f892t f892d">
+<title id="f892t">Building a geohash by halving the world</title>
+<desc id="f892d">The world as a rectangle of longitude from −180 to 180 and latitude from −90 to 90, and a point at latitude 40, longitude 10. Five halvings, alternating longitude and latitude, keep the half containing the point: east (1), north (1), west of 90 (0), south of 45 (0), west of 45 (0). The five bits 11000 are 24, the character s in the geohash alphabet. Each further character halves five more times: sp, spp, and spp5e, a cell about 3.7 km wide and 4.9 km high.</desc>
+<rect class="n sunk" x="20" y="40" width="400" height="200" rx="2"/>
+<text class="ts" x="20" y="30">longitude −180</text>
+<text class="ts end" x="420" y="30">180</text>
+<text class="ts" x="426" y="48">90</text>
+<text class="ts" x="426" y="240">−90</text>
+<g data-s="1">
+<rect class="n store" x="220.0" y="40.0" width="200.0" height="200.0" rx="1" style="fill-opacity:0.35"/>
+<path class="e none" d="M220.0 40.0V240.0"/>
+<text class="ts" x="450" y="52">bit 1: longitude, east of 0 → 1</text>
+</g>
+<g data-s="2">
+<rect class="n store" x="220.0" y="40.0" width="200.0" height="100.0" rx="1" style="fill-opacity:0.35"/>
+<path class="e none" d="M220.0 140.0H420.0"/>
+<text class="ts" x="450" y="76">bit 2: latitude, north of 0 → 1</text>
+</g>
+<g data-s="3">
+<rect class="n store" x="220.0" y="40.0" width="100.0" height="100.0" rx="1" style="fill-opacity:0.35"/>
+<path class="e none" d="M320.0 40.0V140.0"/>
+<text class="ts" x="450" y="100">bit 3: longitude, west of 90 → 0</text>
+</g>
+<g data-s="4">
+<rect class="n store" x="220.0" y="90.0" width="100.0" height="50.0" rx="1" style="fill-opacity:0.35"/>
+<path class="e none" d="M220.0 90.0H320.0"/>
+<text class="ts" x="450" y="124">bit 4: latitude, south of 45 → 0</text>
+</g>
+<g data-s="5">
+<rect class="n store" x="220.0" y="90.0" width="50.0" height="50.0" rx="1" style="fill-opacity:0.35"/>
+<path class="e none" d="M270.0 90.0V140.0"/>
+<text class="ts" x="450" y="148">bit 5: longitude, west of 45 → 0</text>
+</g>
+<circle class="dot" cx="231.1" cy="95.6" r="4"/>
+<circle class="dot" cx="26" cy="256" r="4"/>
+<text class="ts" x="36" y="260">the point: latitude 40, longitude 10</text>
+<g data-s="6">
+<text class="tb" x="450" y="182">11000 = 24 = “s”</text>
+<text class="ts" x="450" y="206"></text>
+<text class="ts" x="450" y="206"></text>
+<text class="ts" x="450" y="206"></text>
+<text class="ts" x="450" y="206"></text>
+<text class="ts" x="450" y="206">more characters: sp, spp, … spp5e</text>
+<text class="ts" x="450" y="224">spp5e: about 3.7 km by 4.9 km</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Bits: 1">Split the whole longitude range at 0. The point is east of 0, so the bit is 1 and the eastern half is kept.</li>
+  <li data-msg="none" data-state="Bits: 11">Split the remaining latitude range at 0. The point is north of 0, so the bit is 1 and the northern half is kept.</li>
+  <li data-msg="none" data-state="Bits: 110">Split the remaining longitude range at 90. The point is west of 90, so the bit is 0 and the western half is kept.</li>
+  <li data-msg="none" data-state="Bits: 1100">Split the remaining latitude range at 45. The point is south of 45, so the bit is 0 and the southern half is kept.</li>
+  <li data-msg="none" data-state="Bits: 11000">Split the remaining longitude range at 45. The point is west of 45, so the bit is 0 and the western half is kept.</li>
+  <li data-msg="none" data-state="Bits: 11000; geohash: s">Five bits make one character. 11000 is 24, which is “s” in the geohash alphabet of digits and letters. Each further character halves five more times: “spp5e” is a cell about 3.7 by 4.9 kilometers.</li>
+</ol>
+<figcaption>Generated by the chapter’s encoder. Nearby points share a prefix as long as they fall in the same cells, which is why a prefix search finds a neighborhood.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Encoding a point, and choosing the cell size for a radius">
+// Each character holds 5 bits; bits alternate between longitude (first) and latitude.
+export function encode(lat: number, lon: number, precision: number): string {
+  let latLo = -90, latHi = 90, lonLo = -180, lonHi = 180;
+  let out = "", bits = 0, value = 0, even = true;
+  while (out.length < precision) {
+    if (even) {
+      const mid = (lonLo + lonHi) / 2;
+      if (lon >= mid) { value = value * 2 + 1; lonLo = mid; } else { value *= 2; lonHi = mid; }
+    } else {
+      const mid = (latLo + latHi) / 2;
+      if (lat >= mid) { value = value * 2 + 1; latLo = mid; } else { value *= 2; latHi = mid; }
+    }
+    even = !even;
+    if (++bits === 5) { out += BASE32[value]; bits = 0; value = 0; }
+  }
+  return out;
+}
+// The longest geohash whose cells are at least `radius` wide and high: then a circle around any
+// point inside a cell stays within that cell and its eight neighbors.
+export function precisionFor(radius: number, lat: number): number {
+  let p = 1;
+  while (p < 12) {
+    const c = cellSize(p + 1, lat);
+    if (c.width < radius || c.height < radius) break;
+    p += 1;
+  }
+  return p;
+}
+</pre>
+<p>Two properties make it useful. Points in the same cell share its name as a prefix, so in a sorted list all places of a cell are one contiguous range, found with one binary search: a B-tree index, a sorted set in Redis or a sorted file all answer it. And each extra character divides a cell into 32. At latitude 40 the chapter’s code gives these sizes:</p>
+<table>
+<thead><tr><th>Geohash length</th><th>Cell width</th><th>Cell height</th></tr></thead>
+<tbody>
+<tr><th>4</th><td>29.95 km</td><td>19.55 km</td></tr>
+<tr><th>5</th><td>3.74 km</td><td>4.89 km</td></tr>
+<tr><th>6</th><td>936 m</td><td>611 m</td></tr>
+<tr><th>7</th><td>117 m</td><td>153 m</td></tr>
+<tr><th>8</th><td>29 m</td><td>19 m</td></tr>
+</tbody>
+</table>
+<p>A point near the edge of its cell has neighbors across the edge whose names share nothing with its own. So a search never looks in one cell. It picks the length whose cells are at least as wide and high as the radius, then reads the cell containing the point and its eight neighbors; a circle around any point in the middle cell cannot reach beyond them. For a 1 km radius at latitude 40 that is length 5, nine cells of 3.7 by 4.9 km.</p>
+
+<h2 id="indexes">Step 6b: How much each index has to read</h2>
+<p>Nine cells are always enough and often far too many. The chapter’s code placed 200,000 places in a synthetic city 50 km across, 60% of them in thirty dense neighborhoods, and searched from random places with each method, checking every answer against a full scan.</p>
+
+<figure class="fig wide" id="fig-cells">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 312" role="img" aria-labelledby="f893t f893d">
+<title id="f893t">Three ways to find the places within 2 km of a busy spot</title>
+<desc id="f893d">A window of 16 by 16 km around a search point in a dense area, with a sample of places as dots and a circle of 2 km. Left: the search cell of geohash length 5 and its eight neighbors, about 11 by 15 km together, contain 36,969 places to check. Middle: the 48 cells of length 6 that touch the square around the circle contain 15,476. Right: the leaves of a quadtree with at most 100 places each, small where places are dense; the leaves touching the square contain 12,713. 9,950 places are within 2 km.</desc>
+<text class="tb" x="10" y="18">Nine cells</text>
+<text class="ts" x="10" y="34">geohash length 5</text>
+<rect class="n sunk" x="10" y="44" width="222" height="222" rx="2"/>
+<rect class="n sig" x="30.8" y="156.0" width="52.0" height="67.8"  style="fill-opacity:0.25"/>
+<rect class="n sig" x="82.8" y="156.0" width="52.0" height="67.8"  style="fill-opacity:0.25"/>
+<rect class="n sig" x="134.8" y="156.0" width="52.0" height="67.8"  style="fill-opacity:0.25"/>
+<rect class="n sig" x="30.8" y="88.2" width="52.0" height="67.8"  style="fill-opacity:0.25"/>
+<rect class="n sig" x="82.8" y="88.2" width="52.0" height="67.8"  style="fill-opacity:0.25"/>
+<rect class="n sig" x="134.8" y="88.2" width="52.0" height="67.8"  style="fill-opacity:0.25"/>
+<rect class="n sig" x="30.8" y="44.0" width="52.0" height="44.2"  style="fill-opacity:0.25"/>
+<rect class="n sig" x="82.8" y="44.0" width="52.0" height="44.2"  style="fill-opacity:0.25"/>
+<rect class="n sig" x="134.8" y="44.0" width="52.0" height="44.2"  style="fill-opacity:0.25"/>
+<path d="M84.5 171.7h0M29.5 138.9h0M142.7 159.0h0M83.0 141.9h0M42.1 135.0h0M48.9 85.0h0M127.5 163.3h0M41.0 85.3h0M31.2 88.1h0M102.5 136.2h0M192.4 84.4h0M127.0 162.6h0M205.4 214.6h0M97.8 127.1h0M92.2 118.0h0M98.0 136.1h0M86.4 105.0h0M76.2 89.8h0M93.8 95.9h0M19.2 95.2h0M128.9 170.3h0M15.5 121.4h0M80.6 111.3h0M126.1 172.6h0M169.0 107.0h0M111.7 123.0h0M87.7 111.3h0M123.4 157.9h0M166.9 115.1h0M75.7 231.6h0M50.9 257.6h0M109.7 105.8h0M131.1 164.8h0M184.1 152.2h0M229.8 124.9h0M141.6 161.4h0M114.0 127.6h0M133.1 161.9h0M86.0 120.3h0M127.8 228.8h0M88.0 139.1h0M141.9 216.5h0M91.4 115.2h0M10.9 88.7h0M93.7 97.0h0M189.4 149.5h0M104.0 257.7h0M128.4 168.0h0M55.9 197.1h0M177.1 49.0h0M60.9 96.1h0M75.3 122.0h0M137.9 158.6h0M122.1 163.7h0M101.0 133.8h0M69.0 97.7h0M144.9 158.2h0M90.0 133.3h0M27.8 205.3h0M132.1 163.6h0M136.2 168.0h0M75.0 243.6h0M124.3 174.3h0M78.4 66.3h0M95.8 256.6h0M50.8 154.9h0M86.2 137.6h0M222.7 44.2h0M81.3 192.8h0M84.6 133.8h0M124.9 162.0h0M50.0 162.6h0M135.8 169.3h0M134.5 166.8h0M61.2 151.0h0M139.4 177.7h0M55.5 99.7h0M55.7 101.9h0M93.6 187.9h0M85.7 120.1h0M21.0 91.3h0M202.2 70.4h0M43.8 111.5h0M133.9 159.0h0M116.0 168.5h0M127.6 165.6h0M66.7 71.1h0M165.7 167.4h0M92.6 143.2h0M68.9 108.5h0M103.6 128.2h0M43.9 110.5h0M141.4 181.3h0M145.6 148.8h0M58.6 71.6h0M72.0 234.8h0M106.9 183.0h0M142.6 177.9h0M136.5 166.8h0M210.8 223.4h0M66.4 137.5h0M205.9 77.5h0M93.0 119.0h0M102.7 190.8h0M121.3 147.6h0M34.9 109.7h0M136.1 171.4h0M93.6 153.9h0M224.0 153.3h0M131.1 207.8h0M103.2 234.6h0M91.5 149.0h0M51.0 160.5h0M119.8 66.9h0M83.1 85.9h0M125.8 174.8h0M144.3 159.0h0M21.9 158.1h0M139.4 154.1h0M150.7 60.5h0M150.6 138.2h0M76.3 112.8h0M64.5 135.8h0M102.1 122.5h0M148.1 104.6h0M181.1 147.4h0M64.2 123.5h0M76.2 136.0h0M172.4 224.3h0M187.1 77.6h0M121.0 170.4h0M33.5 51.3h0M135.0 161.6h0M92.8 137.9h0M91.1 143.9h0M93.3 105.8h0M25.4 132.2h0M225.4 213.8h0M34.0 106.7h0M130.9 164.8h0M63.5 131.5h0M136.3 171.8h0M49.1 161.0h0M156.0 108.1h0M110.8 166.0h0M162.9 66.0h0M93.7 165.9h0M88.3 158.6h0M76.1 132.2h0M118.3 60.6h0M138.4 130.1h0M116.2 157.1h0M78.0 174.8h0M75.3 157.8h0M31.9 254.2h0M146.0 165.7h0M72.1 89.9h0M64.5 171.7h0M106.5 107.0h0M144.4 159.9h0M60.9 82.7h0M175.1 153.6h0M158.5 260.5h0M61.4 206.8h0M143.3 81.2h0M67.2 137.2h0M129.6 145.0h0M52.9 258.3h0M68.4 125.9h0M90.6 114.4h0M125.5 97.2h0M49.5 135.3h0M119.6 168.1h0M104.9 145.5h0M100.0 125.3h0M87.0 124.3h0M127.5 140.2h0M134.1 74.5h0M142.0 79.1h0M93.9 128.8h0M86.6 167.2h0M89.9 133.6h0M12.7 114.3h0M119.6 166.9h0M31.7 141.1h0M122.0 151.4h0M185.2 66.8h0M110.8 136.2h0M86.0 114.8h0M103.6 119.9h0M105.4 143.2h0M67.3 113.7h0M64.3 139.6h0M181.4 146.3h0M122.7 169.9h0M79.1 71.4h0M75.1 139.4h0M125.9 148.9h0M24.1 106.1h0M66.8 148.0h0M71.1 94.1h0M111.6 126.5h0M89.1 136.8h0M92.9 171.8h0M97.4 135.4h0M124.0 164.4h0M191.7 149.4h0M127.7 157.3h0M130.4 152.8h0M63.3 91.3h0M143.5 146.1h0M102.2 127.9h0M143.9 206.6h0M26.0 190.1h0M207.3 54.2h0M92.1 111.6h0M127.2 158.1h0M32.9 98.7h0M80.8 90.6h0M129.2 175.4h0M129.2 166.2h0M143.6 49.6h0M26.3 229.4h0M109.2 128.2h0M121.7 113.7h0M147.2 160.3h0M117.5 158.4h0M131.5 143.7h0M32.4 110.8h0M133.7 156.5h0M215.5 184.5h0M61.8 116.4h0M70.3 157.4h0M163.7 250.7h0M88.6 120.9h0M60.5 136.5h0M41.0 112.1h0M125.3 75.3h0M98.7 123.9h0M95.5 115.7h0M96.9 140.0h0M53.6 115.0h0M96.1 115.7h0M39.8 157.9h0M22.2 128.6h0M55.3 101.7h0M135.7 135.9h0M78.9 127.2h0M156.3 231.1h0M104.5 153.9h0M58.7 133.1h0M133.7 167.9h0M75.0 166.4h0M220.6 77.9h0M78.0 83.1h0M95.1 137.4h0M61.0 115.0h0M125.6 161.9h0M127.8 163.0h0M70.8 114.7h0M42.1 130.1h0M181.1 46.0h0M74.2 140.9h0M144.2 171.9h0M95.4 95.1h0M97.8 135.8h0M95.6 118.1h0M81.9 165.7h0M135.1 120.6h0M138.2 143.7h0M231.6 138.1h0M55.4 115.4h0M79.7 145.8h0M88.1 120.1h0M227.0 256.2h0M67.5 125.6h0M128.4 173.6h0M105.9 127.3h0M77.6 158.4h0M123.0 142.2h0M146.2 138.8h0M101.9 139.1h0M82.9 109.7h0M134.8 157.8h0M41.7 152.9h0M90.5 127.3h0M137.7 172.3h0M50.5 144.2h0M76.9 222.6h0M123.4 173.3h0M27.4 232.2h0M110.7 177.6h0M80.6 132.0h0M72.6 117.9h0M68.1 152.4h0M74.6 220.3h0M43.2 238.7h0M138.6 157.2h0M127.2 158.8h0M120.3 86.7h0M130.3 173.9h0M12.7 52.6h0M115.2 120.5h0M132.4 158.8h0M95.2 251.2h0M91.3 136.5h0M90.4 128.0h0M57.1 104.7h0M82.4 218.6h0M143.1 101.3h0M91.1 153.4h0M131.3 150.5h0M80.7 122.5h0M43.0 109.6h0M128.1 152.6h0M29.8 265.5h0M139.1 163.5h0M92.5 122.2h0M106.9 107.0h0M72.5 129.7h0M120.0 170.2h0M82.6 132.9h0M128.8 154.3h0M132.9 106.7h0M102.6 178.9h0M42.8 52.8h0M120.9 183.1h0M171.7 150.7h0M106.1 126.3h0M80.7 126.9h0M56.4 144.3h0M97.4 116.5h0" style="fill:none;stroke:var(--ink-2);stroke-width:2.6;stroke-linecap:round"/>
+<circle cx="121.0" cy="155.0" r="27.8" style="fill:none;stroke:var(--fault);stroke-width:2"/>
+<circle class="dot" cx="121.0" cy="155.0" r="3"/>
+<text class="tb" x="10" y="286">36,969 places checked</text>
+<text class="ts" x="10" y="302">9,950 within 2 km</text>
+<text class="tb" x="249" y="18">48 smaller cells</text>
+<text class="ts" x="249" y="34">geohash length 6</text>
+<rect class="n sunk" x="249" y="44" width="222" height="222" rx="2"/>
+<rect class="n sig" x="321.8" y="181.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="334.8" y="181.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="347.8" y="181.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="360.8" y="181.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="373.8" y="181.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="386.8" y="181.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="321.8" y="173.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="334.8" y="173.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="347.8" y="173.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="360.8" y="173.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="373.8" y="173.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="386.8" y="173.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="321.8" y="164.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="334.8" y="164.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="347.8" y="164.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="360.8" y="164.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="373.8" y="164.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="386.8" y="164.5" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="321.8" y="156.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="334.8" y="156.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="347.8" y="156.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="360.8" y="156.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="373.8" y="156.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="386.8" y="156.0" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="321.8" y="147.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="334.8" y="147.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="347.8" y="147.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="360.8" y="147.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="373.8" y="147.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="386.8" y="147.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="321.8" y="139.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="334.8" y="139.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="347.8" y="139.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="360.8" y="139.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="373.8" y="139.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="386.8" y="139.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="321.8" y="130.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="334.8" y="130.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="347.8" y="130.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="360.8" y="130.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="373.8" y="130.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="386.8" y="130.6" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="321.8" y="122.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="334.8" y="122.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="347.8" y="122.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="360.8" y="122.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="373.8" y="122.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<rect class="n sig" x="386.8" y="122.1" width="13.0" height="8.5" style="fill-opacity:0.25"/>
+<path d="M323.5 171.7h0M268.5 138.9h0M381.7 159.0h0M322.0 141.9h0M281.1 135.0h0M287.9 85.0h0M366.5 163.3h0M280.0 85.3h0M270.2 88.1h0M341.5 136.2h0M431.4 84.4h0M366.0 162.6h0M444.4 214.6h0M336.8 127.1h0M331.2 118.0h0M337.0 136.1h0M325.4 105.0h0M315.2 89.8h0M332.8 95.9h0M258.2 95.2h0M367.9 170.3h0M254.5 121.4h0M319.6 111.3h0M365.1 172.6h0M408.0 107.0h0M350.7 123.0h0M326.7 111.3h0M362.4 157.9h0M405.9 115.1h0M314.7 231.6h0M289.9 257.6h0M348.7 105.8h0M370.1 164.8h0M423.1 152.2h0M468.8 124.9h0M380.6 161.4h0M353.0 127.6h0M372.1 161.9h0M325.0 120.3h0M366.8 228.8h0M327.0 139.1h0M380.9 216.5h0M330.4 115.2h0M249.9 88.7h0M332.7 97.0h0M428.4 149.5h0M343.0 257.7h0M367.4 168.0h0M294.9 197.1h0M416.1 49.0h0M299.9 96.1h0M314.3 122.0h0M376.9 158.6h0M361.1 163.7h0M340.0 133.8h0M308.0 97.7h0M383.9 158.2h0M329.0 133.3h0M266.8 205.3h0M371.1 163.6h0M375.2 168.0h0M314.0 243.6h0M363.3 174.3h0M317.4 66.3h0M334.8 256.6h0M289.8 154.9h0M325.2 137.6h0M461.7 44.2h0M320.3 192.8h0M323.6 133.8h0M363.9 162.0h0M289.0 162.6h0M374.8 169.3h0M373.5 166.8h0M300.2 151.0h0M378.4 177.7h0M294.5 99.7h0M294.7 101.9h0M332.6 187.9h0M324.7 120.1h0M260.0 91.3h0M441.2 70.4h0M282.8 111.5h0M372.9 159.0h0M355.0 168.5h0M366.6 165.6h0M305.7 71.1h0M404.7 167.4h0M331.6 143.2h0M307.9 108.5h0M342.6 128.2h0M282.9 110.5h0M380.4 181.3h0M384.6 148.8h0M297.6 71.6h0M311.0 234.8h0M345.9 183.0h0M381.6 177.9h0M375.5 166.8h0M449.8 223.4h0M305.4 137.5h0M444.9 77.5h0M332.0 119.0h0M341.7 190.8h0M360.3 147.6h0M273.9 109.7h0M375.1 171.4h0M332.6 153.9h0M463.0 153.3h0M370.1 207.8h0M342.2 234.6h0M330.5 149.0h0M290.0 160.5h0M358.8 66.9h0M322.1 85.9h0M364.8 174.8h0M383.3 159.0h0M260.9 158.1h0M378.4 154.1h0M389.7 60.5h0M389.6 138.2h0M315.3 112.8h0M303.5 135.8h0M341.1 122.5h0M387.1 104.6h0M420.1 147.4h0M303.2 123.5h0M315.2 136.0h0M411.4 224.3h0M426.1 77.6h0M360.0 170.4h0M272.5 51.3h0M374.0 161.6h0M331.8 137.9h0M330.1 143.9h0M332.3 105.8h0M264.4 132.2h0M464.4 213.8h0M273.0 106.7h0M369.9 164.8h0M302.5 131.5h0M375.3 171.8h0M288.1 161.0h0M395.0 108.1h0M349.8 166.0h0M401.9 66.0h0M332.7 165.9h0M327.3 158.6h0M315.1 132.2h0M357.3 60.6h0M377.4 130.1h0M355.2 157.1h0M317.0 174.8h0M314.3 157.8h0M270.9 254.2h0M385.0 165.7h0M311.1 89.9h0M303.5 171.7h0M345.5 107.0h0M383.4 159.9h0M299.9 82.7h0M414.1 153.6h0M397.5 260.5h0M300.4 206.8h0M382.3 81.2h0M306.2 137.2h0M368.6 145.0h0M291.9 258.3h0M307.4 125.9h0M329.6 114.4h0M364.5 97.2h0M288.5 135.3h0M358.6 168.1h0M343.9 145.5h0M339.0 125.3h0M326.0 124.3h0M366.5 140.2h0M373.1 74.5h0M381.0 79.1h0M332.9 128.8h0M325.6 167.2h0M328.9 133.6h0M251.7 114.3h0M358.6 166.9h0M270.7 141.1h0M361.0 151.4h0M424.2 66.8h0M349.8 136.2h0M325.0 114.8h0M342.6 119.9h0M344.4 143.2h0M306.3 113.7h0M303.3 139.6h0M420.4 146.3h0M361.7 169.9h0M318.1 71.4h0M314.1 139.4h0M364.9 148.9h0M263.1 106.1h0M305.8 148.0h0M310.1 94.1h0M350.6 126.5h0M328.1 136.8h0M331.9 171.8h0M336.4 135.4h0M363.0 164.4h0M430.7 149.4h0M366.7 157.3h0M369.4 152.8h0M302.3 91.3h0M382.5 146.1h0M341.2 127.9h0M382.9 206.6h0M265.0 190.1h0M446.3 54.2h0M331.1 111.6h0M366.2 158.1h0M271.9 98.7h0M319.8 90.6h0M368.2 175.4h0M368.2 166.2h0M382.6 49.6h0M265.3 229.4h0M348.2 128.2h0M360.7 113.7h0M386.2 160.3h0M356.5 158.4h0M370.5 143.7h0M271.4 110.8h0M372.7 156.5h0M454.5 184.5h0M300.8 116.4h0M309.3 157.4h0M402.7 250.7h0M327.6 120.9h0M299.5 136.5h0M280.0 112.1h0M364.3 75.3h0M337.7 123.9h0M334.5 115.7h0M335.9 140.0h0M292.6 115.0h0M335.1 115.7h0M278.8 157.9h0M261.2 128.6h0M294.3 101.7h0M374.7 135.9h0M317.9 127.2h0M395.3 231.1h0M343.5 153.9h0M297.7 133.1h0M372.7 167.9h0M314.0 166.4h0M459.6 77.9h0M317.0 83.1h0M334.1 137.4h0M300.0 115.0h0M364.6 161.9h0M366.8 163.0h0M309.8 114.7h0M281.1 130.1h0M420.1 46.0h0M313.2 140.9h0M383.2 171.9h0M334.4 95.1h0M336.8 135.8h0M334.6 118.1h0M320.9 165.7h0M374.1 120.6h0M377.2 143.7h0M470.6 138.1h0M294.4 115.4h0M318.7 145.8h0M327.1 120.1h0M466.0 256.2h0M306.5 125.6h0M367.4 173.6h0M344.9 127.3h0M316.6 158.4h0M362.0 142.2h0M385.2 138.8h0M340.9 139.1h0M321.9 109.7h0M373.8 157.8h0M280.7 152.9h0M329.5 127.3h0M376.7 172.3h0M289.5 144.2h0M315.9 222.6h0M362.4 173.3h0M266.4 232.2h0M349.7 177.6h0M319.6 132.0h0M311.6 117.9h0M307.1 152.4h0M313.6 220.3h0M282.2 238.7h0M377.6 157.2h0M366.2 158.8h0M359.3 86.7h0M369.3 173.9h0M251.7 52.6h0M354.2 120.5h0M371.4 158.8h0M334.2 251.2h0M330.3 136.5h0M329.4 128.0h0M296.1 104.7h0M321.4 218.6h0M382.1 101.3h0M330.1 153.4h0M370.3 150.5h0M319.7 122.5h0M282.0 109.6h0M367.1 152.6h0M268.8 265.5h0M378.1 163.5h0M331.5 122.2h0M345.9 107.0h0M311.5 129.7h0M359.0 170.2h0M321.6 132.9h0M367.8 154.3h0M371.9 106.7h0M341.6 178.9h0M281.8 52.8h0M359.9 183.1h0M410.7 150.7h0M345.1 126.3h0M319.7 126.9h0M295.4 144.3h0M336.4 116.5h0" style="fill:none;stroke:var(--ink-2);stroke-width:2.6;stroke-linecap:round"/>
+<circle cx="360.0" cy="155.0" r="27.8" style="fill:none;stroke:var(--fault);stroke-width:2"/>
+<circle class="dot" cx="360.0" cy="155.0" r="3"/>
+<text class="tb" x="249" y="286">15,476 places checked</text>
+<text class="ts" x="249" y="302">9,950 within 2 km</text>
+<text class="tb" x="488" y="18">Quadtree leaves</text>
+<text class="ts" x="488" y="34">100 places at most</text>
+<rect class="n sunk" x="488" y="44" width="222" height="222" rx="2"/>
+<path d="M488.0 44.0H488.0V48.8H488.0ZM488.0 44.0H498.9V48.8H488.0ZM498.9 44.0H520.6V48.8H498.9ZM488.0 48.8H488.0V54.2H488.0ZM488.0 54.2H488.0V59.6H488.0ZM488.0 48.8H498.9V59.6H488.0ZM488.0 59.6H488.0V70.5H488.0ZM488.0 59.6H498.9V70.5H488.0ZM498.9 48.8H509.8V59.6H498.9ZM509.8 48.8H520.6V59.6H509.8ZM498.9 59.6H509.8V70.5H498.9ZM509.8 59.6H520.6V70.5H509.8ZM488.0 70.5H498.9V92.2H488.0ZM498.9 70.5H509.8V81.3H498.9ZM509.8 70.5H520.6V81.3H509.8ZM498.9 81.3H509.8V92.2H498.9ZM509.8 81.3H520.6V92.2H509.8ZM520.6 44.0H531.5V48.8H520.6ZM531.5 44.0H542.4V48.8H531.5ZM542.4 44.0H553.3V48.8H542.4ZM553.3 44.0H564.1V48.8H553.3ZM564.1 44.0H575.0V48.8H564.1ZM575.0 44.0H585.9V48.8H575.0ZM585.9 44.0H591.3V48.8H585.9ZM591.3 44.0H596.8V48.8H591.3ZM596.8 44.0H602.2V48.8H596.8ZM602.2 44.0H607.6V48.8H602.2ZM520.6 48.8H531.5V59.6H520.6ZM531.5 48.8H542.4V59.6H531.5ZM520.6 59.6H531.5V70.5H520.6ZM531.5 59.6H542.4V70.5H531.5ZM542.4 48.8H553.3V59.6H542.4ZM553.3 48.8H564.1V59.6H553.3ZM542.4 59.6H553.3V70.5H542.4ZM553.3 59.6H564.1V70.5H553.3ZM520.6 70.5H531.5V81.3H520.6ZM531.5 70.5H542.4V81.3H531.5ZM520.6 81.3H526.1V86.7H520.6ZM526.1 81.3H531.5V86.7H526.1ZM520.6 86.7H526.1V92.2H520.6ZM526.1 86.7H531.5V92.2H526.1ZM531.5 81.3H536.9V86.7H531.5ZM536.9 81.3H542.4V86.7H536.9ZM531.5 86.7H536.9V92.2H531.5ZM536.9 86.7H542.4V92.2H536.9ZM542.4 70.5H553.3V81.3H542.4ZM553.3 70.5H564.1V81.3H553.3ZM542.4 81.3H547.8V86.7H542.4ZM547.8 81.3H553.3V86.7H547.8ZM542.4 86.7H547.8V92.2H542.4ZM547.8 86.7H553.3V92.2H547.8ZM553.3 81.3H558.7V86.7H553.3ZM558.7 81.3H564.1V86.7H558.7ZM553.3 86.7H558.7V92.2H553.3ZM558.7 86.7H564.1V92.2H558.7ZM564.1 48.8H575.0V59.6H564.1ZM575.0 48.8H585.9V59.6H575.0ZM564.1 59.6H575.0V70.5H564.1ZM575.0 59.6H585.9V70.5H575.0ZM585.9 48.8H591.3V54.2H585.9ZM591.3 48.8H596.8V54.2H591.3ZM585.9 54.2H591.3V59.6H585.9ZM591.3 54.2H596.8V59.6H591.3ZM596.8 48.8H607.6V59.6H596.8ZM585.9 59.6H596.8V70.5H585.9ZM596.8 59.6H607.6V70.5H596.8ZM564.1 70.5H569.6V75.9H564.1ZM569.6 70.5H575.0V75.9H569.6ZM564.1 75.9H569.6V81.3H564.1ZM569.6 75.9H575.0V81.3H569.6ZM575.0 70.5H585.9V81.3H575.0ZM564.1 81.3H569.6V86.7H564.1ZM569.6 81.3H575.0V86.7H569.6ZM564.1 86.7H569.6V92.2H564.1ZM569.6 86.7H575.0V92.2H569.6ZM575.0 81.3H580.4V86.7H575.0ZM580.4 81.3H585.9V86.7H580.4ZM575.0 86.7H580.4V92.2H575.0ZM580.4 86.7H585.9V92.2H580.4ZM585.9 70.5H591.3V75.9H585.9ZM591.3 70.5H596.8V75.9H591.3ZM585.9 75.9H591.3V81.3H585.9ZM591.3 75.9H596.8V81.3H591.3ZM596.8 70.5H607.6V81.3H596.8ZM585.9 81.3H591.3V86.7H585.9ZM591.3 81.3H596.8V86.7H591.3ZM585.9 86.7H591.3V92.2H585.9ZM591.3 86.7H596.8V92.2H591.3ZM596.8 81.3H602.2V86.7H596.8ZM602.2 81.3H607.6V86.7H602.2ZM596.8 86.7H602.2V92.2H596.8ZM602.2 86.7H607.6V92.2H602.2ZM488.0 92.2H488.0V103.0H488.0ZM488.0 92.2H498.9V103.0H488.0ZM488.0 103.0H488.0V113.9H488.0ZM488.0 103.0H498.9V113.9H488.0ZM498.9 92.2H509.8V103.0H498.9ZM509.8 92.2H520.6V103.0H509.8ZM498.9 103.0H509.8V113.9H498.9ZM509.8 103.0H515.2V108.4H509.8ZM515.2 103.0H520.6V108.4H515.2ZM509.8 108.4H515.2V113.9H509.8ZM515.2 108.4H520.6V113.9H515.2ZM488.0 113.9H488.0V124.7H488.0ZM488.0 113.9H498.9V124.7H488.0ZM488.0 124.7H488.0V135.5H488.0ZM488.0 124.7H498.9V135.5H488.0ZM498.9 113.9H509.8V124.7H498.9ZM509.8 113.9H515.2V119.3H509.8ZM515.2 113.9H520.6V119.3H515.2ZM509.8 119.3H515.2V124.7H509.8ZM515.2 119.3H520.6V124.7H515.2ZM498.9 124.7H509.8V135.5H498.9ZM509.8 124.7H515.2V130.1H509.8ZM515.2 124.7H520.6V130.1H515.2ZM509.8 130.1H515.2V135.5H509.8ZM515.2 130.1H520.6V135.5H515.2ZM488.0 135.5H488.0V146.4H488.0ZM488.0 135.5H498.9V146.4H488.0ZM488.0 146.4H488.0V157.2H488.0ZM488.0 146.4H498.9V157.2H488.0ZM498.9 135.5H509.8V146.4H498.9ZM509.8 135.5H520.6V146.4H509.8ZM498.9 146.4H509.8V157.2H498.9ZM509.8 146.4H520.6V157.2H509.8ZM488.0 157.2H488.0V168.1H488.0ZM488.0 157.2H498.9V168.1H488.0ZM488.0 168.1H488.0V178.9H488.0ZM488.0 168.1H498.9V178.9H488.0ZM498.9 157.2H509.8V168.1H498.9ZM509.8 157.2H520.6V168.1H509.8ZM498.9 168.1H509.8V178.9H498.9ZM509.8 168.1H520.6V178.9H509.8ZM520.6 92.2H526.1V97.6H520.6ZM526.1 92.2H531.5V97.6H526.1ZM520.6 97.6H526.1V103.0H520.6ZM526.1 97.6H531.5V103.0H526.1ZM531.5 92.2H536.9V97.6H531.5ZM536.9 92.2H542.4V97.6H536.9ZM531.5 97.6H536.9V103.0H531.5ZM536.9 97.6H542.4V103.0H536.9ZM520.6 103.0H526.1V108.4H520.6ZM526.1 103.0H531.5V108.4H526.1ZM520.6 108.4H526.1V113.9H520.6ZM526.1 108.4H531.5V113.9H526.1ZM531.5 103.0H536.9V108.4H531.5ZM536.9 103.0H542.4V108.4H536.9ZM531.5 108.4H536.9V113.9H531.5ZM536.9 108.4H542.4V113.9H536.9ZM542.4 92.2H547.8V97.6H542.4ZM547.8 92.2H553.3V97.6H547.8ZM542.4 97.6H547.8V103.0H542.4ZM547.8 97.6H553.3V103.0H547.8ZM553.3 92.2H558.7V97.6H553.3ZM558.7 92.2H564.1V97.6H558.7ZM553.3 97.6H558.7V103.0H553.3ZM558.7 97.6H564.1V103.0H558.7ZM542.4 103.0H547.8V108.4H542.4ZM547.8 103.0H553.3V108.4H547.8ZM542.4 108.4H547.8V113.9H542.4ZM547.8 108.4H553.3V113.9H547.8ZM553.3 103.0H558.7V108.4H553.3ZM558.7 103.0H564.1V108.4H558.7ZM553.3 108.4H556.0V111.1H553.3ZM556.0 108.4H558.7V111.1H556.0ZM553.3 111.1H556.0V113.9H553.3ZM556.0 111.1H558.7V113.9H556.0ZM558.7 108.4H561.4V111.1H558.7ZM561.4 108.4H564.1V111.1H561.4ZM558.7 111.1H561.4V113.9H558.7ZM561.4 111.1H564.1V113.9H561.4ZM520.6 113.9H526.1V119.3H520.6ZM526.1 113.9H531.5V119.3H526.1ZM520.6 119.3H526.1V124.7H520.6ZM526.1 119.3H531.5V124.7H526.1ZM531.5 113.9H536.9V119.3H531.5ZM536.9 113.9H542.4V119.3H536.9ZM531.5 119.3H536.9V124.7H531.5ZM536.9 119.3H542.4V124.7H536.9ZM520.6 124.7H526.1V130.1H520.6ZM526.1 124.7H531.5V130.1H526.1ZM520.6 130.1H526.1V135.5H520.6ZM526.1 130.1H531.5V135.5H526.1ZM531.5 124.7H536.9V130.1H531.5ZM536.9 124.7H542.4V130.1H536.9ZM531.5 130.1H536.9V135.5H531.5ZM536.9 130.1H542.4V135.5H536.9ZM542.4 113.9H547.8V119.3H542.4ZM547.8 113.9H550.5V116.6H547.8ZM550.5 113.9H553.3V116.6H550.5ZM547.8 116.6H550.5V119.3H547.8ZM550.5 116.6H553.3V119.3H550.5ZM542.4 119.3H545.1V122.0H542.4ZM545.1 119.3H547.8V122.0H545.1ZM542.4 122.0H545.1V124.7H542.4ZM545.1 122.0H547.8V124.7H545.1ZM547.8 119.3H550.5V122.0H547.8ZM550.5 119.3H553.3V122.0H550.5ZM547.8 122.0H550.5V124.7H547.8ZM550.5 122.0H553.3V124.7H550.5ZM553.3 113.9H556.0V116.6H553.3ZM556.0 113.9H558.7V116.6H556.0ZM553.3 116.6H556.0V119.3H553.3ZM556.0 116.6H558.7V119.3H556.0ZM558.7 113.9H561.4V116.6H558.7ZM561.4 113.9H564.1V116.6H561.4ZM558.7 116.6H561.4V119.3H558.7ZM561.4 116.6H564.1V119.3H561.4ZM553.3 119.3H556.0V122.0H553.3ZM556.0 119.3H558.7V122.0H556.0ZM553.3 122.0H556.0V124.7H553.3ZM556.0 122.0H558.7V124.7H556.0ZM558.7 119.3H561.4V122.0H558.7ZM561.4 119.3H564.1V122.0H561.4ZM558.7 122.0H561.4V124.7H558.7ZM561.4 122.0H564.1V124.7H561.4ZM542.4 124.7H545.1V127.4H542.4ZM545.1 124.7H547.8V127.4H545.1ZM542.4 127.4H545.1V130.1H542.4ZM545.1 127.4H547.8V130.1H545.1ZM547.8 124.7H550.5V127.4H547.8ZM550.5 124.7H553.3V127.4H550.5ZM547.8 127.4H550.5V130.1H547.8ZM550.5 127.4H553.3V130.1H550.5ZM542.4 130.1H545.1V132.8H542.4ZM545.1 130.1H547.8V132.8H545.1ZM542.4 132.8H545.1V135.5H542.4ZM545.1 132.8H547.8V135.5H545.1ZM547.8 130.1H553.3V135.5H547.8ZM553.3 124.7H556.0V127.4H553.3ZM556.0 124.7H558.7V127.4H556.0ZM553.3 127.4H556.0V130.1H553.3ZM556.0 127.4H558.7V130.1H556.0ZM558.7 124.7H561.4V127.4H558.7ZM561.4 124.7H564.1V127.4H561.4ZM558.7 127.4H561.4V130.1H558.7ZM561.4 127.4H564.1V130.1H561.4ZM553.3 130.1H556.0V132.8H553.3ZM556.0 130.1H558.7V132.8H556.0ZM553.3 132.8H556.0V135.5H553.3ZM556.0 132.8H558.7V135.5H556.0ZM558.7 130.1H561.4V132.8H558.7ZM561.4 130.1H564.1V132.8H561.4ZM558.7 132.8H561.4V135.5H558.7ZM561.4 132.8H564.1V135.5H561.4ZM564.1 92.2H569.6V97.6H564.1ZM569.6 92.2H575.0V97.6H569.6ZM564.1 97.6H569.6V103.0H564.1ZM569.6 97.6H575.0V103.0H569.6ZM575.0 92.2H580.4V97.6H575.0ZM580.4 92.2H585.9V97.6H580.4ZM575.0 97.6H580.4V103.0H575.0ZM580.4 97.6H585.9V103.0H580.4ZM564.1 103.0H569.6V108.4H564.1ZM569.6 103.0H575.0V108.4H569.6ZM564.1 108.4H566.8V111.1H564.1ZM566.8 108.4H569.6V111.1H566.8ZM564.1 111.1H566.8V113.9H564.1ZM566.8 111.1H569.6V113.9H566.8ZM569.6 108.4H572.3V111.1H569.6ZM572.3 108.4H575.0V111.1H572.3ZM569.6 111.1H572.3V113.9H569.6ZM572.3 111.1H575.0V113.9H572.3ZM575.0 103.0H580.4V108.4H575.0ZM580.4 103.0H585.9V108.4H580.4ZM575.0 108.4H580.4V113.9H575.0ZM580.4 108.4H585.9V113.9H580.4ZM585.9 92.2H591.3V97.6H585.9ZM591.3 92.2H596.8V97.6H591.3ZM585.9 97.6H591.3V103.0H585.9ZM591.3 97.6H596.8V103.0H591.3ZM596.8 92.2H602.2V97.6H596.8ZM602.2 92.2H607.6V97.6H602.2ZM596.8 97.6H602.2V103.0H596.8ZM602.2 97.6H607.6V103.0H602.2ZM585.9 103.0H591.3V108.4H585.9ZM591.3 103.0H596.8V108.4H591.3ZM585.9 108.4H591.3V113.9H585.9ZM591.3 108.4H596.8V113.9H591.3ZM596.8 103.0H602.2V108.4H596.8ZM602.2 103.0H607.6V108.4H602.2ZM596.8 108.4H602.2V113.9H596.8ZM602.2 108.4H607.6V113.9H602.2ZM564.1 113.9H566.8V116.6H564.1ZM566.8 113.9H569.6V116.6H566.8ZM564.1 116.6H566.8V119.3H564.1ZM566.8 116.6H569.6V119.3H566.8ZM569.6 113.9H572.3V116.6H569.6ZM572.3 113.9H575.0V116.6H572.3ZM569.6 116.6H572.3V119.3H569.6ZM572.3 116.6H575.0V119.3H572.3ZM564.1 119.3H566.8V122.0H564.1ZM566.8 119.3H569.6V122.0H566.8ZM564.1 122.0H566.8V124.7H564.1ZM566.8 122.0H569.6V124.7H566.8ZM569.6 119.3H572.3V122.0H569.6ZM572.3 119.3H575.0V122.0H572.3ZM569.6 122.0H572.3V124.7H569.6ZM572.3 122.0H575.0V124.7H572.3ZM575.0 113.9H577.7V116.6H575.0ZM577.7 113.9H580.4V116.6H577.7ZM575.0 116.6H577.7V119.3H575.0ZM577.7 116.6H580.4V119.3H577.7ZM580.4 113.9H585.9V119.3H580.4ZM575.0 119.3H577.7V122.0H575.0ZM577.7 119.3H580.4V122.0H577.7ZM575.0 122.0H577.7V124.7H575.0ZM577.7 122.0H580.4V124.7H577.7ZM580.4 119.3H583.2V122.0H580.4ZM583.2 119.3H585.9V122.0H583.2ZM580.4 122.0H583.2V124.7H580.4ZM583.2 122.0H585.9V124.7H583.2ZM564.1 124.7H566.8V127.4H564.1ZM566.8 124.7H569.6V127.4H566.8ZM564.1 127.4H566.8V130.1H564.1ZM566.8 127.4H569.6V130.1H566.8ZM569.6 124.7H572.3V127.4H569.6ZM572.3 124.7H575.0V127.4H572.3ZM569.6 127.4H572.3V130.1H569.6ZM572.3 127.4H575.0V130.1H572.3ZM564.1 130.1H566.8V132.8H564.1ZM566.8 130.1H569.6V132.8H566.8ZM564.1 132.8H566.8V135.5H564.1ZM566.8 132.8H569.6V135.5H566.8ZM569.6 130.1H572.3V132.8H569.6ZM572.3 130.1H575.0V132.8H572.3ZM569.6 132.8H572.3V135.5H569.6ZM572.3 132.8H575.0V135.5H572.3ZM575.0 124.7H577.7V127.4H575.0ZM577.7 124.7H580.4V127.4H577.7ZM575.0 127.4H577.7V130.1H575.0ZM577.7 127.4H580.4V130.1H577.7ZM580.4 124.7H583.2V127.4H580.4ZM583.2 124.7H585.9V127.4H583.2ZM580.4 127.4H583.2V130.1H580.4ZM583.2 127.4H585.9V130.1H583.2ZM575.0 130.1H577.7V132.8H575.0ZM577.7 130.1H580.4V132.8H577.7ZM575.0 132.8H577.7V135.5H575.0ZM577.7 132.8H580.4V135.5H577.7ZM580.4 130.1H583.2V132.8H580.4ZM583.2 130.1H585.9V132.8H583.2ZM580.4 132.8H583.2V135.5H580.4ZM583.2 132.8H585.9V135.5H583.2ZM585.9 113.9H591.3V119.3H585.9ZM591.3 113.9H596.8V119.3H591.3ZM585.9 119.3H591.3V124.7H585.9ZM591.3 119.3H596.8V124.7H591.3ZM596.8 113.9H602.2V119.3H596.8ZM602.2 113.9H607.6V119.3H602.2ZM596.8 119.3H602.2V124.7H596.8ZM602.2 119.3H607.6V124.7H602.2ZM585.9 124.7H591.3V130.1H585.9ZM591.3 124.7H596.8V130.1H591.3ZM585.9 130.1H591.3V135.5H585.9ZM591.3 130.1H596.8V135.5H591.3ZM596.8 124.7H602.2V130.1H596.8ZM602.2 124.7H607.6V130.1H602.2ZM596.8 130.1H602.2V135.5H596.8ZM602.2 130.1H607.6V135.5H602.2ZM520.6 135.5H526.1V141.0H520.6ZM526.1 135.5H531.5V141.0H526.1ZM520.6 141.0H526.1V146.4H520.6ZM526.1 141.0H531.5V146.4H526.1ZM531.5 135.5H536.9V141.0H531.5ZM536.9 135.5H542.4V141.0H536.9ZM531.5 141.0H536.9V146.4H531.5ZM536.9 141.0H542.4V146.4H536.9ZM520.6 146.4H526.1V151.8H520.6ZM526.1 146.4H531.5V151.8H526.1ZM520.6 151.8H526.1V157.2H520.6ZM526.1 151.8H531.5V157.2H526.1ZM531.5 146.4H536.9V151.8H531.5ZM536.9 146.4H542.4V151.8H536.9ZM531.5 151.8H536.9V157.2H531.5ZM536.9 151.8H542.4V157.2H536.9ZM542.4 135.5H547.8V141.0H542.4ZM547.8 135.5H553.3V141.0H547.8ZM542.4 141.0H547.8V146.4H542.4ZM547.8 141.0H553.3V146.4H547.8ZM553.3 135.5H556.0V138.3H553.3ZM556.0 135.5H558.7V138.3H556.0ZM553.3 138.3H556.0V141.0H553.3ZM556.0 138.3H558.7V141.0H556.0ZM558.7 135.5H561.4V138.3H558.7ZM561.4 135.5H564.1V138.3H561.4ZM558.7 138.3H561.4V141.0H558.7ZM561.4 138.3H564.1V141.0H561.4ZM553.3 141.0H558.7V146.4H553.3ZM558.7 141.0H564.1V146.4H558.7ZM542.4 146.4H547.8V151.8H542.4ZM547.8 146.4H553.3V151.8H547.8ZM542.4 151.8H547.8V157.2H542.4ZM547.8 151.8H553.3V157.2H547.8ZM553.3 146.4H558.7V151.8H553.3ZM558.7 146.4H564.1V151.8H558.7ZM553.3 151.8H558.7V157.2H553.3ZM558.7 151.8H564.1V157.2H558.7ZM520.6 157.2H531.5V168.1H520.6ZM531.5 157.2H536.9V162.7H531.5ZM536.9 157.2H542.4V162.7H536.9ZM531.5 162.7H536.9V168.1H531.5ZM536.9 162.7H542.4V168.1H536.9ZM520.6 168.1H531.5V178.9H520.6ZM531.5 168.1H542.4V178.9H531.5ZM542.4 157.2H547.8V162.7H542.4ZM547.8 157.2H553.3V162.7H547.8ZM542.4 162.7H547.8V168.1H542.4ZM547.8 162.7H553.3V168.1H547.8ZM553.3 157.2H558.7V162.7H553.3ZM558.7 157.2H564.1V162.7H558.7ZM553.3 162.7H558.7V168.1H553.3ZM558.7 162.7H564.1V168.1H558.7ZM542.4 168.1H553.3V178.9H542.4ZM553.3 168.1H564.1V178.9H553.3ZM564.1 135.5H566.8V138.3H564.1ZM566.8 135.5H569.6V138.3H566.8ZM564.1 138.3H566.8V141.0H564.1ZM566.8 138.3H569.6V141.0H566.8ZM569.6 135.5H572.3V138.3H569.6ZM572.3 135.5H575.0V138.3H572.3ZM569.6 138.3H572.3V141.0H569.6ZM572.3 138.3H575.0V141.0H572.3ZM564.1 141.0H569.6V146.4H564.1ZM569.6 141.0H572.3V143.7H569.6ZM572.3 141.0H575.0V143.7H572.3ZM569.6 143.7H572.3V146.4H569.6ZM572.3 143.7H575.0V146.4H572.3ZM575.0 135.5H577.7V138.3H575.0ZM577.7 135.5H580.4V138.3H577.7ZM575.0 138.3H577.7V141.0H575.0ZM577.7 138.3H580.4V141.0H577.7ZM580.4 135.5H583.2V138.3H580.4ZM583.2 135.5H585.9V138.3H583.2ZM580.4 138.3H583.2V141.0H580.4ZM583.2 138.3H585.9V141.0H583.2ZM575.0 141.0H580.4V146.4H575.0ZM580.4 141.0H585.9V146.4H580.4ZM564.1 146.4H569.6V151.8H564.1ZM569.6 146.4H575.0V151.8H569.6ZM564.1 151.8H569.6V157.2H564.1ZM569.6 151.8H575.0V157.2H569.6ZM575.0 146.4H580.4V151.8H575.0ZM580.4 146.4H585.9V151.8H580.4ZM575.0 151.8H580.4V157.2H575.0ZM580.4 151.8H585.9V157.2H580.4ZM585.9 135.5H591.3V141.0H585.9ZM591.3 135.5H596.8V141.0H591.3ZM585.9 141.0H591.3V146.4H585.9ZM591.3 141.0H596.8V146.4H591.3ZM596.8 135.5H602.2V141.0H596.8ZM602.2 135.5H607.6V141.0H602.2ZM596.8 141.0H602.2V146.4H596.8ZM602.2 141.0H607.6V146.4H602.2ZM585.9 146.4H591.3V151.8H585.9ZM591.3 146.4H596.8V151.8H591.3ZM585.9 151.8H591.3V157.2H585.9ZM591.3 151.8H596.8V157.2H591.3ZM596.8 146.4H602.2V151.8H596.8ZM602.2 146.4H607.6V151.8H602.2ZM596.8 151.8H599.5V154.5H596.8ZM599.5 151.8H602.2V154.5H599.5ZM596.8 154.5H599.5V157.2H596.8ZM599.5 154.5H602.2V157.2H599.5ZM602.2 151.8H604.9V154.5H602.2ZM604.9 151.8H607.6V154.5H604.9ZM602.2 154.5H604.9V157.2H602.2ZM604.9 154.5H607.6V157.2H604.9ZM564.1 157.2H569.6V162.7H564.1ZM569.6 157.2H575.0V162.7H569.6ZM564.1 162.7H569.6V168.1H564.1ZM569.6 162.7H575.0V168.1H569.6ZM575.0 157.2H580.4V162.7H575.0ZM580.4 157.2H585.9V162.7H580.4ZM575.0 162.7H580.4V168.1H575.0ZM580.4 162.7H585.9V168.1H580.4ZM564.1 168.1H575.0V178.9H564.1ZM575.0 168.1H585.9V178.9H575.0ZM585.9 157.2H591.3V162.7H585.9ZM591.3 157.2H596.8V162.7H591.3ZM585.9 162.7H591.3V168.1H585.9ZM591.3 162.7H596.8V168.1H591.3ZM596.8 157.2H599.5V160.0H596.8ZM599.5 157.2H602.2V160.0H599.5ZM596.8 160.0H599.5V162.7H596.8ZM599.5 160.0H602.2V162.7H599.5ZM602.2 157.2H604.9V160.0H602.2ZM604.9 157.2H606.3V158.6H604.9ZM606.3 157.2H607.6V158.6H606.3ZM604.9 158.6H606.3V160.0H604.9ZM606.3 158.6H607.6V160.0H606.3ZM602.2 160.0H603.5V161.3H602.2ZM603.5 160.0H604.9V161.3H603.5ZM602.2 161.3H603.5V162.7H602.2ZM603.5 161.3H604.9V162.7H603.5ZM604.9 160.0H606.3V161.3H604.9ZM606.3 160.0H607.6V161.3H606.3ZM604.9 161.3H606.3V162.7H604.9ZM606.3 161.3H607.6V162.7H606.3ZM596.8 162.7H599.5V165.4H596.8ZM599.5 162.7H602.2V165.4H599.5ZM596.8 165.4H599.5V168.1H596.8ZM599.5 165.4H602.2V168.1H599.5ZM602.2 162.7H603.5V164.0H602.2ZM603.5 162.7H604.9V164.0H603.5ZM602.2 164.0H603.5V165.4H602.2ZM603.5 164.0H604.9V165.4H603.5ZM604.9 162.7H606.3V164.0H604.9ZM606.3 162.7H607.6V164.0H606.3ZM604.9 164.0H606.3V165.4H604.9ZM606.3 164.0H607.6V165.4H606.3ZM602.2 165.4H603.5V166.7H602.2ZM603.5 165.4H604.9V166.7H603.5ZM602.2 166.7H603.5V168.1H602.2ZM603.5 166.7H604.9V168.1H603.5ZM604.9 165.4H606.3V166.7H604.9ZM606.3 165.4H607.6V166.7H606.3ZM604.9 166.7H606.3V168.1H604.9ZM606.3 166.7H607.6V168.1H606.3ZM585.9 168.1H591.3V173.5H585.9ZM591.3 168.1H596.8V173.5H591.3ZM585.9 173.5H591.3V178.9H585.9ZM591.3 173.5H596.8V178.9H591.3ZM596.8 168.1H599.5V170.8H596.8ZM599.5 168.1H602.2V170.8H599.5ZM596.8 170.8H599.5V173.5H596.8ZM599.5 170.8H602.2V173.5H599.5ZM602.2 168.1H604.9V170.8H602.2ZM604.9 168.1H606.3V169.4H604.9ZM606.3 168.1H607.6V169.4H606.3ZM604.9 169.4H606.3V170.8H604.9ZM606.3 169.4H607.6V170.8H606.3ZM602.2 170.8H604.9V173.5H602.2ZM604.9 170.8H607.6V173.5H604.9ZM596.8 173.5H602.2V178.9H596.8ZM602.2 173.5H604.9V176.2H602.2ZM604.9 173.5H607.6V176.2H604.9ZM602.2 176.2H604.9V178.9H602.2ZM604.9 176.2H607.6V178.9H604.9ZM607.6 44.0H618.5V48.8H607.6ZM618.5 44.0H629.4V48.8H618.5ZM629.4 44.0H640.2V48.8H629.4ZM640.2 44.0H645.7V48.8H640.2ZM645.7 44.0H651.1V48.8H645.7ZM651.1 44.0H656.6V48.8H651.1ZM656.6 44.0H662.0V48.8H656.6ZM662.0 44.0H667.4V48.8H662.0ZM667.4 44.0H672.9V48.8H667.4ZM672.9 44.0H678.3V48.8H672.9ZM678.3 44.0H683.7V48.8H678.3ZM683.7 44.0H694.6V48.8H683.7ZM607.6 48.8H618.5V59.6H607.6ZM618.5 48.8H629.4V59.6H618.5ZM607.6 59.6H618.5V70.5H607.6ZM618.5 59.6H629.4V70.5H618.5ZM629.4 48.8H640.2V59.6H629.4ZM640.2 48.8H651.1V59.6H640.2ZM629.4 59.6H640.2V70.5H629.4ZM640.2 59.6H651.1V70.5H640.2ZM607.6 70.5H618.5V81.3H607.6ZM618.5 70.5H629.4V81.3H618.5ZM607.6 81.3H618.5V92.2H607.6ZM618.5 81.3H629.4V92.2H618.5ZM629.4 70.5H640.2V81.3H629.4ZM640.2 70.5H651.1V81.3H640.2ZM629.4 81.3H640.2V92.2H629.4ZM640.2 81.3H651.1V92.2H640.2ZM651.1 48.8H662.0V59.6H651.1ZM662.0 48.8H672.9V59.6H662.0ZM651.1 59.6H662.0V70.5H651.1ZM662.0 59.6H672.9V70.5H662.0ZM672.9 48.8H683.7V59.6H672.9ZM683.7 48.8H694.6V59.6H683.7ZM672.9 59.6H683.7V70.5H672.9ZM683.7 59.6H694.6V70.5H683.7ZM651.1 70.5H662.0V81.3H651.1ZM662.0 70.5H672.9V81.3H662.0ZM651.1 81.3H662.0V92.2H651.1ZM662.0 81.3H672.9V92.2H662.0ZM672.9 70.5H694.6V92.2H672.9ZM694.6 44.0H710.0V48.8H694.6ZM694.6 48.8H710.0V70.5H694.6ZM694.6 70.5H710.0V92.2H694.6ZM607.6 92.2H618.5V103.0H607.6ZM618.5 92.2H629.4V103.0H618.5ZM607.6 103.0H613.1V108.4H607.6ZM613.1 103.0H618.5V108.4H613.1ZM607.6 108.4H613.1V113.9H607.6ZM613.1 108.4H618.5V113.9H613.1ZM618.5 103.0H629.4V113.9H618.5ZM629.4 92.2H640.2V103.0H629.4ZM640.2 92.2H651.1V103.0H640.2ZM629.4 103.0H640.2V113.9H629.4ZM640.2 103.0H651.1V113.9H640.2ZM607.6 113.9H613.1V119.3H607.6ZM613.1 113.9H618.5V119.3H613.1ZM607.6 119.3H613.1V124.7H607.6ZM613.1 119.3H618.5V124.7H613.1ZM618.5 113.9H629.4V124.7H618.5ZM607.6 124.7H613.1V130.1H607.6ZM613.1 124.7H618.5V130.1H613.1ZM607.6 130.1H613.1V135.5H607.6ZM613.1 130.1H618.5V135.5H613.1ZM618.5 124.7H629.4V135.5H618.5ZM629.4 113.9H640.2V124.7H629.4ZM640.2 113.9H651.1V124.7H640.2ZM629.4 124.7H640.2V135.5H629.4ZM640.2 124.7H651.1V135.5H640.2ZM651.1 92.2H662.0V103.0H651.1ZM662.0 92.2H672.9V103.0H662.0ZM651.1 103.0H662.0V113.9H651.1ZM662.0 103.0H672.9V113.9H662.0ZM672.9 92.2H694.6V113.9H672.9ZM651.1 113.9H662.0V124.7H651.1ZM662.0 113.9H672.9V124.7H662.0ZM651.1 124.7H662.0V135.5H651.1ZM662.0 124.7H672.9V135.5H662.0ZM672.9 113.9H694.6V135.5H672.9ZM607.6 135.5H613.1V141.0H607.6ZM613.1 135.5H618.5V141.0H613.1ZM607.6 141.0H613.1V146.4H607.6ZM613.1 141.0H618.5V146.4H613.1ZM618.5 135.5H623.9V141.0H618.5ZM623.9 135.5H629.4V141.0H623.9ZM618.5 141.0H623.9V146.4H618.5ZM623.9 141.0H629.4V146.4H623.9ZM607.6 146.4H610.3V149.1H607.6ZM610.3 146.4H613.1V149.1H610.3ZM607.6 149.1H610.3V151.8H607.6ZM610.3 149.1H613.1V151.8H610.3ZM613.1 146.4H618.5V151.8H613.1ZM607.6 151.8H610.3V154.5H607.6ZM610.3 151.8H613.1V154.5H610.3ZM607.6 154.5H610.3V157.2H607.6ZM610.3 154.5H613.1V157.2H610.3ZM613.1 151.8H615.8V154.5H613.1ZM615.8 151.8H618.5V154.5H615.8ZM613.1 154.5H615.8V157.2H613.1ZM615.8 154.5H618.5V157.2H615.8ZM618.5 146.4H623.9V151.8H618.5ZM623.9 146.4H629.4V151.8H623.9ZM618.5 151.8H621.2V154.5H618.5ZM621.2 151.8H623.9V154.5H621.2ZM618.5 154.5H621.2V157.2H618.5ZM621.2 154.5H623.9V157.2H621.2ZM623.9 151.8H629.4V157.2H623.9ZM629.4 135.5H640.2V146.4H629.4ZM640.2 135.5H651.1V146.4H640.2ZM629.4 146.4H640.2V157.2H629.4ZM640.2 146.4H651.1V157.2H640.2ZM607.6 157.2H609.0V158.6H607.6ZM609.0 157.2H610.3V158.6H609.0ZM607.6 158.6H609.0V160.0H607.6ZM609.0 158.6H610.3V160.0H609.0ZM610.3 157.2H611.7V158.6H610.3ZM611.7 157.2H613.1V158.6H611.7ZM610.3 158.6H611.7V160.0H610.3ZM611.7 158.6H613.1V160.0H611.7ZM607.6 160.0H609.0V161.3H607.6ZM609.0 160.0H610.3V161.3H609.0ZM607.6 161.3H609.0V162.7H607.6ZM609.0 161.3H610.3V162.7H609.0ZM610.3 160.0H611.7V161.3H610.3ZM611.7 160.0H613.1V161.3H611.7ZM610.3 161.3H611.7V162.7H610.3ZM611.7 161.3H613.1V162.7H611.7ZM613.1 157.2H614.4V158.6H613.1ZM614.4 157.2H615.8V158.6H614.4ZM613.1 158.6H614.4V160.0H613.1ZM614.4 158.6H615.8V160.0H614.4ZM615.8 157.2H618.5V160.0H615.8ZM613.1 160.0H614.4V161.3H613.1ZM614.4 160.0H615.8V161.3H614.4ZM613.1 161.3H614.4V162.7H613.1ZM614.4 161.3H615.8V162.7H614.4ZM615.8 160.0H618.5V162.7H615.8ZM607.6 162.7H609.0V164.0H607.6ZM609.0 162.7H610.3V164.0H609.0ZM607.6 164.0H609.0V165.4H607.6ZM609.0 164.0H610.3V165.4H609.0ZM610.3 162.7H611.7V164.0H610.3ZM611.7 162.7H613.1V164.0H611.7ZM610.3 164.0H611.7V165.4H610.3ZM611.7 164.0H613.1V165.4H611.7ZM607.6 165.4H609.0V166.7H607.6ZM609.0 165.4H610.3V166.7H609.0ZM607.6 166.7H609.0V168.1H607.6ZM609.0 166.7H610.3V168.1H609.0ZM610.3 165.4H611.7V166.7H610.3ZM611.7 165.4H613.1V166.7H611.7ZM610.3 166.7H611.7V168.1H610.3ZM611.7 166.7H613.1V168.1H611.7ZM613.1 162.7H614.4V164.0H613.1ZM614.4 162.7H615.8V164.0H614.4ZM613.1 164.0H614.4V165.4H613.1ZM614.4 164.0H615.8V165.4H614.4ZM615.8 162.7H617.1V164.0H615.8ZM617.1 162.7H618.5V164.0H617.1ZM615.8 164.0H617.1V165.4H615.8ZM617.1 164.0H618.5V165.4H617.1ZM613.1 165.4H614.4V166.7H613.1ZM614.4 165.4H615.8V166.7H614.4ZM613.1 166.7H614.4V168.1H613.1ZM614.4 166.7H615.8V168.1H614.4ZM615.8 165.4H618.5V168.1H615.8ZM618.5 157.2H621.2V160.0H618.5ZM621.2 157.2H623.9V160.0H621.2ZM618.5 160.0H621.2V162.7H618.5ZM621.2 160.0H623.9V162.7H621.2ZM623.9 157.2H629.4V162.7H623.9ZM618.5 162.7H621.2V165.4H618.5ZM621.2 162.7H623.9V165.4H621.2ZM618.5 165.4H621.2V168.1H618.5ZM621.2 165.4H623.9V168.1H621.2ZM623.9 162.7H629.4V168.1H623.9ZM607.6 168.1H609.0V169.4H607.6ZM609.0 168.1H610.3V169.4H609.0ZM607.6 169.4H609.0V170.8H607.6ZM609.0 169.4H610.3V170.8H609.0ZM610.3 168.1H611.7V169.4H610.3ZM611.7 168.1H613.1V169.4H611.7ZM610.3 169.4H611.7V170.8H610.3ZM611.7 169.4H613.1V170.8H611.7ZM607.6 170.8H610.3V173.5H607.6ZM610.3 170.8H613.1V173.5H610.3ZM613.1 168.1H614.4V169.4H613.1ZM614.4 168.1H615.8V169.4H614.4ZM613.1 169.4H614.4V170.8H613.1ZM614.4 169.4H615.8V170.8H614.4ZM615.8 168.1H618.5V170.8H615.8ZM613.1 170.8H615.8V173.5H613.1ZM615.8 170.8H618.5V173.5H615.8ZM607.6 173.5H610.3V176.2H607.6ZM610.3 173.5H613.1V176.2H610.3ZM607.6 176.2H610.3V178.9H607.6ZM610.3 176.2H613.1V178.9H610.3ZM613.1 173.5H615.8V176.2H613.1ZM615.8 173.5H618.5V176.2H615.8ZM613.1 176.2H615.8V178.9H613.1ZM615.8 176.2H618.5V178.9H615.8ZM618.5 168.1H621.2V170.8H618.5ZM621.2 168.1H623.9V170.8H621.2ZM618.5 170.8H621.2V173.5H618.5ZM621.2 170.8H623.9V173.5H621.2ZM623.9 168.1H629.4V173.5H623.9ZM618.5 173.5H623.9V178.9H618.5ZM623.9 173.5H629.4V178.9H623.9ZM629.4 157.2H634.8V162.7H629.4ZM634.8 157.2H640.2V162.7H634.8ZM629.4 162.7H634.8V168.1H629.4ZM634.8 162.7H640.2V168.1H634.8ZM640.2 157.2H651.1V168.1H640.2ZM629.4 168.1H640.2V178.9H629.4ZM640.2 168.1H651.1V178.9H640.2ZM651.1 135.5H662.0V146.4H651.1ZM662.0 135.5H672.9V146.4H662.0ZM651.1 146.4H662.0V157.2H651.1ZM662.0 146.4H672.9V157.2H662.0ZM672.9 135.5H694.6V157.2H672.9ZM651.1 157.2H672.9V178.9H651.1ZM672.9 157.2H694.6V178.9H672.9ZM694.6 92.2H710.0V113.9H694.6ZM694.6 113.9H710.0V135.5H694.6ZM694.6 135.5H710.0V157.2H694.6ZM694.6 157.2H710.0V178.9H694.6ZM488.0 178.9H488.0V184.4H488.0ZM488.0 184.4H488.0V189.8H488.0ZM488.0 178.9H498.9V189.8H488.0ZM488.0 189.8H488.0V195.2H488.0ZM488.0 195.2H488.0V200.6H488.0ZM488.0 189.8H498.9V200.6H488.0ZM498.9 178.9H509.8V189.8H498.9ZM509.8 178.9H520.6V189.8H509.8ZM498.9 189.8H509.8V200.6H498.9ZM509.8 189.8H520.6V200.6H509.8ZM488.0 200.6H488.0V211.5H488.0ZM488.0 200.6H498.9V211.5H488.0ZM488.0 211.5H488.0V222.3H488.0ZM488.0 211.5H498.9V222.3H488.0ZM498.9 200.6H520.6V222.3H498.9ZM488.0 222.3H498.9V244.0H488.0ZM498.9 222.3H520.6V244.0H498.9ZM488.0 244.0H498.9V265.7H488.0ZM498.9 244.0H520.6V265.7H498.9ZM520.6 178.9H531.5V189.8H520.6ZM531.5 178.9H542.4V189.8H531.5ZM520.6 189.8H531.5V200.6H520.6ZM531.5 189.8H542.4V200.6H531.5ZM542.4 178.9H553.3V189.8H542.4ZM553.3 178.9H564.1V189.8H553.3ZM542.4 189.8H553.3V200.6H542.4ZM553.3 189.8H564.1V200.6H553.3ZM520.6 200.6H542.4V222.3H520.6ZM542.4 200.6H564.1V222.3H542.4ZM564.1 178.9H575.0V189.8H564.1ZM575.0 178.9H585.9V189.8H575.0ZM564.1 189.8H575.0V200.6H564.1ZM575.0 189.8H585.9V200.6H575.0ZM585.9 178.9H596.8V189.8H585.9ZM596.8 178.9H602.2V184.4H596.8ZM602.2 178.9H607.6V184.4H602.2ZM596.8 184.4H602.2V189.8H596.8ZM602.2 184.4H607.6V189.8H602.2ZM585.9 189.8H596.8V200.6H585.9ZM596.8 189.8H607.6V200.6H596.8ZM564.1 200.6H585.9V222.3H564.1ZM585.9 200.6H607.6V222.3H585.9ZM520.6 222.3H542.4V244.0H520.6ZM542.4 222.3H564.1V244.0H542.4ZM520.6 244.0H542.4V265.7H520.6ZM542.4 244.0H564.1V265.7H542.4ZM564.1 222.3H585.9V244.0H564.1ZM585.9 222.3H596.8V233.2H585.9ZM596.8 222.3H607.6V233.2H596.8ZM585.9 233.2H596.8V244.0H585.9ZM596.8 233.2H607.6V244.0H596.8ZM564.1 244.0H585.9V265.7H564.1ZM585.9 244.0H607.6V265.7H585.9ZM488.0 265.7H498.9V266.0H488.0ZM498.9 265.7H520.6V266.0H498.9ZM520.6 265.7H542.4V266.0H520.6ZM542.4 265.7H564.1V266.0H542.4ZM564.1 265.7H585.9V266.0H564.1ZM585.9 265.7H607.6V266.0H585.9ZM607.6 178.9H613.1V184.4H607.6ZM613.1 178.9H618.5V184.4H613.1ZM607.6 184.4H613.1V189.8H607.6ZM613.1 184.4H618.5V189.8H613.1ZM618.5 178.9H629.4V189.8H618.5ZM607.6 189.8H618.5V200.6H607.6ZM618.5 189.8H629.4V200.6H618.5ZM629.4 178.9H640.2V189.8H629.4ZM640.2 178.9H651.1V189.8H640.2ZM629.4 189.8H640.2V200.6H629.4ZM640.2 189.8H651.1V200.6H640.2ZM607.6 200.6H618.5V211.5H607.6ZM618.5 200.6H629.4V211.5H618.5ZM607.6 211.5H618.5V222.3H607.6ZM618.5 211.5H629.4V222.3H618.5ZM629.4 200.6H651.1V222.3H629.4ZM651.1 178.9H672.9V200.6H651.1ZM672.9 178.9H694.6V200.6H672.9ZM651.1 200.6H672.9V222.3H651.1ZM672.9 200.6H694.6V222.3H672.9ZM607.6 222.3H629.4V244.0H607.6ZM629.4 222.3H651.1V244.0H629.4ZM607.6 244.0H629.4V265.7H607.6ZM629.4 244.0H651.1V265.7H629.4ZM651.1 222.3H672.9V244.0H651.1ZM672.9 222.3H694.6V244.0H672.9ZM651.1 244.0H672.9V265.7H651.1ZM672.9 244.0H694.6V265.7H672.9ZM694.6 178.9H710.0V200.6H694.6ZM694.6 200.6H710.0V222.3H694.6ZM694.6 222.3H710.0V244.0H694.6ZM694.6 244.0H710.0V265.7H694.6ZM607.6 265.7H629.4V266.0H607.6ZM629.4 265.7H651.1V266.0H629.4ZM651.1 265.7H672.9V266.0H651.1ZM672.9 265.7H694.6V266.0H672.9ZM694.6 265.7H710.0V266.0H694.6Z" style="fill:none;stroke:var(--rule-2);stroke-width:0.8"/>
+<circle cx="599.0" cy="155.0" r="27.8" style="fill:none;stroke:var(--fault);stroke-width:2"/>
+<circle class="dot" cx="599.0" cy="155.0" r="3"/>
+<text class="tb" x="488" y="286">12,713 places checked</text>
+<text class="ts" x="488" y="302">9,950 within 2 km</text>
+</svg>
+</div>
+<figcaption>Drawn from the chapter’s code. Nine large cells are only three lookups but check nearly four times as many places as needed here; smaller cells or a quadtree check close to the ones inside the circle.</figcaption>
+</figure>
+
+<p>The alternative to fixed cells is a tree that adapts to density. A <dfn>quadtree</dfn> divides a square into four whenever it holds more than a set number of points, and repeats, so its leaves are small where points are dense and large where they are sparse. In the test, with at most 100 places per leaf, the 4,012 leaves ranged from 0.01 km² in the densest neighborhood to 2.4 km² in empty country. A search visits the leaves that touch the square around the circle.</p>
+<pre data-lang="ts" data-title="A quadtree splits a leaf when it holds too many places">
+private insert(n: QNode, p: Place, depth: number): void {
+    if (n.kids) { this.insert(this.child(n, p), p, depth + 1); return; }
+    (n.points as Place[]).push(p);
+    if ((n.points as Place[]).length > this.capacity && depth < 24) {
+      const midLat = (n.latLo + n.latHi) / 2, midLon = (n.lonLo + n.lonHi) / 2;
+      n.kids = [
+        { latLo: midLat, latHi: n.latHi, lonLo: n.lonLo, lonHi: midLon, points: [], kids: null },
+        { latLo: midLat, latHi: n.latHi, lonLo: midLon, lonHi: n.lonHi, points: [], kids: null },
+        { latLo: n.latLo, latHi: midLat, lonLo: n.lonLo, lonHi: midLon, points: [], kids: null },
+        { latLo: n.latLo, latHi: midLat, lonLo: midLon, lonHi: n.lonHi, points: [], kids: null },
+      ];
+      const pts = n.points as Place[];
+      n.points = null;
+      for (const q of pts) this.insert(this.child(n, q), q, depth + 1);
+    }
+  }
+</pre>
+
+<figure class="fig wide" id="fig-cost">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 434" role="img" aria-labelledby="f894t f894d">
+<title id="f894t">Places examined to answer one search, by radius</title>
+<desc id="f894d">Means over 100 searches from random places among 200,000. 250 m: 70 found; examined 1,319 with nine cells, 143 with a covering of 22 smaller cells, 239 with the quadtree, 200,000 with a full scan. 500 m: 269 found; examined 1,304 with nine cells, 426 with a covering of 72 smaller cells, 602 with the quadtree, 200,000 with a full scan. 1,000 m: 1,059 found; examined 20,451 with nine cells, 2,108 with a covering of 13 smaller cells, 1,742 with the quadtree, 200,000 with a full scan. 2,000 m: 3,181 found; examined 21,671 with nine cells, 4,960 with a covering of 40 smaller cells, 4,559 with the quadtree, 200,000 with a full scan. 5,000 m: 11,450 found; examined 176,928 with nine cells, 24,355 with a covering of 11 smaller cells, 15,257 with the quadtree, 200,000 with a full scan.</desc>
+<rect class="bar store" x="10" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="30" y="20">found within the radius</text>
+<rect class="bar " x="180" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="200" y="20">quadtree</text>
+<rect class="bar async" x="350" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="370" y="20">covering of smaller cells</text>
+<rect class="bar mute" x="520" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="540" y="20">nine cells</text>
+<line class="grid" x1="221.3" y1="44" x2="221.3" y2="404"/>
+<text class="ts mid" x="221.3" y="40">10</text>
+<line class="grid" x1="312.6" y1="44" x2="312.6" y2="404"/>
+<text class="ts mid" x="312.6" y="40">100</text>
+<line class="grid" x1="403.9" y1="44" x2="403.9" y2="404"/>
+<text class="ts mid" x="403.9" y="40">1,000</text>
+<line class="grid" x1="495.2" y1="44" x2="495.2" y2="404"/>
+<text class="ts mid" x="495.2" y="40">10,000</text>
+<line class="grid" x1="586.4" y1="44" x2="586.4" y2="404"/>
+<text class="ts mid" x="586.4" y="40">100,000</text>
+<line class="axis" x1="613.9" y1="44" x2="613.9" y2="404" style="stroke-dasharray:4 3"/>
+<text class="ts" x="617.9" y="58">full</text>
+<text class="ts" x="617.9" y="72">scan</text>
+<text class="ts end" x="118" y="80">250 m</text>
+<rect class="bar store" x="130" y="50" width="168.4" height="12" rx="2"/>
+<text class="ts" x="304.4" y="60">70</text>
+<rect class="bar " x="130" y="65" width="217.1" height="12" rx="2"/>
+<text class="ts" x="353.1" y="75">239</text>
+<rect class="bar async" x="130" y="80" width="196.8" height="12" rx="2"/>
+<text class="ts" x="332.8" y="90">143</text>
+<rect class="bar mute" x="130" y="95" width="284.8" height="12" rx="2"/>
+<text class="ts" x="420.8" y="105">1,319</text>
+<rect class="hit" x="8" y="46" width="704" height="66" data-tip="Radius 250 m|found: 70|quadtree: 239 examined|covering of 22 smaller cells: 143 examined|nine cells: 1,319 examined|full scan: 200,000"/>
+<text class="ts end" x="118" y="154">500 m</text>
+<rect class="bar store" x="130" y="124" width="221.8" height="12" rx="2"/>
+<text class="ts" x="357.8" y="134">269</text>
+<rect class="bar " x="130" y="139" width="253.7" height="12" rx="2"/>
+<text class="ts" x="389.7" y="149">602</text>
+<rect class="bar async" x="130" y="154" width="240.0" height="12" rx="2"/>
+<text class="ts" x="376.0" y="164">426</text>
+<rect class="bar mute" x="130" y="169" width="284.4" height="12" rx="2"/>
+<text class="ts" x="420.4" y="179">1,304</text>
+<rect class="hit" x="8" y="120" width="704" height="66" data-tip="Radius 500 m|found: 269|quadtree: 602 examined|covering of 72 smaller cells: 426 examined|nine cells: 1,304 examined|full scan: 200,000"/>
+<text class="ts end" x="118" y="228">1,000 m</text>
+<rect class="bar store" x="130" y="198" width="276.1" height="12" rx="2"/>
+<text class="ts" x="412.1" y="208">1,059</text>
+<rect class="bar " x="130" y="213" width="295.9" height="12" rx="2"/>
+<text class="ts" x="431.9" y="223">1,742</text>
+<rect class="bar async" x="130" y="228" width="303.4" height="12" rx="2"/>
+<text class="ts" x="439.4" y="238">2,108</text>
+<rect class="bar mute" x="130" y="243" width="393.5" height="12" rx="2"/>
+<text class="ts" x="529.5" y="253">20,451</text>
+<rect class="hit" x="8" y="194" width="704" height="66" data-tip="Radius 1,000 m|found: 1,059|quadtree: 1,742 examined|covering of 13 smaller cells: 2,108 examined|nine cells: 20,451 examined|full scan: 200,000"/>
+<text class="ts end" x="118" y="302">2,000 m</text>
+<rect class="bar store" x="130" y="272" width="319.7" height="12" rx="2"/>
+<text class="ts" x="455.7" y="282">3,181</text>
+<rect class="bar " x="130" y="287" width="334.0" height="12" rx="2"/>
+<text class="ts" x="470.0" y="297">4,559</text>
+<rect class="bar async" x="130" y="302" width="337.4" height="12" rx="2"/>
+<text class="ts" x="473.4" y="312">4,960</text>
+<rect class="bar mute" x="130" y="317" width="395.8" height="12" rx="2"/>
+<text class="ts" x="531.8" y="327">21,671</text>
+<rect class="hit" x="8" y="268" width="704" height="66" data-tip="Radius 2,000 m|found: 3,181|quadtree: 4,559 examined|covering of 40 smaller cells: 4,960 examined|nine cells: 21,671 examined|full scan: 200,000"/>
+<text class="ts end" x="118" y="376">5,000 m</text>
+<rect class="bar store" x="130" y="346" width="370.5" height="12" rx="2"/>
+<text class="ts" x="506.5" y="356">11,450</text>
+<rect class="bar " x="130" y="361" width="381.9" height="12" rx="2"/>
+<text class="ts" x="517.9" y="371">15,257</text>
+<rect class="bar async" x="130" y="376" width="400.4" height="12" rx="2"/>
+<text class="ts" x="536.4" y="386">24,355</text>
+<rect class="bar mute" x="130" y="391" width="479.1" height="12" rx="2"/>
+<text class="ts" x="615.1" y="401">176,928</text>
+<rect class="hit" x="8" y="342" width="704" height="66" data-tip="Radius 5,000 m|found: 11,450|quadtree: 15,257 examined|covering of 11 smaller cells: 24,355 examined|nine cells: 176,928 examined|full scan: 200,000"/>
+<text class="ts" x="10" y="424">Logarithmic scale. Each search checks the true distance of every place it examines.</text>
+</svg>
+</div>
+<figcaption>Measured on the chapter’s synthetic city. Each geohash character makes cells 32 times smaller, so nine cells can be up to about 32 times too large; covering with smaller cells trades a few dozen range lookups for far fewer places.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Radius</th><th>Found</th><th>Nine cells</th><th>Smaller cells (lookups)</th><th>Quadtree</th></tr></thead>
+<tbody>
+<tr><th>250 m</th><td>70</td><td>1,319</td><td>143 (22)</td><td>239</td></tr>
+<tr><th>1 km</th><td>1,059</td><td>20,451</td><td>2,108 (13)</td><td>1,742</td></tr>
+<tr><th>5 km</th><td>11,450</td><td>176,928</td><td>24,355 (11)</td><td>15,257</td></tr>
+</tbody>
+</table>
+<p>The nine-cell search examined up to nineteen times as many places as it returned, because a radius slightly above a cell size forces the next size up, 32 times larger. Covering the circle with cells one size smaller cut the work by three to ten times at the price of 11 to 72 range lookups instead of 9, and the quadtree did about as well. All of them beat a full scan of 200,000 by a wide margin. For places, which are read millions of times between edits, the choice is mostly about what the storage can do: a geohash column works in any database or key-value store, a quadtree is a structure the search servers build in memory, and Google’s S2 and Uber’s H3 cells, described in <x-ref to="specialized-databases#cells"></x-ref>, cover the sphere with less distortion. Ranking by rating as well as distance happens after this step, on the few hundred places found.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Querying with latitude and longitude as two separate ranges, <code>lat BETWEEN … AND lon BETWEEN …</code>, with an index on each. Each index finds a band around the whole world, and the database must intersect two huge sets. Index one value that captures both, a cell, or use a spatial index such as PostGIS’s.</p></div>
+
+<h2 id="live">Step 6c: Moving friends at scale</h2>
+<p>Searching would be the wrong tool for friends. With 333,000 updates a second, running a radius search for each would mean hundreds of thousands of searches a second over an index that changes with every one of them. Instead, each update goes only to the people allowed to see it, through a channel named after the user. A socket server that holds Ben subscribes to Ana’s channel while both are online; an update on that channel reaches Ben’s server, which knows Ben’s position and drops it if Ana is more than 8 km away.</p>
+<p>Three details make this hold up. The channels are spread over the publish and subscribe servers by a hash of the channel name (<x-ref to="partitioning#consistent-hashing"></x-ref>), so adding servers moves only a share of the channels. Delivery can be fire-and-forget, with no queue or acknowledgment, because a lost position is replaced by the next one 30 seconds later, and a fresh connection reads the latest positions from the location cache rather than replaying anything. And sharing is checked when subscribing, not when delivering, so a user who stops sharing is unsubscribed from everyone at once.</p>
+<p>A variant shows people nearby who are not friends. Then there is no friend list to subscribe to, and channels are named after geohash cells instead: each phone publishes in its cell and its server subscribes to the cell and its eight neighbors. The measurements above apply directly, with deliveries in place of places examined: nine cells of the size forced by an 8 km radius would deliver many times more updates than anyone sees, so smaller cells and more subscriptions are the better trade.</p>
+<div class="note production"><p><span class="label">In production.</span> Precise location is among the most sensitive data a service holds. Keep the current position only as long as it is useful, with the cache’s expiry; keep history only if the user asked for it, for a stated time; send distances rather than coordinates by default; and make both people opt in before either sees the other.</p></div>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A search server crashes</th><td>Nothing</td><td>Every server holds the whole index; the load balancer uses the others</td></tr>
+<tr><th>The places database primary fails</th><td>Owners cannot edit for a while</td><td>Searches read replicas and the in-memory index; the primary fails over (<x-ref to="replication#failover"></x-ref>)</td></tr>
+<tr><th>A socket server crashes</th><td>Friends freeze for a few seconds</td><td>Phones reconnect to another server, which reads positions from the cache and subscribes again</td></tr>
+<tr><th>A publish and subscribe server crashes</th><td>Some friends’ updates stop</td><td>Channels on it move to others; subscribers resubscribe; the next update arrives within 30 s</td></tr>
+<tr><th>The location cache loses a node</th><td>Some friends missing until they next move</td><td>Positions return with the next update; nothing else depends on them</td></tr>
+<tr><th>A crowded district at peak hour</th><td>Slower searches downtown</td><td>Cache results per cell and category for a minute; the read rate is spread over replicas</td></tr>
+</tbody>
+</table>
+<p><b>At ten times the scale</b>, places grow little: the number of businesses on Earth does not grow tenfold, so more replicas carry more searches. Friends grow linearly in connections and updates, and in deliveries by the number of online friends too: 100 million connections and 67 million deliveries a second need ten times the socket and publish and subscribe servers, which scale out as long as no channel is huge. A user with a million followers sharing location is the celebrity problem of <x-ref to="hld-news-feed"></x-ref>; it is avoided by limiting live sharing to friends. <b>At a hundred times</b>, the fan-out cost dominates, and the usual relief is to send updates less often: only when a user has moved more than some distance, and less often when no friend is nearby.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Redis’s geospatial commands</b>, as documented in 2026, store each member in a sorted set with a score made by interleaving latitude and longitude bits into a 52-bit integer, and answer radius and box searches “by checking the 1+8 areas needed to cover the whole shape and discarding elements outside it”. Distances use the haversine formula on a spherical Earth, with errors up to 0.5% in the worst case, and latitudes beyond about 85.05 degrees cannot be indexed.</li>
+  <li><b>Facebook’s Nearby Friends</b>, announced on 17 April 2014 for Android and iPhone in the United States, was optional and worked only between friends who had both turned it on. It showed that a friend was nearby, and a person could choose to share a precise location with a chosen friend for a set time, such as an hour.</li>
+  <li><b>Geohash</b> was invented by Gustavo Niemeyer, who put it in the public domain in February 2008.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“The 20 nearest”, whatever the distance</th><td>Search a small radius and widen it until enough are found, or walk the quadtree nearest first</td><td>The index</td></tr>
+<tr><th>Owners’ edits visible within a minute</th><td>Update the index from the database’s change stream instead of rebuilding nightly</td><td>Searches, which still read memory</td></tr>
+<tr><th>Places as shapes: parks, delivery zones</th><td>An R-tree or PostGIS for “which zone contains this point” (<x-ref to="specialized-databases#rtree"></x-ref>)</td><td>Points still in cells</td></tr>
+<tr><th>Notify when a friend comes within 1 km</th><td>The subscriber’s server compares old and new distances and sends an event on crossing</td><td>Channels and the cache</td></tr>
+<tr><th>Save battery</th><td>Update on significant movement, less often when stationary or when no friend is near</td><td>The server design</td></tr>
+<tr><th>Several regions</th><td>Places replicated everywhere; users’ channels and cache entries in their home region, with cross-region subscriptions for friends abroad (<x-ref to="multi-region#home-region"></x-ref>)</td><td>The per-user channel</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> If you are given both features, say early that they are different problems and design them separately. For places: estimate the index size, show that it fits in memory, explain geohash with neighbors and how to choose the length, and mention quadtrees and S2 as alternatives. For friends: estimate updates and deliveries, draw socket servers, a cache with expiry and a channel per user, and say where the distance check happens. Ten minutes on each deep dive is about right.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Searching only the cell containing the point</th><td>Places across a cell edge are missed</td><td>The cell and its eight neighbors, or a covering</td></tr>
+<tr><th>Choosing the geohash length by the radius alone, and never measuring</th><td>Up to nineteen times as many places checked as returned, in the test</td><td>Smaller cells and more lookups, or a quadtree, where the read cost matters</td></tr>
+<tr><th>Treating latitude and longitude as flat coordinates</th><td>Distances wrong by the cosine of the latitude, worse toward the poles</td><td>Haversine or a geography type for the final distance</td></tr>
+<tr><th>Running a radius search for every friend update</th><td>Hundreds of thousands of searches a second on a changing index</td><td>Push through a channel per user, filter at the subscriber</td></tr>
+<tr><th>A queue with acknowledgments for live positions</th><td>Backlogs of stale positions after any hiccup</td><td>Fire-and-forget delivery; the next update replaces a lost one</td></tr>
+<tr><th>Keeping positions forever by default</th><td>A history nobody asked for, and a liability</td><td>Expiry on the current position; history only on request</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="specialized-databases#geospatial"></x-ref>: cell schemes, R-trees and spatial databases.</li>
+  <li><x-ref to="realtime-communication#gateway"></x-ref>: socket servers with a publish and subscribe backplane.</li>
+  <li><x-ref to="partitioning#consistent-hashing"></x-ref>: spreading channels and cache keys.</li>
+  <li><x-ref to="hld-ride-hailing"></x-ref>: positions that move every few seconds, matched instead of shown.</li>
+  <li><x-ref to="hld-maps"></x-ref>: the map those places and friends are drawn on.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Nearby places and nearby friends are different problems: an index read millions of times, and a stream of updates pushed to a few people each.</li>
+  <li>A geohash names a cell by halving longitude and latitude in turn. Points in one cell share a prefix, so a cell is one range in any sorted index.</li>
+  <li>Search the cell and its eight neighbors, with cells at least as large as the radius. Each character is a factor of 32, so nine cells checked up to nineteen times more places than they found in the test.</li>
+  <li>Smaller cells with more lookups, or a quadtree that adapts to density, cut the places checked by three to ten times.</li>
+  <li>The places index is small enough to hold in memory on every server; replicate it.</li>
+  <li>For friends, publish each update on the user’s channel, subscribe on behalf of online friends, filter by distance at the subscriber, and let a lost update be replaced by the next.</li>
+  <li>Keep current positions with an expiry, and treat location as sensitive data from the first design.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why can a single B-tree on a geohash column answer a radius search, when two B-trees on latitude and longitude cannot do it well?</summary><p>All points in a cell share its geohash as a prefix, so each cell is one contiguous range in the sorted index, and a radius search becomes nine or so range scans. Separate indexes on latitude and longitude each return a band around the world, and intersecting them means reading far more rows than are near the point.</p></details>
+<details><summary>Why must a search read the eight neighboring cells as well as the point’s own?</summary><p>A point near the edge of its cell can have places across the edge, in cells whose names share little or nothing with its own. If every cell is at least as wide and high as the radius, the circle around any point in the middle cell stays within the nine.</p></details>
+<details><summary>For a 1 km radius at latitude 40 the code picks geohash length 5, not 6. Why, and what does it cost?</summary><p>Length 6 cells are about 0.94 by 0.61 km, smaller than the radius, so nine of them might not cover the circle. Length 5 cells are 3.7 by 4.9 km, so nine cover about 11 by 15 km for a circle of about 3 km². In the test that meant examining 20,451 places to find 1,059.</p></details>
+<details><summary>What makes a quadtree examine fewer places than nine geohash cells in a dense city?</summary><p>Its leaves are sized by how many points they hold, not by a fixed grid, so in dense neighborhoods they are small. The leaves that touch the circle’s bounding square cover little more than the circle.</p></details>
+<details><summary>Ana and Ben are friends sharing locations. Where is the 8 km check done, and why there?</summary><p>On the socket server that holds Ben, when Ana’s update arrives on her channel. That server already knows Ben’s current position, and Ana’s server would otherwise have to know where every one of her friends is.</p></details>
+<details><summary>Why is it acceptable for the publish and subscribe system to lose a location update?</summary><p>Only the latest position matters, and the next one arrives within 30 seconds. A newly connected phone reads positions from the location cache, so nothing needs to be replayed. A queue that guaranteed delivery would only build backlogs of stale positions.</p></details>
+<details><summary>Why does each current location have an expiry of ten minutes?</summary><p>So that a phone that stops sending, because it lost signal, ran out of battery or closed the app, disappears from friends’ lists without any cleanup job. It also keeps the store from holding positions longer than they are useful, which matters for privacy.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Redis, <a href="https://redis.io/docs/latest/commands/geoadd/">GEOADD</a>, Redis documentation, accessed October 2026. How a sorted set holds interleaved coordinates, and how radius searches use nine areas.</li>
+  <li>Meta, <a href="https://about.fb.com/news/2014/04/introducing-a-new-optional-feature-called-nearby-friends">Introducing A New Optional Feature Called Nearby Friends</a>, 17 April 2014. The opt-in design of a production nearby-friends feature.</li>
+  <li><a href="https://en.wikipedia.org/wiki/Geohash">Geohash</a>, Wikipedia. The encoding, its alphabet and its history.</li>
+</ol>
+</section>

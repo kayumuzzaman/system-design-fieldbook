@@ -1,0 +1,442 @@
+<!--meta
+{ "description": "IP addressing for system design: network layers, IPv4 and CIDR subnets, private ranges, address exhaustion, NAT, IPv6, how routing and BGP work, anycast, and how a cloud virtual network is laid out.",
+  "lede": "Every packet carries the address it came from and the address it is going to. This chapter explains how those addresses are structured, why most machines do not have a public one, and how networks that do not trust each other still manage to deliver packets across the world.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="layers">Layers: who is responsible for what</h2>
+<p><x-ref to="journey-of-a-request">Chapter 2</x-ref> followed one request from a browser to a server. It skipped over a question that this part of the book answers: how do the bytes actually cross the network? The answer is organized in <dfn>layers</dfn>. Each layer solves one problem and relies on the layer below for everything else.</p>
+
+<figure class="fig wide" id="fig-layers">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f71t f71d">
+<title id="f71t">The four network layers and how each wraps the data from the one above</title>
+<desc id="f71d">Four layers from top to bottom: application, transport, internet and link. The application produces an HTTP request. The transport layer adds a TCP header to make a segment. The internet layer adds an IP header to make a packet. The link layer adds a frame header to make a frame.</desc>
+<rect class="n" x="10" y="16" width="262" height="44" rx="6"/><text class="tb" x="24" y="35">Application</text><text class="ts" x="24" y="51">HTTP, DNS, gRPC</text><text class="ts end" x="260" y="43">layer 7</text>
+<rect class="n" x="10" y="72" width="262" height="44" rx="6"/><text class="tb" x="24" y="91">Transport</text><text class="ts" x="24" y="107">TCP, UDP, QUIC</text><text class="ts end" x="260" y="99">layer 4</text>
+<rect class="n sig" x="10" y="128" width="262" height="44" rx="6"/><text class="tb" x="24" y="147">Internet</text><text class="ts" x="24" y="163">IP, in versions 4 and 6</text><text class="ts end" x="260" y="155">layer 3</text>
+<rect class="n" x="10" y="184" width="262" height="44" rx="6"/><text class="tb" x="24" y="203">Link</text><text class="ts" x="24" y="219">Ethernet, Wi-Fi, mobile</text><text class="ts end" x="260" y="211">layer 2</text>
+<g data-s="1">
+<rect class="n" x="528" y="22" width="180" height="32" rx="4"/><text class="mid" x="618" y="43">HTTP request</text>
+</g>
+<g data-s="2">
+<rect class="n" x="442" y="78" width="84" height="32" rx="4"/><text class="mid" x="484" y="99">TCP header</text>
+<rect class="n" x="528" y="78" width="180" height="32" rx="4"/><text class="mid" x="618" y="99">HTTP request</text>
+</g>
+<g data-s="3">
+<rect class="n sig" x="356" y="134" width="84" height="32" rx="4"/><text class="tb mid" x="398" y="155">IP header</text>
+<rect class="n" x="442" y="134" width="84" height="32" rx="4"/><text class="mid" x="484" y="155">TCP header</text>
+<rect class="n" x="528" y="134" width="180" height="32" rx="4"/><text class="mid" x="618" y="155">HTTP request</text>
+</g>
+<g data-s="4">
+<rect class="n" x="290" y="190" width="64" height="32" rx="4"/><text class="mid" x="322" y="211">Frame</text>
+<rect class="n sig" x="356" y="190" width="84" height="32" rx="4"/><text class="mid" x="398" y="211">IP header</text>
+<rect class="n" x="442" y="190" width="84" height="32" rx="4"/><text class="mid" x="484" y="211">TCP header</text>
+<rect class="n" x="528" y="190" width="180" height="32" rx="4"/><text class="mid" x="618" y="211">HTTP request</text>
+</g>
+<g data-s="2">
+<text class="ts end" x="432" y="99">a segment</text>
+</g>
+<g data-s="3">
+<text class="ts end" x="346" y="155">a packet</text>
+</g>
+<g data-s="4">
+<text class="ts" x="290" y="238">a frame, replaced at every hop</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="What exists now: an HTTP request">The application produces an HTTP request and hands it down.</li>
+  <li data-state="What exists now: a segment (TCP header, request)">The transport layer puts a TCP header in front of it, carrying the port numbers. The result is called a segment.</li>
+  <li data-state="What exists now: a packet (IP header, TCP header, request)">The internet layer adds an IP header with the source and destination addresses. The result is a packet. Routers read only this header.</li>
+  <li data-state="What exists now: a frame around the packet">The link layer wraps the packet in a frame for one hop, such as Wi-Fi or Ethernet. The frame is replaced at every hop, and the packet inside stays the same.</li>
+</ol>
+<figcaption>Each layer wraps what it receives from above in its own header. Routers read only the IP header. The server’s operating system removes the headers in reverse order.</figcaption>
+</figure>
+
+<ul>
+  <li>The <b>link layer</b> moves a frame between two machines that are directly connected: your laptop and the Wi-Fi router, or two routers joined by a fiber.</li>
+  <li>The <b>internet layer</b>, the subject of this chapter, moves a packet across many links from any machine to any other, using IP addresses.</li>
+  <li>The <b>transport layer</b> turns unreliable packets into something programs can use, such as an ordered stream of bytes. <x-ref to="transport-protocols"></x-ref> covers it.</li>
+  <li>The <b>application layer</b> is the protocol your code speaks. <x-ref to="http-and-tls"></x-ref> and the chapters after it cover those.</li>
+</ul>
+<aside class="sn"><b>Why “layer 4” and “layer 7”</b>The numbers come from the OSI model, a seven-layer reference design from the 1980s. The internet uses a simpler four-layer stack, and the OSI numbers survived as vocabulary. You will hear them constantly: a “layer 4 load balancer” forwards by IP address and port without reading the request, and a “layer 7” one understands HTTP. Layers 5 and 6 are almost never mentioned.</aside>
+<p>The value of layering is that each layer can change without the others noticing. HTTP runs unchanged over Wi-Fi, fiber or a mobile network. A router forwards a packet without knowing or caring whether it carries a web page or a video call.</p>
+
+<h2 id="ipv4">IPv4 addresses and CIDR</h2>
+<p>An <dfn>IPv4 address</dfn> is a 32-bit number. For people it is written as four decimal numbers from 0 to 255 separated by dots, one per byte: <code>203.0.113.10</code>. Thirty-two bits give 2<sup>32</sup>, about 4.3 billion, possible addresses.</p>
+<p>An address has two parts. The leading bits identify a <dfn>network</dfn>, and the remaining bits identify a <dfn>host</dfn> within it. This split is what makes routing workable: a router far away needs one entry for the whole network, not one for every machine in it.</p>
+<p>Where the split falls is written with <dfn>CIDR notation</dfn> (classless inter-domain routing): an address, a slash, and the number of leading bits that belong to the network. <code>10.0.0.0/20</code> means “the first 20 bits are the network, the remaining 12 are for hosts”.</p>
+
+<figure class="fig" id="fig-cidr">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 150" role="img" aria-labelledby="f72t f72d">
+<title id="f72t">The address 10.0.5.130 in the block 10.0.0.0/20, bit by bit</title>
+<desc id="f72d">The 32 bits of the address 10.0.5.130. The first 20 bits are the network prefix, shared by every address in the block 10.0.0.0/20. The last 12 bits identify the host, giving 4,096 addresses in the block.</desc>
+<text class="tb mid" x="138" y="32">10</text>
+<text class="tb mid" x="286" y="32">0</text>
+<text class="tb mid" x="434" y="32">5</text>
+<text class="tb mid" x="582" y="32">130</text>
+<rect class="n sig" x="70" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="77.5" y="64">0</text>
+<rect class="n sig" x="87" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="94.5" y="64">0</text>
+<rect class="n sig" x="104" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="111.5" y="64">0</text>
+<rect class="n sig" x="121" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="128.5" y="64">0</text>
+<rect class="n sig" x="138" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="145.5" y="64">1</text>
+<rect class="n sig" x="155" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="162.5" y="64">0</text>
+<rect class="n sig" x="172" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="179.5" y="64">1</text>
+<rect class="n sig" x="189" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="196.5" y="64">0</text>
+<rect class="n sig" x="218" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="225.5" y="64">0</text>
+<rect class="n sig" x="235" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="242.5" y="64">0</text>
+<rect class="n sig" x="252" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="259.5" y="64">0</text>
+<rect class="n sig" x="269" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="276.5" y="64">0</text>
+<rect class="n sig" x="286" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="293.5" y="64">0</text>
+<rect class="n sig" x="303" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="310.5" y="64">0</text>
+<rect class="n sig" x="320" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="327.5" y="64">0</text>
+<rect class="n sig" x="337" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="344.5" y="64">0</text>
+<rect class="n sig" x="366" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="373.5" y="64">0</text>
+<rect class="n sig" x="383" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="390.5" y="64">0</text>
+<rect class="n sig" x="400" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="407.5" y="64">0</text>
+<rect class="n sig" x="417" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="424.5" y="64">0</text>
+<rect class="n store" x="434" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="441.5" y="64">0</text>
+<rect class="n store" x="451" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="458.5" y="64">1</text>
+<rect class="n store" x="468" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="475.5" y="64">0</text>
+<rect class="n store" x="485" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="492.5" y="64">1</text>
+<rect class="n store" x="514" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="521.5" y="64">1</text>
+<rect class="n store" x="531" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="538.5" y="64">0</text>
+<rect class="n store" x="548" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="555.5" y="64">0</text>
+<rect class="n store" x="565" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="572.5" y="64">0</text>
+<rect class="n store" x="582" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="589.5" y="64">0</text>
+<rect class="n store" x="599" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="606.5" y="64">0</text>
+<rect class="n store" x="616" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="623.5" y="64">1</text>
+<rect class="n store" x="633" y="46" width="15" height="26" rx="2"/><text class="ts mid" x="640.5" y="64">0</text>
+<path class="e none sig" d="M70 78v6H432v-6"/>
+<path class="e none store" d="M434 78v6H648v-6"/>
+<text class="tb mid" x="251.0" y="106">network prefix: 20 bits</text><text class="ts mid" x="251.0" y="123">identical in every address of 10.0.0.0/20</text>
+<text class="tb mid" x="541.0" y="106">host part: 12 bits</text><text class="ts mid" x="541.0" y="123">4,096 possible values</text>
+</svg>
+</div>
+<figcaption>One address, written out as bits. Every address in <code>10.0.0.0/20</code> shares the first 20 bits, and the last 12 distinguish the 4,096 addresses inside it.</figcaption>
+</figure>
+
+<p>A larger number after the slash means a longer network part and therefore a smaller block. Each extra bit halves it.</p>
+<table>
+<thead><tr><th>Block</th><th>Host bits</th><th>Addresses</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>/32</code></td><td class="r">0</td><td class="r">1</td><td>One specific machine, in a firewall rule or a route</td></tr>
+<tr><td><code>/28</code></td><td class="r">4</td><td class="r">16</td><td>A very small subnet, for a pair of load balancers</td></tr>
+<tr><td><code>/24</code></td><td class="r">8</td><td class="r">256</td><td>A small subnet. The smallest block normally accepted in internet routing.</td></tr>
+<tr><td><code>/20</code></td><td class="r">12</td><td class="r">4,096</td><td>A subnet for application servers or containers</td></tr>
+<tr><td><code>/16</code></td><td class="r">16</td><td class="r">65,536</td><td>A whole virtual network in a cloud</td></tr>
+<tr><td><code>/8</code></td><td class="r">24</td><td class="r">16,777,216</td><td>The largest private range</td></tr>
+<tr><td><code>/0</code></td><td class="r">32</td><td class="r">all of them</td><td>“Anywhere”: the default route, or a firewall rule open to the world</td></tr>
+</tbody>
+</table>
+<p>Two addresses in every block are traditionally reserved, the first as the network’s own address and the last for broadcast, so a <code>/24</code> offers 254 addresses to hosts. Cloud providers reserve a few more. In an AWS subnet, for example, five addresses are unavailable.</p>
+
+<div class="widget" data-widget="subnet">
+<h4>Subnet calculator</h4>
+<p>Type any IPv4 block to see what it contains.</p>
+<div class="controls">
+  <label>Address block in CIDR notation<input type="text" name="cidr" value="10.0.16.0/20" spellcheck="false" autocomplete="off"></label>
+</div>
+<dl class="results">
+  <div><dt>Network</dt><dd data-out="network">10.0.16.0/20</dd></div>
+  <div><dt>Subnet mask</dt><dd data-out="mask">255.255.240.0</dd></div>
+  <div><dt>Addresses in the block</dt><dd data-out="count">4,096</dd></div>
+  <div><dt>Usable by hosts</dt><dd data-out="hosts">4,094</dd></div>
+  <div><dt>First to last</dt><dd data-out="range" style="font-size:1rem">10.0.16.0 to 10.0.31.255</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">This is a private range, usable inside your own network and never routed on the internet. Each bit added to the prefix halves the block: a /21 here would hold 2,048 addresses.</p>
+</div>
+
+<h3 id="special-ranges">Ranges with a special meaning</h3>
+<p>Not every address is a public one. Several ranges are set aside, and you will recognize them in configuration files and logs.</p>
+<table>
+<thead><tr><th>Range</th><th>Name</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>10.0.0.0/8</code><br><code>172.16.0.0/12</code><br><code>192.168.0.0/16</code></td><td>Private</td><td>Free for anyone to use inside their own network. Never routed on the public internet, so millions of networks reuse the same addresses.</td></tr>
+<tr><td><code>127.0.0.0/8</code></td><td>Loopback</td><td>The machine itself. <code>127.0.0.1</code> is <code>localhost</code>.</td></tr>
+<tr><td><code>169.254.0.0/16</code></td><td>Link-local</td><td>Valid only on the directly attached network. Clouds serve instance metadata at <code>169.254.169.254</code>.</td></tr>
+<tr><td><code>100.64.0.0/10</code></td><td>Shared address space</td><td>Used by internet providers for carrier-grade NAT, described below.</td></tr>
+<tr><td><code>0.0.0.0</code></td><td>Unspecified</td><td>As a listening address: “every interface on this machine”.</td></tr>
+<tr><td><code>192.0.2.0/24</code><br><code>198.51.100.0/24</code><br><code>203.0.113.0/24</code></td><td>Documentation</td><td>Reserved for examples. This book uses them so that no example points at a real machine.</td></tr>
+</tbody>
+</table>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Binding a service to <code>0.0.0.0</code> when it was meant to be reachable only locally. A database or admin panel listening on every interface, on a machine with a public address and a permissive firewall, is open to the internet. Bind internal services to a private address or to <code>127.0.0.1</code>, and treat the firewall as a second line of defense.</p></div>
+
+<h2 id="exhaustion">Running out of addresses</h2>
+<p>Four billion addresses were plenty in 1981. They are far fewer than the number of phones, laptops, servers and sensors now connected. The central pool of unallocated IPv4 addresses was handed out completely in February 2011, and the regional registries that distribute addresses to providers ran dry over the following years: North America’s in 2015, Europe’s in 2019.</p>
+<p>The internet kept growing anyway, by three means that every system designer now has to deal with.</p>
+<ul>
+  <li><b>Sharing.</b> Many machines sit behind one public address, using network address translation. This is the subject of the next section.</li>
+  <li><b>Trading and charging.</b> Addresses are bought and sold, and cloud providers bill for them. Since February 2024 AWS has charged $0.005 per hour for every public IPv4 address, about $44 a year each. A fleet of a thousand servers with public addresses pays that a thousand times over, which is one more reason to keep servers on private addresses behind a load balancer.</li>
+  <li><b>IPv6.</b> A new version of the protocol with a far larger address space, described later in this chapter.</li>
+</ul>
+
+<h2 id="nat">NAT: many machines behind one address</h2>
+<p><dfn>Network address translation</dfn> (NAT) lets machines with private addresses reach the internet through a shared public one. A device at the edge of the private network, such as your home router or a cloud NAT gateway, rewrites packets as they pass.</p>
+
+<figure class="fig wide" id="fig-nat">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f73t f73d">
+<title id="f73t">Network address translation</title>
+<desc id="f73d">Two devices on a private network, 10.0.1.5 and 10.0.1.6, send packets through a NAT gateway with public address 198.51.100.7 to a server at 203.0.113.10. The gateway rewrites each source address and port to its own address and a unique port, and remembers the mapping so that replies can be sent back to the right device.</desc>
+<rect class="n ghost" x="8" y="22" width="216" height="160" rx="8"/>
+<text class="ts" x="20" y="42">Private network 10.0.1.0/24</text>
+<rect class="n" x="24" y="56" width="184" height="46" rx="6"/>
+<text class="tb mid" x="116" y="76">Laptop</text>
+<text class="ts mid" x="116" y="93">10.0.1.5, port 51000</text>
+<rect class="n" x="24" y="118" width="184" height="46" rx="6"/>
+<text class="tb mid" x="116" y="138">Phone</text>
+<text class="ts mid" x="116" y="155">10.0.1.6, port 51000</text>
+<rect class="n sig" x="296" y="68" width="170" height="84" rx="6"/>
+<text class="tb mid" x="381" y="98">NAT gateway</text>
+<text class="ts mid" x="381" y="116">public address</text>
+<text class="ts mid" x="381" y="132">198.51.100.7</text>
+<rect class="n" x="548" y="82" width="162" height="56" rx="6"/>
+<text class="tb mid" x="629" y="106">Server</text>
+<text class="ts mid" x="629" y="123">203.0.113.10, port 443</text>
+<g data-s="1">
+<path class="e sig" d="M208 79 296 98"/>
+</g>
+<g data-s="5">
+<path class="e sig" d="M208 141 296 122"/>
+</g>
+<g data-s="3">
+<path class="e sig both" d="M466 110H548"/>
+<text class="ts mid" x="507" y="100">sees only</text>
+<text class="ts mid" x="507" y="130">198.51.100.7</text>
+</g>
+<g data-s="2">
+<text class="tb" x="250" y="184">Translation table kept by the gateway</text>
+<text class="ts" x="250" y="202">10.0.1.5 port 51000   becomes   198.51.100.7 port 40001</text>
+</g>
+<g data-s="5">
+<text class="ts" x="250" y="219">10.0.1.6 port 51000   becomes   198.51.100.7 port 40002</text>
+</g>
+<g data-s="4"><path class="e sig none" d="M548 110H466"/><path class="e sig none" d="M296 98 208 79"/></g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="from 10.0.1.5:51000" data-state="Port 40001: unused; Port 40002: unused">The laptop sends a packet to the server. Its source is the laptop’s private address, 10.0.1.5, and port 51000.</li>
+  <li data-state="Port 40001: 10.0.1.5, port 51000; Port 40002: unused">The gateway rewrites the source to its own public address and a port of its choosing, 40001, and records the pairing in its table.</li>
+  <li data-msg="from 198.51.100.7:40001">It forwards the packet. The server sees only 198.51.100.7, and replies to that address and port.</li>
+  <li data-msg="to 198.51.100.7:40001|to 10.0.1.5:51000">When the reply arrives on port 40001, the gateway looks the port up in its table, restores the laptop’s address and delivers the packet.</li>
+  <li data-msg="from 10.0.1.6:51000" data-state="Port 40001: 10.0.1.5, port 51000; Port 40002: 10.0.1.6, port 51000">The phone happens to use the same private port, 51000. The gateway gives it a different public port, 40002, so the two conversations never mix.</li>
+</ol>
+<figcaption>NAT rewrites the source of each outgoing packet to the gateway’s public address and a port of its choosing, and uses the remembered mapping to deliver replies to the right private machine.</figcaption>
+</figure>
+
+<p>When the laptop opens a connection, the gateway replaces the packet’s private source address and port with its own public address and an unused port, and records the pair. When the reply arrives at that port, it reverses the substitution. The server never learns the private address. It sees a connection from <code>198.51.100.7</code>.</p>
+<p>NAT is why the internet still works, and it has consequences that surface in design work again and again.</p>
+<table>
+<thead><tr><th>Consequence</th><th>Why</th><th>Where it bites</th></tr></thead>
+<tbody>
+<tr><th>Connections can only start from inside</th><td>A mapping exists only after an inside machine has sent something. An unsolicited packet from outside matches nothing and is dropped.</td><td>Peer-to-peer calls and games need helper servers to connect two machines that are both behind NAT. See <x-ref to="realtime-communication"></x-ref>.</td></tr>
+<tr><th>Many users share one address</th><td>A whole office, university or mobile network may appear as a handful of addresses. Providers add a second layer, <dfn>carrier-grade NAT</dfn>, which puts thousands of customers behind each one.</td><td>Rate limiting or blocking “by IP address” punishes everyone behind it. An IP address does not identify a user.</td></tr>
+<tr><th>Idle connections are forgotten</th><td>The table is finite, so mappings unused for a while are removed, often after a few minutes.</td><td>A long-lived connection that goes quiet dies silently. This is why WebSockets and database connections send keepalives.</td></tr>
+<tr><th>Ports run out</th><td>One public address has about 64,000 ports to hand out toward any single destination.</td><td>A busy service calling one external API through a NAT gateway can exhaust them and see connections fail under load.</td></tr>
+<tr><th>The gateway is a dependency</th><td>All outbound traffic passes through it.</td><td>It is a possible single point of failure, and cloud providers bill for the data it carries.</td></tr>
+</tbody>
+</table>
+<p>The same mechanism runs in the other direction on purpose. A <dfn>port forwarding</dfn> rule tells the gateway that anything arriving on public port 443 goes to a particular private machine. A load balancer with a public address in front of private servers is the grown-up version of that idea.</p>
+
+<h2 id="ipv6">IPv6</h2>
+<p><dfn>IPv6</dfn> replaces the 32-bit address with a 128-bit one. That is enough for 3.4 × 10<sup>38</sup> addresses, which removes scarcity as a design constraint altogether.</p>
+<p>An IPv6 address is written as eight groups of four hexadecimal digits separated by colons. Leading zeros in a group may be dropped, and one run of all-zero groups may be replaced by a double colon:</p>
+<div class="formula">2001:0db8:0000:0000:0000:0000:0000:0010    in full
+2001:db8::10                               the same address, shortened</div>
+<p>The conventions differ from IPv4 in ways that matter in practice.</p>
+<ul>
+  <li><b>Subnets are almost always <code>/64</code>.</b> The first 64 bits identify the network and the last 64 the interface. A single subnet holds 2<sup>64</sup> addresses, so sizing subnets stops being a concern.</li>
+  <li><b>NAT is unnecessary.</b> Every device can have a globally unique address. Reachability is then controlled by firewalls alone, which need to be configured with that in mind: there is no NAT acting as an accidental barrier.</li>
+  <li><b>A device has several addresses.</b> A link-local one starting <code>fe80:</code> for its own network segment, usually one or more global ones, and often temporary ones that change for privacy.</li>
+  <li><b>Customers receive whole blocks.</b> A home connection is typically given a <code>/56</code> or <code>/64</code>, so one household can produce an effectively unlimited number of addresses.</li>
+</ul>
+<p>IPv4 and IPv6 are separate protocols that do not interoperate directly. The usual arrangement is <dfn>dual stack</dfn>: a machine has both kinds of address, and DNS returns both an <code>A</code> and an <code>AAAA</code> record. The client tries both and uses whichever connects first, a technique known as Happy Eyeballs. Some networks, mobile ones in particular, are now IPv6 only inside and translate at the edge to reach the IPv4 internet.</p>
+<aside class="sn"><b>How far along is it?</b>It depends on who is counting. Google saw IPv6 from half its users for the first time in March 2026. Cloudflare, which counts requests rather than users, reported that under a third of requests able to use either protocol chose IPv6 during 2025. Mobile networks are far ahead of corporate ones, and India is far ahead of most countries.</aside>
+<p>For a designer the practical points are few and easy to get wrong:</p>
+<ul>
+  <li><b>Store addresses in a type made for them.</b> A column sized for <code>255.255.255.255</code> is too small, and an integer column cannot hold 128 bits. Use the database’s IP address type, or allow 45 characters of text.</li>
+  <li><b>Rate limit and block by <code>/64</code>, not by single address.</b> One user can change the low 64 bits at will.</li>
+  <li><b>Check every place that parses an address.</b> Log pipelines, allow lists, geolocation lookups and validation code are where IPv6 support usually turns out to be missing.</li>
+  <li><b>Serve both.</b> A public endpoint without an <code>AAAA</code> record forces IPv6-only users through a translator. Most CDNs and cloud load balancers will accept IPv6 for you and speak IPv4 to your servers.</li>
+</ul>
+
+<h2 id="routing">Routing: getting a packet there</h2>
+<p>No device on the internet knows the complete path to every destination. Each <dfn>router</dfn> knows only which of its neighbors is the best next step, and forwarding proceeds one hop at a time.</p>
+<p>A router holds a <dfn>routing table</dfn>: a list of address blocks, each with the neighbor to forward to. To forward a packet it finds the entries that contain the destination address and picks the most specific, the one with the longest prefix. This is <dfn>longest-prefix match</dfn>. If both <code>203.0.113.0/24</code> and <code>203.0.0.0/16</code> match, the <code>/24</code> wins. An entry for <code>0.0.0.0/0</code>, the <dfn>default route</dfn>, matches everything and catches whatever nothing else did.</p>
+<p>Your laptop has such a table too, with two useful entries: its own subnet, reachable directly, and a default route pointing at the local router.</p>
+<aside class="sn"><b>Seeing the hops</b>Every packet carries a counter, the TTL in IPv4 or hop limit in IPv6, that each router decreases by one. At zero the packet is discarded and the router reports back. This stops packets circling forever. The <code>traceroute</code> tool exploits it by sending packets with a limit of 1, then 2, then 3, and listing which router complains each time.</aside>
+
+<h3 id="bgp">BGP: how separate networks cooperate</h3>
+<p>The internet is a network of networks. Each large independently run network, such as an internet provider, a cloud or a big company, is an <dfn>autonomous system</dfn> (AS) with a number. In October 2026 there were about 79,600 of them, exchanging routes for roughly 1.09 million address blocks.</p>
+<p>They exchange those routes with the <dfn>Border Gateway Protocol</dfn> (BGP). Each AS announces to its neighbors the address blocks it can reach, along with the chain of ASes the route passes through. A neighbor that hears several routes to the same block chooses one by its own rules, which are as much commercial as technical: a route through a paying customer is preferred to one that costs money. It then passes its choice on.</p>
+
+<figure class="fig wide" id="fig-bgp">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f74t f74d">
+<title id="f74t">Autonomous systems exchanging routes with BGP</title>
+<desc id="f74d">A cloud provider, AS 64499, announces the block 203.0.113.0/24 to two transit networks. Each passes the route on to an internet provider, AS 64496, adding its own number to the path. The provider hears two paths to the same block and chooses one of them for its traffic.</desc>
+<rect class="n" x="10" y="84" width="150" height="62" rx="20"/><text class="tb mid" x="85" y="110">Internet provider</text><text class="ts mid" x="85" y="128">AS 64496</text>
+<rect class="n" x="280" y="22" width="150" height="56" rx="20"/><text class="tb mid" x="355" y="46">Transit network A</text><text class="ts mid" x="355" y="63">AS 64497</text>
+<rect class="n" x="280" y="152" width="150" height="56" rx="20"/><text class="tb mid" x="355" y="176">Transit network B</text><text class="ts mid" x="355" y="193">AS 64498</text>
+<rect class="n store" x="550" y="78" width="160" height="74" rx="20"/><text class="tb mid" x="630" y="104">Cloud provider</text><text class="ts mid" x="630" y="121">AS 64499</text><text class="ts mid" x="630" y="138">owns 203.0.113.0/24</text>
+<path class="e sig" d="M160 104 280 58"/>
+<path class="e sig" d="M430 54 550 98"/>
+<path class="e dash" d="M160 126 280 172"/>
+<path class="e dash" d="M430 176 550 132"/>
+<text class="ts" x="448" y="50">“I can reach 203.0.113.0/24”</text>
+<text class="ts" x="100" y="58">path: 64497, 64499</text>
+<text class="ts" x="100" y="184">path: 64498, 64499</text>
+<text class="ts" x="10" y="226">Blue is the path chosen for traffic. The dashed path is known and held in reserve.</text>
+</svg>
+</div>
+<figcaption>BGP in miniature. Announcements travel from the owner of an address block outward, each network adding itself to the path. Traffic then flows in the opposite direction along the chosen path.</figcaption>
+</figure>
+
+<p>BGP was designed for a small community of operators who knew each other, and it accepts announcements on trust. Two kinds of accident follow from that, and both have taken large services offline.</p>
+<ul>
+  <li><b>A network announces something it should not.</b> In a <dfn>route leak</dfn> or <dfn>hijack</dfn>, an AS announces another network’s block, by mistake or on purpose, and part of the internet starts sending that traffic to the wrong place.</li>
+  <li><b>A network withdraws something it needs.</b> On 4 October 2021 a maintenance command at Facebook disconnected its data centers from its own backbone. Its DNS servers, unable to reach the data centers, withdrew their BGP announcements as designed. Facebook’s names stopped resolving for the whole world, and its services were unreachable for about six hours. Recovery was slowed because the internal tools needed to fix the problem depended on the same network.</li>
+</ul>
+<p>The defense against false announcements is <dfn>RPKI</dfn> (resource public key infrastructure), in which the owner of a block publishes a signed statement of which AS may announce it, and other networks reject announcements that contradict it. By mid-2026 about two-thirds of announced blocks were covered by such statements. It is a large improvement, and it does not help with the second kind of accident, which is self-inflicted.</p>
+<div class="note production"><p><span class="label">In production.</span> You will probably never configure BGP. You still depend on it for every request, and its failures look like nothing else: your servers are healthy, your monitoring from inside shows green, and some or all of the world cannot reach you. Monitor from outside your own network, from several places, and keep a way to manage your systems that does not depend on the network you are trying to fix.</p></div>
+
+<h2 id="anycast">Anycast: one address in many places</h2>
+<p>Normally an address belongs to one machine in one place. Nothing in BGP requires that. If the same block is announced from data centers on three continents, every network simply routes toward whichever announcement looks closest. This is <dfn>anycast</dfn>.</p>
+
+<figure class="fig" id="fig-anycast">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 206" role="img" aria-labelledby="f75t f75d">
+<title id="f75t">Anycast routing</title>
+<desc id="f75d">Three sites, in Frankfurt, Singapore and Virginia, all announce the same address, 198.51.100.53. A user in Europe is routed to Frankfurt, a user in Asia to Singapore, and a user in North America to Virginia.</desc>
+<rect class="n" x="20" y="24" width="150" height="40" rx="6"/><text class="mid" x="95" y="49">User in Europe</text>
+<rect class="n" x="20" y="84" width="150" height="40" rx="6"/><text class="mid" x="95" y="109">User in Asia</text>
+<rect class="n" x="20" y="144" width="150" height="40" rx="6"/><text class="mid" x="95" y="169">User in North America</text>
+<rect class="n sig" x="470" y="20" width="230" height="48" rx="6"/><text class="tb mid" x="585" y="40">Frankfurt site</text><text class="ts mid" x="585" y="57">announces 198.51.100.53</text>
+<rect class="n sig" x="470" y="80" width="230" height="48" rx="6"/><text class="tb mid" x="585" y="100">Singapore site</text><text class="ts mid" x="585" y="117">announces 198.51.100.53</text>
+<rect class="n sig" x="470" y="140" width="230" height="48" rx="6"/><text class="tb mid" x="585" y="160">Virginia site</text><text class="ts mid" x="585" y="177">announces 198.51.100.53</text>
+<path class="e sig" d="M170 44H470"/><path class="e sig" d="M170 104H470"/><path class="e sig" d="M170 164H470"/>
+<text class="ts mid" x="320" y="36">all three send to 198.51.100.53</text>
+<text class="ts mid" x="320" y="96">routing picks the nearest site</text>
+</svg>
+</div>
+<figcaption>Anycast. One address, announced from several sites. The routing system delivers each user to the nearest one with no decision made by the user or by DNS.</figcaption>
+</figure>
+
+<p>Anycast gives three things at once. Users reach a nearby site, which lowers latency. If a site fails and stops announcing, routing carries its users to the next nearest within seconds to minutes, with no DNS change. And a flood of attack traffic is split among all the sites according to where it originates, so no single site receives the whole of it.</p>
+<p>It is how the DNS root servers, public resolvers such as <code>1.1.1.1</code> and <code>8.8.8.8</code>, and most CDNs are reached. Its limitation is that routing can change in the middle of a conversation, sending later packets of a connection to a different site that knows nothing about it. That is harmless for a one-packet DNS query. For long connections it has to be engineered around, which CDNs do. <x-ref to="cdn-and-edge"></x-ref> returns to it.</p>
+
+<h2 id="cloud-networks">A cloud network, drawn once</h2>
+<p>When you rent machines in a cloud you also design a small private internet for them, usually called a <dfn>virtual private cloud</dfn> (VPC) or virtual network. The products differ by provider and the shape is nearly always the same.</p>
+
+<figure class="fig wide" id="fig-vpc">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-labelledby="f76t f76d">
+<title id="f76t">A typical virtual network across two availability zones</title>
+<desc id="f76d">A virtual network with the block 10.0.0.0/16 spans two availability zones. Each zone has a public subnet holding a load balancer and a NAT gateway, a private subnet holding application servers, and a data subnet holding a database. Traffic from the internet enters through an internet gateway to the load balancers only.</desc>
+<rect class="n" x="300" y="6" width="120" height="30" rx="6"/><text class="tb mid" x="360" y="26">Internet</text>
+<rect class="n ghost" x="8" y="52" width="704" height="270" rx="10"/><text class="tb" x="20" y="70">Virtual network 10.0.0.0/16</text>
+<rect class="n ghost" x="20" y="78" width="336" height="236" rx="8"/><text class="ts" x="30" y="94">Zone A</text>
+<rect class="n sunk" x="30" y="100" width="316" height="60" rx="6"/><text class="ts end" x="336" y="116">Public subnet 10.0.0.0/24</text>
+<rect class="n sunk" x="30" y="172" width="316" height="60" rx="6"/><text class="ts end" x="336" y="188">Private subnet 10.0.16.0/20</text>
+<rect class="n sunk" x="30" y="244" width="316" height="60" rx="6"/><text class="ts end" x="336" y="260">Data subnet 10.0.48.0/24</text>
+<rect class="n sig" x="40" y="124" width="124" height="28" rx="5"/><text class="tb mid" x="102" y="143">Load balancer</text>
+<rect class="n" x="212" y="124" width="124" height="28" rx="5"/><text class="mid" x="274" y="143">NAT gateway</text>
+<rect class="n" x="40" y="196" width="296" height="28" rx="5"/><text class="mid" x="188" y="215">Application servers</text>
+<rect class="n store" x="40" y="268" width="180" height="28" rx="5"/><text class="tb mid" x="130" y="287">Database, primary</text>
+<path class="e sig" d="M102 152V196"/>
+<path class="e store" d="M130 224V268"/>
+<path class="e dash" d="M274 196V152"/>
+<path class="e sig" d="M350 36 102 124"/>
+<rect class="n ghost" x="364" y="78" width="336" height="236" rx="8"/><text class="ts" x="374" y="94">Zone B</text>
+<rect class="n sunk" x="374" y="100" width="316" height="60" rx="6"/><text class="ts end" x="680" y="116">Public subnet 10.0.1.0/24</text>
+<rect class="n sunk" x="374" y="172" width="316" height="60" rx="6"/><text class="ts end" x="680" y="188">Private subnet 10.0.32.0/20</text>
+<rect class="n sunk" x="374" y="244" width="316" height="60" rx="6"/><text class="ts end" x="680" y="260">Data subnet 10.0.49.0/24</text>
+<rect class="n sig" x="384" y="124" width="124" height="28" rx="5"/><text class="tb mid" x="446" y="143">Load balancer</text>
+<rect class="n" x="556" y="124" width="124" height="28" rx="5"/><text class="mid" x="618" y="143">NAT gateway</text>
+<rect class="n" x="384" y="196" width="296" height="28" rx="5"/><text class="mid" x="532" y="215">Application servers</text>
+<rect class="n store" x="384" y="268" width="180" height="28" rx="5"/><text class="tb mid" x="474" y="287">Database, standby</text>
+<path class="e sig" d="M446 152V196"/>
+<path class="e store" d="M474 224V268"/>
+<path class="e dash" d="M618 196V152"/>
+<path class="e sig" d="M370 36 446 124"/>
+<path class="e store" d="M220 282H384"/>
+</svg>
+</div>
+<figcaption>The standard layout. Only the load balancers have public addresses. Application servers reach the internet outward through NAT, and the databases have no route to the internet at all.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Piece</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><th>Virtual network</th><td>A private address block, such as <code>10.0.0.0/16</code>, that is yours alone.</td></tr>
+<tr><th>Subnet</th><td>A slice of that block, placed in one availability zone. You create matching subnets in two or three zones so that each tier survives the loss of a zone.</td></tr>
+<tr><th>Public subnet</th><td>A subnet whose route table sends <code>0.0.0.0/0</code> to an internet gateway. Resources here can have public addresses.</td></tr>
+<tr><th>Private subnet</th><td>A subnet whose default route goes to a NAT gateway, or nowhere. Nothing outside can start a connection to it.</td></tr>
+<tr><th>Security group or firewall rule</th><td>A list of what may connect to a resource. Good ones name the source by role: “the database accepts port 5432 from the application servers’ group”, not from an address range.</td></tr>
+<tr><th>Peering and private links</th><td>Ways to join two virtual networks, or to reach a managed service, without crossing the public internet.</td></tr>
+</tbody>
+</table>
+<p>Two decisions here are hard to change later, so they deserve a moment early.</p>
+<p><b>Choose address blocks that do not overlap.</b> Two networks can be joined only if their ranges are distinct. If every environment and every team picks <code>10.0.0.0/16</code> because it is the default in the tutorial, none of them can ever be connected to each other or to an office network that uses the same range. Keep one plan for the whole organization and give each network its own block.</p>
+<p><b>Make subnets bigger than you think you need.</b> Containers and serverless functions can each consume an address, and a subnet cannot be enlarged once things are running in it. Private address space costs nothing, so be generous.</p>
+<aside class="sn"><b>Packet size</b>A link has a maximum packet size, its MTU, which is 1,500 bytes on ordinary Ethernet. Tunnels and VPNs add their own headers and so leave less room. When a path’s limit is lower than a sender assumes and the error messages that would report it are blocked by a firewall, small requests work and large ones hang without explanation. If you see exactly that pattern, suspect the MTU.</aside>
+
+<h2 id="design-notes">What this means for design</h2>
+<ul>
+  <li><b>An IP address is a weak identity.</b> It may stand for one person or for fifty thousand behind a NAT, and with IPv6 one person may have billions. Use it as one signal among several for rate limiting and abuse detection, and never as proof of who someone is.</li>
+  <li><b>The client’s address is easy to lose.</b> Behind a load balancer or CDN, your server sees the address of that intermediary. The original is passed along in a header such as <code>X-Forwarded-For</code>, which is trustworthy only when your own infrastructure set it. <x-ref to="proxies-and-load-balancers"></x-ref> covers this.</li>
+  <li><b>Private by default.</b> Give public addresses only to the entry points. It reduces the attack surface and the bill.</li>
+  <li><b>Outbound traffic needs design too.</b> Calls to third-party APIs leave through NAT, which has port limits, costs money and presents one source address that the third party may need to allow.</li>
+  <li><b>Distance is set by routing, not geography.</b> Two cities that are close on a map may be connected through a third far away. Measure latency between regions before assuming it.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>DNS.</b> Names resolve to the addresses described here, and anycast and DNS are the two ways to steer users toward a nearby site. <x-ref to="dns"></x-ref> compares them.</li>
+  <li><b>Security.</b> Network segmentation, firewalls and private subnets are the outer layer of defense. They are necessary and not sufficient, as <x-ref to="threats-and-defenses"></x-ref> explains.</li>
+  <li><b>Containers.</b> Kubernetes gives every pod its own IP address and builds a second, virtual network on top of this one. See <x-ref to="containers-and-orchestration"></x-ref>.</li>
+  <li><b>Availability.</b> Zones and regions are network constructs as well as physical ones. The failure domains of <x-ref to="availability-and-reliability">Chapter 6</x-ref> are implemented as subnets and routes.</li>
+  <li><b>Economics and policy.</b> Address scarcity created a market, and who may announce which block is governed by five regional registries. Networking is one of the places where engineering, commerce and governance meet most visibly.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>The network is layered. IP, at layer 3, moves packets between networks on a best-effort basis and knows nothing about connections or requests.</li>
+  <li>An address is a network prefix plus a host part. CIDR notation gives the prefix length, and each extra bit halves the block.</li>
+  <li>IPv4 addresses ran out. Private ranges with NAT, a market in addresses, and IPv6 are the three responses, and all three are in use.</li>
+  <li>NAT means connections start from inside, many users share an address, idle connections are dropped and ports can run out.</li>
+  <li>IPv6 removes scarcity. Store addresses properly, limit by <code>/64</code>, and serve both protocols.</li>
+  <li>Routing is hop by hop with longest-prefix match. BGP joins independent networks on trust, and its failures make healthy services unreachable.</li>
+  <li>Anycast announces one address from many sites to give proximity, failover and attack absorption.</li>
+  <li>In a cloud network, only entry points are public, address blocks must not overlap, and subnets should be sized generously.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>How many addresses are in <code>10.20.0.0/22</code>, and what is the last one?</summary><p>A /22 leaves 10 host bits, so 2<sup>10</sup> = 1,024 addresses. The block runs from 10.20.0.0 to 10.20.3.255.</p></details>
+<details><summary>Your API blocks any IP address that makes more than 100 requests a minute. A university complains that all its students are locked out. What happened?</summary><p>The university’s students reach the internet through NAT and share a small number of public addresses. Together they exceeded the limit that was meant for one client. Limit by something that identifies the client, such as an API key or account, and use the address only as a coarse backstop with a much higher threshold.</p></details>
+<details><summary>A service keeps a connection to a database open and uses it once every twenty minutes. The first query after each pause fails. Why, and what are two fixes?</summary><p>A NAT gateway or firewall on the path removed the idle connection’s entry from its table, so the next packet matches nothing. Either send keepalives more often than the idle timeout, or have the connection pool test and replace idle connections before using them.</p></details>
+<details><summary>Two teams each built a virtual network using <code>10.0.0.0/16</code>. They now need their services to talk privately. What is the problem?</summary><p>The ranges overlap, so the networks cannot be peered: a packet for 10.0.5.9 could belong to either side. One network has to be rebuilt on a different block, or the teams must connect through public endpoints or a translating gateway. An organization-wide address plan would have prevented it.</p></details>
+<details><summary>Your monitoring, which runs inside your own data center, shows everything healthy. Customers report that the site is unreachable. Name a cause at the layer discussed in this chapter.</summary><p>A routing problem: your address block is no longer announced, is being announced by someone else, or a network between you and the customers has lost its route. Internal monitoring cannot see it because it never leaves your network. Probes from outside, in several locations, would.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc1918">RFC 1918: Address Allocation for Private Internets</a>, <a href="https://www.rfc-editor.org/rfc/rfc4632">RFC 4632: Classless Inter-domain Routing</a>, <a href="https://www.rfc-editor.org/rfc/rfc6598">RFC 6598: Shared Address Space</a> and <a href="https://www.rfc-editor.org/rfc/rfc8200">RFC 8200: IPv6</a>.</li>
+  <li><a href="https://www.cidr-report.org/as2.0/">The CIDR Report</a>. 1,086,218 routed prefixes and 79,571 autonomous systems on 9 October 2026.</li>
+  <li>Amazon Web Services, <a href="https://aws.amazon.com/blogs/aws/new-aws-public-ipv4-address-charge-public-ip-insights/">“New: AWS Public IPv4 Address Charge”</a>. The $0.005 per hour charge from 1 February 2024.</li>
+  <li>Meta Engineering, <a href="https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/">“More details about the October 4 outage”</a>, 2021.</li>
+  <li>ipregistry, <a href="https://ipregistry.co/blog/rpki-blind-spots">“RPKI Covers 67% of Routes”</a>, 2026, reporting Hurricane Electric’s count of announced prefixes covered by route origin authorizations.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/radar-2025-year-in-review/">Cloudflare Radar 2025 Year in Review</a>. IPv6 share of dual-stack requests.</li>
+  <li>Internet Society Pulse, <a href="https://pulse.internetsociety.org/en/blog/18-years-later-ipv6-reaches-majority/">“18 Years Later, IPv6 Reaches Majority”</a>, 2026.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html">Subnet CIDR blocks</a>. The five reserved addresses per subnet.</li>
+</ol>
+</section>

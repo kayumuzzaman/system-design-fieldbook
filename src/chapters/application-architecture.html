@@ -1,0 +1,640 @@
+<!--meta
+{ "description": "How to arrange the inside of an application so that business rules do not depend on HTTP or SQL: layered architecture and its flaw, the dependency rule, ports and adapters with a working TypeScript example that runs behind HTTP, a command line and a test suite and stores to memory or SQLite, the composition root, where frameworks belong, checking the rule automatically, packaging by feature, and when all of this is too much.",
+  "lede": "A service does three different kinds of thing: it speaks a protocol to the outside, it applies the rules of a business, and it stores data somewhere. The three change for different reasons and at different speeds. Application architecture is the question of how to keep them apart, and its central answer is one rule about which code is allowed to know about which. This chapter builds a small application that obeys the rule, then runs it behind three interfaces and two databases without changing its core.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">Three kinds of knowledge in one function</h2>
+<p>The previous chapter built an <code>Order</code> that guards its own rules. Something still has to receive the HTTP request, find the order, call it, store the result and reply. Here is that something, written the way most services begin.</p>
+<pre data-lang="ts" data-title="Placing an order: protocol, storage and rules in one handler">
+export function placeOrderHandler(db: DatabaseSync, sendEmail: (to: string, text: string) => void) {
+  return (req: IncomingMessage, res: ServerResponse): void => {
+    const id = req.url?.split("/")[2] ?? "";                                                     // HTTP
+    const order = db.prepare("SELECT status, customer FROM orders WHERE id = ?").get(id);        // SQL
+    if (!order) { res.writeHead(404).end(); return; }                                            // HTTP
+    const lines = db.prepare("SELECT quantity, unit_cents FROM order_lines WHERE order_id = ?").all(id); // SQL
+    if (order["status"] !== "draft" || lines.length === 0) { res.writeHead(422).end(); return; } // a business rule
+    const total = lines.reduce((sum, l) => sum + Number(l["quantity"]) * Number(l["unit_cents"]), 0); // a business rule
+    db.prepare("UPDATE orders SET status = 'placed' WHERE id = ?").run(id);                      // SQL
+    sendEmail(String(order["customer"]), `Your order of ${total / 100} is placed`);              // a side effect
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id, total })); // HTTP
+  };
+}
+</pre>
+<p>It works. A test confirmed that it answers 200 and sends the email. The comments on the right show the difficulty: nine lines, and four different concerns interleaved. Each consequence follows directly.</p>
+<ul>
+  <li><b>It cannot be tested without a database and an HTTP exchange.</b> The test had to create tables, insert rows, start a server and send a real request to check one business rule.</li>
+  <li><b>It cannot be reused.</b> An operator’s command-line tool or a queue worker that also needs to place orders must copy the rules, and the copies will drift.</li>
+  <li><b>The rules are hostage to the tools.</b> Changing the web framework or the database means editing, and risking, the logic about what makes an order placeable.</li>
+  <li><b>The rules are hard to find.</b> “An order must be a draft with at least one line” is half of an <code>if</code> between two SQL statements.</li>
+</ul>
+<p><dfn>Application architecture</dfn> is the arrangement of code inside one deployable program: what the parts are, and which may depend on which. It is a different question from the architecture between services that Part VI covered, and it applies equally to a monolith and to each microservice.</p>
+
+<h2 id="layers">Layers</h2>
+<p>The oldest answer is to sort code into <dfn>layers</dfn>, each a group of code with one kind of responsibility, stacked so that each uses only the one beneath it.</p>
+<table>
+<thead><tr><th>Layer</th><th>Knows about</th><th>In the order example</th></tr></thead>
+<tbody>
+<tr><th>Presentation</th><td>The protocol: routes, status codes, JSON</td><td>Parsing the path, choosing 404 or 422</td></tr>
+<tr><th>Application</th><td>What the system can be asked to do, and in what sequence</td><td>Load the order, place it, save it, announce it</td></tr>
+<tr><th>Domain</th><td>The rules of the business</td><td><code>Order.place()</code> and its checks</td></tr>
+<tr><th>Data access, or infrastructure</th><td>How things are stored and what external systems look like</td><td>The SQL, the email client</td></tr>
+</tbody>
+</table>
+<p>This is already a large improvement over the single handler, and for many applications it is enough. It has one structural flaw. If each layer depends on the one below, the domain depends on data access. The business rules, the most valuable and most stable code in the system, sit on top of the most replaceable. In practice the domain objects become shaped by the database tables, and rules migrate into SQL.</p>
+
+<h2 id="rule">The dependency rule</h2>
+<p>The repair is to reverse one arrow.</p>
+
+<figure class="fig wide" id="fig-direction">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f641t f641d">
+<title id="f641t">Layers that depend downward, and layers that depend inward</title>
+<desc id="f641d">Two arrangements of the same four parts. On the left, a traditional layered stack: presentation depends on application, application on domain, and domain on data access, which talks to the database. The business rules depend on the database code. On the right, the dependency at the bottom is reversed. Driving adapters such as HTTP depend on the application, the application depends on the domain, and the driven adapters such as SQL also depend on the application, because they implement interfaces the application defines. Nothing in the domain or the application depends on an adapter.</desc>
+<text class="tb" x="10" y="18">Layered: each layer depends on the one below</text>
+<text class="tb" x="380" y="18">Inverted: every dependency points at the core</text>
+<rect class="n " x="20" y="34" width="200" height="38" rx="5"/>
+<text class="ts tb mid" x="120" y="50">Presentation</text>
+<text class="ts mid" x="120" y="65">HTTP handlers</text>
+<path class="e" d="M120 73V88"/>
+<rect class="n " x="20" y="90" width="200" height="38" rx="5"/>
+<text class="ts tb mid" x="120" y="106">Application</text>
+<text class="ts mid" x="120" y="121">use cases</text>
+<path class="e" d="M120 129V144"/>
+<rect class="n sig" x="20" y="146" width="200" height="38" rx="5"/>
+<text class="ts tb mid" x="120" y="162">Domain</text>
+<text class="ts mid" x="120" y="177">business rules</text>
+<path class="e" d="M120 185V200"/>
+<rect class="n " x="20" y="202" width="200" height="38" rx="5"/>
+<text class="ts tb mid" x="120" y="218">Data access</text>
+<text class="ts mid" x="120" y="233">SQL</text>
+<path class="e fault" d="M221 165H250V221H222" style="fill:none"/>
+<text class="ts" x="258" y="188">the rules</text>
+<text class="ts" x="258" y="203">depend on SQL</text>
+<text class="ts" x="10" y="272">Change the database, and the domain must be</text>
+<text class="ts" x="10" y="288">recompiled, retested and often rewritten.</text>
+<rect class="n " x="390" y="34" width="220" height="38" rx="5"/>
+<text class="ts tb mid" x="500" y="50">Driving adapters</text>
+<text class="ts mid" x="500" y="65">HTTP, CLI, tests</text>
+<rect class="n " x="390" y="90" width="220" height="38" rx="5"/>
+<text class="ts tb mid" x="500" y="106">Application</text>
+<text class="ts mid" x="500" y="121">use cases, and the ports they need</text>
+<rect class="n sig" x="390" y="146" width="220" height="38" rx="5"/>
+<text class="ts tb mid" x="500" y="162">Domain</text>
+<text class="ts mid" x="500" y="177">business rules</text>
+<rect class="n " x="390" y="214" width="220" height="38" rx="5"/>
+<text class="ts tb mid" x="500" y="230">Driven adapters</text>
+<text class="ts mid" x="500" y="245">SQL, email, clock</text>
+<path class="e" d="M500 73V88"/>
+<path class="e" d="M500 129V144"/>
+<path class="e implements store" d="M611 233H640V109H613" style="fill:none"/>
+<text class="ts" x="648" y="166">implements</text>
+<text class="ts" x="648" y="181">a port</text>
+<text class="ts" x="380" y="272">The SQL code now depends on the application.</text>
+<text class="ts" x="380" y="288">The core depends on nothing outside itself.</text>
+<path class="e none dash" d="M362 8V292"/>
+</svg>
+</div>
+<figcaption>The boxes are the same on both sides. What changed is one arrow: the application declares what storage it needs, and the database code conforms to that declaration.</figcaption>
+</figure>
+
+<p>The application layer states what it needs from storage as an interface: “something that can get an order and save an order”. The SQL code implements that interface. At run time the calls still flow from the application to the database, as before. In the source code, the dependency now points the other way: the SQL file imports the application’s interface, and the application imports nothing about SQL. This is the dependency inversion principle of <x-ref to="solid-principles#dip"></x-ref>, applied to a whole program.</p>
+<p>Stated as a rule: <b>source code dependencies point inward only, toward the business rules.</b> Code in an inner layer never names anything in an outer one: no class, no function, no type. Three named architectures are built on this rule, and they differ mainly in vocabulary.</p>
+
+<h2 id="hexagon">Ports and adapters</h2>
+<p>The clearest of the three is <dfn>hexagonal architecture</dfn>, also called ports and adapters, described by Alistair Cockburn in 2005. Its stated aim was for an application to be driven equally by users, other programs, automated tests and batch scripts, and to be developed and tested in isolation from its databases and devices.</p>
+<ul>
+  <li>A <dfn>port</dfn> is an interface at the edge of the application, written in the application’s own terms. It describes a conversation, with no reference to any technology.</li>
+  <li>An <dfn>adapter</dfn> connects a port to something real: a web framework, a database, a queue, a test. It is the adapter pattern of <x-ref to="structural-patterns#adapter"></x-ref> in a fixed place.</li>
+  <li><dfn>Driving</dfn> adapters call the application. <dfn>Driven</dfn> adapters are called by it.</li>
+</ul>
+
+<figure class="fig wide" id="fig-hexagon">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f642t f642d">
+<title id="f642t">Ports and adapters around the order application</title>
+<desc id="f642d">A hexagon in the middle holds the application: the use cases, and inside them the domain model of Order and Money. On its left edge is one driving port, OrderApp. Three driving adapters point at it: an HTTP adapter used by browsers and apps, a command-line adapter used by an operator, and the test suite. On its right edge are three driven ports: OrderRepository, Publisher and Clock. Driven adapters implement them: SqliteOrders and InMemoryOrders for the repository, a log publisher and a recording publisher, and a system clock and a fixed clock.</desc>
+<path class="n sunk" d="M236 150L300 36H420L484 150L420 264H300Z"/>
+<text class="tb mid" x="360" y="62">Application</text>
+<text class="ts mid" x="360" y="78">the use cases</text>
+<rect class="n sig" x="296" y="108" width="128" height="84" rx="8"/>
+<text class="tb mid" x="360" y="138">Domain</text>
+<text class="ts mid" x="360" y="156">Order, Money</text>
+<text class="ts mid" x="360" y="172">the rules</text>
+<text class="ts mid" x="360" y="222">defines its ports</text>
+<text class="ts mid" x="360" y="238">in its own terms</text>
+<rect class="n store" x="214" y="134" width="56" height="32" rx="4"/>
+<text class="ts mid" x="242" y="154">OrderApp</text>
+<rect class="n store" x="444" y="68" width="108.5" height="32" rx="4"/>
+<text class="ts mid" x="498.25" y="88">OrderRepository</text>
+<rect class="n store" x="460" y="134" width="70.7" height="32" rx="4"/>
+<text class="ts mid" x="495.35" y="154">Publisher</text>
+<rect class="n store" x="444" y="200" width="45.5" height="32" rx="4"/>
+<text class="ts mid" x="466.75" y="220">Clock</text>
+<text class="tb" x="10" y="18">Driving adapters: they call the application</text>
+<text class="tb end" x="710" y="18">Driven adapters: the application calls them</text>
+<rect class="n" x="10" y="56" width="150" height="40" rx="5"/>
+<text class="ts tb mid" x="85" y="73">HTTP adapter</text>
+<text class="ts mid" x="85" y="88">routes, status codes</text>
+<path class="e" d="M161 76L212 150"/>
+<rect class="n" x="10" y="132" width="150" height="40" rx="5"/>
+<text class="ts tb mid" x="85" y="149">CLI adapter</text>
+<text class="ts mid" x="85" y="164">commands, text output</text>
+<path class="e" d="M161 152L212 150"/>
+<rect class="n" x="10" y="208" width="150" height="40" rx="5"/>
+<text class="ts tb mid" x="85" y="225">Tests</text>
+<text class="ts mid" x="85" y="240">call the port directly</text>
+<path class="e" d="M161 228L212 150"/>
+<rect class="n" x="590" y="40" width="120" height="30" rx="5"/>
+<text class="ts mid" x="650" y="59">SqliteOrders</text>
+<path class="e implements" d="M589 55L552 78"/>
+<rect class="n" x="590" y="80" width="120" height="30" rx="5"/>
+<text class="ts mid" x="650" y="99">InMemoryOrders</text>
+<path class="e implements" d="M589 95L552 90"/>
+<rect class="n" x="590" y="122" width="120" height="30" rx="5"/>
+<text class="ts mid" x="650" y="141">Log publisher</text>
+<path class="e implements" d="M589 137L536 146"/>
+<rect class="n" x="590" y="162" width="120" height="30" rx="5"/>
+<text class="ts mid" x="650" y="181">RecordingPublisher</text>
+<path class="e implements" d="M589 177L536 156"/>
+<rect class="n" x="590" y="204" width="120" height="30" rx="5"/>
+<text class="ts mid" x="650" y="223">System clock</text>
+<path class="e implements" d="M589 219L492 212"/>
+<rect class="n" x="590" y="244" width="120" height="30" rx="5"/>
+<text class="ts mid" x="650" y="263">FixedClock</text>
+<path class="e implements" d="M589 259L492 222"/>
+<text class="ts" x="10" y="288">Solid arrows are calls. Dashed arrows with a hollow head mean “implements”. Every arrow points toward the hexagon.</text>
+</svg>
+</div>
+<figcaption>The application is surrounded by interfaces it owns. Anything that can speak a port can be plugged in, which is how the same use cases run behind HTTP, behind a command line and inside a test.</figcaption>
+</figure>
+
+<p>The hexagon has no significance beyond leaving room to draw several ports. What matters is that there is an inside and an outside, and that the inside owns the interfaces between them. The driven ports for the print shop are short.</p>
+<pre data-lang="ts" data-title="Driven ports: what the application needs, in its own words">
+// Driven ports: what the application needs from the outside world, stated in its own terms.
+export interface OrderRepository {
+  get(id: OrderId): Promise<Order | null>;
+  save(order: Order): Promise<void>; // rejects with ConflictError if the order changed since it was loaded
+}
+export interface Publisher {
+  publish(event: OrderEvent): Promise<void>;
+}
+export interface Clock {
+  now(): Date;
+}
+export interface PriceList {
+  priceOf(size: PrintSize): Money;
+}
+
+export interface Ports {
+  orders: OrderRepository;
+  publisher: Publisher;
+  clock: Clock;
+  prices: PriceList;
+}
+</pre>
+<p>The driving port is the application’s own interface: the list of things it can be asked to do. Its inputs and outputs are plain data.</p>
+<pre data-lang="ts" data-title="The application: a driving port and the use cases behind it">
+// The driving port: everything the outside world can ask this application to do.
+export interface OrderApp {
+  startOrder(input: { orderId: string; customerId: string }): Promise<OrderView>;
+  addPrints(input: { orderId: string; photoId: string; size: PrintSize; quantity: number }): Promise<OrderView>;
+  placeOrder(input: { orderId: string }): Promise<Receipt>;
+  getOrder(input: { orderId: string }): Promise<OrderView>;
+}
+
+// …view(order) copies an Order’s fields into a plain OrderView…
+
+export function createOrderApp({ orders, publisher, clock, prices }: Ports): OrderApp {
+  const load = async (id: string): Promise<Order> => {
+    const order = await orders.get(id as OrderId);
+    if (!order) throw new NotFoundError(`no order ${id}`);
+    return order;
+  };
+
+  // Load, tell, save, publish. A conflict means someone else saved first, so start again from their version.
+  const change = async (id: string, apply: (order: Order) => void, attempts = 3): Promise<Order> => {
+    for (let attempt = 1; ; attempt += 1) {
+      const order = await load(id);
+      apply(order);
+      try {
+        await orders.save(order);
+      } catch (error) {
+        if (error instanceof ConflictError && attempt < attempts) continue;
+        throw error;
+      }
+      for (const event of order.pullEvents()) await publisher.publish(event);
+      return order;
+    }
+  };
+
+  return {
+    async startOrder({ orderId, customerId }) {
+      const order = new Order(orderId as OrderId, customerId as CustomerId);
+      await orders.save(order);
+      return view(order);
+    },
+    async addPrints({ orderId, photoId, size, quantity }) {
+      return view(await change(orderId, (order) => order.addPrints(photoId as PhotoId, size, quantity, prices.priceOf(size))));
+    },
+    async placeOrder({ orderId }) {
+      const order = await change(orderId, (o) => o.place());
+      return { ...view(order), placedAt: clock.now().toISOString() };
+    },
+    async getOrder({ orderId }) {
+      return view(await load(orderId));
+    },
+  };
+}
+</pre>
+<p>This file imports the domain and the port definitions, and nothing else. It does not know whether it is being called from a web request or a test, or whether orders live in memory or in a database. Now the adapters, one of each kind.</p>
+<pre data-lang="ts" data-title="A driven adapter: the repository port implemented with SQL">
+export class SqliteOrders implements OrderRepository {
+  // …the constructor creates two tables, and get() reads an order and its lines from them…
+
+  // The whole aggregate in one transaction, and only if the version is still the one that was loaded.
+  async save(order: Order): Promise<void> {
+    const data = order.toSnapshot();
+    const expected = this.loadedAt.get(order) ?? 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const written = expected === 0
+        ? this.db.prepare("INSERT INTO orders (id, customer, currency, status, version) VALUES (?, ?, ?, ?, 1) ON CONFLICT (id) DO NOTHING").run(data.id, data.customer, data.currency, data.status)
+        : this.db.prepare("UPDATE orders SET status = ?, version = version + 1 WHERE id = ? AND version = ?").run(data.status, data.id, expected);
+      if (written.changes !== 1) throw new ConflictError(`order ${order.id} was changed by someone else`);
+      this.db.prepare("DELETE FROM order_lines WHERE order_id = ?").run(data.id);
+      const insert = this.db.prepare("INSERT INTO order_lines (order_id, position, photo, size, quantity, unit_cents) VALUES (?, ?, ?, ?, ?, ?)");
+      data.lines.forEach((line, position) => insert.run(data.id, position, line.photo, line.size, line.quantity, line.unitCents));
+      this.db.exec("COMMIT");
+      this.loadedAt.set(order, expected + 1);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+}
+</pre>
+<pre data-lang="ts" data-title="A driving adapter: HTTP in, application call, HTTP out">
+// A driving adapter. Its whole job is translation: a request into a call, a result or an error into a response.
+export function createRouter(app: OrderApp) {
+  return async (method: string, path: string, body: Record<string, unknown>): Promise<HttpResponse> => {
+    const [, resource, orderId, action] = path.split("/");
+    if (resource !== "orders" || !orderId) return { status: 404, body: { error: "not found" } };
+    try {
+      if (method === "PUT" && !action) return { status: 201, body: await app.startOrder({ orderId, customerId: String(body["customerId"]) }) };
+      if (method === "GET" && !action) return { status: 200, body: await app.getOrder({ orderId }) };
+      if (method === "POST" && action === "prints") {
+        const size = body["size"];
+        if (size !== "10x15" && size !== "13x18" && size !== "20x30") return { status: 400, body: { error: "size must be 10x15, 13x18 or 20x30" } };
+        return { status: 200, body: await app.addPrints({ orderId, photoId: String(body["photoId"]), size, quantity: Number(body["quantity"]) }) };
+      }
+      if (method === "POST" && action === "place") return { status: 200, body: await app.placeOrder({ orderId }) };
+      return { status: 404, body: { error: "not found" } };
+    } catch (error) {
+      if (error instanceof NotFoundError) return { status: 404, body: { error: error.message } };
+      if (error instanceof DomainError) return { status: 422, body: { error: error.message } };
+      if (error instanceof ConflictError) return { status: 409, body: { error: "the order was changed at the same time, try again" } };
+      throw error;
+    }
+  };
+}
+</pre>
+<p>The claim that adapters are interchangeable was tested four ways.</p>
+<table>
+<thead><tr><th>Test</th><th>Result</th></tr></thead>
+<tbody>
+<tr><th>One set of eight checks on the repository port, run against <code>InMemoryOrders</code> and against <code>SqliteOrders</code></th><td>Both passed all eight, including refusing a stale save</td></tr>
+<tr><th>Start an order, add two kinds of print, place it: once with in-memory storage, once with SQLite</th><td>Identical receipts: 550 cents, placed at the fixed clock’s time</td></tr>
+<tr><th>The same application behind a real HTTP server: eight requests, valid and invalid</th><td>Statuses 201, 200, 400, 422, 200, 422, 200, 404, and 409 when the repository reports a conflict</td></tr>
+<tr><th>The same application object behind a command-line adapter</th><td><code>show o5</code> printed “o5: draft, 1 lines, 1.20 EUR”, and <code>place o5</code> placed it</td></tr>
+</tbody>
+</table>
+<p>The first row deserves a name. A <dfn>contract test</dfn> is one suite of expectations written against a port and run against every adapter that implements it. It is what entitles a fast in-memory adapter to stand in for the real one in other tests: both have been shown to keep the same promises.</p>
+
+<h2 id="request">A request, end to end</h2>
+
+<figure class="fig wide" id="fig-request">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 340" role="img" aria-labelledby="f643t f643d">
+<title id="f643t">One request crossing the layers and returning</title>
+<desc id="f643d">A sequence across six participants: a client, the HTTP adapter, the application OrderApp, the Order aggregate, the SqliteOrders adapter and the database. The client sends POST /orders/o1/place. The HTTP adapter turns it into a call to placeOrder with plain data. The application asks its repository port for the order, and the SQLite adapter runs a SELECT. The application tells the order to place itself. It saves through the port, and the adapter writes in a transaction. The application returns a receipt as plain data, and the HTTP adapter turns it into a 200 response with JSON.</desc>
+<text class="tb mid" x="44" y="20">Client</text>
+<line class="axis" x1="44" y1="28" x2="44" y2="296"/>
+<text class="tb mid" x="158" y="20">HTTP adapter</text>
+<line class="axis" x1="158" y1="28" x2="158" y2="296"/>
+<text class="tb mid" x="290" y="20">OrderApp</text>
+<line class="axis" x1="290" y1="28" x2="290" y2="296"/>
+<text class="tb mid" x="398" y="20">Order</text>
+<line class="axis" x1="398" y1="28" x2="398" y2="296"/>
+<text class="tb mid" x="520" y="20">SqliteOrders</text>
+<line class="axis" x1="520" y1="28" x2="520" y2="296"/>
+<text class="tb mid" x="664" y="20">Database</text>
+<line class="axis" x1="664" y1="28" x2="664" y2="296"/>
+<g data-s="1">
+<path class="e sig" d="M45 54H157"/>
+<text class="ts mid" x="101.0" y="48">1. POST …/o1/place</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M159 82H289"/>
+<text class="ts mid" x="224.0" y="76">2. placeOrder(input)</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M291 110H519"/>
+<text class="ts mid" x="405.0" y="104">3. orders.get("o1")</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M521 138H663"/>
+<text class="ts mid" x="592.0" y="132">4. SELECT …</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M291 166H397"/>
+<text class="ts mid" x="344.0" y="160">5. place()</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M291 194H519"/>
+<text class="ts mid" x="405.0" y="188">6. orders.save(order)</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M521 222H663"/>
+<text class="ts mid" x="592.0" y="216">7. BEGIN … COMMIT</text>
+</g>
+<g data-s="8">
+<path class="e uses" d="M289 250H159"/>
+<text class="ts mid" x="224.0" y="244">8. a Receipt</text>
+</g>
+<g data-s="9">
+<path class="e uses" d="M157 278H45"/>
+<text class="ts mid" x="101.0" y="272">9. 200 and JSON</text>
+</g>
+<text class="ts" x="10" y="326">Data changes form at each boundary: an HTTP request, then plain input, then a domain object, then rows, and back.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="POST" data-state="Running in: the HTTP adapter (outer ring)">A request arrives. Everything about it so far is HTTP: a method, a path, headers, a body.</li>
+  <li data-msg="placeOrder" data-state="Running in: the application">The adapter extracts what the application needs and calls it with plain data. The request object goes no further than this.</li>
+  <li data-msg="get" data-state="Running in: the SQLite adapter (outer ring)">The application asks its repository port for the order. It is calling an interface it defined, and does not know that SQLite is behind it.</li>
+  <li data-msg="SELECT">The adapter runs the queries, builds an Order from the rows and returns it. No row or SQL type leaves the adapter.</li>
+  <li data-state="Running in: the domain (the center)">The application tells the order what to do, and the order applies the business rules. This is the only step that decides anything.</li>
+  <li data-msg="save" data-state="Running in: the SQLite adapter (outer ring)">The application hands the changed order back to the port.</li>
+  <li data-msg="COMMIT">The adapter writes the order and its lines in one transaction, checking the version.</li>
+  <li data-msg="Receipt" data-state="Running in: the HTTP adapter (outer ring)">The application returns plain data: identifiers, numbers, strings. The Order object stays inside.</li>
+  <li data-msg="200">The adapter chooses the status code and the encoding. Had the order thrown a DomainError, this is where it would become a 422.</li>
+</ol>
+<figcaption>Control passes inward and out again, and each layer speaks only its own language. The two adapters could both be replaced without touching the three steps in the middle.</figcaption>
+</figure>
+
+<p>Two things cross each boundary in that figure and both are translated there.</p>
+<ul>
+  <li><b>Data.</b> Each layer has its own representation, and none is passed through to the next. The HTTP body becomes a plain input object. The application returns a plain <code>OrderView</code>, not the <code>Order</code>, so that no outside code can call <code>place()</code> on it or come to depend on its internals. Rows become an <code>Order</code> inside the adapter. Objects that exist only to carry data across a boundary are called <dfn>data transfer objects</dfn>.</li>
+  <li><b>Errors.</b> The domain throws a <code>DomainError</code> with a message about orders. Only the HTTP adapter knows that this should be a 422, that a missing order is a 404 and a version conflict a 409. A command-line adapter would turn the same errors into text and an exit code. <x-ref to="errors-and-testing"></x-ref> develops this.</li>
+</ul>
+<p>The translation is real work, and it is the main cost of the approach. It buys the freedom to change one representation without changing the others: a column can be renamed, or a field added to the API, with no effect on the rules.</p>
+
+<h2 id="names">Hexagonal, onion, clean</h2>
+<p>Three descriptions of this idea are in common use, and job descriptions and interviewers use the names interchangeably.</p>
+<table>
+<thead><tr><th></th><th>Hexagonal, 2005</th><th>Onion, 2008</th><th>Clean, 2012</th></tr></thead>
+<tbody>
+<tr><th>Described by</th><td>Alistair Cockburn</td><td>Jeffrey Palermo</td><td>Robert C. Martin</td></tr>
+<tr><th>Business rules</th><td>The application, inside the hexagon</td><td>Domain model, at the center</td><td>Entities</td></tr>
+<tr><th>Sequencing of a use case</th><td>Also inside the hexagon</td><td>Application services</td><td>Use cases</td></tr>
+<tr><th>Interfaces the core defines</th><td>Ports</td><td>Interfaces in the inner rings</td><td>Boundaries, or gateways</td></tr>
+<tr><th>Protocol and storage code</th><td>Adapters</td><td>Infrastructure and user interface, the outer ring</td><td>Interface adapters, then frameworks and drivers</td></tr>
+<tr><th>The rule</th><td colspan="3">Dependencies point inward. The core does not know what is outside it</td></tr>
+</tbody>
+</table>
+<p>The hexagonal description draws one boundary and stops. The other two also divide the inside into rings, domain within application, as this chapter’s folders do. Choose whichever vocabulary your team already uses. The rule in the last row is the part that matters.</p>
+
+<h2 id="wiring">The composition root, and where frameworks belong</h2>
+<p>If no layer may name a concrete adapter, something outside the layers has to. That place is the <dfn>composition root</dfn>, introduced in <x-ref to="creational-patterns#wiring"></x-ref>: the one file that creates every concrete object and hands each to whatever needs it.</p>
+<pre data-lang="ts" data-title="main.ts: the only file that names every concrete class">
+const prices = new FixedPrices({ "10x15": Money.of(25, "EUR"), "13x18": Money.of(60, "EUR"), "20x30": Money.of(450, "EUR") });
+
+// Production wiring: a real database file, the real clock, events written to the log.
+export function production(databasePath: string): OrderApp {
+  return createOrderApp({
+    orders: new SqliteOrders(new DatabaseSync(databasePath)),
+    publisher: { publish: async (event) => console.log("event", JSON.stringify(event)) },
+    clock: { now: () => new Date() },
+    prices,
+  });
+}
+
+// Test wiring: everything in memory, and handles on the fakes so a test can look inside.
+export function forTests(overrides: Partial<Ports> = {}) {
+  const publisher = new RecordingPublisher();
+  const ports: Ports = { orders: new InMemoryOrders(), publisher, clock: new FixedClock("2026-10-11T09:00:00Z"), prices, ...overrides };
+  return { app: createOrderApp(ports), publisher, ports };
+}
+
+if (import.meta.main) {
+  createHttpServer(production("orders.db")).listen(8080, () => console.log("listening on http://localhost:8080"));
+}
+</pre>
+<p>Production and tests get the same application, built from different parts. Swapping a database, or running against fakes, is a change to this file alone.</p>
+<p>The same reasoning settles where a framework goes. A web framework, an object-relational mapper and a queue client are all details of how the program talks to the world, so they belong in the outer ring, used by adapters. Two habits follow.</p>
+<ul>
+  <li><b>Keep framework types out of the core.</b> A use case that accepts the framework’s request object, or a domain class that extends the mapper’s base class or carries its annotations, has pointed a dependency outward. The framework can then no longer be upgraded or replaced without touching the rules.</li>
+  <li><b>Let the framework do its job at the edge.</b> Routing, parsing, validation of shape, serialization and connection pooling are what it is good at. The adapter in this chapter uses Node’s bare HTTP server to stay dependency-free. Replacing it with a framework would change <code>adapters/http.ts</code> and nothing else.</li>
+</ul>
+
+<h2 id="enforce">Keeping the rule true</h2>
+<p>A dependency rule that lives in a wiki is broken within months, by one convenient import at a time. It has to be checked by a machine. The check for this chapter’s code is under forty lines: read every file’s <code>import</code> statements, work out which layer each file is in, and compare against a table.</p>
+<pre data-lang="ts" data-title="What each layer may import">
+// What each layer is allowed to import. Dependencies point inward: adapters -> application -> domain.
+const allowed: Record<Layer, Layer[]> = {
+  domain: ["domain"],
+  application: ["application", "domain"],
+  adapters: ["adapters", "application", "domain"],
+  root: ["root", "adapters", "application", "domain"],
+};
+</pre>
+
+<figure class="fig wide" id="fig-imports">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f644t f644d">
+<title id="f644t">Which file imports which, in the code of this chapter</title>
+<desc id="f644d">A graph of the 9 files of the chapter’s code, drawn from their import statements. One file, main.ts, is the composition root on the left. Four files are adapters: cli, http, memory and sqlite. Two are the application: orders and ports. Two are the domain: money and order. There are 20 imports between them. Every arrow goes from left to right: from the root to anything, from adapters to the application and the domain, and from the application to the domain. No arrow goes the other way.</desc>
+<text class="tb" x="20" y="24">Composition root</text>
+<text class="tb" x="170" y="24">Adapters</text>
+<text class="tb" x="400" y="24">Application</text>
+<text class="tb" x="600" y="24">Domain</text>
+<path class="e" d="M281 75L398 75"/>
+<path class="e" d="M281 127L598 127"/>
+<path class="e" d="M281 127L398 75"/>
+<path class="e" d="M281 127L398 127"/>
+<path class="e" d="M281 179L598 75"/>
+<path class="e" d="M281 179L598 127"/>
+<path class="e" d="M281 179L398 127"/>
+<path class="e" d="M281 231L598 127"/>
+<path class="e" d="M281 231L398 127"/>
+<path class="e" d="M511 75L598 127"/>
+<path class="e" d="M455 91V110"/>
+<path class="e" d="M511 127L598 75"/>
+<path class="e" d="M511 127L598 127"/>
+<path class="e" d="M655 111V92"/>
+<path class="e uses" d="M131 153L598 75"/>
+<path class="e uses" d="M131 153L398 75"/>
+<path class="e uses" d="M131 153L398 127"/>
+<path class="e uses" d="M131 153L168 127"/>
+<path class="e uses" d="M131 153L168 179"/>
+<path class="e uses" d="M131 153L168 231"/>
+<rect class="n sunk" x="20" y="138" width="110" height="30" rx="5"/>
+<text class="ts mid" x="75.0" y="157">main.ts</text>
+<rect class="n " x="170" y="60" width="110" height="30" rx="5"/>
+<text class="ts mid" x="225.0" y="79">cli.ts</text>
+<rect class="n " x="170" y="112" width="110" height="30" rx="5"/>
+<text class="ts mid" x="225.0" y="131">http.ts</text>
+<rect class="n " x="170" y="164" width="110" height="30" rx="5"/>
+<text class="ts mid" x="225.0" y="183">memory.ts</text>
+<rect class="n " x="170" y="216" width="110" height="30" rx="5"/>
+<text class="ts mid" x="225.0" y="235">sqlite.ts</text>
+<rect class="n store" x="400" y="60" width="110" height="30" rx="5"/>
+<text class="ts mid" x="455.0" y="79">orders.ts</text>
+<rect class="n store" x="400" y="112" width="110" height="30" rx="5"/>
+<text class="ts mid" x="455.0" y="131">ports.ts</text>
+<rect class="n sig" x="600" y="60" width="110" height="30" rx="5"/>
+<text class="ts mid" x="655.0" y="79">money.ts</text>
+<rect class="n sig" x="600" y="112" width="110" height="30" rx="5"/>
+<text class="ts mid" x="655.0" y="131">order.ts</text>
+<text class="ts" x="10" y="268">20 imports: adapters to application 5, adapters to domain 4, application to domain 3, toward the outside 0.</text>
+<text class="ts" x="10" y="284">Dashed arrows are main.ts, the one file allowed to know every concrete class.</text>
+</svg>
+</div>
+<figcaption>This picture was generated from the source files, and the test suite fails if an arrow ever points outward. A dependency rule that is not checked by a machine does not stay true.</figcaption>
+</figure>
+
+<p>The test suite runs this check and found 20 imports between the nine files, none pointing outward. It also confirmed that the check has teeth: given one extra import from <code>domain/order.ts</code> to <code>adapters/sqlite.ts</code>, it reported exactly that one as a violation. In a real project the same job is done by a lint rule that restricts imports by folder, such as ESLint’s <code>no-restricted-imports</code>, or by a tool that analyzes the dependency graph, such as dependency-cruiser, run on every commit.</p>
+
+<h2 id="packaging">Folders: by layer or by feature</h2>
+
+<figure class="fig wide" id="fig-packaging">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 276" role="img" aria-labelledby="f645t f645d">
+<title id="f645t">Folders by layer, and folders by feature</title>
+<desc id="f645d">Two folder trees for the same application. On the left, the top-level folders are technical layers: controllers, services, repositories and models, each containing a file for orders, a file for albums and a file for billing. A change to orders touches four folders. On the right, the top-level folders are features: orders, albums and billing. Inside orders are its own domain, application and adapters folders and an index file, which is the only file other features may import.</desc>
+<text class="tb" x="10" y="18">By layer</text>
+<text class="tb" x="380" y="18">By feature, with layers inside</text>
+<rect class="n sig" x="119" y="50" width="66" height="19" rx="3"/>
+<rect class="n sig" x="119" y="70" width="66" height="19" rx="3"/>
+<rect class="n sig" x="119" y="90" width="66" height="19" rx="3"/>
+<rect class="n sig" x="119" y="110" width="66" height="19" rx="3"/>
+<rect class="n sig" x="390" y="50" width="322" height="100" rx="4"/>
+<text class="ts mono" x="10" y="44">src/</text>
+<text class="ts mono" x="10" y="64">  controllers/   orders.ts  albums.ts  billing.ts</text>
+<text class="ts mono" x="10" y="84">  services/      orders.ts  albums.ts  billing.ts</text>
+<text class="ts mono" x="10" y="104">  repositories/  orders.ts  albums.ts  billing.ts</text>
+<text class="ts mono" x="10" y="124">  models/        order.ts   album.ts   invoice.ts</text>
+<text class="ts mono" x="10" y="144">  main.ts</text>
+<text class="ts mono" x="380" y="44">src/</text>
+<text class="ts mono" x="380" y="64">  orders/</text>
+<text class="ts mono" x="380" y="84">    domain/        order.ts  money.ts</text>
+<text class="ts mono" x="380" y="104">    application/   orders.ts  ports.ts</text>
+<text class="ts mono" x="380" y="124">    adapters/      http.ts  sqlite.ts</text>
+<text class="ts mono" x="380" y="144">    index.ts       the only file others may import</text>
+<text class="ts mono" x="380" y="164">  albums/          the same three folders</text>
+<text class="ts mono" x="380" y="184">  billing/         the same three folders</text>
+<text class="ts mono" x="380" y="204">  main.ts          wires the features together</text>
+<text class="ts" x="10" y="196">A change to orders is spread over four folders,</text>
+<text class="ts" x="10" y="212">and nothing stops billing reaching into the</text>
+<text class="ts" x="10" y="228">orders repository.</text>
+<text class="ts" x="380" y="244">A change to orders stays in one folder, and each</text>
+<text class="ts" x="380" y="260">feature has one door. This is a modular monolith.</text>
+<path class="e none dash" d="M362 8V270"/>
+</svg>
+</div>
+<figcaption>The first split of a codebase should follow what the business does, with technical layers inside each part. The folder names then say what the system is for.</figcaption>
+</figure>
+
+<p>Layers describe how one feature is built. They are a poor first division for a whole codebase, because every change then cuts across every top-level folder, and nothing separates one feature’s internals from another’s. Divide first by what the business does, along the bounded contexts of <x-ref to="domain-modeling#contexts"></x-ref>, and apply the layers inside each part. Give each part one public entry file, and extend the import check so that no feature reaches into another’s folders.</p>
+<p>The result is the modular monolith recommended in <x-ref to="monoliths-and-microservices#modular-monolith"></x-ref>. It also makes later extraction cheap: a module that is already reached only through its own interface can be moved behind a network call by writing one new adapter.</p>
+
+<h2 id="worth">What it buys, and what it costs</h2>
+<p>The largest practical gain is in testing. The same scenario, start an order, add two lines and place it, was run 500 times at two levels.</p>
+<table>
+<thead><tr><th>How the scenario was run</th><th>500 runs</th><th>Each</th></tr></thead>
+<tbody>
+<tr><th>Calling the application directly, with in-memory adapters</th><td>About 27 ms</td><td>About 0.05 ms</td></tr>
+<tr><th>Through an HTTP server and a SQLite database, each started fresh</th><td>About 2.6 s</td><td>About 5 ms</td></tr>
+</tbody>
+</table>
+<p>A hundredfold difference decides how tests get written. At a twentieth of a millisecond each, every rule and every edge case can have a test, and the whole suite runs on every save. The slower level is still needed, for a handful of tests that prove the adapters are wired correctly.</p>
+<p>The costs are also real: more files, an interface and a mapping for each boundary, and a layer of indirection to follow when reading. Whether they are worth paying depends on how much there is to protect.</p>
+<table>
+<thead><tr><th>The application is</th><th>A fitting structure</th></tr></thead>
+<tbody>
+<tr><th>A script, a prototype, a tool with a short life</th><td>One file. Structure can be added when it survives</td></tr>
+<tr><th>Mostly forms over tables, with little logic</th><td>The framework’s conventions, with handlers that talk to the database through a thin data layer. Ports around every table would be ceremony</td></tr>
+<tr><th>Real business rules, expected to live for years</th><td>A domain model, use cases, and ports for the database and for each external system</td></tr>
+<tr><th>Several teams or several bounded contexts</th><td>The same, as modules with enforced boundaries</td></tr>
+</tbody>
+</table>
+<p>The decision need not be uniform. One application can keep a plain handler for its settings page and a full hexagon around its billing.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> In a low-level design round, show the rule without lecturing on it: put the rules in domain classes, give storage and any external service an interface, and pass those interfaces in. If asked how you would test or how you would change the database, the answer is then already in the design. In a system design round, “what is inside this box?” is answered by the same picture: handlers at the edge, use cases, a domain model, and adapters to the stores and queues drawn elsewhere on the board.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Business rules in handlers or in SQL</th><td>Rules that cannot be tested alone, and are duplicated by the next entry point</td><td>Handlers translate, the model decides</td></tr>
+<tr><th>Ports shaped like the technology: <code>runQuery(sql)</code>, <code>httpPost(url)</code></th><td>The application still knows it is talking to SQL or HTTP. Nothing was inverted</td><td>Ports in the application’s language: <code>orders.save(order)</code></td></tr>
+<tr><th>Returning domain objects or database rows from the API</th><td>Every internal rename is a breaking change for clients</td><td>Plain output types, mapped at the boundary</td></tr>
+<tr><th>Framework annotations and base classes on domain types</th><td>The core depends on the framework after all</td><td>Keep them in adapters, and map</td></tr>
+<tr><th>Layers that only pass calls through</th><td>Four files changed for every new field, and no rule protected by any of them</td><td>Add a layer where there is something for it to do</td></tr>
+<tr><th>An interface for every class, each with one implementation and no test double</th><td>Indirection with no boundary behind it</td><td>Ports at the edges of the application, where a second implementation exists or is needed for tests</td></tr>
+<tr><th>The rule stated but never checked</th><td>One “temporary” import, then many</td><td>An automated import check in the build</td></tr>
+<tr><th>Top-level folders by technical layer in a large codebase</th><td>Every feature smeared across the tree, and no module boundaries</td><td>Features first, layers inside</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="solid-principles"></x-ref>: dependency inversion, which this chapter applies to a whole program.</li>
+  <li><x-ref to="domain-modeling"></x-ref>: the model and the repositories that sit at the center.</li>
+  <li><x-ref to="structural-patterns"></x-ref>: the adapter pattern, and the anticorruption layer between contexts.</li>
+  <li><x-ref to="creational-patterns"></x-ref>: the composition root and dependency injection.</li>
+  <li><x-ref to="errors-and-testing"></x-ref>: test doubles and the levels of testing that this structure makes possible.</li>
+  <li><x-ref to="monoliths-and-microservices"></x-ref>: the modular monolith, and extracting a module into a service.</li>
+  <li><x-ref to="lld-method"></x-ref>: using this structure under interview time.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A service holds three kinds of knowledge: protocol, business rules and storage. They change for different reasons and should not share functions.</li>
+  <li>Plain layering leaves the domain depending on data access. Reverse that one arrow.</li>
+  <li>The dependency rule: source code dependencies point inward, toward the business rules, and never outward.</li>
+  <li>A port is an interface the application owns. An adapter connects a port to a technology. Driving adapters call the application, and driven adapters are called by it.</li>
+  <li>Hexagonal, onion and clean architecture are three vocabularies for the same rule.</li>
+  <li>Data and errors are translated at each boundary. Domain objects and framework types do not cross.</li>
+  <li>The composition root is the one place that names concrete classes. Frameworks live in the outer ring.</li>
+  <li>Check the rule with a tool on every build, and divide a large codebase by feature before dividing by layer.</li>
+  <li>The structure pays for itself where there are rules worth protecting, and is overhead where there are none.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>In a traditional four-layer stack, which dependency is the problem, and what exactly is done to fix it?</summary><p>The domain layer depending on the data access layer, which makes the business rules depend on the database code. The fix is for the application or domain to declare an interface for the storage it needs, and for the data access code to implement that interface. The calls at run time are unchanged. The source code dependency now points from the database code toward the core.</p></details>
+<details><summary>Classify each as a driving adapter, a driven adapter, or neither: a REST controller, a class that sends email through a provider’s API, a nightly job that calls a use case, the <code>Order</code> class, an in-memory repository used in tests.</summary><p>The REST controller and the nightly job are driving adapters: they call the application. The email sender and the in-memory repository are driven adapters: the application calls them through a port. <code>Order</code> is neither. It is part of the domain at the center.</p></details>
+<details><summary>A colleague defines the port <code>interface Database { query(sql: string): Promise&lt;Row[]&gt; }</code> and passes it to the use cases. Why does this not achieve what a port is for?</summary><p>The use cases must still write SQL and understand rows, so they depend on the storage technology in every way that matters. The interface inverts nothing. A port should be stated in the application’s terms, such as <code>get(id)</code> and <code>save(order)</code>, so that an implementation with no SQL at all, in memory or over a network, can satisfy it.</p></details>
+<details><summary>The application returns an <code>OrderView</code> of plain data where it could return the <code>Order</code> itself. Give two reasons.</summary><p>An <code>Order</code> has methods that change it, so handing it out would let outer code alter state without going through a use case or a save. And outer code, including API clients through serialization, would come to depend on the internal structure of the domain object, so that refactoring it would break them. The view is a stable, deliberately chosen shape.</p></details>
+<details><summary>Which file in this chapter’s code is allowed to import <code>SqliteOrders</code>, and why only that one?</summary><p><code>main.ts</code>, the composition root, and tests that set up the adapter. It is the one place whose job is to choose concrete implementations and connect them. If the application or domain imported it, they would depend on SQLite and the dependency rule would be broken.</p></details>
+<details><summary>What is a contract test, and what does it allow you to do safely?</summary><p>One suite of expectations written against a port and run against every adapter that implements it, here the in-memory and SQLite repositories. Because both are shown to behave the same way where it matters, including refusing a stale save, the fast in-memory adapter can be used in the many tests of the use cases, with confidence that the results carry over to the real one.</p></details>
+<details><summary>A team has a three-screen internal tool that reads and writes four tables with almost no rules. A new member proposes ports, adapters and use-case classes for all of it. What would you say?</summary><p>That the structure protects business rules from technology, and there are almost none here to protect. It would add interfaces, mappings and files to every change for no benefit. Use the framework’s defaults with a thin data layer. If one part later grows real rules, give that part a domain model and ports, and leave the rest alone.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Alistair Cockburn, <a href="https://alistair.cockburn.us/hexagonal-architecture/">Hexagonal Architecture</a>, 2005. The original description of ports and adapters, and of driving and driven actors.</li>
+  <li>Robert C. Martin, <a href="https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html">The Clean Architecture</a>, 2012. States the dependency rule and relates it to the hexagonal and onion descriptions.</li>
+  <li>Jeffrey Palermo, <a href="https://jeffreypalermo.com/2008/07/the-onion-architecture-part-1/">The Onion Architecture: part 1</a>, 2008.</li>
+  <li>Martin Fowler, <cite>Patterns of Enterprise Application Architecture</cite>, Addison-Wesley, 2002. Layering, service layer, repository and data transfer object.</li>
+  <li>Mark Seemann, <a href="https://blog.ploeh.dk/2011/07/28/CompositionRoot/">Composition Root</a>, 2011.</li>
+  <li>Node.js documentation, <a href="https://nodejs.org/api/sqlite.html">SQLite</a>. The built-in database module used by this chapter’s SQL adapter.</li>
+  <li>ESLint, <a href="https://eslint.org/docs/latest/rules/no-restricted-imports">no-restricted-imports</a>, and <a href="https://github.com/sverweij/dependency-cruiser">dependency-cruiser</a>. Two ways to check import rules automatically.</li>
+</ol>
+</section>

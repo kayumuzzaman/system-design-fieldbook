@@ -1,0 +1,474 @@
+<!--meta
+{ "description": "Partitioning and sharding explained: range, hash and directory partitioning, rebalancing and why hash mod N fails, consistent hashing with virtual nodes, choosing a shard key, hot keys, cross-shard queries, request routing, and how to shard an existing database.",
+  "lede": "Replication copies the same data to several machines. Partitioning does the opposite: it gives each machine a different part of the data, so that together they hold more and accept more writes than any one could. It is the only way past the limits of a single server, and it takes away things a single server gave you for free.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">When one machine is not enough</h2>
+<p><x-ref to="replication"></x-ref> ended with a limit: replicas add read capacity and nothing else, because every replica holds all the data and applies every write. Three pressures eventually exceed what one leader can do.</p>
+<ul>
+  <li><b>Write volume.</b> One machine’s CPU and disk can only apply so many changes per second.</li>
+  <li><b>Data size.</b> Indexes stop fitting in memory, and queries that were fast slow down sharply (<x-ref to="storage-engines#btree-engine"></x-ref>).</li>
+  <li><b>Operational weight.</b> Backups, restores, index builds, schema changes and cleanup all take time in proportion to size. At some point a restore takes longer than the business can be down.</li>
+</ul>
+<p><dfn>Partitioning</dfn> splits a data set into pieces so that each piece can live on a different machine. A piece is called a <dfn>partition</dfn> or, when the pieces are on separate database servers, a <dfn>shard</dfn>. Each record belongs to exactly one partition.</p>
+<p>The third pressure is often the one that forces the decision. When Notion split its PostgreSQL database in 2021, the triggers were not query speed. The database’s routine cleanup process could no longer keep up, and the team faced the prospect of the database refusing writes to protect itself.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Sharding too early. It is the most disruptive change you can make to a data layer, and it is hard to reverse. Before it, exhaust the cheaper options in order: fix the queries and indexes, add memory or move to a larger machine, add read replicas, cache, move old data to an archive, and move unrelated tables to a database of their own. A single modern server handles tens of thousands of transactions per second and terabytes of data. Many systems never need more.</p></div>
+
+<h2 id="with-replication">Partitions are replicated too</h2>
+<p>Partitioning and replication are separate ideas, used together. Each partition is a small database with its own leader and followers.</p>
+
+<figure class="fig wide" id="fig-partition-replica">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f211t f211d">
+<title id="f211t">Three partitions, each replicated across three nodes</title>
+<desc id="f211d">A grid of three partitions and three nodes. Partition A has its leader on node 1 and followers on nodes 2 and 3. Partition B has its leader on node 2. Partition C has its leader on node 3. Every node holds a copy of every partition, leading one and following two.</desc>
+<rect class="grp" x="170" y="10" width="164" height="168" rx="8"/>
+<text class="tb mid" x="252" y="30">Node 1</text>
+<rect class="grp" x="354" y="10" width="164" height="168" rx="8"/>
+<text class="tb mid" x="436" y="30">Node 2</text>
+<rect class="grp" x="538" y="10" width="164" height="168" rx="8"/>
+<text class="tb mid" x="620" y="30">Node 3</text>
+<text class="tb" x="10" y="65">Partition A</text>
+<rect class="n sig" x="182" y="44" width="140" height="34" rx="5"/>
+<text class="ts mid" x="252" y="65.5">leader</text>
+<rect class="n" x="366" y="44" width="140" height="34" rx="5"/>
+<text class="ts mid" x="436" y="65.5">follower</text>
+<rect class="n" x="550" y="44" width="140" height="34" rx="5"/>
+<text class="ts mid" x="620" y="65.5">follower</text>
+<text class="tb" x="10" y="109">Partition B</text>
+<rect class="n" x="182" y="88" width="140" height="34" rx="5"/>
+<text class="ts mid" x="252" y="109.5">follower</text>
+<rect class="n sig" x="366" y="88" width="140" height="34" rx="5"/>
+<text class="ts mid" x="436" y="109.5">leader</text>
+<rect class="n" x="550" y="88" width="140" height="34" rx="5"/>
+<text class="ts mid" x="620" y="109.5">follower</text>
+<text class="tb" x="10" y="153">Partition C</text>
+<rect class="n" x="182" y="132" width="140" height="34" rx="5"/>
+<text class="ts mid" x="252" y="153.5">follower</text>
+<rect class="n" x="366" y="132" width="140" height="34" rx="5"/>
+<text class="ts mid" x="436" y="153.5">follower</text>
+<rect class="n sig" x="550" y="132" width="140" height="34" rx="5"/>
+<text class="ts mid" x="620" y="153.5">leader</text>
+<text class="ts" x="10" y="202">Each partition has its own leader and followers, spread so that every node leads some partitions and no node holds</text>
+<text class="ts" x="10" y="218">the only copy of anything.</text>
+
+</svg>
+</div>
+<figcaption>Partitioning spreads the data, and replication protects each piece. Losing node 2 costs partition B its leader, and a follower elsewhere takes over.</figcaption>
+</figure>
+
+<p>Everything in the previous chapter applies within each partition. This chapter is about the new questions: which partition a record goes to, how that changes when machines are added, and what becomes difficult once data is split.</p>
+
+<h2 id="strategies">Deciding where each record goes</h2>
+<p>Every partitioned system has a rule that maps a record to a partition, based on one of its fields, the <dfn>partition key</dfn> or shard key. There are three kinds of rule.</p>
+
+<figure class="fig wide" id="fig-range-hash">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f212t f212d">
+<title id="f212t">Twenty usernames distributed by range partitioning and by hash partitioning</title>
+<desc id="f212d">With range partitioning, shard 1 holds names from a to e, shard 2 from f to m, and shard 3 from n to z. Alphabetical neighbors are on the same shard and the shards hold 6, 6 and 8 names. With hash partitioning, each name is hashed and assigned by the remainder after dividing by 3. The shards hold 7, 6 and 7 names, and names that are adjacent alphabetically are scattered.</desc>
+<text class="tl" x="10" y="18">Range partitioning: neighbors stay together</text>
+<rect class="n sunk" x="10" y="30" width="220" height="26" rx="4"/>
+<text class="ts mid" x="120" y="47.5">Shard 1: a to e</text>
+<rect class="n" x="10" y="56" width="220" height="74" rx="4"/>
+<text class="ts" x="20" y="74">adam</text>
+<text class="ts" x="20" y="90">ana</text>
+<text class="ts" x="20" y="106">ben</text>
+<text class="ts" x="20" y="122">chi</text>
+<text class="ts" x="76" y="74">dev</text>
+<text class="ts" x="76" y="90">eli</text>
+<rect class="n sunk" x="250" y="30" width="220" height="26" rx="4"/>
+<text class="ts mid" x="360" y="47.5">Shard 2: f to m</text>
+<rect class="n" x="250" y="56" width="220" height="74" rx="4"/>
+<text class="ts" x="260" y="74">fay</text>
+<text class="ts" x="260" y="90">gus</text>
+<text class="ts" x="260" y="106">ian</text>
+<text class="ts" x="260" y="122">kim</text>
+<text class="ts" x="316" y="74">lee</text>
+<text class="ts" x="316" y="90">mia</text>
+<rect class="n sunk" x="490" y="30" width="220" height="26" rx="4"/>
+<text class="ts mid" x="600" y="47.5">Shard 3: n to z</text>
+<rect class="n" x="490" y="56" width="220" height="74" rx="4"/>
+<text class="ts" x="500" y="74">noor</text>
+<text class="ts" x="500" y="90">omar</text>
+<text class="ts" x="500" y="106">raj</text>
+<text class="ts" x="500" y="122">sam</text>
+<text class="ts" x="556" y="74">tia</text>
+<text class="ts" x="556" y="90">uma</text>
+<text class="ts" x="556" y="106">vic</text>
+<text class="ts" x="556" y="122">zoe</text>
+<text class="tl" x="10" y="176">Hash partitioning: spread evenly, neighbors scattered</text>
+<rect class="n sunk" x="10" y="188" width="220" height="26" rx="4"/>
+<text class="ts mid" x="120" y="205.5">Shard 1: hash mod 3 = 0</text>
+<rect class="n" x="10" y="214" width="220" height="74" rx="4"/>
+<text class="ts" x="20" y="232">ana</text>
+<text class="ts" x="20" y="248">chi</text>
+<text class="ts" x="20" y="264">dev</text>
+<text class="ts" x="20" y="280">ian</text>
+<text class="ts" x="76" y="232">kim</text>
+<text class="ts" x="76" y="248">noor</text>
+<text class="ts" x="76" y="264">sam</text>
+<rect class="n sunk" x="250" y="188" width="220" height="26" rx="4"/>
+<text class="ts mid" x="360" y="205.5">Shard 2: hash mod 3 = 1</text>
+<rect class="n" x="250" y="214" width="220" height="74" rx="4"/>
+<text class="ts" x="260" y="232">adam</text>
+<text class="ts" x="260" y="248">mia</text>
+<text class="ts" x="260" y="264">raj</text>
+<text class="ts" x="260" y="280">tia</text>
+<text class="ts" x="316" y="232">uma</text>
+<text class="ts" x="316" y="248">zoe</text>
+<rect class="n sunk" x="490" y="188" width="220" height="26" rx="4"/>
+<text class="ts mid" x="600" y="205.5">Shard 3: hash mod 3 = 2</text>
+<rect class="n" x="490" y="214" width="220" height="74" rx="4"/>
+<text class="ts" x="500" y="232">ben</text>
+<text class="ts" x="500" y="248">eli</text>
+<text class="ts" x="500" y="264">fay</text>
+<text class="ts" x="500" y="280">gus</text>
+<text class="ts" x="556" y="232">lee</text>
+<text class="ts" x="556" y="248">omar</text>
+<text class="ts" x="556" y="264">vic</text>
+
+</svg>
+</div>
+<figcaption>The same twenty keys under the two main schemes. Range keeps order and risks imbalance. Hashing balances and destroys order.</figcaption>
+</figure>
+
+<h3 id="range">Range partitioning</h3>
+<p>Each partition owns a continuous range of key values, like the volumes of a printed encyclopedia. Keys that are close together are stored together, so a query for a range, such as all events between two timestamps, reads from one or a few partitions.</p>
+<p>The weakness is uneven load. If the key is a timestamp, every new record belongs to the newest range, and one partition takes all the writes while the rest sit idle. Systems that use ranges split a partition automatically when it grows too large, and the application must choose keys that do not concentrate activity. Used by HBase, Bigtable, CockroachDB, Spanner and TiDB.</p>
+
+<h3 id="hash">Hash partitioning</h3>
+<p>Run the key through a hash function, which turns it into an evenly distributed number, and use that number to pick the partition. Similar keys land far apart, so load spreads evenly even when keys are sequential.</p>
+<p>The price is range queries. Adjacent keys are on different partitions, so a range scan has to ask all of them. Used by Cassandra, DynamoDB, and Redis Cluster.</p>
+<p>The two can be combined, and usually are. A compound key hashes its first part to choose the partition and keeps rows sorted by its second part inside it. This is the partition key and clustering key from <x-ref to="data-models#wide-column"></x-ref>: messages are spread by channel, and within a channel they are ordered by time.</p>
+
+<h3 id="directory">Directory partitioning</h3>
+<p>Keep an explicit lookup table that says which partition holds each key or each group of keys: tenant 17 is on shard 4. This is the most flexible scheme. A large customer can be given a shard to itself, and a group can be moved by copying its data and changing one entry. The cost is that every request consults the directory, which must therefore be fast, cached and highly available.</p>
+
+<h2 id="rebalancing">Adding machines: the rebalancing problem</h2>
+<p>A partitioned system has to grow, and growing means moving data. How much data moves when a machine is added is the test of a partitioning scheme.</p>
+<p>The obvious way to hash keys onto <i>N</i> servers is to take the hash’s remainder after dividing by <i>N</i>. It distributes evenly and fails badly when <i>N</i> changes, because the remainder of almost every number changes with the divisor.</p>
+
+<div class="widget" data-widget="rehash">
+<h4>How many keys move when the number of servers changes?</h4>
+<p>Compare assigning keys by hash modulo the server count with consistent hashing.</p>
+<div class="controls">
+  <label>Servers before<input type="number" name="from" value="10" min="1" max="1000" step="1"></label>
+  <label>Servers after<input type="number" name="to" value="11" min="1" max="1000" step="1"></label>
+  <label>Positions for each server on the ring<input type="number" name="vnodes" value="1" min="1" max="200" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 262" role="img" aria-label="Left, a ring with the servers and 96 sample keys, the keys that change owner under consistent hashing marked. Right, the same 96 keys as squares, the ones that move under hashing modulo the server count marked."><text x="10" y="18" class="tb">Consistent hashing: 9 of 96 sample keys move</text><text x="350" y="18" class="tb">Hash mod N: 86 of 96 sample keys move</text><circle cx="116" cy="140" r="88" class="axis" fill="none"></circle><circle cx="42.4" cy="91.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="76.8" cy="61.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="52.7" cy="78.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="202" cy="121.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="75.2" cy="218" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="31.3" cy="163.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="28.8" cy="151.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="71.6" cy="216" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="181.3" cy="81" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="51.2" cy="199.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="33.9" cy="171.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="81.8" cy="221.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="139" cy="224.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="78.5" cy="219.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="187.7" cy="191" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="41.7" cy="187.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="44.4" cy="191.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="202.1" cy="121.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="34.2" cy="107.5" r="4.2" class="fill-sig" style=""></circle><circle cx="75.4" cy="218.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="66.4" cy="212.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="151.3" cy="59.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="47.3" cy="85" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="142.5" cy="56.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="76.8" cy="218.8" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="32.6" cy="111.9" r="4.2" class="fill-sig" style=""></circle><circle cx="161.8" cy="215.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="40" cy="184.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="69.9" cy="65" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="153.6" cy="219.5" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="199.2" cy="168.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="138.5" cy="225.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="194.7" cy="100.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="56.6" cy="205" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="146.7" cy="57.5" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="203.6" cy="131.3" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="196.4" cy="175.8" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="180.9" cy="199.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="74.9" cy="62.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="37.4" cy="100.5" r="4.2" class="fill-sig" style=""></circle><circle cx="135.3" cy="225.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="194.9" cy="179" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="28.3" cy="132.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="194.7" cy="100.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="39.9" cy="95.8" r="4.2" class="fill-sig" style=""></circle><circle cx="122.3" cy="227.8" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="143.4" cy="56.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="202" cy="158.8" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="173.5" cy="73.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="96.4" cy="54.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="70.1" cy="215.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="112.1" cy="227.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="130.6" cy="53.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="81.5" cy="220.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="141.8" cy="55.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="59.4" cy="72.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="162.3" cy="65.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="57.4" cy="205.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="114.9" cy="228" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="32.5" cy="112.2" r="4.2" class="fill-sig" style=""></circle><circle cx="32.3" cy="112.7" r="4.2" class="fill-sig" style=""></circle><circle cx="39.8" cy="95.9" r="4.2" class="fill-sig" style=""></circle><circle cx="174.7" cy="205.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="55.2" cy="203.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="132.3" cy="226.5" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="186.4" cy="87.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="203.1" cy="127.5" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="150.1" cy="221.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="203.9" cy="143.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="173.3" cy="73.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="194.4" cy="100" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="175.7" cy="204.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="196.8" cy="105.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="163.9" cy="213.8" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="82.5" cy="58.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="94.6" cy="225.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="118.7" cy="52" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="203.1" cy="152.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="112.9" cy="52.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="193.8" cy="181.1" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="201.4" cy="118.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="197.5" cy="106.8" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="192.1" cy="184.2" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="61.9" cy="70.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="70.7" cy="64.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="73.2" cy="216.9" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="95.6" cy="54.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="55.1" cy="203.5" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="85.7" cy="222.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="30.8" cy="118" r="4.2" class="fill-sig" style=""></circle><circle cx="43.4" cy="90.3" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="136.1" cy="225.7" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="54.2" cy="77.4" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="35.1" cy="105.4" r="4.2" class="fill-sig" style=""></circle><circle cx="134.9" cy="226" r="2.6" class="" style="fill:var(--ink-3)"></circle><circle cx="174.6" cy="205.6" r="2.6" class="" style="fill:var(--ink-3)"></circle><rect x="128.9" y="36.6" width="10" height="10" rx="2.5" class="n"></rect><rect x="202.2" y="94" width="10" height="10" rx="2.5" class="n"></rect><rect x="208.9" y="114.6" width="10" height="10" rx="2.5" class="n"></rect><rect x="165.4" y="218.9" width="10" height="10" rx="2.5" class="n"></rect><rect x="124.4" y="234.1" width="10" height="10" rx="2.5" class="n"></rect><rect x="46.4" y="211.4" width="10" height="10" rx="2.5" class="n"></rect><rect x="14.7" y="161.8" width="10" height="10" rx="2.5" class="n"></rect><rect x="13.9" y="111" width="10" height="10" rx="2.5" class="n"></rect><rect x="25" y="84" width="10" height="10" rx="2.5" class="n store"></rect><rect x="47.6" y="57.7" width="10" height="10" rx="2.5" class="n"></rect><rect x="71.5" y="43.1" width="10" height="10" rx="2.5" class="n"></rect><rect x="236" y="64" width="10" height="10" rx="2.5" class="n"></rect><text x="253" y="73" class="ts">a server</text><rect x="236" y="84" width="10" height="10" rx="2.5" class="n store"></rect><text x="253" y="93" class="ts">added</text><circle cx="241" cy="109" r="4.2" class="fill-sig"></circle><text x="253" y="113" class="ts">key that moves</text><text x="236" y="146" class="ts">A key belongs</text><text x="236" y="161" class="ts">to the next</text><text x="236" y="176" class="ts">server clockwise.</text><rect x="350" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="367" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="384" y="34" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="401" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="418" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="435" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="452" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="469" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="486" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="503" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="520" y="34" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="537" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="554" y="34" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="571" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="588" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="605" y="34" width="13" height="13" rx="2.5" class="bar"></rect><rect x="350" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="367" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="384" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="401" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="418" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="435" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="452" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="469" y="51" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="486" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="503" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="520" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="537" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="554" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="571" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="588" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="605" y="51" width="13" height="13" rx="2.5" class="bar"></rect><rect x="350" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="367" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="384" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="401" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="418" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="435" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="452" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="469" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="486" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="503" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="520" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="537" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="554" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="571" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="588" y="68" width="13" height="13" rx="2.5" class="bar"></rect><rect x="605" y="68" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="350" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="367" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="384" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="401" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="418" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="435" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="452" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="469" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="486" y="85" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="503" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="520" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="537" y="85" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="554" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="571" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="588" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="605" y="85" width="13" height="13" rx="2.5" class="bar"></rect><rect x="350" y="102" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="367" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="384" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="401" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="418" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="435" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="452" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="469" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="486" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="503" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="520" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="537" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="554" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="571" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="588" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="605" y="102" width="13" height="13" rx="2.5" class="bar"></rect><rect x="350" y="119" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="367" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="384" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="401" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="418" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="435" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="452" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="469" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="486" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="503" y="119" width="13" height="13" rx="2.5" class="bar mute"></rect><rect x="520" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="537" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="554" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="571" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="588" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="605" y="119" width="13" height="13" rx="2.5" class="bar"></rect><rect x="350" y="146" width="13" height="13" rx="2.5" class="bar"></rect><text x="370" y="157" class="ts">moves to another server</text><rect x="350" y="166" width="13" height="13" rx="2.5" class="bar mute"></rect><text x="370" y="177" class="ts">stays where it is</text><text x="350" y="206" class="ts">With one position for each server the arcs are</text><text x="350" y="221" class="ts">uneven, so this sample can be far from the average</text><text x="350" y="236" class="ts">below. Give each server more positions and it</text><text x="350" y="251" class="ts">comes closer.</text></svg>
+<dl class="results">
+  <div><dt>Keys that move with hash mod N</dt><dd><span data-out="modulo">90.9%</span><svg viewBox="0 0 100 6" preserveAspectRatio="none" style="height:10px;margin-top:.35rem" aria-hidden="true"><rect x="0" y="0" width="100" height="6" style="fill:var(--sunk)"/><rect data-bar="modulo" x="0" y="0" width="90.9%" height="6" style="fill:var(--fault)"/></svg></dd></div>
+  <div><dt>Keys that move with consistent hashing</dt><dd><span data-out="consistent">9.1%</span><svg viewBox="0 0 100 6" preserveAspectRatio="none" style="height:10px;margin-top:.35rem" aria-hidden="true"><rect x="0" y="0" width="100" height="6" style="fill:var(--sunk)"/><rect data-bar="consistent" x="0" y="0" width="9.1%" height="6" style="fill:var(--store)"/></svg></dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Going from 10 to 11 servers, hashing modulo the server count sends 90.9% of keys to a different server. Consistent hashing moves 9.1%, which is only the share the new servers should take.</p>
+</div>
+
+<p>Moving nine tenths of the data to add one tenth more capacity is unworkable. For a cache it means nearly every lookup misses at once. For a database it means copying almost everything across the network while serving traffic. The goal is to move only what the new machine should take, and there are three ways to achieve it.</p>
+
+<h3 id="fixed-partitions">A fixed number of logical partitions</h3>
+<p>Separate the two questions. Hash each key into one of a large, fixed number of logical partitions, say 1,024, and never change that number. Separately, keep a small table saying which machine currently holds each logical partition. Adding a machine means reassigning some whole partitions to it. No key ever changes its partition, so nothing needs rehashing.</p>
+<p>This is the most common approach in practice. Redis Cluster divides the key space into 16,384 slots. Notion hashed each workspace into one of 480 logical shards and placed them on 32 physical databases, 15 to each, so that it could later spread the same logical shards over more machines without touching the routing logic. The one decision that cannot be revisited is the number of logical partitions, so choose it generously.</p>
+
+<h3 id="consistent-hashing">Consistent hashing</h3>
+<p><dfn>Consistent hashing</dfn> achieves the same result with no central table. Picture the output range of the hash function bent into a circle. Each server is placed on the circle at the position given by hashing its name. Each key is hashed to a position too, and belongs to the first server found going clockwise from there.</p>
+
+<figure class="fig wide" id="fig-ring">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f213t f213d">
+<title id="f213t">A consistent hashing ring before and after a node is added</title>
+<desc id="f213d">Two rings. On the first, three nodes A, B and C are placed around a circle, with seven keys between them. Each key belongs to the next node clockwise. On the second, node D has joined between B and C. The two keys that lie between B and D now belong to D instead of C. All other keys keep their owner.</desc>
+<g data-s="1">
+<text class="tl mid" x="180" y="18">Three nodes</text>
+<circle cx="180" cy="140" r="92" fill="none" stroke="var(--rule-2)" stroke-width="2"/>
+<circle class="" cx="259.7" cy="94.0" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="270.6" cy="156.0" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="192.8" cy="231.1" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="151.6" cy="227.5" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="93.5" cy="171.5" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="100.3" cy="94.0" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="164.0" cy="49.4" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="n sig" cx="226.0" cy="60.3" r="15"/>
+<text class="tb mid" x="226.0" y="64.8">A</text>
+<circle class="n sig" cx="226.0" cy="219.7" r="15"/>
+<text class="tb mid" x="226.0" y="224.2">B</text>
+<circle class="n sig" cx="88.0" cy="140.0" r="15"/>
+<text class="tb mid" x="88.0" y="144.5">C</text>
+<text class="ts mid" x="180" y="136">keys belong to the</text>
+<text class="ts mid" x="180" y="152">next node clockwise</text>
+</g>
+<g data-s="2">
+<text class="tl mid" x="540" y="18">Node D joins</text>
+<circle cx="540" cy="140" r="92" fill="none" stroke="var(--rule-2)" stroke-width="2"/>
+</g>
+<g data-s="3">
+<path class="e none async" style="stroke-width:6;stroke-dasharray:none" d="M586.0 219.7A92 92 0 0 1 494.0 219.7"/>
+</g>
+<g data-s="2">
+<circle class="" cx="619.7" cy="94.0" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="630.6" cy="156.0" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+</g>
+<g class="hide" data-s="3">
+<circle class="fill-async" cx="552.8" cy="231.1" r="5.5" stroke="var(--surface)" stroke-width="2"/>
+<circle class="fill-async" cx="511.6" cy="227.5" r="5.5" stroke="var(--surface)" stroke-width="2"/>
+</g>
+<g data-s="2">
+<circle class="" cx="453.5" cy="171.5" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="460.3" cy="94.0" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="" cx="524.0" cy="49.4" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+<circle class="n sig" cx="586.0" cy="60.3" r="15"/>
+<text class="tb mid" x="586.0" y="64.8">A</text>
+<circle class="n sig" cx="586.0" cy="219.7" r="15"/>
+<text class="tb mid" x="586.0" y="224.2">B</text>
+<circle class="n sig" cx="448.0" cy="140.0" r="15"/>
+<text class="tb mid" x="448.0" y="144.5">C</text>
+<circle class="n async" cx="494.0" cy="219.7" r="15"/>
+<text class="tb mid" x="494.0" y="224.2">D</text>
+<text class="ts mid" x="540" y="136">keys belong to the</text>
+<text class="ts mid" x="540" y="152">next node clockwise</text>
+</g>
+<path class="e none dash" d="M360 8V262"/>
+<g data-s="1">
+<text class="ts mid" x="180" y="268">small dots are keys</text>
+</g>
+<g data-s="3">
+<text class="ts mid" x="540" y="268">only the two keys on the highlighted arc move, from C to D</text>
+</g>
+
+<g data-s="2" data-e="2"><circle cx="552.8" cy="231.1" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/><circle cx="511.6" cy="227.5" r="5.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/></g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Nodes: A, B, C; Keys that changed owner: none">Three nodes sit on a ring, placed by hashing their names. Each key, a small dot, is hashed onto the same ring and belongs to the next node clockwise.</li>
+  <li data-state="Nodes: A, B, C, D; Keys that changed owner: none yet">A fourth node, D, joins. Its hash puts it on the ring between B and C.</li>
+  <li data-state="Nodes: A, B, C, D; Keys that changed owner: 2, from C to D">Only the two keys on the arc just before D change owner. They used to reach C first, and now they reach D. Every other key stays where it was.</li>
+</ol>
+<figcaption>Adding node D affects only the arc immediately before it. Keys elsewhere on the ring do not move, and no node other than C gives anything up.</figcaption>
+</figure>
+
+<p>When a server joins, it takes over only the keys between its position and the previous server’s. When one leaves, its keys pass to the next server along. On average, a change to one server out of <i>N</i> moves about one <i>N</i>th of the keys.</p>
+<p>The simple version has two flaws. Servers placed by a hash land unevenly, so some own much larger arcs than others. And when a server leaves, its whole load falls on a single neighbor. Both are fixed by <dfn>virtual nodes</dfn>: each physical server is placed on the ring at many positions, perhaps a hundred or more. Its share of the ring becomes the sum of many small arcs, which averages out the unevenness, and when it leaves, its load is spread across many servers. A more powerful machine can be given more positions.</p>
+<p>Consistent hashing appears wherever keys must be assigned to a changing set of servers without coordination: distributed caches, the Dynamo family of databases, the load balancers in <x-ref to="proxies-and-load-balancers#hashing"></x-ref>, and CDNs choosing which cache holds an object.</p>
+
+<h3 id="dynamic">Splitting as you grow</h3>
+<p>Range-partitioned systems take a third approach. They start with one partition and split any partition in two when it passes a size threshold, 512 MB by default in CockroachDB, then move partitions between machines to keep the load even. The number of partitions tracks the data size automatically. All of this is done by the database, which is a strong reason to prefer databases that have partitioning built in.</p>
+
+<h2 id="shard-key">Choosing the partition key</h2>
+<p>This is the decision that matters most and is hardest to undo, because changing it means moving every record. A good key has four properties.</p>
+<table>
+<thead><tr><th>Property</th><th>Why</th><th>What failure looks like</th></tr></thead>
+<tbody>
+<tr><th>Many distinct values</th><td>The data can only be divided as finely as the key</td><td>Partitioning by country: one partition holds a third of your users and cannot be split</td></tr>
+<tr><th>Even spread of load</th><td>Each partition should get a similar share of reads and writes</td><td>One very active key overloads its partition</td></tr>
+<tr><th>Present in most queries</th><td>A query that includes the key goes to one partition. A query without it goes to all.</td><td>Common queries fan out to every shard</td></tr>
+<tr><th>Never changes</th><td>Changing a record’s key means moving it between machines</td><td>Partitioning by a user’s region, and the user moves</td></tr>
+</tbody>
+</table>
+<p>The third property is the one that shapes the design. For the photo app, consider two choices for the photos table.</p>
+<ul>
+  <li><b>By owner.</b> All of a user’s photos are on one shard. “Show Ana’s photos” touches one shard, and a transaction that updates Ana’s photo and her profile stays on one machine. The risk is a user with millions of followers and thousands of photos making one shard much busier than the others.</li>
+  <li><b>By photo ID.</b> Load is perfectly even. “Show Ana’s photos” must now ask every shard, since her photos are everywhere.</li>
+</ul>
+<p>Most applications have a natural unit that most requests stay inside: a user, a customer account, a conversation, a device. Partitioning by that unit keeps nearly all queries and transactions on one shard. For software sold to businesses, the unit is the tenant, which is why Notion chose the workspace ID. Discord uses the channel, combined with a time window so that no partition grows forever.</p>
+
+<h2 id="hot-keys">Hot keys and skew</h2>
+<p>Hashing spreads keys evenly. It does not spread load evenly if some keys are far more active than others, and real workloads are always uneven: a few users, products or topics receive a large share of all activity.</p>
+
+<figure class="fig wide" id="fig-hot">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f214t f214d">
+<title id="f214t">Load per shard in a cluster with one hot shard</title>
+<desc id="f214d">A bar chart of eight shards. Seven handle between 8 and 10 thousand requests per second. Shard 5 handles 34 thousand, which is above the 30 thousand that one shard can handle.</desc>
+<line class="grid" x1="70" y1="190" x2="700" y2="190"/>
+<text class="ts end" x="62" y="194">0</text>
+<line class="grid" x1="70" y1="152" x2="700" y2="152"/>
+<text class="ts end" x="62" y="156">10</text>
+<line class="grid" x1="70" y1="115" x2="700" y2="115"/>
+<text class="ts end" x="62" y="119">20</text>
+<line class="grid" x1="70" y1="78" x2="700" y2="78"/>
+<text class="ts end" x="62" y="82">30</text>
+<line class="grid" x1="70" y1="40" x2="700" y2="40"/>
+<text class="ts end" x="62" y="44">40</text>
+<path class="bar" d="M90 190v-29.8a4 4 0 0 1 4 -4h40a4 4 0 0 1 4 4v29.8z"/>
+<text class="ts mid" x="114" y="208">shard 1</text>
+<text class="ts mid" x="114" y="150.25">9</text>
+<path class="bar" d="M168 190v-33.5a4 4 0 0 1 4 -4h40a4 4 0 0 1 4 4v33.5z"/>
+<text class="ts mid" x="192" y="208">shard 2</text>
+<text class="ts mid" x="192" y="146.5">10</text>
+<path class="bar" d="M246 190v-26.0a4 4 0 0 1 4 -4h40a4 4 0 0 1 4 4v26.0z"/>
+<text class="ts mid" x="270" y="208">shard 3</text>
+<text class="ts mid" x="270" y="154.0">8</text>
+<path class="bar" d="M324 190v-29.8a4 4 0 0 1 4 -4h40a4 4 0 0 1 4 4v29.8z"/>
+<text class="ts mid" x="348" y="208">shard 4</text>
+<text class="ts mid" x="348" y="150.25">9</text>
+<path class="bar fault" d="M402 190v-123.5a4 4 0 0 1 4 -4h40a4 4 0 0 1 4 4v123.5z"/>
+<text class="ts mid" x="426" y="208">shard 5</text>
+<text class="ts mid" x="426" y="56.5">34</text>
+<path class="bar" d="M480 190v-33.5a4 4 0 0 1 4 -4h40a4 4 0 0 1 4 4v33.5z"/>
+<text class="ts mid" x="504" y="208">shard 6</text>
+<text class="ts mid" x="504" y="146.5">10</text>
+<path class="bar" d="M558 190v-29.8a4 4 0 0 1 4 -4h40a4 4 0 0 1 4 4v29.8z"/>
+<text class="ts mid" x="582" y="208">shard 7</text>
+<text class="ts mid" x="582" y="150.25">9</text>
+<path class="bar" d="M636 190v-29.8a4 4 0 0 1 4 -4h40a4 4 0 0 1 4 4v29.8z"/>
+<text class="ts mid" x="660" y="208">shard 8</text>
+<text class="ts mid" x="660" y="150.25">9</text>
+<path class="e none dash" d="M70 78H700"/>
+<text class="ts end" x="696" y="71.5">what one shard can handle</text>
+<text class="ts mid" transform="translate(22 115.0) rotate(-90)">thousand requests per second</text>
+
+<rect class="hit" x="75" y="36" width="78" height="178" data-tip="Shard 1|9,000 requests per second|30% of what one shard can handle"/>
+<rect class="hit" x="153" y="36" width="78" height="178" data-tip="Shard 2|10,000 requests per second|33% of what one shard can handle"/>
+<rect class="hit" x="231" y="36" width="78" height="178" data-tip="Shard 3|8,000 requests per second|27% of what one shard can handle"/>
+<rect class="hit" x="309" y="36" width="78" height="178" data-tip="Shard 4|9,000 requests per second|30% of what one shard can handle"/>
+<rect class="hit" x="387" y="36" width="78" height="178" data-tip="Shard 5|34,000 requests per second|113% of what one shard can handle|over its limit"/>
+<rect class="hit" x="465" y="36" width="78" height="178" data-tip="Shard 6|10,000 requests per second|33% of what one shard can handle"/>
+<rect class="hit" x="543" y="36" width="78" height="178" data-tip="Shard 7|9,000 requests per second|30% of what one shard can handle"/>
+<rect class="hit" x="621" y="36" width="78" height="178" data-tip="Shard 8|9,000 requests per second|30% of what one shard can handle"/>
+</svg>
+</div>
+<figcaption>An illustrative cluster. In total it is using 41% of its capacity, and it is failing, because one shard is over its limit. Adding shards will not help, since the hot key will still live on one of them.</figcaption>
+</figure>
+
+<p>A partition that is overloaded while the cluster as a whole has room is a <dfn>hot spot</dfn>. Adding machines does not fix it. The remedies work on the key:</p>
+<ul>
+  <li><b>Split the hot key.</b> Append a small number to it, so that <code>post:871</code> becomes <code>post:871#0</code> through <code>post:871#9</code>, spread over ten partitions. Writes pick one at random. Reads must fetch all ten and combine them, so this is only applied to keys known to be hot.</li>
+  <li><b>Add a time component</b>, so that a busy entity’s data is divided into buckets by day or month.</li>
+  <li><b>Isolate the largest tenants</b> on shards of their own, which a directory makes possible.</li>
+  <li><b>Take the reads away</b> with a cache in front (<x-ref to="caching"></x-ref>).</li>
+</ul>
+<p>The “celebrity problem” in feed design is this problem under another name, and <x-ref to="hld-news-feed"></x-ref> works through it.</p>
+
+<h2 id="harder">What you give up</h2>
+<p>On one machine, a database answers any query, joins any tables and makes any set of changes atomic. Once data is partitioned, each of those needs qualification.</p>
+<table>
+<thead><tr><th>Capability</th><th>On one machine</th><th>Across partitions</th></tr></thead>
+<tbody>
+<tr><th>Query by the partition key</th><td>Fast</td><td>Fast: routed to one partition</td></tr>
+<tr><th>Query by anything else</th><td>Fast with an index</td><td><dfn>Scatter-gather</dfn>: sent to every partition and the results merged. As slow as the slowest partition.</td></tr>
+<tr><th>Joins</th><td>Any tables</td><td>Cheap only when both sides share a partition key. Otherwise done in the application or avoided by denormalizing.</td></tr>
+<tr><th>Transactions</th><td>Any rows</td><td>Within one partition as before. Across partitions they need a coordination protocol, which is slower and can block.</td></tr>
+<tr><th>Unique constraints</th><td>Any column</td><td>Only enforceable on columns that include the partition key</td></tr>
+<tr><th>Sequential IDs</th><td>One counter</td><td>No shared counter. IDs must be generated another way.</td></tr>
+<tr><th>Schema changes</th><td>One operation</td><td>One per shard, with shards briefly at different versions</td></tr>
+</tbody>
+</table>
+<p>Scatter-gather deserves a second look, because it interacts with a result from <x-ref to="latency-and-throughput#tail-at-scale"></x-ref>. A query sent to 50 shards waits for the slowest of 50 responses, so its typical latency is close to a single shard’s worst case. It also consumes capacity on every shard, which means such queries do not get cheaper as you add shards. A workload dominated by them gains nothing from partitioning.</p>
+<p>Secondary indexes face the same choice. A <dfn>local index</dfn> lives on each partition and covers only that partition’s rows, so writing is cheap and searching means asking everyone. A <dfn>global index</dfn> covers all partitions and is itself partitioned by the indexed value, so searching is cheap, and every write must update an index on another machine. Global indexes are therefore usually updated asynchronously and can lag behind the data, as DynamoDB’s do.</p>
+<p>Cross-partition transactions are covered in <x-ref to="distributed-transactions"></x-ref>, and ID generation in <x-ref to="unique-ids"></x-ref>. The practical advice is to choose the partition key so that you need neither very often.</p>
+
+<h2 id="routing">Finding the right partition</h2>
+<p>A client with a key needs to reach the machine that holds it, and the answer changes as partitions move. There are three arrangements.</p>
+<table>
+<thead><tr><th>Approach</th><th>How it works</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><th>A routing tier</th><td>Clients connect to a proxy that knows the partition map and forwards each query. The application sees what looks like one database.</td><td>Vitess for MySQL, MongoDB’s router process</td></tr>
+<tr><th>Any node forwards</th><td>Clients connect to any node. If it does not hold the key, it passes the request to the node that does.</td><td>Cassandra, ScyllaDB</td></tr>
+<tr><th>Smart clients</th><td>The client library fetches the partition map and connects straight to the right node</td><td>Redis Cluster clients, and Cassandra drivers as an optimization</td></tr>
+</tbody>
+</table>
+<p>In every case something must hold the authoritative map and tell everyone when it changes. That is a small, critical piece of data that must itself be consistent and highly available, and it is usually kept in a coordination service such as ZooKeeper or etcd (<x-ref to="membership-and-coordination"></x-ref>).</p>
+
+<h2 id="migrating">Sharding a database that is already running</h2>
+<p>Most teams reach partitioning with a live single database and users who must not notice the change. There are two routes.</p>
+<p>The first is to adopt something that does the work: a sharding layer over the database you have, such as Vitess for MySQL or Citus for PostgreSQL, or a database with partitioning built in, such as CockroachDB, YugabyteDB, TiDB, MongoDB, Cassandra or DynamoDB. These handle routing, rebalancing and much of the cross-shard machinery.</p>
+<p>The second is to do it in the application. The procedure Notion published is a good model, and it is the expand-and-contract pattern from <x-ref to="schema-design#migrations"></x-ref> applied to an entire database:</p>
+<ol>
+  <li><b>Choose the key and the layout.</b> Workspace ID, 480 logical shards on 32 databases.</li>
+  <li><b>Double-write.</b> Every write goes to the old database and to the new shards.</li>
+  <li><b>Backfill.</b> Copy existing data to the shards, taking care not to overwrite newer double-written rows. For Notion this took about three days.</li>
+  <li><b>Verify.</b> Compare the old and new stores, and serve some reads from both, checking that the answers match, before any user depends on the new one.</li>
+  <li><b>Switch over</b>, shard by shard or all at once, then stop writing to the old database.</li>
+</ol>
+<p>The verification step is the one that is tempting to shorten and the one that finds the bugs.</p>
+
+<h2 id="table-partitioning">Partitioning inside one database</h2>
+<p>The word “partitioning” is also used for something more modest. PostgreSQL and MySQL can divide one large table into several smaller physical tables on the same server, most often by time: one partition per month of an events table. This does nothing for the limits of the machine. Its benefits are different and useful.</p>
+<ul>
+  <li><b>Queries skip irrelevant partitions.</b> A query for last week does not look at last year.</li>
+  <li><b>Old data is removed by dropping a partition</b>, which is instant, instead of deleting millions of rows.</li>
+  <li><b>Indexes are per partition</b>, so the ones for recent data stay small and in memory.</li>
+</ul>
+<pre data-lang="sql" data-title="A table partitioned by month in PostgreSQL">
+CREATE TABLE events (
+  id          BIGINT NOT NULL,
+  device_id   BIGINT NOT NULL,
+  recorded_at TIMESTAMPTZ NOT NULL,
+  payload     JSONB
+) PARTITION BY RANGE (recorded_at);
+
+CREATE TABLE events_2026_10 PARTITION OF events
+  FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+
+DROP TABLE events_2025_10;   -- a year of retention: remove the oldest month in an instant
+</pre>
+<p>For tables of events, logs and measurements, this is often all the partitioning that is ever needed.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Bring up partitioning when your estimate shows the data or write rate exceeding one machine, and say three things: the key and why (“by user ID, since nearly every query is for one user”), the scheme (“hashed into a fixed number of logical partitions so we can rebalance”), and the cost (“queries across users, such as global search, will go to a separate index”). Then name the hot-key risk before the interviewer does.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Sharding before exhausting simpler options.</b></li>
+  <li><b>Hash mod N</b> with a server count that will change.</li>
+  <li><b>A partition key with few values</b>, or one that changes.</li>
+  <li><b>A key that is absent from the common queries</b>, turning them into scatter-gather.</li>
+  <li><b>Sequential keys with range partitioning</b>, sending all writes to one partition.</li>
+  <li><b>Ignoring skew</b> and discovering the hot key in production.</li>
+  <li><b>Too few logical partitions</b>, fixed forever.</li>
+  <li><b>Assuming transactions and unique constraints still span everything.</b></li>
+  <li><b>Cutting over without comparing old and new data.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="replication"></x-ref>: each partition is replicated.</li>
+  <li><x-ref to="data-models"></x-ref>: key-value and wide-column models are designed around a partition key.</li>
+  <li><x-ref to="distributed-transactions"></x-ref> and <x-ref to="unique-ids"></x-ref>: what replaces cross-shard transactions and sequences.</li>
+  <li><x-ref to="membership-and-coordination"></x-ref>: where the partition map lives.</li>
+  <li><x-ref to="caching"></x-ref> and <x-ref to="proxies-and-load-balancers"></x-ref>: other users of consistent hashing.</li>
+  <li><x-ref to="multi-tenancy"></x-ref>: partitioning by customer.</li>
+  <li><x-ref to="hld-key-value-store"></x-ref>: a full design built on these ideas.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Partitioning splits data across machines to scale writes and size. Use it after cheaper options are exhausted.</li>
+  <li>Range partitioning keeps neighbors together and risks hot spots. Hash partitioning spreads evenly and loses range queries. A directory gives full control at the cost of a lookup.</li>
+  <li>Hash mod N moves almost every key when N changes. Use a fixed number of logical partitions, consistent hashing, or automatic splitting.</li>
+  <li>Consistent hashing moves about one Nth of the keys when one of N servers changes. Virtual nodes even out the load.</li>
+  <li>The partition key should have many values, spread load evenly, appear in most queries and never change.</li>
+  <li>Skewed load creates hot spots that more machines do not cure. Split or isolate the hot keys.</li>
+  <li>Queries without the key fan out to every partition. Joins, transactions and unique constraints across partitions become expensive or unavailable.</li>
+  <li>Partitioning a table by time within one server is a simpler tool with different benefits.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A cache cluster assigns keys with hash mod N. You add one server to a cluster of 20. What happens to the hit ratio, and why?</summary><p>It collapses. About 95% of keys now map to a different server than the one that holds their cached value, so nearly every lookup misses until the cache refills. With consistent hashing only about one key in 21 would have moved.</p></details>
+<details><summary>An events table is range-partitioned by timestamp across ten shards. One shard is overloaded with writes and nine are idle. Why, and what would you change?</summary><p>New events all have recent timestamps, so they all fall in the newest range. Partition by something that spreads writes, such as a hash of the device ID, and keep the timestamp as the sort order within each partition.</p></details>
+<details><summary>Why are virtual nodes used in consistent hashing?</summary><p>With one position per server, the arcs are uneven and a departing server’s whole load lands on one neighbor. Giving each server many positions makes each server’s share an average of many small arcs, which evens the load, and spreads a departing server’s keys over many others.</p></details>
+<details><summary>You partition orders by customer ID. Which of these becomes expensive: listing a customer’s orders, looking up an order by its ID, a report of all orders placed yesterday?</summary><p>Listing a customer’s orders stays on one shard. Looking up by order ID alone must ask every shard, unless the order ID encodes the customer or a global index maps one to the other. Yesterday’s report must scan every shard, and is better served from a separate analytical copy.</p></details>
+<details><summary>A cluster averages 40% utilization and one shard is at 100%. Will doubling the number of shards fix it?</summary><p>Probably not. If the cause is one very active key, that key still lives on a single shard after the split. The fix is to split the hot key across partitions, isolate it, or absorb its reads with a cache.</p></details>
+<details><summary>What is the difference between partitioning a table by month inside PostgreSQL and sharding?</summary><p>Table partitioning divides one table into several on the same server. It makes time-bounded queries and deleting old data cheap, and does not add capacity. Sharding places the pieces on different servers, which adds capacity and brings the costs of cross-shard queries and transactions.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 6, “Partitioning”.</li>
+  <li>David Karger and others, <a href="https://cs.brown.edu/courses/csci2950-u/f09/papers/chash97stoc.pdf">Consistent Hashing and Random Trees</a>, STOC 1997. The original paper.</li>
+  <li>Giuseppe DeCandia and others, <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon’s Highly Available Key-value Store</a>, SOSP 2007. Consistent hashing with virtual nodes in production.</li>
+  <li>Notion, <a href="https://www.notion.com/blog/sharding-postgres-at-notion">Herding elephants: lessons learned from sharding Postgres at Notion</a>, October 2021.</li>
+  <li>Bo Ingram, <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages">How Discord Stores Trillions of Messages</a>, March 2023.</li>
+  <li>Redis documentation, <a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">Redis cluster specification</a>. The 16,384 hash slots.</li>
+  <li><a href="https://vitess.io/docs/">Vitess documentation</a> and <a href="https://docs.citusdata.com/">Citus documentation</a>. Sharding layers for MySQL and PostgreSQL.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/ddl-partitioning.html">Table Partitioning</a>.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html">Best practices for designing and using partition keys effectively in DynamoDB</a>.</li>
+  <li>Cockroach Labs, <a href="https://www.cockroachlabs.com/docs/stable/architecture/distribution-layer">Distribution layer</a>. Ranges and automatic splitting.</li>
+</ol>
+</section>

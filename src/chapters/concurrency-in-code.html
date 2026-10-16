@@ -1,0 +1,820 @@
+<!--meta
+{ "description": "Concurrency inside one program, with measured TypeScript examples: concurrency and parallelism, the event loop and its queues, what blocking the loop costs, awaiting in sequence or together, race conditions across an await, async locks, stale responses and cancellation, worker threads, data races and atomic operations, deadlock, and how to design code that is safe when several things happen at once.",
+  "lede": "A server handles many requests at the same time, and the code for each one reads as if it were alone. Most of the time that illusion holds. This chapter is about where it breaks: two requests that both pass a check only one should pass, a calculation that freezes every other user, two threads that add to a counter and lose half the additions. Every result quoted here was measured by running the code.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">Several things at once</h2>
+<p>The earlier chapters on transactions and distributed systems dealt with many machines touching the same data. The same problems appear inside a single program, and they need to be understood there first, because that is where most of them are written.</p>
+<p>Two words are used for “several things at once”, and they mean different things.</p>
+<ul>
+  <li><dfn>Concurrency</dfn> is dealing with several tasks whose lifetimes overlap. A server with a thousand open requests is concurrent, even if at any instant it is working on one of them.</li>
+  <li><dfn>Parallelism</dfn> is executing several computations at the same instant, on separate processor cores.</li>
+</ul>
+<p>Concurrency is about structure, and parallelism is about hardware. A program can have either without the other. The unit the operating system runs on a core is a <dfn>thread</dfn>: a sequence of instructions with its own call stack. A <dfn>process</dfn> is a running program with its own private memory, containing one or more threads that all share that memory.</p>
+<p>Languages offer two main models for writing concurrent code.</p>
+<table>
+<thead><tr><th></th><th>Many threads, shared memory</th><th>One thread, an event loop</th></tr></thead>
+<tbody>
+<tr><th>Used by</th><td>Java, C#, C++, Go, Rust</td><td>JavaScript and TypeScript, and optionally Python</td></tr>
+<tr><th>A request is handled by</th><td>A thread of its own, which simply waits when it needs the network or the disk</td><td>Callbacks on the one thread, which never waits: it starts the operation and moves on</td></tr>
+<tr><th>Code can be interrupted</th><td>Between any two instructions</td><td>Only where the code itself says <code>await</code></td></tr>
+<tr><th>Uses several cores</th><td>Naturally</td><td>Only by starting more threads or processes explicitly</td></tr>
+<tr><th>Main danger</th><td>Two threads changing the same data at once</td><td>One slow piece of code holding up everything else</td></tr>
+</tbody>
+</table>
+<p>This chapter works in the second model, because this part of the book is in TypeScript, and then shows real threads, because design interviews ask “how would you make this thread-safe?” whatever language you write. The reasoning carries over with one substitution: where a threaded program can be interrupted anywhere, an event-loop program can be interrupted only at an <code>await</code>.</p>
+
+<h2 id="loop">The event loop</h2>
+<p>A JavaScript runtime runs your code on one thread. An <dfn>event loop</dfn> is the program at the center of it: it takes one waiting callback from a queue, runs it until it returns, then takes the next. Network data arriving, a timer expiring and a file finishing its read all become callbacks in that queue.</p>
+<p>Two rules explain nearly all of its behavior.</p>
+<ul>
+  <li><b>Run to completion.</b> Once a piece of code starts, it runs until it returns or reaches an <code>await</code>. Nothing else runs in between.</li>
+  <li><b>Two queues, one with priority.</b> Callbacks from timers, the network and the disk are <dfn>tasks</dfn>, taken one at a time. Callbacks from promises, which includes everything after an <code>await</code>, are <dfn>microtasks</dfn>. All waiting microtasks run as soon as the current code finishes, before the next task.</li>
+</ul>
+<pre data-lang="ts" data-title="Six lines of output, and the order they appear in">
+// In what order do these lines run? The log answers.
+export function order(): Promise<string[]> {
+  const log: string[] = [];
+  return new Promise((done) => {
+    log.push("A  synchronous code, first line");
+    setTimeout(() => {
+      log.push("F  timer callback: a new task");
+      done(log);
+    }, 0);
+    Promise.resolve().then(() => log.push("D  promise callback: a microtask"));
+    (async () => {
+      log.push("B  async function, up to its first await");
+      await null;
+      log.push("E  async function, after the await: a microtask");
+    })();
+    log.push("C  synchronous code, last line");
+  });
+}
+</pre>
+
+<figure class="fig wide" id="fig-loop">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 292" role="img" aria-labelledby="f621t f621d">
+<title id="f621t">The event loop running a five-line program</title>
+<desc id="f621d">On the left, a program of five lines: log A, set a timer whose callback logs F, attach a promise callback that logs D, call an async function that logs B, awaits and then logs E, and log C. On the right, three areas: what is running now, the microtask queue and the task queue. The script runs from top to bottom without interruption, logging A, B and C, while the timer callback is placed in the task queue and the promise callback and the rest of the async function are placed in the microtask queue. When the script ends, the microtasks run in order and log D and E. Only then does the loop take the next task, the timer callback, which logs F.</desc>
+<text class="tb" x="10" y="18">The program</text>
+<text class="ts mono" x="34" y="46">log("A")</text>
+<text class="ts mono" x="34" y="72">setTimeout(logF, 0)</text>
+<text class="ts mono" x="34" y="98">promise.then(logD)</text>
+<text class="ts mono" x="34" y="124">work()</text>
+<text class="ts mono" x="34" y="150">log("C")</text>
+<text class="ts" x="98" y="124">async: log("B"), await, log("E")</text>
+<text class="tb" x="330" y="28">Running now</text>
+<text class="ts end" x="710" y="28">one piece of code at a time, to its end</text>
+<rect class="n sunk" x="330" y="34" width="380" height="36" rx="5"/>
+<text class="tb" x="330" y="98">Microtask queue</text>
+<text class="ts end" x="710" y="98">emptied whenever the running code finishes</text>
+<rect class="n sunk" x="330" y="104" width="380" height="36" rx="5"/>
+<text class="tb" x="330" y="168">Task queue</text>
+<text class="ts end" x="710" y="168">one task for each turn of the loop</text>
+<rect class="n sunk" x="330" y="174" width="380" height="36" rx="5"/>
+<text class="tb" x="330" y="250">Output</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n sig" x="14" y="33" width="8" height="18" rx="2"/>
+<rect class="n sig" x="338" y="40" width="78" height="24" rx="12"/>
+<text class="ts mid" x="377" y="56">the script</text>
+<text class="tb mono" x="330" y="272">A</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n sig" x="14" y="59" width="8" height="18" rx="2"/>
+<rect class="n sig" x="338" y="40" width="78" height="24" rx="12"/>
+<text class="ts mid" x="377" y="56">the script</text>
+<rect class="n store" x="338" y="180" width="84.2" height="24" rx="12"/>
+<text class="ts mid" x="380.1" y="196">timer: logF</text>
+<text class="tb mono" x="330" y="272">A</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n sig" x="14" y="85" width="8" height="18" rx="2"/>
+<rect class="n sig" x="338" y="40" width="78" height="24" rx="12"/>
+<text class="ts mid" x="377" y="56">the script</text>
+<rect class="n async" x="338" y="110" width="40.8" height="24" rx="12"/>
+<text class="ts mid" x="358.4" y="126">logD</text>
+<rect class="n store" x="338" y="180" width="84.2" height="24" rx="12"/>
+<text class="ts mid" x="380.1" y="196">timer: logF</text>
+<text class="tb mono" x="330" y="272">A</text>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n sig" x="14" y="111" width="8" height="18" rx="2"/>
+<rect class="n sig" x="338" y="40" width="78" height="24" rx="12"/>
+<text class="ts mid" x="377" y="56">the script</text>
+<rect class="n sig" x="424" y="40" width="53.2" height="24" rx="12"/>
+<text class="ts mid" x="450.6" y="56">work()</text>
+<rect class="n async" x="338" y="110" width="40.8" height="24" rx="12"/>
+<text class="ts mid" x="358.4" y="126">logD</text>
+<rect class="n async" x="386.8" y="110" width="102.8" height="24" rx="12"/>
+<text class="ts mid" x="438.2" y="126">rest of work()</text>
+<rect class="n store" x="338" y="180" width="84.2" height="24" rx="12"/>
+<text class="ts mid" x="380.1" y="196">timer: logF</text>
+<text class="tb mono" x="330" y="272">A  B</text>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<rect class="n sig" x="14" y="137" width="8" height="18" rx="2"/>
+<rect class="n sig" x="338" y="40" width="78" height="24" rx="12"/>
+<text class="ts mid" x="377" y="56">the script</text>
+<rect class="n async" x="338" y="110" width="40.8" height="24" rx="12"/>
+<text class="ts mid" x="358.4" y="126">logD</text>
+<rect class="n async" x="386.8" y="110" width="102.8" height="24" rx="12"/>
+<text class="ts mid" x="438.2" y="126">rest of work()</text>
+<rect class="n store" x="338" y="180" width="84.2" height="24" rx="12"/>
+<text class="ts mid" x="380.1" y="196">timer: logF</text>
+<text class="tb mono" x="330" y="272">A  B  C</text>
+</g>
+<g class="hide" data-s="6" data-e="6">
+<rect class="n sig" x="338" y="40" width="171" height="24" rx="12"/>
+<text class="ts mid" x="423.5" y="56">logD, then rest of work()</text>
+<rect class="n store" x="338" y="180" width="84.2" height="24" rx="12"/>
+<text class="ts mid" x="380.1" y="196">timer: logF</text>
+<text class="tb mono" x="330" y="272">A  B  C  D  E</text>
+</g>
+<g class="hide" data-s="7">
+<rect class="n sig" x="338" y="40" width="84.2" height="24" rx="12"/>
+<text class="ts mid" x="380.1" y="56">timer: logF</text>
+<text class="tb mono" x="330" y="272">A  B  C  D  E  F</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Output so far: A">The script itself is the first task. It starts running at its first line and logs A. Nothing can interrupt it.</li>
+  <li data-msg="none" data-state="Output so far: A">setTimeout hands the callback to the timer system. With a delay of zero it becomes a task waiting in the task queue. It does not run now.</li>
+  <li data-msg="none" data-state="Output so far: A">Attaching a callback to an already resolved promise does not run it either. It goes into the microtask queue.</li>
+  <li data-msg="none" data-state="Output so far: A B">work() is an async function. It runs like any function up to its first await and logs B. At the await it stops, and the rest of it becomes a microtask.</li>
+  <li data-msg="none" data-state="Output so far: A B C">Control returns to the script, which logs C and reaches its end. Three callbacks are waiting, and none has run.</li>
+  <li data-msg="none" data-state="Output so far: A B C D E">The running code has finished, so the microtask queue is emptied, in order: D, then the rest of work(), which logs E.</li>
+  <li data-msg="none" data-state="Output so far: A B C D E F">With no microtasks left, the loop takes the next task. The timer callback logs F, about a millisecond after it was set and after everything else.</li>
+</ol>
+<figcaption>One thread, one piece of code at a time. Callbacks wait in queues, and promise callbacks are always served before the next timer or network event.</figcaption>
+</figure>
+
+<p>Run on Node.js, the log came out in the order A, B, C, D, E, F, as the letters predict. Three details are worth taking from it.</p>
+<ul>
+  <li><b>An async function starts synchronously.</b> B is logged before C. Calling an async function runs it at once, up to its first <code>await</code>.</li>
+  <li><b><code>await</code> always yields.</b> Even <code>await null</code>, which has nothing to wait for, puts the rest of the function in the microtask queue and lets the caller continue.</li>
+  <li><b>A timer of zero is not immediate.</b> F comes last. The delay is a minimum, and the callback waits for everything already in progress.</li>
+</ul>
+<p>The first rule is a real guarantee, and a valuable one. Between two <code>await</code>s your code has the program’s memory to itself. A stretch of code with no <code>await</code> in it cannot be interleaved with anything, and needs no lock.</p>
+
+<h2 id="blocking">Blocking the loop</h2>
+<p>The same rule has a price. If one callback runs for a long time, nothing else runs at all: no other request is answered, no timer fires, no health check gets a reply. This is called <dfn>blocking</dfn> the event loop.</p>
+<p>The test below set a timer for 10 ms and then counted the prime numbers below three million, which takes most of a second.</p>
+<pre data-lang="ts" data-title="The same calculation in one go and in slices">
+// CPU-bound work, done in one go. Nothing else can run on this thread until it returns.
+export function countPrimes(from: number, to: number): number {
+  let count = 0;
+  for (let n = from; n < to; n += 1) if (isPrime(n)) count += 1;
+  return count;
+}
+
+// The same work in slices. After each slice it lets the event loop run whatever is waiting.
+export async function countPrimesPolitely(from: number, to: number, slice = 20_000): Promise<number> {
+  let count = 0;
+  for (let start = from; start < to; start += slice) {
+    count += countPrimes(start, Math.min(to, start + slice));
+    await nextTurn();
+  }
+  return count;
+}
+</pre>
+<table>
+<thead><tr><th>How the work was done</th><th>Time for the work</th><th>The 10 ms timer fired</th></tr></thead>
+<tbody>
+<tr><th>In one go, on the main thread</th><td>0.8 to 1.0 s</td><td>0.7 to 1.0 s late</td></tr>
+<tr><th>In slices of 20,000 numbers, yielding between them</th><td>About the same</td><td>0 to 1 ms late</td></tr>
+<tr><th>On a worker thread</th><td>About the same</td><td>0 to 1 ms late</td></tr>
+</tbody>
+</table>
+<p>The timer stands for every other user of the server. In the first row they all waited the best part of a second, and had there been ten such calculations queued, they would have waited ten seconds. Work comes in two kinds, and only one of them is a problem here.</p>
+<ul>
+  <li><dfn>I/O-bound</dfn> work spends its time waiting for something outside the program: a database, another service, a disk. It costs the thread nothing while it waits. The event loop handles it well.</li>
+  <li><dfn>CPU-bound</dfn> work spends its time computing: resizing an image, hashing a password, parsing a 50 MB JSON document, a regular expression that backtracks. It occupies the thread for its whole duration.</li>
+</ul>
+<p>There are three remedies, in order of how much they change.</p>
+<ol>
+  <li><b>Slice it.</b> Do a bounded amount, yield to the loop, continue. Simple, and still limited to one core.</li>
+  <li><b>Move it to another thread.</b> A worker thread computes while the main thread stays responsive. This is covered under <a href="#threads">real threads</a> below.</li>
+  <li><b>Move it out of the request.</b> Put a job on a queue and let a separate worker process do it (<x-ref to="message-queues"></x-ref>). This is the usual answer for anything that takes seconds.</li>
+</ol>
+<div class="widget" data-widget="oneloop">
+<h4>How much synchronous work can one event loop carry?</h4>
+<p>The share of the thread used by the synchronous part of each request, and what a single slow operation does to everyone else. Waiting on the network or a database does not count: only time the code itself is running.</p>
+<div class="controls">
+  <label>Requests a second<input type="number" name="rate" value="200" min="1" max="1000000" step="1"></label>
+  <label>Synchronous work in each request, ms<input type="number" name="cpu" value="2" min="0.01" max="10000" step="0.01"></label>
+  <label>One slow synchronous operation, ms<input type="number" name="block" value="200" min="0" max="60000" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Thread in use</dt><dd data-out="busy">40%</dd></div>
+  <div><dt>Ceiling for this thread</dt><dd data-out="ceiling">500 a second</dd></div>
+  <div><dt>Average wait for the thread</dt><dd data-out="wait">667 µs</dd></div>
+  <div><dt>Requests held up by the slow operation</dt><dd data-out="stalled">about 40</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">200 requests a second at 2 ms each keep the thread running code 40% of the time. A request waits 667 µs on average for its turn, assuming random arrivals. The ceiling is 500 a second. One synchronous operation of 200 ms stops everything for that long: about 40 requests arrive during it, and all of them wait.</p>
+</div>
+<aside class="sn"><b>Not quite one thread</b>Node.js runs your JavaScript on one thread, but the runtime has others. Network waiting is handled by the operating system. File access, DNS lookups and some cryptography run on a small internal pool, four threads by default. That pool can be exhausted too, by a burst of slow file reads for example.</aside>
+
+<h2 id="await">Waiting for several things</h2>
+<p>An album page needs the sizes of three photos, each a network call of about 100 ms. The way the awaits are written decides whether the page takes 100 ms or 300.</p>
+<pre data-lang="ts" data-title="In sequence, all at once, and with a limit">
+// One after another: each await finishes before the next call starts.
+export async function inSequence<T, R>(items: T[], fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (const item of items) results.push(await fn(item));
+  return results;
+}
+
+// All at once: every call is started, then all are awaited together.
+export function allAtOnce<T, R>(items: T[], fn: (item: T) => Promise<R>): Promise<R[]> {
+  return Promise.all(items.map(fn));
+}
+
+// At most `limit` at a time. Each of the `limit` runners takes the next item when it finishes one.
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const runner = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next++; // no await between the check and the claim, so no two runners take the same item
+      results[index] = await fn(items[index] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
+  return results;
+}
+</pre>
+
+<figure class="fig wide" id="fig-await">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 268" role="img" aria-labelledby="f622t f622d">
+<title id="f622t">Calls in sequence, all at once, and three at a time</title>
+<desc id="f622d">A timeline from 0 to 300 milliseconds with three groups of bars, as measured in a test. Three calls of 100 milliseconds awaited one after another occupy 0 to 100, 100 to 200 and 200 to 300: 301 milliseconds in total. The same three started together and awaited with Promise.all all occupy 0 to 100: 101 milliseconds. Ten calls of 50 milliseconds limited to three at a time run in three lanes and finish at 201 milliseconds.</desc>
+<text class="tb" x="10" y="26">One after another</text>
+<text class="ts" x="10" y="42">await in a loop</text>
+<text class="ts tb" x="10" y="58">301 ms</text>
+<rect class="n " x="190" y="14" width="168" height="14" rx="3"/>
+<text class="ts mid" x="275" y="25">call 1</text>
+<rect class="n " x="360" y="31" width="168" height="14" rx="3"/>
+<text class="ts mid" x="445" y="42">call 2</text>
+<rect class="n " x="530" y="48" width="168" height="14" rx="3"/>
+<text class="ts mid" x="615" y="59">call 3</text>
+<text class="tb" x="10" y="96">All at once</text>
+<text class="ts" x="10" y="112">Promise.all</text>
+<text class="ts tb" x="10" y="128">101 ms</text>
+<rect class="n sig" x="190" y="84" width="168" height="14" rx="3"/>
+<text class="ts mid" x="275" y="95">call 1</text>
+<rect class="n sig" x="190" y="101" width="168" height="14" rx="3"/>
+<text class="ts mid" x="275" y="112">call 2</text>
+<rect class="n sig" x="190" y="118" width="168" height="14" rx="3"/>
+<text class="ts mid" x="275" y="129">call 3</text>
+<text class="tb" x="10" y="166">Three at a time</text>
+<text class="ts" x="10" y="182">mapLimit(items, 3, …)</text>
+<text class="ts tb" x="10" y="198">ten calls, 201 ms</text>
+<rect class="n store" x="190" y="154" width="83" height="14" rx="3"/>
+<text class="ts mid" x="232.5" y="165">1</text>
+<rect class="n store" x="275" y="154" width="83" height="14" rx="3"/>
+<text class="ts mid" x="317.5" y="165">4</text>
+<rect class="n store" x="360" y="154" width="83" height="14" rx="3"/>
+<text class="ts mid" x="402.5" y="165">7</text>
+<rect class="n store" x="445" y="154" width="83" height="14" rx="3"/>
+<text class="ts mid" x="487.5" y="165">10</text>
+<rect class="n store" x="190" y="171" width="83" height="14" rx="3"/>
+<text class="ts mid" x="232.5" y="182">2</text>
+<rect class="n store" x="275" y="171" width="83" height="14" rx="3"/>
+<text class="ts mid" x="317.5" y="182">5</text>
+<rect class="n store" x="360" y="171" width="83" height="14" rx="3"/>
+<text class="ts mid" x="402.5" y="182">8</text>
+<rect class="n store" x="190" y="188" width="83" height="14" rx="3"/>
+<text class="ts mid" x="232.5" y="199">3</text>
+<rect class="n store" x="275" y="188" width="83" height="14" rx="3"/>
+<text class="ts mid" x="317.5" y="199">6</text>
+<rect class="n store" x="360" y="188" width="83" height="14" rx="3"/>
+<text class="ts mid" x="402.5" y="199">9</text>
+<line class="grid" x1="10" y1="76" x2="710" y2="76"/>
+<line class="grid" x1="10" y1="146" x2="710" y2="146"/>
+<line class="axis" x1="190" y1="222" x2="700" y2="222"/>
+<line class="axis" x1="190" y1="222" x2="190" y2="227"/>
+<text class="ts mid" x="190" y="242">0 ms</text>
+<line class="axis" x1="360" y1="222" x2="360" y2="227"/>
+<text class="ts mid" x="360" y="242">100 ms</text>
+<line class="axis" x1="530" y1="222" x2="530" y2="227"/>
+<text class="ts mid" x="530" y="242">200 ms</text>
+<line class="axis" x1="700" y1="222" x2="700" y2="227"/>
+<text class="ts mid" x="700" y="242">300 ms</text>
+<text class="ts" x="190" y="262">Each bar is one call waiting on the network. Waiting costs the thread nothing, so the waits can overlap.</text>
+</svg>
+</div>
+<figcaption>Awaiting inside a loop adds the waits together. Starting the calls first and awaiting them together costs only the longest. A limit sits between the two, and protects whatever is being called.</figcaption>
+</figure>
+
+<p>The measured times were 301 ms in sequence and 101 ms all at once. Ten calls of 50 ms, at most three at a time, took 201 ms and never had more than three in flight. Four points follow.</p>
+<ul>
+  <li><b>A promise is work already started.</b> <code>items.map(fn)</code> starts every call. <code>Promise.all</code> starts nothing. It only waits for what is already running.</li>
+  <li><b><code>Promise.all</code> fails fast and cancels nothing.</b> If one call rejects, the combined promise rejects at once, and the other calls carry on with their results discarded. Use <code>Promise.allSettled</code> when you want every outcome, as in a page that should show the photos that did load.</li>
+  <li><b>Unlimited concurrency is an unbounded queue.</b> “All at once” over ten thousand items opens ten thousand requests. The work has not got faster. It has moved to the database’s connection pool or the other service’s rate limiter, as a spike (<x-ref to="resilience-patterns#bulkheads"></x-ref>). A limit gives most of the speed and keeps the load predictable.</li>
+  <li><b>A promise nobody awaits can fail silently.</b> An event listener that is an async function returns a promise to an emitter that ignores it. In a test, the emitter’s <code>try</code> block caught nothing, <code>emit</code> returned at once, and the error arrived later as an unhandled rejection, which by default ends a Node.js process. Await every promise, or attach a <code>catch</code> to it.</li>
+</ul>
+
+<h2 id="races">Races without threads</h2>
+<p>A <dfn>race condition</dfn> is a bug in which the result depends on the order in which overlapping operations happen to run. It is often assumed that a single-threaded language cannot have one. It can, and the commonest form is a check followed by an <code>await</code> followed by an action that relied on the check.</p>
+<pre data-lang="ts" data-title="A storage quota, checked wrongly and then correctly">
+export class Quota {
+  readonly limit: number;
+  private bytesUsed = 0;
+  private readonly save: (bytes: number) => Promise<void>;
+
+  constructor(limit: number, save: (bytes: number) => Promise<void>) {
+    this.limit = limit;
+    this.save = save;
+  }
+  get used(): number {
+    return this.bytesUsed;
+  }
+
+  // Broken: the check and the update are separated by an await.
+  async addRacy(bytes: number): Promise<boolean> {
+    if (this.bytesUsed + bytes > this.limit) return false;
+    await this.save(bytes); // other calls run while this one waits here
+    this.bytesUsed += bytes;
+    return true;
+  }
+
+  // Fixed: claim the space before waiting, and give it back if the save fails.
+  async addReserved(bytes: number): Promise<boolean> {
+    if (this.bytesUsed + bytes > this.limit) return false;
+    this.bytesUsed += bytes;
+    try {
+      await this.save(bytes);
+      return true;
+    } catch (error) {
+      this.bytesUsed -= bytes;
+      throw error;
+    }
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-race">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 420" role="img" aria-labelledby="f623t f623d">
+<title id="f623t">Two uploads checking the same quota</title>
+<desc id="f623d">Two sequences between upload A, upload B, a quota with a limit of 50 megabytes and storage. In the first, A asks whether there is room for 30, is told yes and starts saving. While A waits for storage, B asks the same question and is also told yes, because nothing has been recorded. Both saves finish, 30 is added twice, and the quota shows 60 used of 50. In the second, A’s check also claims the 30 before A starts saving. B’s check finds 30 already used, is refused, and the quota ends at 30.</desc>
+<text class="tb" x="10" y="16">Check, wait, then record</text>
+<g data-scene="racy">
+<text class="tb mid" x="70" y="36">Upload A</text>
+<line class="axis" x1="70" y1="44" x2="70" y2="196"/>
+<text class="tb mid" x="220" y="36">Upload B</text>
+<line class="axis" x1="220" y1="44" x2="220" y2="196"/>
+<text class="tb mid" x="430" y="36">Quota</text>
+<line class="axis" x1="430" y1="44" x2="430" y2="196"/>
+<text class="tb mid" x="640" y="36">Storage</text>
+<line class="axis" x1="640" y1="44" x2="640" y2="196"/>
+<g data-s="1">
+<path class="e sig" d="M71 72H429"/>
+<text class="ts mid" x="250.0" y="66">1. room for 30?  yes</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M71 99H639"/>
+<text class="ts mid" x="355.0" y="93">2. save 30, and wait</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M221 126H429"/>
+<text class="ts mid" x="325.0" y="120">3. room for 30?  yes</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M221 153H639"/>
+<text class="ts mid" x="430.0" y="147">4. save 30, and wait</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M639 180H431"/>
+<text class="ts mid" x="535.0" y="174">5. saved, saved: add 30 twice</text>
+</g>
+</g>
+<path class="e none dash" d="M10 212H710"/>
+<text class="tb" x="10" y="232">Check and record together, then wait</text>
+<g data-scene="reserved">
+<text class="tb mid" x="70" y="252">Upload A</text>
+<line class="axis" x1="70" y1="260" x2="70" y2="404"/>
+<text class="tb mid" x="220" y="252">Upload B</text>
+<line class="axis" x1="220" y1="260" x2="220" y2="404"/>
+<text class="tb mid" x="430" y="252">Quota</text>
+<line class="axis" x1="430" y1="260" x2="430" y2="404"/>
+<text class="tb mid" x="640" y="252">Storage</text>
+<line class="axis" x1="640" y1="260" x2="640" y2="404"/>
+<g data-s="1">
+<path class="e sig" d="M71 288H429"/>
+<text class="ts mid" x="250.0" y="282">1. room for 30?  yes, claimed</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M71 315H639"/>
+<text class="ts mid" x="355.0" y="309">2. save 30, and wait</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M221 342H429"/>
+<text class="ts mid" x="325.0" y="336">3. room for 30?</text>
+</g>
+<g data-s="4">
+<path class="e uses" d="M429 369H221"/>
+<text class="ts mid" x="325.0" y="363">4. no</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M639 396H71"/>
+<text class="ts mid" x="355.0" y="390">5. saved</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="racy" data-label="Check, wait, record">
+  <li data-msg="room for 30?" data-state="used: 0 of 50">Upload A asks whether 30 more would fit. Nothing is used and the limit is 50, so the answer is yes.</li>
+  <li data-msg="save" data-state="used: 0 of 50">A starts saving and awaits the result. It has not recorded anything yet. While it waits, the thread is free to run other code.</li>
+  <li data-msg="room for 30?" data-state="used: 0 of 50">That other code is upload B. It asks the same question and gets the same answer, because the number it reads has not changed.</li>
+  <li data-msg="save">B starts saving too. Both uploads now believe they fit.</li>
+  <li data-msg="saved" data-state="used: 60 of 50">Both saves complete and each upload adds its 30. The limit has been passed, and no line of the code is wrong on its own.</li>
+</ol>
+<ol class="steps" data-scene="reserved" data-label="Check and record together">
+  <li data-msg="room for 30?" data-state="used: 30 of 50">A asks and, in the same uninterrupted stretch of code, adds its 30 to the count.</li>
+  <li data-msg="save">Now A waits for storage. The claim is already visible to everyone else.</li>
+  <li data-state="used: 30 of 50">B runs while A waits, as before. This time it reads 30 used, and 30 more would make 60.</li>
+  <li data-state="used: 30 of 50">B is refused. It never reaches storage.</li>
+  <li data-state="used: 30 of 50">A’s save completes. Had it failed, A would have given its 30 back.</li>
+</ol>
+<figcaption>JavaScript cannot be interrupted between two lines, but every <code>await</code> is a place where other code runs. A check made before an await may no longer be true after it.</figcaption>
+</figure>
+
+<p>Five uploads of 30 MB were started together against a limit of 100.</p>
+<table>
+<thead><tr><th>Method</th><th>Uploads accepted</th><th>Recorded as used</th></tr></thead>
+<tbody>
+<tr><th><code>addRacy</code></th><td>5 of 5</td><td>150 of 100</td></tr>
+<tr><th><code>addReserved</code></th><td>3 of 5</td><td>90 of 100</td></tr>
+</tbody>
+</table>
+<p>This is the lost-update and check-then-act family that <x-ref to="transactions#anomalies"></x-ref> described for databases, and the asynchronous singleton of <x-ref to="creational-patterns#async-singleton"></x-ref> was another member of it. The rule for finding these bugs is short: <b>treat every <code>await</code> as a point where anything you have read may have changed.</b> Then there are three ways to fix one, in order of preference.</p>
+<ol>
+  <li><b>Do not wait between the check and the action.</b> <code>addReserved</code> moves the update in front of the <code>await</code>. The check and the claim are then one uninterrupted stretch of code, and the claim is undone if the slow part fails.</li>
+  <li><b>Make the waiting callers take turns.</b> When the check itself needs an <code>await</code>, serialize the whole operation with a lock, as below.</li>
+  <li><b>Let the data store decide.</b> One conditional write or constraint in the database does the check and the update as a single atomic step (<x-ref to="transactions#atomic-ops"></x-ref>).</li>
+</ol>
+
+<h3 id="mutex">A lock for asynchronous code</h3>
+<p>A <dfn>mutex</dfn>, short for mutual exclusion, is a lock that one holder at a time may have. The stretch of code that must not be run by two at once is called a <dfn>critical section</dfn>. JavaScript has no built-in mutex for asynchronous code, and a small one is a chain of promises.</p>
+<pre data-lang="ts" data-title="An async mutex, and one that locks separately for each key">
+// A lock for asynchronous code: the functions given to run() execute one at a time, in order of arrival.
+export class Mutex {
+  private tail: Promise<unknown> = Promise.resolve();
+
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(fn);
+    this.tail = result.catch(() => undefined); // a failure must not block the callers behind it
+    return result;
+  }
+}
+
+// One lock for each key, so that work on different keys does not wait.
+export class KeyedMutex {
+  private readonly locks = new Map<string, { mutex: Mutex; waiting: number }>();
+
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const entry = this.locks.get(key) ?? { mutex: new Mutex(), waiting: 0 };
+    this.locks.set(key, entry);
+    entry.waiting += 1;
+    try {
+      return await entry.mutex.run(fn);
+    } finally {
+      entry.waiting -= 1;
+      if (entry.waiting === 0) this.locks.delete(key); // do not keep a lock for every key ever seen
+    }
+  }
+  get size(): number {
+    return this.locks.size;
+  }
+}
+</pre>
+<p>With the racy method wrapped as <code>mutex.run(() =&gt; quota.addRacy(30))</code>, the same five uploads gave the right answer: three accepted, 90 used. The test also showed what the lock costs. The five calls took 61 ms behind the mutex, against 20 ms with <code>addReserved</code>, because each call’s save now waited for the previous one’s.</p>
+<p>That cost is the “lock held during a network call” that <x-ref to="latency-and-throughput#reduce"></x-ref> warned about. A mutex turns concurrent work back into a queue. Two habits keep the damage small.</p>
+<ul>
+  <li><b>Lock as narrowly as the invariant allows.</b> One user’s quota has nothing to do with another’s. With <code>KeyedMutex</code>, two jobs for Ana and one for Ben, 40 ms each, finished in 81 ms: Ana’s two took turns, and Ben’s did not wait for either.</li>
+  <li><b>Hold it as briefly as possible.</b> Prefer the first remedy, which holds nothing while waiting, whenever the logic permits it.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> A lock in memory protects one process. A real service runs several copies behind a load balancer, and two requests for the same user can land on two of them, each with its own <code>Quota</code> object and its own mutex. Then the only place the check can be made safely is the shared data store: an atomic update, a uniqueness constraint or, where neither fits, a distributed lock with all its caveats (<x-ref to="membership-and-coordination#locks"></x-ref>). In-process locks remain useful for what lives in one process, such as a local cache or a connection being set up.</p></div>
+
+<h3 id="stale">Answers that arrive in the wrong order</h3>
+<p>A search box sends a request on every keystroke. The user types “li” and then “lis”. Nothing guarantees that the answers return in the order the questions were asked. In a test, the first search took 80 ms and the second 20, and the screen ended up showing the results for “li” under a box that said “lis”.</p>
+<pre data-lang="ts" data-title="Keep only the newest answer, and give up on slow ones">
+// Wraps an asynchronous lookup so that only the most recent call's answer is delivered.
+// An earlier call that finishes late resolves to undefined, and its signal is aborted so the work can stop.
+export function latestOnly<A, R>(fn: (arg: A, signal: AbortSignal) => Promise<R>): (arg: A) => Promise<R | undefined> {
+  let current: AbortController | null = null;
+  return async (arg) => {
+    current?.abort();
+    const mine = new AbortController();
+    current = mine;
+    const result = await fn(arg, mine.signal);
+    return mine.signal.aborted ? undefined : result;
+  };
+}
+
+// Gives up on a slow operation. The operation is told through the signal, so it can stop its own work.
+export async function withTimeout<R>(ms: number, fn: (signal: AbortSignal) => Promise<R>): Promise<R> {
+  const signal = AbortSignal.timeout(ms);
+  return Promise.race([
+    fn(signal),
+    new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+  ]);
+}
+</pre>
+<p>Wrapped in <code>latestOnly</code>, the late answer for “li” was discarded and the screen showed “lis”. The wrapper also aborts the earlier request’s <code>AbortSignal</code>, the standard way to tell asynchronous work that its result is no longer wanted, so that a well-behaved <code>fetch</code> or database driver can stop. <code>withTimeout</code> uses the same mechanism: with a limit of 50 ms on an operation that would have taken 500, the caller got a <code>TimeoutError</code> after 51 ms and the operation was told to stop. A timeout that does not cancel leaves the work running to no purpose (<x-ref to="resilience-patterns#timeouts"></x-ref>).</p>
+
+<h2 id="threads">Real threads</h2>
+<p>For CPU-bound work, one thread means one core. Node.js can start more with <dfn>worker threads</dfn>, each with its own event loop and its own memory. By default a worker shares nothing with the thread that started it. Data goes in and out as messages, which are copied.</p>
+<pre data-lang="ts" data-title="Splitting a calculation across worker threads">
+const runWorker = <R>(file: string, workerData: unknown): Promise<R> =>
+  new Promise((resolve, reject) => {
+    const worker = new Worker(new URL(file, import.meta.url), { workerData });
+    worker.once("message", resolve);
+    worker.once("error", reject);
+  });
+
+// Splits the range into equal parts and counts each part on its own thread.
+export async function countPrimesOnThreads(limit: number, threads: number): Promise<number> {
+  const size = Math.ceil(limit / threads);
+  const parts = Array.from({ length: threads }, (_, i) => ({ from: i * size, to: Math.min(limit, (i + 1) * size) }));
+  const counts = await Promise.all(parts.map((part) => runWorker<number>("./primes.worker.ts", part)));
+  return counts.reduce((sum, count) => sum + count, 0);
+}
+</pre>
+<p>On a machine with two cores, counting the primes below six million took 2.1 to 2.7 s on one worker and about 1.5 s on two. The answer was the same, 412,849. Two cores did not make it twice as fast, for a reason worth noticing: the range was split into equal halves, but the upper half is more work, because larger numbers take longer to test. Parallel speed depends on dividing the work evenly, and on how much of it cannot be divided at all.</p>
+<p>Copying messages is safe and sometimes too slow. Threads can instead share one block of memory, a <code>SharedArrayBuffer</code>, and then they face the problem every threaded language has.</p>
+<pre data-lang="ts" data-title="A worker that adds one to a shared counter, many times">
+// Adds one to a shared counter many times, either with a plain read-then-write or with an atomic operation.
+import { parentPort, workerData } from "node:worker_threads";
+
+const { shared, times, atomic } = workerData as { shared: SharedArrayBuffer; times: number; atomic: boolean };
+const counter = new Int32Array(shared);
+for (let i = 0; i < times; i += 1) {
+  if (atomic) Atomics.add(counter, 0, 1);
+  else counter[0] = (counter[0] as number) + 1; // read, add, write: three steps another thread can interleave with
+}
+parentPort?.postMessage("done");
+</pre>
+
+<figure class="fig wide" id="fig-threads">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 338" role="img" aria-labelledby="f624t f624d">
+<title id="f624t">Two threads adding one to the same counter</title>
+<desc id="f624d">Two sequences between thread 1, a counter in shared memory holding 41, and thread 2. In the first, each thread performs counter equals counter plus one as separate steps. Thread 1 reads 41, thread 2 reads 41, thread 1 writes 42, thread 2 writes 42. Two additions were made and the counter rose by one. In the second, each thread uses an atomic add, which reads, adds and writes as one indivisible step. Thread 1 makes it 42 and thread 2 makes it 43.</desc>
+<text class="tb mono" x="10" y="16">counter[0] = counter[0] + 1</text>
+<g data-scene="plain">
+<text class="tb mid" x="110" y="36">Thread 1</text>
+<line class="axis" x1="110" y1="44" x2="110" y2="168"/>
+<text class="tb mid" x="360" y="36">Shared counter</text>
+<line class="axis" x1="360" y1="44" x2="360" y2="168"/>
+<text class="tb mid" x="610" y="36">Thread 2</text>
+<line class="axis" x1="610" y1="44" x2="610" y2="168"/>
+<g data-s="1">
+<path class="e sig" d="M359 72H111"/>
+<text class="ts mid" x="235.0" y="66">1. read 41</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M361 99H609"/>
+<text class="ts mid" x="485.0" y="93">2. read 41</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M111 126H359"/>
+<text class="ts mid" x="235.0" y="120">3. write 42</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M609 153H361"/>
+<text class="ts mid" x="485.0" y="147">4. write 42</text>
+</g>
+</g>
+<path class="e none dash" d="M10 184H710"/>
+<text class="tb mono" x="10" y="204">Atomics.add(counter, 0, 1)</text>
+<g data-scene="atomic">
+<text class="tb mid" x="110" y="224">Thread 1</text>
+<line class="axis" x1="110" y1="232" x2="110" y2="322"/>
+<text class="tb mid" x="360" y="224">Shared counter</text>
+<line class="axis" x1="360" y1="232" x2="360" y2="322"/>
+<text class="tb mid" x="610" y="224">Thread 2</text>
+<line class="axis" x1="610" y1="232" x2="610" y2="322"/>
+<g data-s="1">
+<path class="e store" d="M111 260H359"/>
+<text class="ts mid" x="235.0" y="254">1. add 1: now 42</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M609 287H361"/>
+<text class="ts mid" x="485.0" y="281">2. add 1: now 43</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="plain" data-label="Read, add, write">
+  <li data-msg="41" data-state="counter: 41; additions performed: 0">Thread 1 begins its addition by reading the current value into a register of its own processor core.</li>
+  <li data-msg="41" data-state="counter: 41; additions performed: 0">Thread 2 is running at the same instant on another core. It reads before thread 1 has written, and gets the same 41.</li>
+  <li data-msg="42" data-state="counter: 42; additions performed: 1">Thread 1 adds one and writes the result back.</li>
+  <li data-msg="42" data-state="counter: 42; additions performed: 2">Thread 2 adds one to the 41 it read and writes 42 over the 42 already there. One of the two additions has vanished.</li>
+</ol>
+<ol class="steps" data-scene="atomic" data-label="One atomic step">
+  <li data-msg="add 1" data-state="counter: 42; additions performed: 1">An atomic add is carried out by the processor as one indivisible step. No other thread can read between its read and its write.</li>
+  <li data-msg="add 1" data-state="counter: 43; additions performed: 2">Thread 2’s add happens wholly before or wholly after thread 1’s. Either way both are counted.</li>
+</ol>
+<figcaption>With real threads the interleaving can happen inside a single line. In a test, two threads adding one two million times each produced a different wrong total on every run.</figcaption>
+</figure>
+
+<p>Two workers each added one to the same counter two million times. The correct total is 4,000,000.</p>
+<table>
+<thead><tr><th>How each addition was written</th><th>Final count, over four runs</th></tr></thead>
+<tbody>
+<tr><th><code>counter[0] = counter[0] + 1</code></th><td>2,717,605, then 3,998,704, then 3,032,619, then 3,837,562</td></tr>
+<tr><th><code>Atomics.add(counter, 0, 1)</code></th><td>4,000,000 every time</td></tr>
+</tbody>
+</table>
+<p>A <dfn>data race</dfn> is two threads accessing the same memory at the same time, at least one of them writing, with nothing to order them. The first row shows its two worst properties. The result is wrong by a different amount each time. And in the second run it was wrong by only 1,296 in four million, close enough that a casual test would have passed. An <dfn>atomic operation</dfn> is one that the hardware carries out as a single indivisible step, so that no other thread can observe it half done.</p>
+<p>Atomic operations cover single values. To keep several values consistent with each other, threaded languages use locks: Java’s <code>synchronized</code>, a <code>Mutex</code> in Go or Rust. They work as the async mutex above does, with the same costs, and one further hazard.</p>
+
+<h2 id="deadlock">Deadlock</h2>
+<p>A <dfn>deadlock</dfn> is a state in which each of a group of tasks is waiting for a lock that another task in the group holds. None of them can proceed, and none of them will ever release what it has.</p>
+
+<figure class="fig wide" id="fig-deadlock">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 246" role="img" aria-labelledby="f625t f625d">
+<title id="f625t">Two tasks and two locks, taken in opposite orders and in the same order</title>
+<desc id="f625d">Two pictures, each with task 1, task 2, lock A and lock B. On the left the tasks take the locks in opposite orders. Task 1 holds A and task 2 holds B. Then task 1 waits for B and task 2 waits for A. Each waits for a lock the other holds, and neither can ever continue. On the right both tasks take A before B. Task 1 holds A, and task 2 waits for A while holding nothing. Task 1 takes B, finishes and releases both locks, and task 2 then takes A and B in turn.</desc>
+<text class="tb" x="10" y="18">Opposite orders: 1 takes A then B, 2 takes B then A</text>
+<text class="tb" x="380" y="18">Same order: both take A, then B</text>
+<path class="e none dash" d="M360 8V240"/>
+<g data-scene="cycle">
+<rect class="n" x="10" y="96" width="84" height="40" rx="5"/>
+<text class="ts tb mid" x="52" y="120">Task 1</text>
+<rect class="n" x="246" y="96" width="84" height="40" rx="5"/>
+<text class="ts tb mid" x="288" y="120">Task 2</text>
+<rect class="n sunk" x="130" y="44" width="80" height="32" rx="16"/>
+<text class="ts mid" x="170" y="64">Lock A</text>
+<rect class="n sunk" x="130" y="156" width="80" height="32" rx="16"/>
+<text class="ts mid" x="170" y="176">Lock B</text>
+<g class="hide" data-s="1">
+<path class="e store" d="M130 60L96 104"/>
+<text class="ts end" x="100" y="84">held by</text>
+</g>
+<g class="hide" data-s="2">
+<path class="e store" d="M210 172L244 128"/>
+<text class="ts " x="240" y="154">held by</text>
+</g>
+<g class="hide" data-s="3">
+<path class="e fault" style="stroke-dasharray:5 4" d="M60 138L128 176"/>
+<text class="ts mid" x="40" y="160">waits for</text>
+</g>
+<g class="hide" data-s="4">
+<path class="e fault" style="stroke-dasharray:5 4" d="M280 94L212 56"/>
+<text class="ts mid" x="300" y="80">waits for</text>
+<text class="ts mid" x="170" y="226">Each waits for what the other holds. Neither will ever move.</text>
+</g>
+</g>
+<g data-scene="ordered">
+<rect class="n" x="380" y="96" width="84" height="40" rx="5"/>
+<text class="ts tb mid" x="422" y="120">Task 1</text>
+<rect class="n" x="616" y="96" width="84" height="40" rx="5"/>
+<text class="ts tb mid" x="658" y="120">Task 2</text>
+<rect class="n sunk" x="500" y="44" width="80" height="32" rx="16"/>
+<text class="ts mid" x="540" y="64">Lock A</text>
+<rect class="n sunk" x="500" y="156" width="80" height="32" rx="16"/>
+<text class="ts mid" x="540" y="176">Lock B</text>
+<g class="hide" data-s="1" data-e="3">
+<path class="e store" d="M500 60L466 104"/>
+<text class="ts end" x="470" y="84">held by</text>
+</g>
+<g class="hide" data-s="2" data-e="3">
+<path class="e fault" style="stroke-dasharray:5 4" d="M650 94L582 56"/>
+<text class="ts mid" x="670" y="80">waits for</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<path class="e store" d="M500 172L466 128"/>
+<text class="ts end" x="470" y="154">held by</text>
+</g>
+<g class="hide" data-s="4">
+<path class="e store" d="M580 60L614 104"/>
+<text class="ts " x="610" y="84">held by</text>
+<path class="e store" d="M580 172L614 128"/>
+<text class="ts " x="610" y="154">held by</text>
+<text class="ts mid" x="540" y="226">Task 1 has finished. Task 2 now holds both.</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="cycle" data-label="Opposite orders">
+  <li data-msg="lock A" data-state="Task 1 holds: A; Task 2 holds: nothing">Task 1 moves a photo from album A to album B, so it locks A first. It gets the lock at once.</li>
+  <li data-msg="lock B" data-state="Task 1 holds: A; Task 2 holds: B">Task 2 moves a photo the other way and locks B first. It also succeeds.</li>
+  <li data-msg="none" data-state="Task 1 holds: A, waiting for B; Task 2 holds: B">Task 1 now needs B. It is taken, so task 1 waits, still holding A.</li>
+  <li data-msg="none" data-state="Task 1 holds: A, waiting for B; Task 2 holds: B, waiting for A">Task 2 needs A, which task 1 holds. The waiting forms a circle, and nothing inside the program will ever break it. This is a deadlock.</li>
+</ol>
+<ol class="steps" data-scene="ordered" data-label="Same order">
+  <li data-msg="lock A" data-state="Task 1 holds: A; Task 2 holds: nothing">Both tasks follow one rule: lock A before B, whichever way the photo is moving. Task 1 takes A.</li>
+  <li data-msg="none" data-state="Task 1 holds: A; Task 2 holds: nothing, waiting for A">Task 2 also starts with A and has to wait. The difference is that it waits holding nothing that task 1 needs.</li>
+  <li data-msg="lock B" data-state="Task 1 holds: A and B; Task 2 holds: nothing, waiting for A">Task 1 takes B without competition, does its work and releases both locks.</li>
+  <li data-msg="lock A|lock B" data-state="Task 1 holds: nothing, finished; Task 2 holds: A and B">Task 2 takes A, then B, and does its work. With a fixed order no circle of waiting can form.</li>
+</ol>
+<figcaption>A deadlock needs a circle of tasks each holding one lock and waiting for the next. Taking locks in one agreed order makes the circle impossible.</figcaption>
+</figure>
+
+<p>Moving a photo between two albums must lock both. In a test with the async mutex, one task locked album A and then asked for B, while another locked B and then asked for A. After 300 ms neither had finished, and neither ever would. The repair is a rule about order.</p>
+<pre data-lang="ts" data-title="Always take two locks in the same order">
+// Takes two locks in a fixed order, whatever order the caller named them in.
+export function withBoth<T>(a: [string, Mutex], b: [string, Mutex], fn: () => Promise<T>): Promise<T> {
+  const [first, second] = a[0] < b[0] ? [a[1], b[1]] : [b[1], a[1]];
+  return first.run(() => second.run(fn));
+}
+</pre>
+<p>With both moves going through <code>withBoth</code>, which sorts the two locks by name before taking them, both completed. Databases meet the same problem with row locks and solve it by detecting the cycle and aborting one transaction (<x-ref to="transactions#deadlocks"></x-ref>). Application code rarely has a detector, so it has to prevent the cycle.</p>
+<ul>
+  <li><b>Take locks in one global order</b>, such as by identifier.</li>
+  <li><b>Hold one lock at a time</b> wherever the design allows. A lock that is never held together with another cannot be part of a cycle.</li>
+  <li><b>Never call unknown code while holding a lock.</b> A callback or an event listener may try to take a lock of its own.</li>
+  <li><b>Put a time limit on waiting</b>, so that a deadlock becomes an error that can be seen and retried.</li>
+</ul>
+
+<h2 id="design">Designing for safety</h2>
+<p>Every problem in this chapter needs three ingredients: state that is shared, that can change, and that is touched by operations which overlap. Remove any one and the problem is gone. That gives an order in which to try things, safest first.</p>
+<table>
+<thead><tr><th>Approach</th><th>Removes</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>Do not share</th><td>Sharing</td><td>Each request builds its own objects. Each worker thread has its own memory. Nothing in a module-level variable</td></tr>
+<tr><th>Share only what cannot change</th><td>Change</td><td>Frozen configuration, value objects (<x-ref to="domain-modeling"></x-ref>). Any number of readers is safe</td></tr>
+<tr><th>Give the state one owner and send it messages</th><td>Overlap</td><td>A queue with a single consumer. A worker that owns a resource. This is the idea behind actors and behind Go’s channels</td></tr>
+<tr><th>Use an atomic operation</th><td>Overlap, for one step</td><td><code>Atomics.add</code>. A conditional update in the database. Redis’s <code>INCR</code></td></tr>
+<tr><th>Lock</th><td>Overlap, for a critical section</td><td>A mutex for each key, held briefly, never across a call you do not control</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> “How would you make this thread-safe?” has a method. Name the shared mutable state: the cache’s map, the parking lot’s free spots, the rate limiter’s counters. State the invariant that must hold: no spot assigned twice, never more than the limit. Find the operations that read and then write, since those are the critical sections. Then choose the weakest tool that protects them, and say what granularity you would lock at and why. In TypeScript, add where the awaits are, because those are the only places another request can get in. Finish by saying what changes with several server instances: the lock has to move into the shared store.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>CPU-heavy work in a request handler</th><td>Every other request waits for it</td><td>A worker thread, or a job on a queue</td></tr>
+<tr><th>A synchronous file or crypto call, as a one-off, in a hot path</th><td>The same, a few milliseconds at a time, under load</td><td>The asynchronous version of the call</td></tr>
+<tr><th><code>await</code> inside a loop over independent items</th><td>Latency that grows with the number of items</td><td>Start them together, with a limit</td></tr>
+<tr><th><code>Promise.all</code> over an unbounded list</th><td>A burst that overwhelms the database or the service being called</td><td>A concurrency limit</td></tr>
+<tr><th>A check, then an <code>await</code>, then an action that relies on the check</th><td>Two requests both pass a check that only one should</td><td>Act before waiting, lock, or let the database enforce it</td></tr>
+<tr><th>An in-memory lock in a service that runs as several instances</th><td>Each instance is safe and the system is not</td><td>An atomic operation or constraint in the shared store</td></tr>
+<tr><th>One global mutex around an operation that includes network calls</th><td>The service handles one request at a time</td><td>Lock for each key, and hold the lock for as little as possible</td></tr>
+<tr><th>Showing whichever response arrived last</th><td>Stale data on screen after fast typing or navigation</td><td>Keep only the newest request’s answer, and cancel the rest</td></tr>
+<tr><th>A floating promise: an async call that is neither awaited nor given a <code>catch</code></th><td>Errors that surface nowhere, or end the process</td><td>Await it, or handle its failure where it is started</td></tr>
+<tr><th>Shared memory between threads with plain reads and writes</th><td>Totals that are wrong by a different amount every run</td><td>Messages by default. Atomics or locks if memory must be shared</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="transactions"></x-ref>: the same anomalies between database transactions, and isolation levels as the remedy.</li>
+  <li><x-ref to="latency-and-throughput"></x-ref>: queues, utilization and why a busy thread means long waits.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: timeouts, bulkheads and limits on concurrency between services.</li>
+  <li><x-ref to="membership-and-coordination"></x-ref>: locks that work across machines, and their limits.</li>
+  <li><x-ref to="creational-patterns"></x-ref>: the asynchronous singleton, a race during initialization.</li>
+  <li><x-ref to="lld-lru-cache"></x-ref> and <x-ref to="lld-rate-limiter"></x-ref>: making two small components safe under concurrent use.</li>
+  <li><x-ref to="lld-booking"></x-ref>: preventing two people from getting the same seat.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Concurrency is overlapping tasks. Parallelism is simultaneous execution on several cores. JavaScript gives you the first on one thread.</li>
+  <li>The event loop runs one callback at a time to completion. Promise callbacks run before the next timer or network event.</li>
+  <li>CPU-bound work blocks every other request for as long as it runs. Slice it, move it to a worker thread, or move it to a queue.</li>
+  <li>Awaiting in a loop adds the waits together. Start independent calls together, and limit how many run at once.</li>
+  <li>Every <code>await</code> is a point where shared state may change. A check made before it may be false after it.</li>
+  <li>Fix a race by not waiting between the check and the action, by serializing with a lock for each key, or by making the data store do it atomically.</li>
+  <li>An in-memory lock protects one process. With several instances the protection has to live in the shared store.</li>
+  <li>Threads that share memory need atomic operations or locks. Locks taken in inconsistent order deadlock.</li>
+  <li>The safest designs do not share, share only immutable data, or give each piece of state a single owner.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>What does this print, and why? <code>setTimeout(() =&gt; console.log(1), 0); Promise.resolve().then(() =&gt; console.log(2)); console.log(3);</code></summary><p>3, 2, 1. The synchronous code runs to its end first and prints 3. The promise callback is a microtask, and all microtasks run as soon as the current code finishes, so 2 is next. The timer callback is a task and waits for the next turn of the loop, even with a delay of zero.</p></details>
+<details><summary>A request handler resizes an uploaded image in 400 ms of pure computation. The service receives 5 such requests a second, among 500 ordinary ones. What happens, and what are two ways to fix it?</summary><p>Five resizes a second need 2,000 ms of computation every second on a thread that has 1,000, so the event loop is overloaded on that work alone and every request queues without limit. Even one resize delays every other request by up to 400 ms. Move the resizing to a pool of worker threads, or put a job on a queue and resize in a separate worker process, so that the request thread only coordinates.</p></details>
+<details><summary>A function loads 200 user records with <code>for (const id of ids) users.push(await load(id))</code>, and each load takes 20 ms. How long does it take, and what would you change?</summary><p>About 4 seconds, since the waits are added together. The loads are independent, so start them together with a limit, for example twenty at a time, which takes about 200 ms. Unlimited <code>Promise.all</code> would be fastest on paper and would open 200 connections at once, which may exhaust the database’s pool. Better still, one query that loads all 200.</p></details>
+<details><summary>Find the bug: <code>if (!(await cache.has(key))) { const value = await compute(key); await cache.set(key, value); }</code>, called by many requests for the same key.</summary><p>Check, then await, then act. Every request that arrives before the first <code>set</code> completes sees that the key is missing and runs <code>compute</code> itself, so an expensive computation runs many times at once. This is a cache stampede. Remember the promise of the computation for each key as soon as it starts, so that later callers wait on the same one, or serialize callers with a lock for each key.</p></details>
+<details><summary>A service uses the <code>KeyedMutex</code> from this chapter to stop a user from exceeding their quota. It is then scaled from one instance to three. Is it still correct?</summary><p>No. Each instance has its own mutex and its own view, so two uploads from the same user handled by different instances can both pass the check. The check and the update have to become one atomic operation in the shared database, for example an update that only succeeds if the new total is within the limit, or a row lock inside a transaction.</p></details>
+<details><summary>Two threads each run <code>counter = counter + 1</code> a million times on shared memory and the result is 1,400,000. Explain the missing 600,000, and say why <code>Atomics.add</code> fixes it.</summary><p>The statement is three steps: read, add, write. When both threads read the same value before either writes, both write the same result and one addition is lost. That happened 600,000 times. <code>Atomics.add</code> performs the three steps as one indivisible operation, so every addition starts from the result of the previous one.</p></details>
+<details><summary>Transfers between accounts lock the source account and then the destination. Under load the service occasionally hangs. Why, and what is the smallest fix?</summary><p>A transfer from X to Y and another from Y to X can each take their first lock and then wait for the other’s: a deadlock. Lock the two accounts in a fixed order that does not depend on the direction of the transfer, such as the lower account identifier first. Then no circle of waiting can form.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Node.js, <a href="https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick">The Node.js Event Loop</a> and <a href="https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop">Don’t Block the Event Loop (or the Worker Pool)</a>. The phases of the loop, and the two remedies this chapter calls slicing and moving the work.</li>
+  <li>Node.js documentation, <a href="https://nodejs.org/api/worker_threads.html">Worker threads</a>. What workers are for, and how data is copied, transferred or shared.</li>
+  <li>libuv documentation, <a href="https://docs.libuv.org/en/v1.x/threadpool.html">Thread pool work scheduling</a>. The internal pool and its default size of four.</li>
+  <li>Jake Archibald, <a href="https://jakearchibald.com/2015/tasks-microtasks-queues-and-schedules/">Tasks, microtasks, queues and schedules</a>, 2015. The clearest explanation of the two queues.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Atomics">Atomics</a> and <a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal">AbortSignal</a>.</li>
+  <li>Brian Goetz and others, <cite>Java Concurrency in Practice</cite>, Addison-Wesley, 2006. Still the standard text on shared-memory threads: confinement, immutability, locks and their ordering.</li>
+  <li>Rob Pike, <a href="https://go.dev/blog/waza-talk">Concurrency is not parallelism</a>, a talk introduced on the Go blog by Andrew Gerrand in January 2013. The distinction this chapter opens with.</li>
+  <li>E. G. Coffman, M. J. Elphick and A. Shoshani, “System Deadlocks”, <cite>ACM Computing Surveys</cite>, 1971. The conditions under which deadlock can occur.</li>
+</ol>
+</section>

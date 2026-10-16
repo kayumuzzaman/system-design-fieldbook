@@ -1,0 +1,748 @@
+<!--meta
+{ "description": "Observability explained for system design: metrics, logs and traces, counters and histograms, why percentiles cannot be averaged, structured logging, distributed tracing and context propagation, OpenTelemetry, SLO-based alerting with burn rates, dashboards, and how to debug a problem across services.",
+  "lede": "A running system is a black box unless it was built to explain itself. Observability is the practice of making it emit enough evidence, in the right forms, that you can answer questions about its behavior without shipping new code to ask them. This chapter covers the three kinds of evidence, how they are collected, how to alert on what matters to users, and how the pieces are used together to find a fault.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Knowing what a system is doing</h2>
+<p>The photo app’s feed has become slow for some users. Not all of them, and not all the time. Nothing has crashed, every server reports healthy, and average response time has barely moved. Someone has to find out which users, since when, and why.</p>
+<p>Two words describe the tools for this, and they are often used loosely.</p>
+<ul>
+  <li><dfn>Monitoring</dfn> watches for conditions you decided in advance to care about: the error rate is above 1%, a disk is nearly full. It answers questions you knew to ask.</li>
+  <li><dfn>Observability</dfn> is a property of the system: how well its internal state can be understood from what it emits. It is what lets you answer a question nobody anticipated, such as “why is the feed slow for users with more than a thousand follows, on the new version, in one region?”.</li>
+</ul>
+<p>The more parts a system has, the more the second matters. In a single program a debugger and a log file go a long way. In forty services, the request that failed passed through six of them, and the evidence is in six places.</p>
+
+<h2 id="signals">Three kinds of evidence</h2>
+<p>Systems emit three kinds of <dfn>telemetry</dfn>, often called signals. They describe the same events at different levels of detail and cost.</p>
+
+<figure class="fig wide" id="fig-signals">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 174" role="img" aria-labelledby="f481t f481d">
+<title id="f481t">A metric, a log line and a trace describing the same failure</title>
+<desc id="f481d">Three panels. A metric: the counter http_requests_total for service feed and status 500 has the value 1,204, a number that goes up. It is cheap and tells you that something is wrong and how much, not for whom. A log line: a structured record with a time, the level error, the message tags lookup timed out, a trace ID and a user. It is a record of one event, with detail, and tells you what happened here. A trace: bars for the web service, the feed service inside it, and a database call and a tags call inside that. It is the path and timing of one request and tells you where the time went.</desc>
+<text class="tb" x="10" y="18">Metric</text>
+<rect class="n store" x="10" y="30" width="220" height="96" rx="6"/>
+<text class="ts" x="20" y="50">http_requests_total</text>
+<text class="ts" x="31" y="66">service="feed"  status="500"</text>
+<text class="ts" x="20" y="82">= 1,204</text>
+<text class="ts" x="20" y="98"></text>
+<text class="ts" x="20" y="114">a number that goes up</text>
+<text class="ts" x="10" y="148">Cheap. Tells you that something is</text>
+<text class="ts" x="10" y="163">wrong, and how much. Not for whom.</text>
+<text class="tb" x="250" y="18">Log line</text>
+<rect class="n " x="250" y="30" width="220" height="96" rx="6"/>
+<text class="ts" x="260" y="50">{ "time": "12:01:07.412",</text>
+<text class="ts" x="271" y="66">"level": "error",</text>
+<text class="ts" x="271" y="82">"msg": "tags lookup timed out",</text>
+<text class="ts" x="271" y="98">"trace_id": "4bf9…4736",</text>
+<text class="ts" x="271" y="114">"user": "ana" }</text>
+<text class="ts" x="250" y="148">A record of one event, with detail.</text>
+<text class="ts" x="250" y="163">Tells you what happened here.</text>
+<text class="tb" x="490" y="18">Trace</text>
+<rect class="n async" x="490" y="30" width="220" height="96" rx="6"/>
+<text class="ts" x="490" y="148">The path and timing of one request.</text>
+<text class="ts" x="490" y="163">Tells you where the time went.</text>
+<text class="ts" x="500" y="52">web</text>
+<rect class="n sig" x="560" y="40" width="130" height="14" rx="2"/>
+<text class="ts" x="508" y="72">feed</text>
+<rect class="n sig" x="568" y="60" width="114" height="14" rx="2"/>
+<text class="ts" x="516" y="92">db</text>
+<rect class="n sig" x="574" y="80" width="22" height="14" rx="2"/>
+<text class="ts" x="516" y="112">tags</text>
+<rect class="n sig" x="600" y="100" width="78" height="14" rx="2"/>
+
+</svg>
+</div>
+<figcaption>The same failed request appears in all three. The trace ID in the log line is what lets you move from one to another.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th></th><th>Metrics</th><th>Logs</th><th>Traces</th></tr></thead>
+<tbody>
+<tr><th>What it is</th><td>Numbers measured over time</td><td>Timestamped records of events</td><td>The path of one request through the system</td></tr>
+<tr><th>Answers</th><td>Is something wrong? How much? Since when?</td><td>What exactly happened at this point?</td><td>Where did this request spend its time?</td></tr>
+<tr><th>Cost grows with</th><td>The number of distinct series, not traffic</td><td>Traffic: every event is stored</td><td>Traffic, reduced by sampling</td></tr>
+<tr><th>Good for</th><td>Alerting, dashboards, trends</td><td>Detail, audit, rare events</td><td>Latency and dependencies across services</td></tr>
+<tr><th>Weak at</th><td>Individual requests</td><td>Aggregates and anything across services</td><td>Completeness: most requests are not kept</td></tr>
+</tbody>
+</table>
+<p>A fourth signal, <dfn>profiles</dfn>, records where a program spends CPU time and memory, down to the function. Run continuously at low overhead in production, profiling answers “which code is using the CPU?”, a question the other three cannot.</p>
+<p>The usual route through them during an incident is from cheap to detailed: a metric raises the alarm, a trace shows which service and call are responsible, and logs from that service explain what it was doing.</p>
+
+<h2 id="metrics">Metrics</h2>
+<p>A <dfn>metric</dfn> is a named number, sampled at regular intervals and stored as a time series, the data shape from <x-ref to="specialized-databases#time-series"></x-ref>. There are three basic types.</p>
+<table>
+<thead><tr><th>Type</th><th>Behavior</th><th>Example</th><th>How it is read</th></tr></thead>
+<tbody>
+<tr><th>Counter</th><td>Only goes up, and resets to zero on restart</td><td>Requests served, errors, bytes sent</td><td>As a rate: the increase per second over a window</td></tr>
+<tr><th>Gauge</th><td>Goes up and down</td><td>Queue length, memory in use, connections open</td><td>As its current value</td></tr>
+<tr><th>Histogram</th><td>Counts observations into ranges</td><td>Request duration, response size</td><td>As percentiles and distributions</td></tr>
+</tbody>
+</table>
+<p>Each metric carries <dfn>labels</dfn>, key-value pairs that split it into separate series: the request counter for <code>service="feed", status="500"</code> is one series, and the same counter for <code>status="200"</code> is another. Labels are what make a metric useful, and they are also its cost. Every distinct combination of label values is a series that must be stored and indexed, so five services, twenty endpoints, five status classes and fifty instances already make 25,000 series for one metric. Adding a label with a million values, such as a user ID, multiplies that by a million. This is the cardinality problem from <x-ref to="specialized-databases#cardinality"></x-ref>, and the rule is the one given there: labels are for dimensions with a bounded, small set of values. Identifiers of users and requests go in logs and traces.</p>
+
+<h3 id="what-to-measure">What to measure</h3>
+<p>Two short checklists cover most of what a service and its resources should report.</p>
+<table>
+<thead><tr><th>For every service: RED</th><th>For every resource: USE</th></tr></thead>
+<tbody>
+<tr><td><b>R</b>ate: requests per second</td><td><b>U</b>tilization: how busy it is, as a share of capacity</td></tr>
+<tr><td><b>E</b>rrors: the share that fail</td><td><b>S</b>aturation: how much work is waiting</td></tr>
+<tr><td><b>D</b>uration: how long they take, as a distribution</td><td><b>E</b>rrors: failures of the resource itself</td></tr>
+</tbody>
+</table>
+<p>RED describes what users experience and belongs on every request-serving component. USE describes machines, disks, connection pools and queues, and explains <em>why</em> the first set looks the way it does. Google’s four “golden signals”, latency, traffic, errors and saturation, are the same idea in one list.</p>
+<p>In a query language for metrics, the first two RED numbers for the feed service look like this in Prometheus, a widely used open-source metrics system.</p>
+
+<pre data-lang="text" data-title="rate and error ratio, in PromQL"># requests per second, averaged over the last 5 minutes
+sum(rate(http_requests_total{service="feed"}[5m]))
+
+# share of requests that failed
+sum(rate(http_requests_total{service="feed", status=~"5.."}[5m]))
+  /
+sum(rate(http_requests_total{service="feed"}[5m]))</pre>
+
+<h2 id="histograms">Histograms and percentiles</h2>
+<p><x-ref to="latency-and-throughput#percentiles"></x-ref> argued that latency must be described by percentiles, because an average hides the slow requests that users notice. Computing a percentile exactly needs every individual value, which is far too much to keep for every request on every server. A <dfn>histogram</dfn> keeps counts instead: how many requests took up to 10 ms, how many up to 25 ms, and so on.</p>
+
+<pre data-lang="ts" data-title="histogram.ts">export class Histogram {
+  readonly counts: number[];            // counts[i] = observations <= bounds[i]; last slot is "above all bounds"
+  sum = 0;
+  constructor(readonly bounds: number[]) { this.counts = new Array(bounds.length + 1).fill(0); }
+
+  observe(value: number): void {
+    let i = this.bounds.findIndex((b) => value <= b);
+    if (i < 0) i = this.bounds.length;
+    this.counts[i]++; this.sum += value;
+  }
+
+  get total(): number { return this.counts.reduce((a, b) => a + b, 0); }
+
+  /** Estimates a quantile by assuming values are spread evenly inside the bucket it falls in. */
+  quantile(q: number): number {
+    const rank = q * this.total;
+    let seen = 0;
+    for (let i = 0; i < this.counts.length; i++) {
+      if (seen + this.counts[i] >= rank && this.counts[i] > 0) {
+        if (i === this.bounds.length) return this.bounds[i - 1];      // above the last bound: unknown, report the bound
+        const lower = i === 0 ? 0 : this.bounds[i - 1];
+        return lower + ((rank - seen) / this.counts[i]) * (this.bounds[i] - lower);
+      }
+      seen += this.counts[i];
+    }
+    return NaN;
+  }
+
+  /** Histograms with the same bounds add: this is what makes them work across servers. */
+  merge(other: Histogram): Histogram {
+    const h = new Histogram(this.bounds);
+    for (let i = 0; i < h.counts.length; i++) h.counts[i] = this.counts[i] + other.counts[i];
+    h.sum = this.sum + other.sum;
+    return h;
+  }
+}</pre>
+
+<p>A test with two servers shows both the strength and the weakness. Server A handled 10,000 requests, nearly all between 12 and 28 ms. Server B handled 100, and half of them took 600 ms or more.</p>
+
+<figure class="fig wide" id="fig-histogram">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 252" role="img" aria-labelledby="f482t f482d">
+<title id="f482t">Estimating the 99th percentile from a histogram’s buckets</title>
+<desc id="f482d">A table of eight buckets for 10,100 requests. Up to 10 milliseconds: 0. Up to 25: 8,038. Up to 50: 1,912. Up to 100: 100. Up to 250: 0. Up to 500: 0. Up to 1,000: 50. More: 0. The running totals are 0, 8,038, 9,950, 10,050, 10,050, 10,050, 10,100 and 10,100. The 99th percentile is request number 9,999, which falls in the bucket for 50 to 100 milliseconds, holding requests 9,951 to 10,050. Below, a bar from 50 to 100 milliseconds shows the estimate at 49 percent of the way across, 74.5 milliseconds, and the true value at 79.1 milliseconds.</desc>
+<text class="tb" x="10" y="18">10,100 requests in eight buckets</text>
+<text class="ts tb" x="10" y="50">Bucket, ms</text>
+<text class="ts tb" x="10" y="76">Requests</text>
+<text class="ts tb" x="10" y="102">Running total</text>
+<rect class="n sunk" x="120" y="34" width="68" height="24" rx="3"/>
+<text class="ts mid" x="154.0" y="50">≤ 10</text>
+<rect class="n " x="120" y="60" width="68" height="24" rx="3"/>
+<text class="ts mid" x="154.0" y="76">0</text>
+<rect class="n " x="120" y="86" width="68" height="24" rx="3"/>
+<text class="ts mid" x="154.0" y="102">0</text>
+<rect class="n sunk" x="192" y="34" width="68" height="24" rx="3"/>
+<text class="ts mid" x="226.0" y="50">≤ 25</text>
+<rect class="n " x="192" y="60" width="68" height="24" rx="3"/>
+<text class="ts mid" x="226.0" y="76">8,038</text>
+<rect class="n " x="192" y="86" width="68" height="24" rx="3"/>
+<text class="ts mid" x="226.0" y="102">8,038</text>
+<rect class="n sunk" x="264" y="34" width="68" height="24" rx="3"/>
+<text class="ts mid" x="298.0" y="50">≤ 50</text>
+<rect class="n " x="264" y="60" width="68" height="24" rx="3"/>
+<text class="ts mid" x="298.0" y="76">1,912</text>
+<rect class="n " x="264" y="86" width="68" height="24" rx="3"/>
+<text class="ts mid" x="298.0" y="102">9,950</text>
+<rect class="n async" x="336" y="34" width="68" height="24" rx="3"/>
+<text class="ts mid" x="370.0" y="50">≤ 100</text>
+<rect class="n async" x="336" y="60" width="68" height="24" rx="3"/>
+<text class="ts mid" x="370.0" y="76">100</text>
+<rect class="n async" x="336" y="86" width="68" height="24" rx="3"/>
+<text class="ts mid" x="370.0" y="102">10,050</text>
+<rect class="n sunk" x="408" y="34" width="68" height="24" rx="3"/>
+<text class="ts mid" x="442.0" y="50">≤ 250</text>
+<rect class="n " x="408" y="60" width="68" height="24" rx="3"/>
+<text class="ts mid" x="442.0" y="76">0</text>
+<rect class="n " x="408" y="86" width="68" height="24" rx="3"/>
+<text class="ts mid" x="442.0" y="102">10,050</text>
+<rect class="n sunk" x="480" y="34" width="68" height="24" rx="3"/>
+<text class="ts mid" x="514.0" y="50">≤ 500</text>
+<rect class="n " x="480" y="60" width="68" height="24" rx="3"/>
+<text class="ts mid" x="514.0" y="76">0</text>
+<rect class="n " x="480" y="86" width="68" height="24" rx="3"/>
+<text class="ts mid" x="514.0" y="102">10,050</text>
+<rect class="n sunk" x="552" y="34" width="68" height="24" rx="3"/>
+<text class="ts mid" x="586.0" y="50">≤ 1,000</text>
+<rect class="n " x="552" y="60" width="68" height="24" rx="3"/>
+<text class="ts mid" x="586.0" y="76">50</text>
+<rect class="n " x="552" y="86" width="68" height="24" rx="3"/>
+<text class="ts mid" x="586.0" y="102">10,100</text>
+<rect class="n sunk" x="624" y="34" width="68" height="24" rx="3"/>
+<text class="ts mid" x="658.0" y="50">more</text>
+<rect class="n " x="624" y="60" width="68" height="24" rx="3"/>
+<text class="ts mid" x="658.0" y="76">0</text>
+<rect class="n " x="624" y="86" width="68" height="24" rx="3"/>
+<text class="ts mid" x="658.0" y="102">10,100</text>
+<text class="ts" x="10" y="138">The 99th percentile is request number 9,999. It falls in the bucket for 50 to 100 ms,</text>
+<text class="ts" x="10" y="154">which holds requests 9,951 to 10,050. That is all the histogram knows.</text>
+<rect class="n async" x="120" y="200" width="480" height="22" rx="3"/>
+<text class="ts mid" x="120" y="240">50 ms</text>
+<text class="ts mid" x="600" y="240">100 ms</text>
+<path class="e none" d="M355 192V228"/>
+<text class="ts end" x="349.2" y="188">estimate: 49% of the way across, 74.5 ms</text>
+<path class="e none store" d="M399 192V228"/>
+<text class="ts" x="405.3599999999999" y="188">true value: 79.1 ms</text>
+<rect class="hit" x="120" y="34" width="68" height="76" data-tip="0 to 10 ms|0 requests, 0.0% of all|running total: 0, 0.0%"/>
+<rect class="hit" x="192" y="34" width="68" height="76" data-tip="10 to 25 ms|8,038 requests, 79.6% of all|running total: 8,038, 79.6%"/>
+<rect class="hit" x="264" y="34" width="68" height="76" data-tip="25 to 50 ms|1,912 requests, 18.9% of all|running total: 9,950, 98.5%"/>
+<rect class="hit" x="336" y="34" width="68" height="76" data-tip="50 to 100 ms|100 requests, 1.0% of all|running total: 10,050, 99.5%|request 9,999, the 99th percentile, is in here"/>
+<rect class="hit" x="408" y="34" width="68" height="76" data-tip="100 to 250 ms|0 requests, 0.0% of all|running total: 10,050, 99.5%"/>
+<rect class="hit" x="480" y="34" width="68" height="76" data-tip="250 to 500 ms|0 requests, 0.0% of all|running total: 10,050, 99.5%"/>
+<rect class="hit" x="552" y="34" width="68" height="76" data-tip="500 to 1,000 ms|50 requests, 0.5% of all|running total: 10,100, 100.0%"/>
+<rect class="hit" x="624" y="34" width="68" height="76" data-tip="over 1,000 ms|0 requests, 0.0% of all|running total: 10,100, 100.0%"/>
+</svg>
+</div>
+<figcaption>The merged histogram of both servers. The estimate assumes requests are spread evenly within the bucket, which is never exactly true.</figcaption>
+</figure>
+
+<p>Three results from that test are worth remembering.</p>
+<table>
+<thead><tr><th>Question</th><th>Histogram’s answer</th><th>Exact answer</th></tr></thead>
+<tbody>
+<tr><th>99th percentile of both servers together</th><td>74.5 ms</td><td>79.1 ms</td></tr>
+<tr><th>99th percentile of server A alone</th><td>50.0 ms</td><td>28.0 ms</td></tr>
+<tr><th>Average of the two servers’ 99th percentiles</th><td colspan="2">520 ms, which describes nothing</td></tr>
+</tbody>
+</table>
+<p><b>Histograms merge.</b> Adding the counts of two histograms gives the histogram of the combined traffic. That is why a percentile across a hundred servers, or across the last hour, can be computed after the fact.</p>
+<p><b>Percentiles do not.</b> Server A’s 99th percentile was 50 ms and server B’s was 990 ms. Their average, 520 ms, is wrong by a factor of seven, because server B handled one request in a hundred. You cannot average percentiles, or take a percentile of percentiles. Aggregate the buckets first and compute the percentile last.</p>
+<p><b>The estimate is only as fine as the buckets.</b> For server A alone the histogram said 50 ms when the truth was 28 ms, because the 99th percentile fell at the very top of the 25 to 50 ms bucket and the histogram cannot see inside it. An estimate can be wrong by up to the width of a bucket. Put bucket boundaries where precision matters, above all at the threshold of your latency objective, so that “the share of requests under 250 ms” is counted exactly. Newer histogram formats choose many fine buckets automatically, and the sketches in <x-ref to="probabilistic-structures#quantiles"></x-ref> give bounded relative error by construction.</p>
+
+<pre data-lang="text" data-title="99th percentile across all instances, in PromQL">histogram_quantile(0.99,
+  sum by (le) (rate(http_request_duration_seconds_bucket{service="feed"}[5m])))</pre>
+<p>The query has the right order built in: <code>sum by (le)</code> adds the buckets across instances, and only then is the quantile estimated.</p>
+
+<h2 id="logs">Logs</h2>
+<p>A <dfn>log</dfn> is a record of one event. Logs are the oldest signal and the most detailed, and at scale the most expensive, because their volume follows traffic.</p>
+<p>Two habits make them far more useful.</p>
+<p><b>Structure.</b> Write each line as fields, usually JSON, and not as a sentence. A machine can then filter by <code>level</code>, group by <code>user</code> and join on <code>trace_id</code>. A free-text line has to be picked apart with patterns that break when someone rewords it.</p>
+<p><b>Context.</b> Every line written while handling a request should carry the same identifiers: the trace ID, the user or tenant, the route. Set them once when the request arrives and have the logger attach them automatically, using the same request-scoped context that carried the tenant in <x-ref to="multi-tenancy#context"></x-ref>. One search by trace ID then returns everything every service logged for that request.</p>
+
+<pre data-lang="text" data-title="one structured log line">{"time":"2026-10-10T12:01:07.412Z","level":"error","service":"feed","version":"2026-10-10.3",
+ "msg":"tags lookup timed out","duration_ms":138,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736",
+ "route":"GET /feed","tenant":"acme","region":"eu"}</pre>
+
+<p>What to leave out matters as much. Passwords, tokens, card numbers and personal data do not belong in logs, which are widely readable inside a company, copied to several systems and kept for a long time. Treat a logged secret as leaked.</p>
+<p>Because logs are paid for by the byte, volume needs managing. Log errors and unusual events in full. For routine success, keep a sample, or record it as a metric and not at all as a log. Keep recent logs searchable and move older ones to cheap storage. A service that writes a line for every cache hit will cost more to observe than to run.</p>
+
+<h2 id="traces">Traces</h2>
+<p>A <dfn>trace</dfn> follows one request through every service it touches. It is made of <dfn>spans</dfn>. A span is one unit of work, such as handling a request or running a query, with a start time, a duration, a name, and a reference to the span that caused it. Drawn against time, the spans of a trace form a waterfall.</p>
+
+<figure class="fig wide" id="fig-trace">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 242" role="img" aria-labelledby="f483t f483d">
+<title id="f483t">A trace of one feed request as a waterfall of spans</title>
+<desc id="f483d">Eight spans drawn against a time axis from 0 to 200 milliseconds. The web service’s GET /feed span lasts 212 milliseconds. Inside it, verifying the token takes 4 milliseconds and the feed service’s build feed span takes 195. Inside that, a cache lookup that misses takes 3 milliseconds, a database query for photos takes 40, a batch lookup in the tags service takes 138, and writing the cache takes 4. Inside the tags lookup, a database query for tags takes 130 milliseconds. The tags lookup and its query are highlighted as the slow part.</desc>
+<line class="axis" x1="230" y1="206" x2="230" y2="212"/>
+<text class="ts mid" x="230.0" y="230">0 ms</text>
+<line class="axis" x1="335" y1="206" x2="335" y2="212"/>
+<text class="ts mid" x="335.0" y="230">50 ms</text>
+<line class="axis" x1="440" y1="206" x2="440" y2="212"/>
+<text class="ts mid" x="440.0" y="230">100 ms</text>
+<line class="axis" x1="545" y1="206" x2="545" y2="212"/>
+<text class="ts mid" x="545.0" y="230">150 ms</text>
+<line class="axis" x1="650" y1="206" x2="650" y2="212"/>
+<text class="ts mid" x="650.0" y="230">200 ms</text>
+<line class="axis" x1="230" y1="206" x2="675" y2="206"/>
+<text class="ts" x="10" y="28">web: GET /feed</text>
+<rect class="n sig" x="230.0" y="14" width="445.2" height="18" rx="3"/>
+<text class="ts" x="681.2" y="28">212 ms</text>
+<text class="ts" x="24" y="52">auth: verify token</text>
+<rect class="n " x="234.2" y="38" width="8.4" height="18" rx="3"/>
+<text class="ts" x="248.6" y="52">4 ms</text>
+<text class="ts" x="24" y="76">feed: build feed</text>
+<rect class="n sig" x="251.0" y="62" width="409.5" height="18" rx="3"/>
+<text class="ts" x="666.5" y="76">195 ms</text>
+<text class="ts" x="38" y="100">cache: get feed:ana (miss)</text>
+<rect class="n " x="255.2" y="86" width="6.3" height="18" rx="3"/>
+<text class="ts" x="267.5" y="100">3 ms</text>
+<text class="ts" x="38" y="124">db: select photos</text>
+<rect class="n store" x="267.8" y="110" width="84.0" height="18" rx="3"/>
+<text class="ts" x="357.8" y="124">40 ms</text>
+<text class="ts" x="38" y="148">tags: batch lookup</text>
+<rect class="n fault" x="356.0" y="134" width="289.8" height="18" rx="3"/>
+<text class="ts" x="651.8" y="148">138 ms</text>
+<text class="ts" x="52" y="172">db: select tags</text>
+<rect class="n fault" x="364.4" y="158" width="273.0" height="18" rx="3"/>
+<text class="ts" x="643.4000000000001" y="172">130 ms</text>
+<text class="ts" x="38" y="196">cache: set feed:ana</text>
+<rect class="n " x="647.9" y="182" width="8.4" height="18" rx="3"/>
+<text class="ts" x="662.3" y="196">4 ms</text>
+<rect class="hit" x="6" y="12" width="708" height="22" data-tip="web: GET /feed|212 ms|from 0 ms to 212 ms|the whole request"/>
+<rect class="hit" x="6" y="36" width="708" height="22" data-tip="auth: verify token|4 ms|from 2 ms to 6 ms|2% of the request"/>
+<rect class="hit" x="6" y="60" width="708" height="22" data-tip="feed: build feed|195 ms|from 10 ms to 205 ms|92% of the request"/>
+<rect class="hit" x="6" y="84" width="708" height="22" data-tip="cache: get feed:ana (miss)|3 ms|from 12 ms to 15 ms|1% of the request"/>
+<rect class="hit" x="6" y="108" width="708" height="22" data-tip="db: select photos|40 ms|from 18 ms to 58 ms|19% of the request"/>
+<rect class="hit" x="6" y="132" width="708" height="22" data-tip="tags: batch lookup|138 ms|from 60 ms to 198 ms|65% of the request"/>
+<rect class="hit" x="6" y="156" width="708" height="22" data-tip="db: select tags|130 ms|from 64 ms to 194 ms|61% of the request"/>
+<rect class="hit" x="6" y="180" width="708" height="22" data-tip="cache: set feed:ana|4 ms|from 199 ms to 203 ms|2% of the request"/>
+</svg>
+</div>
+<figcaption>Of 212 ms, 130 are one database query inside the tags service. No metric of the web or feed service alone would have shown that.</figcaption>
+</figure>
+
+<p>For spans from different services to join into one trace, each service must know which trace it is part of. This is <dfn>context propagation</dfn>: the caller sends the trace’s identity with the request, in a header that a W3C standard defines.</p>
+
+<figure class="fig wide" id="fig-propagation">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 204" role="img" aria-labelledby="f484t f484d">
+<title id="f484t">Trace context passed from service to service and through a queue</title>
+<desc id="f484d">A request flows from the browser to the web service, the feed service, a queue and a worker. At every hop the trace ID stays the same, 4bf9 and so on, while the span ID is new: a1 at web, b2 at feed, b2 carried inside the message in the queue, and c3 at the worker. The traceparent header reads 00, then the 32-character trace ID, then the 16-character span ID of the caller, then 01. The fields are the version, the trace ID that is the same at every hop, the caller’s span ID that is new at every hop, and flags, whose last bit says whether this trace is being recorded. Across a queue the header travels inside the message, so the trace survives the wait.</desc>
+<rect class="n" x="10" y="24" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="65" y="48.5">Browser</text>
+<g data-s="1">
+<path class="e" d="M120 44H157"/>
+</g>
+<rect class="n sig" x="157" y="24" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="212" y="48.5">Web</text>
+<g data-s="2">
+<path class="e" d="M267 44H304"/>
+</g>
+<rect class="n sig" x="304" y="24" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="359" y="48.5">Feed</text>
+<g data-s="3">
+<path class="e async" d="M414 44H451"/>
+</g>
+<rect class="n async" x="451" y="24" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="506" y="48.5">Queue</text>
+<g data-s="4">
+<path class="e async" d="M561 44H598"/>
+</g>
+<rect class="n sig" x="598" y="24" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="653" y="48.5">Worker</text>
+<g data-s="1">
+<text class="ts mid" x="212.0" y="84">trace 4bf9…</text>
+<text class="ts mid" x="212.0" y="100">span a1</text>
+</g>
+<g data-s="2">
+<text class="ts mid" x="359.0" y="84">trace 4bf9…</text>
+<text class="ts mid" x="359.0" y="100">span b2</text>
+</g>
+<g data-s="3">
+<text class="ts mid" x="506.0" y="84">trace 4bf9…</text>
+<text class="ts mid" x="506.0" y="100">span b2 (in message)</text>
+</g>
+<g data-s="4">
+<text class="ts mid" x="653.0" y="84">trace 4bf9…</text>
+<text class="ts mid" x="653.0" y="100">span c3</text>
+</g>
+<g data-s="5">
+<rect class="n sunk" x="10" y="122" width="700" height="30" rx="4"/>
+<text class="ts" x="22" y="142">traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</text>
+</g>
+<text class="ts" x="10" y="176">Fields: version, trace ID (the same at every hop), the caller’s span ID (new at every hop), and flags. The last bit says</text>
+<text class="ts" x="10" y="192">whether this trace is being recorded. Across a queue the header travels inside the message, so the trace survives the wait.</text>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="request">The web service is the first to see the request. It creates a trace ID and its own span, a1.</li>
+  <li data-msg="trace 4bf9, span a1">It calls the feed service and sends both IDs in a header. Feed keeps the trace ID and opens a new span, b2, whose parent is a1.</li>
+  <li data-msg="trace 4bf9, span b2">Feed puts a message on a queue. There is no HTTP header here, so the context has to be written into the message itself.</li>
+  <li data-msg="trace 4bf9, span b2">Later, a worker takes the message, reads the context out of it, and opens span c3 in the same trace.</li>
+  <li>This is the whole mechanism: one header carrying the trace ID, the caller’s span ID and a flag saying whether the trace is being recorded.</li>
+</ol>
+<figcaption>Propagation fails silently. One service or one queue that drops the header splits every trace through it in two.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="trace-context.ts">import { randomBytes } from "node:crypto";
+
+type TraceContext = { traceId: string; spanId: string; sampled: boolean };
+
+export function parseTraceparent(header: string): TraceContext | undefined {
+  const m = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/.exec(header);
+  if (!m || /^0+$/.test(m[1]) || /^0+$/.test(m[2])) return undefined;
+  return { traceId: m[1], spanId: m[2], sampled: (parseInt(m[3], 16) & 1) === 1 };
+}
+
+export function formatTraceparent(c: TraceContext): string {
+  return `00-${c.traceId}-${c.spanId}-${c.sampled ? "01" : "00"}`;
+}
+
+/** A new span in the same trace: the trace ID is kept, the span ID is new. */
+export function childOf(parent: TraceContext): TraceContext {
+  return { traceId: parent.traceId, spanId: randomBytes(8).toString("hex"), sampled: parent.sampled };
+}
+
+/** Starts a trace, deciding once whether it is sampled. Every service downstream follows the decision. */
+export function startTrace(sampleRate: number): TraceContext {
+  const traceId = randomBytes(16).toString("hex");
+  const sampled = parseInt(traceId.slice(-8), 16) / 2 ** 32 < sampleRate;
+  return { traceId, spanId: randomBytes(8).toString("hex"), sampled };
+}</pre>
+
+<p>In practice you rarely write this. Instrumentation libraries create spans for incoming requests, outgoing calls and database queries, and pass the header along. What you add by hand are spans around your own important operations, and the propagation through anything the libraries do not know about, which usually means messages and jobs, as <x-ref to="event-driven-architecture#tracing"></x-ref> described.</p>
+
+<h3 id="sampling">Sampling</h3>
+<p>Recording every span of every request is rarely affordable, so traces are sampled. There are two places to decide.</p>
+<table>
+<thead><tr><th></th><th>Head sampling</th><th>Tail sampling</th></tr></thead>
+<tbody>
+<tr><th>Decided</th><td>At the first service, before anything is known</td><td>After the trace is complete</td></tr>
+<tr><th>Keeps</th><td>A random share, such as 1 in 100</td><td>Whatever is interesting: errors, slow requests, plus a random share</td></tr>
+<tr><th>Cost</th><td>Low: unsampled requests record nothing</td><td>Every span must be collected and held until the trace ends</td></tr>
+<tr><th>Weakness</th><td>The one failing request in ten thousand is probably not kept</td><td>More machinery, and more data in motion</td></tr>
+</tbody>
+</table>
+<p>The function above is a head sampler. Deciding from the trace ID, and carrying the decision in the header’s flag, means every service agrees and a trace is either kept whole or not at all. In a test of 20,000 traces at a rate of 10%, it kept 2,035.</p>
+
+<h2 id="opentelemetry">Collecting it: OpenTelemetry</h2>
+<p>For years each monitoring vendor had its own libraries, and changing vendor meant re-instrumenting every service. <dfn>OpenTelemetry</dfn> is the open standard that replaced them. It defines an API for producing all the signals, libraries that implement it for each language, a wire protocol called OTLP, and a <dfn>collector</dfn>: a separate process that receives telemetry, batches and filters it, and forwards it wherever you choose.</p>
+
+<figure class="fig wide" id="fig-otelpipe">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 166" role="img" aria-labelledby="f485t f485d">
+<title id="f485t">A telemetry pipeline from services to storage, dashboards and alerts</title>
+<desc id="f485d">Your services, with an SDK or agent, send telemetry over the OTLP protocol to a collector that batches, filters and samples it. The collector forwards to three stores: a metrics store of time series, a log store of searchable text, and a trace store of spans by trace ID. Dashboards read from all three, and alerts read from the metrics store. There is one instrumentation standard in the services, and where the data goes is decided in the collector.</desc>
+<rect class="n sig" x="10" y="30" width="130" height="50" rx="6"/>
+<text class="ts tb mid" x="75" y="51">Your services</text>
+<text class="ts mid" x="75" y="68">SDK or agent</text>
+<rect class="n async" x="200" y="30" width="130" height="50" rx="6"/>
+<text class="ts tb mid" x="265" y="51">Collector</text>
+<text class="ts mid" x="265" y="68">batch, filter, sample</text>
+<path class="e" d="M140 55H200"/>
+<text class="ts mid" x="170" y="47">OTLP</text>
+<rect class="n store" x="400" y="8" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="470" y="26">Metrics store</text>
+<text class="ts mid" x="470" y="43">time series</text>
+<path class="e store" d="M330 55C365 55 365 30 400 30"/>
+<rect class="n store" x="400" y="60" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="470" y="78">Log store</text>
+<text class="ts mid" x="470" y="95">searchable text</text>
+<path class="e store" d="M330 55C365 55 365 82 400 82"/>
+<rect class="n store" x="400" y="112" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="470" y="130">Trace store</text>
+<text class="ts mid" x="470" y="147">spans by trace ID</text>
+<path class="e store" d="M330 55C365 55 365 134 400 134"/>
+<rect class="n fault" x="600" y="8" width="110" height="34" rx="6"/>
+<text class="ts tb mid" x="655" y="29.5">Alerts</text>
+<rect class="n" x="600" y="72" width="110" height="44" rx="6"/>
+<text class="ts tb mid" x="655" y="98.5">Dashboards</text>
+<path class="e fault" d="M540 20H600"/>
+<path class="e" d="M540 40C570 40 570 84 600 84"/>
+<path class="e" d="M540 82C570 82 570 94 600 94"/>
+<path class="e" d="M540 134C570 134 570 104 600 104"/>
+<text class="ts" x="10" y="110">One instrumentation standard in the services.</text>
+<text class="ts" x="10" y="125">Where the data goes is decided in the collector.</text>
+</svg>
+</div>
+<figcaption>Instrument once, to a standard. The choice of storage and vendor becomes configuration in the collector.</figcaption>
+</figure>
+
+<p>As of October 2026, OpenTelemetry’s tracing, metrics and logs are stable, and its profiling signal entered public alpha in March 2026. Metrics are also still widely collected the way Prometheus introduced, in which the monitoring system fetches, or scrapes, a page of current values from every instance on a schedule. Pulling has a useful side effect, since an instance that cannot be scraped is itself a signal, and the two approaches coexist in most systems.</p>
+<p>Designing the storage side, a system that ingests and queries this data at scale, is a problem of its own and the subject of <x-ref to="hld-metrics-and-logging"></x-ref>.</p>
+
+<h2 id="alerting">Alerting</h2>
+<p>An <dfn>alert</dfn> interrupts a person. That is expensive, and the cost is not only the interruption. A team that is paged often for things that turn out not to matter learns to ignore pages, and then ignores the one that matters. Good alerting is mostly a matter of alerting on less.</p>
+
+<figure class="fig wide" id="fig-alerts">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 212" role="img" aria-labelledby="f486t f486d">
+<title id="f486t">Causes compared with symptoms as the basis for alerts</title>
+<desc id="f486d">On the left, six causes, which are many and often harmless: CPU above 90 percent on one node, a pod restarted, queue depth rising, replica lag of 4 seconds, a disk 80 percent full, and a drop in cache hit ratio. These belong on dashboards, and deserve a ticket only if they predict trouble, such as a disk that will fill. On the right, three symptoms, which are few and always matter: users see errors, users wait too long, and results are wrong or stale. Each of these should page someone. A symptom alert fires whatever the cause, including causes nobody thought of.</desc>
+<text class="tb" x="10" y="18">Causes: many, and often harmless</text>
+<text class="tb" x="400" y="18">Symptoms: few, and always matter</text>
+<rect class="n" x="10" y="30" width="160" height="30" rx="6"/>
+<text class="ts mid" x="90" y="49.5">CPU above 90% on one node</text>
+<rect class="n" x="180" y="30" width="160" height="30" rx="6"/>
+<text class="ts mid" x="260" y="49.5">A pod restarted</text>
+<rect class="n" x="10" y="70" width="160" height="30" rx="6"/>
+<text class="ts mid" x="90" y="89.5">Queue depth rising</text>
+<rect class="n" x="180" y="70" width="160" height="30" rx="6"/>
+<text class="ts mid" x="260" y="89.5">Replica lag 4 s</text>
+<rect class="n" x="10" y="110" width="160" height="30" rx="6"/>
+<text class="ts mid" x="90" y="129.5">Disk 80% full</text>
+<rect class="n" x="180" y="110" width="160" height="30" rx="6"/>
+<text class="ts mid" x="260" y="129.5">Cache hit ratio dropped</text>
+<rect class="n fault" x="400" y="30" width="220" height="30" rx="6"/>
+<text class="ts tb mid" x="510" y="49.5">Users see errors</text>
+<rect class="n fault" x="400" y="70" width="220" height="30" rx="6"/>
+<text class="ts tb mid" x="510" y="89.5">Users wait too long</text>
+<rect class="n fault" x="400" y="110" width="220" height="30" rx="6"/>
+<text class="ts tb mid" x="510" y="129.5">Results are wrong or stale</text>
+<text class="ts tb" x="640" y="49">page</text>
+<text class="ts tb" x="640" y="89">page</text>
+<text class="ts tb" x="640" y="129">page</text>
+<text class="ts" x="10" y="172">Show on dashboards. Alert as a</text>
+<text class="ts" x="10" y="187">ticket only if it predicts trouble,</text>
+<text class="ts" x="10" y="202">such as a disk that will fill.</text>
+<text class="ts" x="400" y="172">Wake someone. A symptom alert fires whatever</text>
+<text class="ts" x="400" y="187">the cause, including causes nobody thought of.</text>
+</svg>
+</div>
+<figcaption>Page on what users experience. Use everything else to explain it.</figcaption>
+</figure>
+
+<p>The principle is to alert on <em>symptoms</em>, the things users experience, and not on <em>causes</em>. A node at 95% CPU may be working exactly as intended. A restarted pod was replaced before anyone noticed. Meanwhile an outage caused by an expired certificate raises no CPU alarm at all. An alert on the error rate catches every cause, including the ones nobody predicted.</p>
+<p>“Users see errors” needs a number, and <x-ref to="availability-and-reliability#slo"></x-ref> supplied one: the service level objective and its <dfn>error budget</dfn>. A 99.9% objective over 30 days allows 0.1% of requests to fail. The alerting question becomes: is the budget being spent too fast?</p>
+<p>The <dfn>burn rate</dfn> is the answer as a single number: the current error rate divided by the error rate the objective allows. At a burn rate of 1 the budget lasts exactly the 30 days. At 10 it is gone in three.</p>
+
+<figure class="fig wide" id="fig-burn">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 252" role="img" aria-labelledby="f487t f487d">
+<title id="f487t">Error budget remaining over a month at three burn rates</title>
+<desc id="f487d">A chart of error budget left, from 100 percent to 0, against days from 0 to 30. At a burn rate of 1 the line falls steadily and reaches zero on day 30. At a burn rate of 6 it reaches zero on day 5. At a burn rate of 14.4 it reaches zero after 50 hours. A 99.9 percent objective over 30 days allows 0.1 percent of requests to fail. Burn rate is how fast that allowance is being used, as a multiple of the rate that would use exactly all of it. The steeper the line, the sooner someone must act.</desc>
+<line class="axis" x1="64" y1="204" x2="470" y2="204"/>
+<text class="ts end" x="56" y="208.0">0%</text>
+<line class="grid" x1="64" y1="159" x2="470" y2="159"/>
+<text class="ts end" x="56" y="163.0">25%</text>
+<line class="grid" x1="64" y1="114" x2="470" y2="114"/>
+<text class="ts end" x="56" y="118.0">50%</text>
+<line class="grid" x1="64" y1="69" x2="470" y2="69"/>
+<text class="ts end" x="56" y="73.0">75%</text>
+<line class="grid" x1="64" y1="24" x2="470" y2="24"/>
+<text class="ts end" x="56" y="28.0">100%</text>
+<text class="ts mid" x="64.0" y="222">0</text>
+<text class="ts mid" x="131.66666666666666" y="222">5</text>
+<text class="ts mid" x="199.33333333333331" y="222">10</text>
+<text class="ts mid" x="267.0" y="222">15</text>
+<text class="ts mid" x="334.66666666666663" y="222">20</text>
+<text class="ts mid" x="402.33333333333337" y="222">25</text>
+<text class="ts mid" x="470.0" y="222">30</text>
+<text class="ts mid" x="267.0" y="242">days</text>
+<text class="ts mid" transform="translate(14 114) rotate(-90)">error budget left</text>
+<path class="line" style="stroke:var(--store)" d="M64.0 24.0L470.0 204.0"/>
+<text class="ts" x="321.1333333333333" y="117.60000000000001">1×: lasts the month</text>
+<path class="line" style="stroke:var(--async)" d="M64.0 24.0L131.7 204.0"/>
+<text class="ts" x="137.08" y="150.0">6×: gone in 5 days</text>
+<path class="line" style="stroke:var(--fault)" d="M64.0 24.0L92.2 204.0"/>
+<text class="ts" x="142.49333333333334" y="195.0">14.4×: gone in 50 hours</text>
+<text class="ts" x="492" y="40">A 99.9% objective over 30 days</text>
+<text class="ts" x="492" y="56">allows 0.1% of requests to fail.</text>
+<text class="ts" x="492" y="92">Burn rate is how fast that</text>
+<text class="ts" x="492" y="108">allowance is being used, as a</text>
+<text class="ts" x="492" y="124">multiple of the rate that would</text>
+<text class="ts" x="492" y="140">use exactly all of it.</text>
+<text class="ts" x="492" y="176">The steeper the line, the sooner</text>
+<text class="ts" x="492" y="192">someone must act.</text>
+<rect class="hit" x="64" y="24" width="6.8" height="180" data-tip="Day 0|at 1×: 100% left|at 6×: 100% left|at 14.4×: 100% left"/>
+<rect class="hit" x="70.8" y="24" width="13.5" height="180" data-tip="Day 1|at 1×: 97% left|at 6×: 80% left|at 14.4×: 52% left"/>
+<rect class="hit" x="84.3" y="24" width="13.5" height="180" data-tip="Day 2|at 1×: 93% left|at 6×: 60% left|at 14.4×: 4% left"/>
+<rect class="hit" x="97.8" y="24" width="13.5" height="180" data-tip="Day 3|at 1×: 90% left|at 6×: 40% left|at 14.4×: none left"/>
+<rect class="hit" x="111.4" y="24" width="13.5" height="180" data-tip="Day 4|at 1×: 87% left|at 6×: 20% left|at 14.4×: none left"/>
+<rect class="hit" x="124.9" y="24" width="13.5" height="180" data-tip="Day 5|at 1×: 83% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="138.4" y="24" width="13.5" height="180" data-tip="Day 6|at 1×: 80% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="152.0" y="24" width="13.5" height="180" data-tip="Day 7|at 1×: 77% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="165.5" y="24" width="13.5" height="180" data-tip="Day 8|at 1×: 73% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="179.0" y="24" width="13.5" height="180" data-tip="Day 9|at 1×: 70% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="192.6" y="24" width="13.5" height="180" data-tip="Day 10|at 1×: 67% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="206.1" y="24" width="13.5" height="180" data-tip="Day 11|at 1×: 63% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="219.6" y="24" width="13.5" height="180" data-tip="Day 12|at 1×: 60% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="233.2" y="24" width="13.5" height="180" data-tip="Day 13|at 1×: 57% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="246.7" y="24" width="13.5" height="180" data-tip="Day 14|at 1×: 53% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="260.2" y="24" width="13.5" height="180" data-tip="Day 15|at 1×: 50% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="273.8" y="24" width="13.5" height="180" data-tip="Day 16|at 1×: 47% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="287.3" y="24" width="13.5" height="180" data-tip="Day 17|at 1×: 43% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="300.8" y="24" width="13.5" height="180" data-tip="Day 18|at 1×: 40% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="314.4" y="24" width="13.5" height="180" data-tip="Day 19|at 1×: 37% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="327.9" y="24" width="13.5" height="180" data-tip="Day 20|at 1×: 33% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="341.4" y="24" width="13.5" height="180" data-tip="Day 21|at 1×: 30% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="355.0" y="24" width="13.5" height="180" data-tip="Day 22|at 1×: 27% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="368.5" y="24" width="13.5" height="180" data-tip="Day 23|at 1×: 23% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="382.0" y="24" width="13.5" height="180" data-tip="Day 24|at 1×: 20% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="395.6" y="24" width="13.5" height="180" data-tip="Day 25|at 1×: 17% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="409.1" y="24" width="13.5" height="180" data-tip="Day 26|at 1×: 13% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="422.6" y="24" width="13.5" height="180" data-tip="Day 27|at 1×: 10% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="436.2" y="24" width="13.5" height="180" data-tip="Day 28|at 1×: 7% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="449.7" y="24" width="13.5" height="180" data-tip="Day 29|at 1×: 3% left|at 6×: none left|at 14.4×: none left"/>
+<rect class="hit" x="463.2" y="24" width="6.8" height="180" data-tip="Day 30|at 1×: none left|at 6×: none left|at 14.4×: none left"/>
+</svg>
+</div>
+<figcaption>The three rates are the thresholds in the table below.</figcaption>
+</figure>
+
+<div class="widget" data-widget="burnrate">
+<h4>Error budget and burn rate</h4>
+<p>How fast an error rate uses up the budget an objective allows, and what that calls for.</p>
+<div class="controls">
+  <label>Objective, %<input type="number" name="slo" value="99.9" min="50" max="99.999" step="0.05"></label>
+  <label>Window, in days<input type="number" name="window" value="30" min="1" max="365" step="1"></label>
+  <label>Current error rate, %<input type="number" name="errors" value="1" min="0" max="100" step="0.1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 210" role="img" aria-label="The error budget left over the window. A dashed line shows the allowed rate, which reaches zero on the last day. A solid line shows the current rate."><line x1="56" x2="620" y1="22" y2="22" class="grid"></line><text x="48" y="26" class="ts end">100%</text><line x1="56" x2="620" y1="96" y2="96" class="grid"></line><text x="48" y="100" class="ts end">50%</text><line x1="56" x2="620" y1="170" y2="170" class="axis"></line><text x="48" y="174" class="ts end">0%</text><text x="56" y="187" class="ts">day 0</text><text x="620" y="187" class="ts end">day 30</text><text x="338" y="204" class="ts mid">Error budget left, if the error rate stays as it is</text><path d="M56 22 L620 170" class="e none dash"></path><text x="470.1" y="122.6" class="ts">allowed: gone on the last day</text><path d="M56 22 L112.4 170 L620 170" class="line" style="stroke:var(--fault)"></path><circle cx="112.4" cy="170" r="5.5" class="dot fill-fault"></circle><text x="120.4" y="160" class="tb">gone after 3 days</text></svg>
+<dl class="results">
+  <div><dt>Error budget</dt><dd data-out="budget">0.1%</dd></div>
+  <div><dt>Equal to total failure for</dt><dd data-out="allowed">43.2 min</dd></div>
+  <div><dt>Burn rate</dt><dd data-out="burn">10×</dd></div>
+  <div><dt>Budget gone in</dt><dd data-out="exhaust">3 days</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">An objective of 99.9% leaves an error budget of 0.1%: over 30 days, the equivalent of 43.2 min of total failure. An error rate of 1% spends it at 10 times the rate the objective allows, so the whole budget would be gone in 3 days. At that rate 8.33% of the budget goes every six hours, at or above the 5% that calls for a page. Page someone if it has lasted that long.</p>
+</div>
+
+<p>Google’s <cite>Site Reliability Workbook</cite> recommends a set of burn-rate alerts that has become the common starting point. For a 30-day window:</p>
+<table>
+<thead><tr><th>Budget used</th><th>In</th><th>Burn rate</th><th>Also checked over</th><th>Action</th></tr></thead>
+<tbody>
+<tr><th>2%</th><td>1 hour</td><td>14.4</td><td>5 minutes</td><td>Page</td></tr>
+<tr><th>5%</th><td>6 hours</td><td>6</td><td>30 minutes</td><td>Page</td></tr>
+<tr><th>10%</th><td>3 days</td><td>1</td><td>6 hours</td><td>Ticket</td></tr>
+</tbody>
+</table>
+<p>Each row uses two windows, and an alert fires only when both are above the threshold. The long window shows that the problem is sustained and has cost real budget. The short window shows that it is still happening, so the alert stops soon after the problem does and does not keep paging for an hour about something already fixed.</p>
+
+<pre data-lang="ts" data-title="slo-alert.ts">export function burnRate(errorRate: number, slo: number): number {
+  return errorRate / (1 - slo);
+}
+
+type Window = { long: number; short: number };   // observed error rates over the two windows
+type Alert = "page" | "ticket" | "none";
+
+/** Fires only if both the long and the short window are burning fast: sustained, and still happening. */
+export function sloAlert(slo: number, oneHour: Window, sixHours: Window, threeDays: Window): Alert {
+  const both = (w: Window, threshold: number) => burnRate(w.long, slo) >= threshold && burnRate(w.short, slo) >= threshold;
+  if (both(oneHour, 14.4) || both(sixHours, 6)) return "page";
+  if (both(threeDays, 1)) return "ticket";
+  return "none";
+}</pre>
+
+<p>Four cases confirm the behavior. A five-minute blip of 20% errors does not page, because the hour as a whole stayed within its rate. A steady 2% error rate for an hour pages. An outage that ended twenty minutes ago does not page again, because the last five minutes are clean. A slow leak of 0.15% errors for three days opens a ticket and wakes nobody.</p>
+<p>Whatever the mechanism, every alert that pages should pass three tests. It is about something users feel, or will feel soon. A person can do something about it now. And it links to a runbook that says what to check first. An alert that fails these belongs on a dashboard or in a ticket queue.</p>
+
+<h2 id="dashboards">Dashboards</h2>
+<p>A dashboard is for orientation: is this service healthy, and if not, where should I look? A useful one for a service is short.</p>
+<ul>
+  <li><b>At the top, the user’s view:</b> request rate, error ratio and latency percentiles, against the objective.</li>
+  <li><b>Below, the explanations:</b> saturation of the resources it depends on, and the same three numbers for each dependency it calls.</li>
+  <li><b>On every chart, markers for changes:</b> deployments, flag changes, configuration pushes. The question “what changed?” resolves more incidents than any other, as <x-ref to="deployment-strategies#why"></x-ref> explained.</li>
+  <li><b>Breakdowns one click away:</b> by version, region, endpoint and, where it exists, tenant.</li>
+</ul>
+<p>A wall of sixty charts answers no question. If a chart has never helped anyone decide anything, remove it.</p>
+
+<h2 id="debugging">Finding the fault: a worked example</h2>
+<p>Return to the slow feed. Here is the investigation, with each step using a different signal.</p>
+<ol>
+  <li><b>The alert.</b> The feed’s latency objective is burning budget at six times the allowed rate. This says there is a problem and roughly how bad. It came from a metric.</li>
+  <li><b>Narrow it.</b> On the dashboard, split the 99th percentile by each dimension in turn. By region: all regions. By endpoint: only <code>GET /feed</code>. By version: only the version deployed forty minutes ago. A marker on the chart shows the deployment at the moment the line rises. Still metrics.</li>
+  <li><b>Look at one.</b> Open a slow trace of <code>GET /feed</code> on the new version, the one in the waterfall figure above. Most of the time is in the tags service, inside one database query. Now traces.</li>
+  <li><b>Read the detail.</b> Search the tags service’s logs for that trace ID. The query log shows the statement and its duration. It filters on a column the new version started using.</li>
+  <li><b>Confirm the cause.</b> The database’s slow-query log shows the same statement thousands of times, each scanning the whole table. The column has no index, the problem that <x-ref to="indexes-and-queries#workflow"></x-ref> walked through.</li>
+  <li><b>Mitigate, then fix.</b> Roll back the deployment, which takes minutes and stops the harm. Add the index, then deploy again.</li>
+</ol>
+<p>Two things made this quick. Every signal carried the same dimensions, version, region and endpoint, so the problem could be narrowed by slicing. And the signals were linked: the latency chart led to an example trace, and the trace ID led to the logs. A slow request that is recorded as a metric, a trace and a log line with nothing in common between them is three separate puzzles.</p>
+
+<h2 id="beyond">Looking from outside</h2>
+<p>Everything so far is reported by the system about itself, which has a blind spot: a service that is unreachable reports nothing, and a system that is fast at the server can be slow for the user. Two outside views close the gap.</p>
+<ul>
+  <li><b>Synthetic checks</b> are scripted requests sent from outside on a schedule, from several places: load the home page, log in, upload a photo. They detect an outage even at 4 a.m. when no real user is trying, and they are the right check for certificates, DNS and anything else between the user and the first server.</li>
+  <li><b>Real user monitoring</b> has the client report what it experienced: page load times, errors in the browser or app, by device and network. It is the only measurement of the last mile, the part of <x-ref to="journey-of-a-request#budget"></x-ref> that the server never sees.</li>
+</ul>
+
+<h2 id="incidents">When the alert fires</h2>
+<p>Telemetry serves people responding to incidents, and how they respond matters as much as the tooling.</p>
+<ul>
+  <li><b>Mitigate first.</b> Stop the harm with the fastest safe action: roll back, turn off a flag, shift traffic, add capacity. Understanding why can wait until users are no longer affected.</li>
+  <li><b>One person coordinates.</b> In a large incident someone who is not typing commands keeps track of what is known, who is doing what, and what has been told to customers.</li>
+  <li><b>Write it down as you go.</b> A timeline kept during the incident is worth far more than one reconstructed afterward.</li>
+  <li><b>Review without blame.</b> Afterward, write up what happened, why the system allowed it, and what will change. The useful question is why a reasonable action led to a bad result, and it is answered only if people can speak freely. The incident accounts quoted throughout this book are public examples of the form.</li>
+  <li><b>Close the loop.</b> If the alert was late, noisy or missing, or the dashboard lacked the breakdown that would have helped, fixing that is part of the follow-up.</li>
+</ul>
+
+<h2 id="cost">What observability costs</h2>
+<p>Telemetry is data, and at scale it is a great deal of data. A system that logs a kilobyte for each request at ten thousand requests a second writes about 860 GB a day before anything is indexed or replicated. Left unmanaged, the bill for observing a system can approach the bill for running it.</p>
+<table>
+<thead><tr><th>Signal</th><th>What drives the cost</th><th>How to control it</th></tr></thead>
+<tbody>
+<tr><th>Metrics</th><td>The number of series</td><td>Bounded labels. Drop series nobody queries. Keep fine resolution for days and coarse for months</td></tr>
+<tr><th>Logs</th><td>Bytes written</td><td>Sample routine events. Shorter retention for verbose levels. Cheap storage for old logs</td></tr>
+<tr><th>Traces</th><td>Spans kept</td><td>Sampling, weighted toward errors and slow requests</td></tr>
+</tbody>
+</table>
+<p>The aim is to keep what answers questions and drop what does not, and to decide that deliberately. A common pattern is full detail for a short time, when an incident is being investigated, and aggregates for the long term, when only trends matter.</p>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Add observability to a design in two sentences. First, every service emits rate, errors and duration, with traces propagated across calls and queues. Second, alerts are on user-facing objectives by burn rate, not on machine metrics. If asked how you would debug a slow request, describe the path from alert to breakdown to trace to logs. If the design has a queue, mention the age of the oldest message as its key signal.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Averaging latency.</b> The mean hides the slow tail that users feel.</li>
+  <li><b>Averaging percentiles</b> across servers or time windows. Aggregate histograms, then compute.</li>
+  <li><b>Unbounded labels.</b> A user ID or full URL as a metric label, and the metrics system falls over.</li>
+  <li><b>Unstructured logs</b> with no identifiers in common, impossible to join.</li>
+  <li><b>Secrets and personal data in logs.</b></li>
+  <li><b>Broken propagation.</b> A proxy, a queue or one old service drops the trace header.</li>
+  <li><b>Alerting on causes.</b> Pages for CPU and restarts, and none for the outage with a cause nobody listed.</li>
+  <li><b>Alerts nobody can act on.</b> They train people to ignore alerts.</li>
+  <li><b>Only internal checks.</b> Everything reports healthy while users cannot connect.</li>
+  <li><b>No deployment markers.</b> Twenty minutes spent discovering that something changed.</li>
+  <li><b>Observability added after the incident.</b> The data needed to explain it was never collected.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="latency-and-throughput"></x-ref>: percentiles, saturation and tail latency, which metrics exist to measure.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: objectives and error budgets, the basis of alerting.</li>
+  <li><x-ref to="specialized-databases"></x-ref>: time-series storage and the cardinality limit.</li>
+  <li><x-ref to="probabilistic-structures"></x-ref>: histograms and sketches for percentiles.</li>
+  <li><x-ref to="event-driven-architecture"></x-ref> and <x-ref to="message-queues"></x-ref>: tracing through messages, and queue age as a signal.</li>
+  <li><x-ref to="deployment-strategies"></x-ref>: canary analysis consumes these signals, and deployments are the first suspect.</li>
+  <li><x-ref to="hld-metrics-and-logging"></x-ref>: designing the system that stores and queries all of this.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Metrics say that something is wrong and how much. Traces say where. Logs say what happened there. Link them with shared identifiers and dimensions.</li>
+  <li>Metric cost follows the number of series. Keep labels bounded, and put identifiers in logs and traces.</li>
+  <li>Measure rate, errors and duration for every service, and utilization, saturation and errors for every resource.</li>
+  <li>Histograms can be added across servers and time. Percentiles cannot. Aggregate buckets first, and place bucket boundaries at your objectives.</li>
+  <li>A trace needs its context passed on every hop, including through queues. Sampling decides which traces are kept.</li>
+  <li>Alert on symptoms users feel, measured against an objective, using burn rate over a long and a short window. Send everything else to dashboards and tickets.</li>
+  <li>Check from outside as well as inside, mark every change on every chart, and manage telemetry volume deliberately.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Which signal would you use first for each question: “is the error rate rising?”, “which service made this request slow?”, “what did the payment service receive for order 1042?”</summary><p>A metric for the error rate, since it is an aggregate over time. A trace for the slow request, since it shows time spent in each service. Logs for the specific order, since they hold the detail of one event.</p></details>
+<details><summary>Why is a user ID a bad metric label and a fine log field?</summary><p>Each distinct label value creates a separate time series, so a label with a million values multiplies the number of series by a million and overwhelms the metrics store. A log line is stored once whatever its fields contain, so a high-cardinality field costs nothing extra there.</p></details>
+<details><summary>Server A has a 99th percentile of 40 ms over 50,000 requests. Server B has 900 ms over 500 requests. Why is 470 ms not the combined 99th percentile, and how is the real one obtained?</summary><p>The average of two percentiles ignores how many requests each describes. B handled 1% of the traffic, so the combined 99th percentile sits near the boundary between A’s requests and B’s slow ones, far below 470 ms. Add the two servers’ histogram buckets, then estimate the percentile from the combined counts.</p></details>
+<details><summary>A histogram’s buckets end at 100, 250 and 500 ms and your objective is “99% of requests under 300 ms”. What is the problem?</summary><p>There is no boundary at 300 ms, so the share of requests under 300 ms can only be estimated by assuming an even spread between 250 and 500. Add a bucket boundary at exactly 300 ms so that the count is exact.</p></details>
+<details><summary>What must stay the same and what must change in the <code>traceparent</code> header as a request passes from one service to the next?</summary><p>The trace ID stays the same, so all spans can be joined. The span ID changes to the ID of the calling span, so the callee can record its parent. The sampled flag is passed on unchanged so that every service makes the same keep-or-drop decision.</p></details>
+<details><summary>An objective is 99.5% over 30 days and the current error rate is 3%. What is the burn rate, how long would the budget last, and what should happen?</summary><p>The budget is 0.5%, so the burn rate is 3 ÷ 0.5 = 6, and the budget would last 30 ÷ 6 = 5 days. That meets the threshold of 6, which uses 5% of the budget in six hours, so it should page if it has been sustained over that window and is still happening.</p></details>
+<details><summary>Why does a burn-rate alert check a short window as well as a long one?</summary><p>The long window alone keeps firing long after a problem ends, because the past errors remain inside it. Requiring the short window to be over the threshold too means the alert fires only while the problem is continuing, and clears soon after it stops.</p></details>
+<details><summary>All internal dashboards are green and users report that the site does not load. Name two kinds of check that would have caught it.</summary><p>Synthetic checks, scripted requests from outside that exercise DNS, certificates, the network path and the front door. And real user monitoring, where clients report failed loads. Internal telemetry cannot see a request that never arrives.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Rob Ewaschuk, <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Monitoring Distributed Systems</a>, chapter 6 of <cite>Site Reliability Engineering</cite>, Google, 2016. Symptoms versus causes and the four golden signals.</li>
+  <li><a href="https://sre.google/workbook/alerting-on-slos/">Alerting on SLOs</a>, a chapter of <cite>The Site Reliability Workbook</cite>, Google, 2018. Burn rates and the multi-window table used here.</li>
+  <li>OpenTelemetry, <a href="https://opentelemetry.io/docs/">documentation</a>, and <a href="https://opentelemetry.io/blog/2026/profiles-alpha">OpenTelemetry Profiles Enters Public Alpha</a>, March 2026.</li>
+  <li>W3C, <a href="https://www.w3.org/TR/trace-context/">Trace Context</a>. The <code>traceparent</code> and <code>tracestate</code> headers.</li>
+  <li>Prometheus, <a href="https://prometheus.io/docs/practices/histograms/">Histograms and summaries</a>. Bucket choice, aggregation and the error of quantile estimates.</li>
+  <li>Benjamin Sigelman and others, “Dapper, a Large-Scale Distributed Systems Tracing Infrastructure”, Google technical report, 2010. The design that later tracing systems follow.</li>
+  <li>Brendan Gregg, <a href="https://www.brendangregg.com/usemethod.html">The USE Method</a>, and Tom Wilkie, “The RED Method”, 2015.</li>
+  <li>Charity Majors, Liz Fong-Jones and George Miranda, <cite>Observability Engineering</cite>, O’Reilly, 2022.</li>
+</ol>
+</section>

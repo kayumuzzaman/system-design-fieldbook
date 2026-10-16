@@ -1,0 +1,633 @@
+<!--meta
+{ "description": "A step-by-step method for low-level design problems, worked through on a library lending system with tested TypeScript: what a class-design interview assesses, how to spend 45 minutes, clarifying scope, turning a problem statement into entities, values and invariants, drawing the class diagram in the right order, choosing patterns from requirements, deciding what to code, and answering the usual follow-up questions.",
+  "lede": "The last ten chapters were a toolbox: objects, principles, diagrams, patterns, concurrency, modeling, structure and testing. This chapter is the procedure for using it under time pressure. A low-level design problem, whether an interviewer sets it or a ticket does, asks you to turn a paragraph of requirements into classes that hold together. The nine case studies that follow all use the method laid out here, so this is the chapter to reread before any of them.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="what">What is being asked</h2>
+<p><x-ref to="what-is-system-design#two-levels"></x-ref> separated two levels of design. High-level design decides which services, stores and queues exist. <dfn>Low-level design</dfn> decides what is inside one of them: the classes, what each knows, what each may do and how they call each other. In an interview it takes the form “design a parking lot” or “design a vending machine”, and you are expected to produce a class diagram and working code for the central part in about 45 minutes.</p>
+<p>The problems are deliberately familiar. Nobody is testing your knowledge of parking. They are watching how you get from a vague sentence to a structure, and the things they look for are few and consistent.</p>
+<table>
+<thead><tr><th>What is assessed</th><th>What it looks like when done well</th><th>From</th></tr></thead>
+<tbody>
+<tr><th>Scoping</th><td>A few questions, then a short written list of what is in and what is out</td><td>This chapter</td></tr>
+<tr><th>Modeling</th><td>The right nouns become classes. Small concepts become values. Nothing important is a bare string</td><td><x-ref to="domain-modeling"></x-ref></td></tr>
+<tr><th>Placing the rules</th><td>Every invariant is stated and lives in one class that can enforce it</td><td><x-ref to="oop-in-typescript#encapsulation"></x-ref></td></tr>
+<tr><th>Designing for change</th><td>An interface exactly where the requirements say behavior varies, and nowhere else</td><td><x-ref to="solid-principles#ocp"></x-ref></td></tr>
+<tr><th>Code</th><td>The core path written so that it would run, with the checks in it</td><td>All of Part IX</td></tr>
+<tr><th>Depth on request</th><td>Clear answers to “what about two at once?” and “how would you test it?”</td><td><x-ref to="concurrency-in-code#design"></x-ref>, <x-ref to="errors-and-testing"></x-ref></td></tr>
+<tr><th>Communication</th><td>Thinking aloud, saying what is being deferred, checking direction</td><td>Practice</td></tr>
+</tbody>
+</table>
+<p>The same list describes good work on a real feature. The interview compresses it.</p>
+
+<h2 id="method">The method</h2>
+<p>The method has seven steps. The order matters more than the exact minutes: each step produces what the next one needs.</p>
+<table>
+<thead><tr><th>Step</th><th>You produce</th><th>Share of the time</th></tr></thead>
+<tbody>
+<tr><th>1. Clarify</th><td>Three to five use cases, and a list of what is out of scope</td><td>12%</td></tr>
+<tr><th>2. Find the model</th><td>Entities, values and the main operations, as a list</td><td>12%</td></tr>
+<tr><th>3. State the invariants</th><td>Two to four rules that must always hold, each with an owner</td><td>6%</td></tr>
+<tr><th>4. Draw the classes</th><td>A class diagram of five to eight classes with relationships</td><td>16%</td></tr>
+<tr><th>5. Decide what varies</th><td>The one or two interfaces the requirements call for, by pattern name</td><td>14%</td></tr>
+<tr><th>6. Code the core</th><td>The main use case, in code that would run, with its checks</td><td>28%</td></tr>
+<tr><th>7. Walk it and extend it</th><td>One scenario traced through, then concurrency, testing and extensions</td><td>12%</td></tr>
+</tbody>
+</table>
+<div class="widget" data-widget="lldclock">
+<h4>A time budget for a design round</h4>
+<p>Minutes for each step, from the length of the round and the time lost to introductions and questions at the end.</p>
+<div class="controls">
+  <label>Length of the round, minutes<input type="number" name="total" value="45" min="15" max="180" step="1"></label>
+  <label>Introductions and closing questions, minutes<input type="number" name="lost" value="5" min="0" max="60" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 150" role="img" aria-label="A bar divided into seven parts, one for each step of the method, each as wide as its share of the working time, with the minute at which each step should end."><rect x="10" y="34" width="620" height="26" rx="4" class="bar mute"></rect><rect x="44.4" y="34" width="64.6" height="26" rx="3" class="bar store"></rect><text x="77.5" y="80" class="ts mid">1 Clarify</text><text x="110.6" y="26" class="ts mid">7</text><rect x="110.6" y="34" width="64.6" height="26" rx="3" class="bar async"></rect><text x="143.6" y="98" class="ts mid">2 Model</text><text x="176.7" y="26" class="ts mid">12</text><rect x="176.7" y="34" width="31.6" height="26" rx="3" class="bar store"></rect><text x="193.2" y="80" class="ts mid">3 Invariants</text><text x="209.8" y="26" class="ts mid">15</text><rect x="209.8" y="34" width="86.7" height="26" rx="3" class="bar async"></rect><text x="253.9" y="98" class="ts mid">4 Classes</text><text x="298" y="26" class="ts mid">21</text><rect x="298" y="34" width="75.7" height="26" rx="3" class="bar store"></rect><text x="336.5" y="80" class="ts mid">5 What varies</text><text x="375.1" y="26" class="ts mid">27</text><rect x="375.1" y="34" width="152.8" height="26" rx="3" class="bar"></rect><text x="452.3" y="98" class="ts mid">6 Code</text><text x="529.4" y="26" class="ts mid">38</text><rect x="529.4" y="34" width="64.6" height="26" rx="3" class="bar store"></rect><text x="562.5" y="80" class="ts mid">7 Walk, extend</text><text x="595.6" y="26" class="ts mid">43</text><text x="44.4" y="26" class="ts mid">3</text><text x="10" y="12" class="ts">Minute at which each step ends</text><text x="10" y="124" class="ts">Gray at each end is time for introductions and for your own questions.</text><text x="10" y="142" class="ts">Steps 1 to 4 end with a class diagram on the board. Step 6 is the only one spent typing.</text></svg>
+<dl class="results">
+  <div><dt>Working time</dt><dd data-out="work">40 min</dd></div>
+  <div><dt>Class diagram finished by</dt><dd data-out="diagram">minute 21</dd></div>
+  <div><dt>Start coding by</dt><dd data-out="code">minute 27</dd></div>
+  <div><dt>Stop coding by</dt><dd data-out="stop">minute 38</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Of 45 minutes, 40 are yours. Spend about 5 on questions, have the class diagram drawn by minute 21, and be writing code by minute 27. That leaves about 11 minutes of coding, enough for one use case and its checks. Stop at minute 38 whatever state the code is in, and trace a scenario.</p>
+</div>
+<p>Two checkpoints matter most. If the class diagram is not on the board by the time shown, stop adding classes and connect the ones you have. If you are still coding at the last checkpoint, stop and walk the scenario with what exists. An unfinished method with a clear explanation is worth more than finished code that nobody had time to discuss.</p>
+<p>The rest of this chapter applies the seven steps to one problem.</p>
+<div class="note brief"><p><span class="label">The problem.</span> Design the lending system for a library. Members borrow and return books. The library owns several copies of each title. A member may hold at most three books at once, and a loan lasts 14 days. A late return costs a fine for each day. A member who owes too much cannot borrow.</p></div>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<p>A problem statement is short on purpose. The first minutes are for finding its edges, and the useful questions fall into four groups.</p>
+<table>
+<thead><tr><th>Ask about</th><th>For the library</th><th>An assumption to state if not told</th></tr></thead>
+<tbody>
+<tr><th>Who uses it, and for what</th><td>Is this the librarian’s desk system, or do members use it directly?</td><td>One caller, a desk application. No login in scope</td></tr>
+<tr><th>The core actions</th><td>Borrow, return, pay a fine. Also search? Reservations? Renewals?</td><td>The three named. Reservations as an extension if time allows</td></tr>
+<tr><th>The numbers and what varies</th><td>Are the limit, the loan period and the fine fixed, or different for each branch or kind of member?</td><td>They are configuration. One policy now, designed so that it can vary</td></tr>
+<tr><th>What is out</th><td>Storage, user interface, payment processing, notifications</td><td>Everything in memory. Paying a fine is a number going down</td></tr>
+</tbody>
+</table>
+<p>Write the answers down where the interviewer can see them, as use cases: “a member borrows a title”, “a copy is returned and a fine may be charged”, “a member pays toward their fines”. That list is the definition of done for the next forty minutes. Asking nothing and asking for ten minutes are both mistakes. The first builds the wrong thing, and the second leaves no time to build anything.</p>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+
+<figure class="fig wide" id="fig-nouns">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f661t f661d">
+<title id="f661t">Sorting the words of a problem statement into a model</title>
+<desc id="f661d">A problem statement of three sentences with words marked in three ways. The nouns Members, books, copies, title, member, loan and fine are marked as things. The verbs borrow and return are marked as actions. The phrases at most three, 14 days, for each day, owes too much and cannot borrow are marked as rules. Below, four boxes show where they go. Things tracked one by one become entities: Member, Copy, Loan. Words that describe or measure become values: the title’s ISBN, dates, the fine. Verbs become operations: borrow, give back, pay. Rules become invariants and policy: at most three loans, a copy in one loan at a time, no borrowing above a fine limit.</desc>
+<rect class="n sig" x="12.0" y="16" width="50.1" height="19" rx="3"/>
+<rect class="n store" x="64.7" y="16" width="43.6" height="19" rx="3"/>
+<rect class="n store" x="137.2" y="16" width="43.6" height="19" rx="3"/>
+<rect class="n sig" x="183.4" y="16" width="37.0" height="19" rx="3"/>
+<rect class="n sig" x="394.3" y="16" width="43.6" height="19" rx="3"/>
+<rect class="n sig" x="493.2" y="16" width="37.0" height="19" rx="3"/>
+<rect class="n sig" x="25.2" y="42" width="43.6" height="19" rx="3"/>
+<rect class="n fault" x="130.7" y="42" width="89.7" height="19" rx="3"/>
+<rect class="n sig" x="222.9" y="42" width="37.0" height="19" rx="3"/>
+<rect class="n sig" x="361.4" y="42" width="30.4" height="19" rx="3"/>
+<rect class="n fault" x="433.9" y="42" width="50.1" height="19" rx="3"/>
+<rect class="n sig" x="157.0" y="68" width="30.4" height="19" rx="3"/>
+<rect class="n fault" x="190.0" y="68" width="83.1" height="19" rx="3"/>
+<rect class="n fault" x="368.0" y="68" width="89.7" height="19" rx="3"/>
+<rect class="n fault" x="460.3" y="68" width="89.7" height="19" rx="3"/>
+<text class="ts mono" x="14" y="30">Members borrow and return books. The library owns several copies of each title.</text>
+<text class="ts mono" x="14" y="56">A member may hold at most three books at once, and a loan lasts 14 days.</text>
+<text class="ts mono" x="14" y="82">A late return costs a fine for each day. A member who owes too much cannot borrow.</text>
+<rect class="n sig" x="10" y="112" width="169" height="130" rx="6" style="fill-opacity:.35"/>
+<text class="ts" x="20" y="132">Things tracked one by one</text>
+<text class="tb" x="20" y="150">entities</text>
+<text class="ts" x="20" y="176">Member</text>
+<text class="ts" x="20" y="196">Copy</text>
+<text class="ts" x="20" y="216">Loan</text>
+<path class="e" d="M94 96V110"/>
+<rect class="n " x="187" y="112" width="169" height="130" rx="6" style="fill-opacity:.35"/>
+<text class="ts" x="197" y="132">Words that describe</text>
+<text class="tb" x="197" y="150">values</text>
+<text class="ts" x="197" y="176">ISBN of a title</text>
+<text class="ts" x="197" y="196">a day, a number of days</text>
+<text class="ts" x="197" y="216">an amount in cents</text>
+<path class="e" d="M271 96V110"/>
+<rect class="n store" x="364" y="112" width="169" height="130" rx="6" style="fill-opacity:.35"/>
+<text class="ts" x="374" y="132">Verbs</text>
+<text class="tb" x="374" y="150">operations</text>
+<text class="ts" x="374" y="176">borrow</text>
+<text class="ts" x="374" y="196">give back</text>
+<text class="ts" x="374" y="216">pay a fine</text>
+<path class="e" d="M448 96V110"/>
+<rect class="n fault" x="541" y="112" width="169" height="130" rx="6" style="fill-opacity:.35"/>
+<text class="ts" x="551" y="132">Must, at most, cannot</text>
+<text class="tb" x="551" y="150">invariants and policy</text>
+<text class="ts" x="551" y="176">at most 3 loans a member</text>
+<text class="ts" x="551" y="196">a copy in one loan at a time</text>
+<text class="ts" x="551" y="216">no borrowing while owing a lot</text>
+<path class="e" d="M625 96V110"/>
+<text class="ts" x="10" y="258">“Book” is the trap. The thing that is lent is a copy. The title is what the member asks for.</text>
+</svg>
+</div>
+<figcaption>The statement already contains most of the model. Nouns suggest classes, verbs suggest methods, and the words “must”, “at most” and “cannot” are the invariants that the design exists to protect.</figcaption>
+</figure>
+
+<p>Go through the statement and the use cases, and sort the words as in <x-ref to="domain-modeling#language"></x-ref>. Three decisions made at this point shape everything after.</p>
+<ul>
+  <li><b>Split the overloaded noun.</b> “Book” means two things here. What a member asks for is a title. What leaves the building is one physical copy. Rules attach to copies: this copy is on loan, that one is free. Most problems have such a word, and finding it early is the largest single improvement to a design. In a parking lot it is the spot and the ticket. In a cinema it is the seat and the booking.</li>
+  <li><b>Promote the relationship.</b> A loan connects a member and a copy, and it has data of its own: when it started and when it is due. A relationship with data of its own is a class.</li>
+  <li><b>Collect the numbers.</b> Three books, fourteen days, a fine per day and a limit on fines owed are policy. They go together in one object, so that the rules read from it and a second library can supply different values.</li>
+</ul>
+<p>Then say the invariants aloud, and give each one an owner: the class that holds the data needed to check it.</p>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th><th>Why that class</th></tr></thead>
+<tbody>
+<tr><th>A copy is in at most one loan at a time</th><td><code>Copy</code></td><td>It holds its current loan, so it alone can refuse a second</td></tr>
+<tr><th>A member holds at most three loans</th><td><code>Member</code></td><td>It holds the member’s loans</td></tr>
+<tr><th>A member owing the limit or more cannot borrow</th><td><code>Member</code></td><td>It holds the amount owed</td></tr>
+<tr><th>A loan is due a fixed number of days after it starts</th><td><code>Loan</code></td><td>It computes the due date once, when created</td></tr>
+</tbody>
+</table>
+<p>This table is the most valuable thing produced in the whole exercise, and it takes two minutes. A design in which every rule has exactly one owner is nearly always a good one. A rule with no owner will be enforced by whichever caller remembers, and a rule with two owners will be enforced twice, differently.</p>
+
+<h2 id="diagram">Step 4: Draw the classes</h2>
+
+<figure class="fig wide" id="fig-build">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 334" role="img" aria-labelledby="f662t f662d">
+<title id="f662t">The class diagram for the lending library, built in the order you would draw it</title>
+<desc id="f662d">A class diagram that grows in five steps. First three empty boxes: Member, Copy and Loan. Second, their fields: a member has an identifier, a name, private loans and a private amount owed. A copy has an identifier, an ISBN and a private current loan. A loan has a copy, a member, a borrowed day and a due day. Third, relationships: a member has zero to three loans, and a copy has zero or one. Fourth, the operations, each in the class that owns the rule: refusal and handBack on Member, lend and takeBack on Copy, daysLate on Loan. Fifth, a Library class as the entry point with borrow and giveBack, and a LendingPolicy holding the four numbers that vary.</desc>
+<g class="hide" data-s="1">
+<rect class="n sig" x="240" y="30" width="190" height="144" rx="4"/>
+<text class="tb mid" x="335.0" y="49">Member</text>
+</g>
+<g class="hide" data-s="2">
+<line class="sep sig" x1="240" y1="58" x2="430" y2="58"/>
+<text class="ts" x="248" y="74">id, name</text>
+<text class="ts" x="248" y="90">− loans</text>
+<text class="ts" x="248" y="106">− owedCents</text>
+</g>
+<g class="hide" data-s="4">
+<line class="sep sig" x1="240" y1="116" x2="430" y2="116"/>
+<text class="ts" x="248" y="132">+ refusal(policy)</text>
+<text class="ts" x="248" y="148">+ take(loan)</text>
+<text class="ts" x="248" y="164">+ handBack(loan, fine)</text>
+</g>
+<g class="hide" data-s="1">
+<rect class="n sig" x="520" y="30" width="190" height="112" rx="4"/>
+<text class="tb mid" x="615.0" y="49">Copy</text>
+</g>
+<g class="hide" data-s="2">
+<line class="sep sig" x1="520" y1="58" x2="710" y2="58"/>
+<text class="ts" x="528" y="74">id, isbn</text>
+<text class="ts" x="528" y="90">− loan</text>
+</g>
+<g class="hide" data-s="4">
+<line class="sep sig" x1="520" y1="100" x2="710" y2="100"/>
+<text class="ts" x="528" y="116">+ lend(loan)</text>
+<text class="ts" x="528" y="132">+ takeBack()</text>
+</g>
+<g class="hide" data-s="1">
+<rect class="n sig" x="400" y="206" width="190" height="96" rx="4"/>
+<text class="tb mid" x="495.0" y="225">Loan</text>
+</g>
+<g class="hide" data-s="2">
+<line class="sep sig" x1="400" y1="234" x2="590" y2="234"/>
+<text class="ts" x="408" y="250">copy, member</text>
+<text class="ts" x="408" y="266">borrowedOn, dueOn</text>
+</g>
+<g class="hide" data-s="4">
+<line class="sep sig" x1="400" y1="276" x2="590" y2="276"/>
+<text class="ts" x="408" y="292">+ daysLate(day)</text>
+</g>
+<g class="hide" data-s="3">
+<path class="e has" d="M340 174L440 204"/>
+<text class="ts end" x="384" y="192">0..3</text>
+<path class="e has" d="M620 142L560 204"/>
+<text class="ts" x="582" y="196">0..1</text>
+</g>
+<g class="hide" data-s="5">
+<rect class="n " x="10" y="30" width="190" height="102" rx="4"/>
+<text class="tb mid" x="105.0" y="49">Library</text>
+</g>
+<g class="hide" data-s="5">
+<line class="sep " x1="10" y1="58" x2="200" y2="58"/>
+<text class="ts" x="18" y="74">+ join(id, name)</text>
+<text class="ts" x="18" y="90">+ addCopy(id, isbn)</text>
+<text class="ts" x="18" y="106">+ borrow(member, isbn, today)</text>
+<text class="ts" x="18" y="122">+ giveBack(copy, today)</text>
+</g>
+<g class="hide" data-s="5">
+<rect class="n store" x="10" y="206" width="190" height="116" rx="4"/>
+<text class="ts mid" x="105.0" y="222">«data»</text>
+<text class="tb mid" x="105.0" y="239">LendingPolicy</text>
+</g>
+<g class="hide" data-s="5">
+<line class="sep store" x1="10" y1="248" x2="200" y2="248"/>
+<text class="ts" x="18" y="264">maxLoans: 3</text>
+<text class="ts" x="18" y="280">loanDays: 14</text>
+<text class="ts" x="18" y="296">finePerDayCents: 25</text>
+<text class="ts" x="18" y="312">finesBlockAtCents: 500</text>
+</g>
+<g class="hide" data-s="5">
+<path class="e has" d="M201 76H238"/>
+<path class="e has" d="M105 132V204"/>
+<path class="e has" d="M150 29C260 2 480 2 590 28" style="fill:none"/>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="On the board: 3 classes">Start with the nouns that have identity. Three boxes and their names are enough to begin a conversation about them.</li>
+  <li data-msg="none" data-state="On the board: 3 classes, their fields">Give each one its data. Mark as private whatever a rule depends on: a member’s loans, a copy’s current loan.</li>
+  <li data-msg="none" data-state="On the board: 3 classes, fields, 2 relationships">Draw how they relate, with numbers. “0..3” and “0..1” are two of the invariants, written down.</li>
+  <li data-msg="none" data-state="On the board: 3 classes with behavior">Add operations, and put each in the class that holds the data its rule needs. Only Copy can know whether it is already lent.</li>
+  <li data-msg="none" data-state="On the board: 5 classes, the whole design">Last, the entry point that callers use, and the numbers that vary between libraries pulled out into one object.</li>
+</ol>
+<figcaption>Draw in this order: things, their data, their relationships, their behavior, and only then the service that coordinates them. Starting from the coordinating class produces one large class and several empty ones.</figcaption>
+</figure>
+
+<p>The notation is that of <x-ref to="uml-diagrams#class"></x-ref>, and an interviewer will accept any reasonable simplification of it. Three habits keep the drawing useful.</p>
+<ul>
+  <li><b>Draw the things before the coordinator.</b> It is tempting to begin with a class named <code>LibrarySystem</code> and hang methods on it. That class then absorbs every rule, and the entities become records. Start from the entities and add the entry point last.</li>
+  <li><b>Put numbers on the lines.</b> “0..3” on the line from member to loan is an invariant in two characters.</li>
+  <li><b>Stop at five to eight classes.</b> If the board has fifteen, most are speculation. If it has two, one of them is doing everything.</li>
+</ul>
+
+<h2 id="varies">Step 5: Decide what varies</h2>
+<p>Patterns enter a design at one point only: where the requirements, or the interviewer’s follow-up questions, say that behavior differs from case to case or will change. Listen for the phrases, and reach for the smallest thing that answers them.</p>
+<table>
+<thead><tr><th>You hear</th><th>It usually means</th><th>Covered in</th></tr></thead>
+<tbody>
+<tr><th>“Different pricing, fees, rules or algorithms for different cases”</th><td>Strategy: an interface or a function passed in</td><td><x-ref to="behavioral-patterns#strategy"></x-ref></td></tr>
+<tr><th>“It can be idle, busy, out of service…”, with different responses in each</th><td>A state table, or the state pattern if states have behavior</td><td><x-ref to="behavioral-patterns#state"></x-ref></td></tr>
+<tr><th>“Notify”, “when that happens, also…”</th><td>Observer: events and subscribers</td><td><x-ref to="behavioral-patterns#observer"></x-ref></td></tr>
+<tr><th>“Several kinds of vehicle, piece, shape or message” that are created from input</th><td>Polymorphism, with a factory where the kind is chosen</td><td><x-ref to="creational-patterns#factory"></x-ref></td></tr>
+<tr><th>“Groups that contain groups”</th><td>Composite</td><td><x-ref to="structural-patterns#composite"></x-ref></td></tr>
+<tr><th>“Add logging, limits or retries around it”</th><td>Decorator, or a chain of handlers</td><td><x-ref to="structural-patterns#decorator"></x-ref></td></tr>
+<tr><th>“Undo”, “queue the requests”, “replay”</th><td>Command</td><td><x-ref to="behavioral-patterns#command"></x-ref></td></tr>
+<tr><th>“Use the payment provider, the map service, the printer”</th><td>A port of your own, with an adapter behind it</td><td><x-ref to="application-architecture#hexagon"></x-ref></td></tr>
+<tr><th>Nothing of the kind</th><td>No pattern. A class with methods</td><td></td></tr>
+</tbody>
+</table>
+<p>In the library, one thing varies: the numbers. They do not need a strategy interface with classes. They need a record, <code>LendingPolicy</code>, passed to the library. If the interviewer then says “students pay no fines and staff may hold ten books”, the answer is a policy for each kind of member. If they say “fines double after a week”, the fine becomes a function in the policy, which is a strategy. Introduce each step when it is asked for, and say what you would change. Building all of it in advance costs minutes you do not have, and shows a weaker judgment than waiting.</p>
+
+<h2 id="code">Step 6: Code the core</h2>
+<p>There is never time to code everything, so choose. Write the use case that touches the most invariants, completely, including the refusals. For the library that is borrowing and returning. Leave out whatever is mechanical, such as listing the catalog, and say that you are leaving it out.</p>
+<pre data-lang="ts" data-title="The lending library: every rule in the class that owns it">
+// Dates are whole days, counted from 1 January 1970. No clock is read anywhere in this file: "today" is passed in.
+export type Day = number;
+export const day = (iso: string): Day => Math.floor(Date.parse(`${iso}T00:00:00Z`) / 86_400_000);
+
+export type MemberId = string & { readonly __brand: "MemberId" };
+export type CopyId = string & { readonly __brand: "CopyId" };
+export type Isbn = string & { readonly __brand: "Isbn" };
+
+// What varies between libraries is data, kept in one place.
+export interface LendingPolicy {
+  readonly maxLoans: number;
+  readonly loanDays: number;
+  readonly finePerDayCents: number;
+  readonly finesBlockAtCents: number;
+}
+export const standardPolicy: LendingPolicy = { maxLoans: 3, loanDays: 14, finePerDayCents: 25, finesBlockAtCents: 500 };
+
+export class LendingError extends Error {}
+
+export class Loan {
+  readonly copy: CopyId;
+  readonly member: MemberId;
+  readonly borrowedOn: Day;
+  readonly dueOn: Day;
+
+  constructor(copy: CopyId, member: MemberId, borrowedOn: Day, loanDays: number) {
+    this.copy = copy;
+    this.member = member;
+    this.borrowedOn = borrowedOn;
+    this.dueOn = borrowedOn + loanDays;
+  }
+  daysLate(returnedOn: Day): number {
+    return Math.max(0, returnedOn - this.dueOn);
+  }
+}
+
+// Owns the rule "one copy is in at most one loan".
+export class Copy {
+  readonly id: CopyId;
+  readonly isbn: Isbn;
+  private loan: Loan | null = null;
+
+  constructor(id: CopyId, isbn: Isbn) {
+    this.id = id;
+    this.isbn = isbn;
+  }
+  get available(): boolean {
+    return this.loan === null;
+  }
+  get currentLoan(): Loan | null {
+    return this.loan;
+  }
+  lend(loan: Loan): void {
+    if (this.loan) throw new LendingError(`copy ${this.id} is already on loan`);
+    this.loan = loan;
+  }
+  takeBack(): Loan {
+    if (!this.loan) throw new LendingError(`copy ${this.id} is not on loan`);
+    const loan = this.loan;
+    this.loan = null;
+    return loan;
+  }
+}
+
+// Owns the rules about one member: how many loans, and how much is owed.
+export class Member {
+  readonly id: MemberId;
+  readonly name: string;
+  private readonly loans = new Set<Loan>();
+  private owedCents = 0;
+
+  constructor(id: MemberId, name: string) {
+    this.id = id;
+    this.name = name;
+  }
+  get openLoans(): number {
+    return this.loans.size;
+  }
+  get finesCents(): number {
+    return this.owedCents;
+  }
+
+  // Returns the reason this member may not borrow, or null if they may.
+  refusal(policy: LendingPolicy): string | null {
+    if (this.loans.size >= policy.maxLoans) return `${this.name} already has ${policy.maxLoans} books`;
+    if (this.owedCents >= policy.finesBlockAtCents) return `${this.name} owes ${this.owedCents} cents in fines`;
+    return null;
+  }
+  take(loan: Loan): void {
+    this.loans.add(loan);
+  }
+  handBack(loan: Loan, fineCents: number): void {
+    if (!this.loans.delete(loan)) throw new LendingError(`${this.name} does not hold that loan`);
+    this.owedCents += fineCents;
+  }
+  pay(cents: number): void {
+    if (!Number.isInteger(cents) || cents <= 0 || cents > this.owedCents) throw new LendingError("pay a whole amount, up to what is owed");
+    this.owedCents -= cents;
+  }
+}
+
+// The entry point. It finds the objects, asks them, and keeps the two sides of a loan in step.
+export class Library {
+  private readonly policy: LendingPolicy;
+  private readonly members = new Map<MemberId, Member>();
+  private readonly copies = new Map<CopyId, Copy>();
+
+  constructor(policy: LendingPolicy = standardPolicy) {
+    this.policy = policy;
+  }
+
+  join(id: string, name: string): Member {
+    const member = new Member(id as MemberId, name);
+    this.members.set(member.id, member);
+    return member;
+  }
+  addCopy(id: string, isbn: string): Copy {
+    const copy = new Copy(id as CopyId, isbn as Isbn);
+    this.copies.set(copy.id, copy);
+    return copy;
+  }
+
+  borrow(memberId: string, isbn: string, today: Day): Loan {
+    const member = this.member(memberId);
+    const refusal = member.refusal(this.policy);
+    if (refusal) throw new LendingError(refusal);
+    const copy = [...this.copies.values()].find((c) => c.isbn === isbn && c.available);
+    if (!copy) throw new LendingError(`no copy of ${isbn} is available`);
+    const loan = new Loan(copy.id, member.id, today, this.policy.loanDays);
+    copy.lend(loan);
+    member.take(loan);
+    return loan;
+  }
+
+  // Returns the fine charged, in cents.
+  giveBack(copyId: string, today: Day): number {
+    const copy = this.copies.get(copyId as CopyId);
+    if (!copy) throw new LendingError(`no copy ${copyId}`);
+    const loan = copy.takeBack();
+    const fine = loan.daysLate(today) * this.policy.finePerDayCents;
+    this.member(loan.member).handBack(loan, fine);
+    return fine;
+  }
+
+  member(id: string): Member {
+    const member = this.members.get(id as MemberId);
+    if (!member) throw new LendingError(`no member ${id}`);
+    return member;
+  }
+  get allCopies(): readonly Copy[] {
+    return [...this.copies.values()];
+  }
+  get allMembers(): readonly Member[] {
+    return [...this.members.values()];
+  }
+}
+</pre>
+<p>Several earlier chapters are visible in this listing, and it is worth being able to point at each.</p>
+<ul>
+  <li><b>Private state, changed only by methods</b> that check first: <code>Copy.lend</code> refuses a second loan, and <code>Member.pay</code> refuses a negative amount.</li>
+  <li><b>Types that prevent mix-ups.</b> A <code>CopyId</code> cannot be passed where a <code>MemberId</code> is expected.</li>
+  <li><b>No hidden inputs.</b> <code>today</code> is a parameter of every operation that depends on the date, so the tests below needed no fake clock (<x-ref to="errors-and-testing#testable"></x-ref>).</li>
+  <li><b>Errors in the language of the domain</b>, of one type, with messages a librarian could read.</li>
+  <li><b>A thin coordinator.</b> <code>Library.borrow</code> is nine lines: find, ask, create, tell. It decides nothing about loans or fines itself.</li>
+</ul>
+<p>The code was tested in two ways. The first is the scenario of the next section, with results at each step. The second is a check of the invariants themselves: 20,000 random borrow, return and payment requests were thrown at a small library, and after every one the test confirmed that no member held more than three loans, that no amount owed was negative, and that the copies’ view of who holds what agreed with the members’. About half of the requests were refused, as they should have been, and the invariants held throughout.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Coding the easy parts first. Constructors, getters and an <code>addBook</code> method fill a screen and prove nothing. Start with the method that has an <code>if</code> in it for every invariant, because that is the one the design exists for.</p></div>
+
+<h2 id="walk">Step 7: Walk it, then extend it</h2>
+
+<figure class="fig wide" id="fig-borrow">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 476" role="img" aria-labelledby="f663t f663d">
+<title id="f663t">Borrowing a book, and returning it late</title>
+<desc id="f663d">Two sequences between a caller, the Library, a Member, a Copy and a Loan. In the first, the caller asks the library to lend Dune to Ana. The library asks Ana’s Member object whether she may borrow, finds an available copy, creates a loan due in 14 days, and records the loan on both the copy and the member. In the second, copy c1 is returned five days after its due date. The library takes the loan back from the copy, asks the loan how late it is, charges 125 cents to the member and returns that amount.</desc>
+<text class="tb mono" x="10" y="16">borrow("ana", "dune", 12 October)</text>
+<g data-scene="borrow">
+<text class="tb mid" x="46" y="36">Caller</text>
+<line class="axis" x1="46" y1="44" x2="46" y2="250"/>
+<text class="tb mid" x="180" y="36">Library</text>
+<line class="axis" x1="180" y1="44" x2="180" y2="250"/>
+<text class="tb mid" x="340" y="36">Member: Ana</text>
+<line class="axis" x1="340" y1="44" x2="340" y2="250"/>
+<text class="tb mid" x="500" y="36">Copy: c1</text>
+<line class="axis" x1="500" y1="44" x2="500" y2="250"/>
+<text class="tb mid" x="650" y="36">Loan</text>
+<line class="axis" x1="650" y1="44" x2="650" y2="250"/>
+<g data-s="1">
+<path class="e sig" d="M47 70H179"/>
+<text class="ts mid" x="113.0" y="64">1. borrow(…)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M181 95H339"/>
+<text class="ts mid" x="260.0" y="89">2. refusal(policy)?  none</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M181 120H499"/>
+<text class="ts mid" x="340.0" y="114">3. available?  yes</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M181 145H649"/>
+<text class="ts mid" x="415.0" y="139">4. new Loan(c1, ana, …)</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M181 170H499"/>
+<text class="ts mid" x="340.0" y="164">5. lend(loan)</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M181 195H339"/>
+<text class="ts mid" x="260.0" y="189">take(loan)</text>
+</g>
+<g data-s="6">
+<path class="e uses" d="M179 220H47"/>
+<text class="ts mid" x="113.0" y="214">6. the loan</text>
+</g>
+</g>
+<path class="e none dash" d="M10 264H710"/>
+<text class="tb mono" x="10" y="284">giveBack("c1", 31 October)</text>
+<g data-scene="late">
+<text class="tb mid" x="46" y="304">Caller</text>
+<line class="axis" x1="46" y1="312" x2="46" y2="462"/>
+<text class="tb mid" x="180" y="304">Library</text>
+<line class="axis" x1="180" y1="312" x2="180" y2="462"/>
+<text class="tb mid" x="340" y="304">Member: Ana</text>
+<line class="axis" x1="340" y1="312" x2="340" y2="462"/>
+<text class="tb mid" x="500" y="304">Copy: c1</text>
+<line class="axis" x1="500" y1="312" x2="500" y2="462"/>
+<text class="tb mid" x="650" y="304">Loan</text>
+<line class="axis" x1="650" y1="312" x2="650" y2="462"/>
+<g data-s="1">
+<path class="e sig" d="M47 338H179"/>
+<text class="ts mid" x="113.0" y="332">1. giveBack(…)</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M181 363H499"/>
+<text class="ts mid" x="340.0" y="357">2. takeBack()</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M181 388H649"/>
+<text class="ts mid" x="415.0" y="382">3. daysLate(31 Oct)?  5</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M181 413H339"/>
+<text class="ts mid" x="260.0" y="407">4. handBack(loan, 125)</text>
+</g>
+<g data-s="5">
+<path class="e uses" d="M179 438H47"/>
+<text class="ts mid" x="113.0" y="432">5. 125</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="borrow" data-label="Borrow">
+  <li data-state="Ana holds: 0 loans; copy c1: available">A request arrives at the one public entry point. The date is an argument, so nothing below reads a clock.</li>
+  <li data-msg="refusal?">The library asks the member whether she may borrow. The member checks her own loan count and fines against the policy, and has no objection.</li>
+  <li data-msg="available?">The library looks for a copy of the title that is not on loan, and finds c1.</li>
+  <li data-msg="new Loan">A loan is created with its due date worked out from the policy: 26 October.</li>
+  <li data-msg="lend|take" data-state="Ana holds: 1 loan; copy c1: on loan until 26 October">The copy records the loan, and would refuse if it already had one. The member records it too.</li>
+  <li data-msg="loan">The caller receives the loan, with its due date.</li>
+</ol>
+<ol class="steps" data-scene="late" data-label="Return late">
+  <li data-state="Ana holds: 1 loan; copy c1: on loan; Ana owes: 0">The copy comes back five days after it was due.</li>
+  <li data-msg="takeBack" data-state="Ana holds: 1 loan; copy c1: available; Ana owes: 0">The copy hands over its loan and is free again. Returning a copy that is not on loan would be refused here.</li>
+  <li data-msg="daysLate?">The loan knows its own due date, so it is the one to say how late the return is.</li>
+  <li data-msg="handBack" data-state="Ana holds: 0 loans; copy c1: available; Ana owes: 125 cents">Five days at 25 cents. The member removes the loan and adds the fine to what she owes.</li>
+  <li data-msg="125">The fine is returned to the caller, in cents.</li>
+</ol>
+<figcaption>Walk one success and one awkward case through the diagram before writing code. Every arrow must land on a method that exists, in a class that has the data to answer.</figcaption>
+</figure>
+
+<p>Tracing a scenario through the finished design is the cheapest test there is, and it regularly finds a method that was drawn and never written or an object that needs data it cannot reach. Use real values, as in the figure, and include one awkward case. In the tested scenario, Ana’s fourth loan was refused with “Ana already has 3 books”, a third request for a title with two copies was refused, a return on the due date cost nothing, one five days late cost 125 cents, and at 500 cents owed she was refused until she had paid.</p>
+<p>The remaining minutes go to the interviewer’s follow-up questions. There are four that come up for nearly every problem, and each has a prepared shape of answer.</p>
+<table>
+<thead><tr><th>Follow-up</th><th>How to answer</th><th>For the library</th></tr></thead>
+<tbody>
+<tr><th>“What if two requests arrive at once?”</th><td>Name the shared state and the invariant at risk. Say where the check and the change must be one step, and what does that with several servers</td><td>Two desks lending the last copy. In one process, <code>borrow</code> has no <code>await</code> between check and change, so it is safe. With a database, a uniqueness constraint on open loans for a copy, and a retry (<x-ref to="concurrency-in-code#races"></x-ref>)</td></tr>
+<tr><th>“How would you test it?”</th><td>Rules directly on the entities, edges named, collaborators faked</td><td>The limit at exactly three. A return on the due day and the day after. No clock to fake, since the date is passed in</td></tr>
+<tr><th>“Now add this feature”</th><td>Say which class changes and which do not. If nothing existing changes, say so: that is the open/closed principle doing its job</td><td>Reservations: a queue for each title, and <code>giveBack</code> announces an event that the queue listens to. <code>Copy</code>, <code>Member</code> and <code>Loan</code> are untouched</td></tr>
+<tr><th>“How would this be stored?”</th><td>Map entities to tables, and move each invariant to a constraint or a transaction</td><td><code>members</code>, <code>copies</code>, <code>loans</code>. A loan row with a null return date is an open loan (<x-ref to="schema-design#relationships"></x-ref>)</td></tr>
+</tbody>
+</table>
+
+<h2 id="shapes">Nine problems, a few shapes</h2>
+<p>Low-level design problems look more varied than they are. The nine that follow fall into a handful of shapes, and recognizing the shape tells you which part of the toolbox will carry the design.</p>
+<table>
+<thead><tr><th>Shape</th><th>Problems</th><th>What carries the design</th></tr></thead>
+<tbody>
+<tr><th>Handing out a limited resource</th><td><x-ref to="lld-parking-lot"></x-ref>, <x-ref to="lld-booking"></x-ref></td><td>One owner for “no two holders of the same thing”, and an atomic claim under concurrency</td></tr>
+<tr><th>A machine with modes</th><td><x-ref to="lld-elevator"></x-ref>, <x-ref to="lld-vending-machine"></x-ref></td><td>A state machine, written as a table or as state objects</td></tr>
+<tr><th>A data structure with a contract</th><td><x-ref to="lld-lru-cache"></x-ref>, <x-ref to="lld-rate-limiter"></x-ref></td><td>The right structure for the required speed, behind a small interface, made safe for concurrent use</td></tr>
+<tr><th>Rules about money between people</th><td><x-ref to="lld-splitwise"></x-ref></td><td>Value objects, strategies for the rules, and totals that must add up</td></tr>
+<tr><th>A game</th><td><x-ref to="lld-board-games"></x-ref></td><td>Polymorphic pieces, a board that validates moves, and a turn-taking state machine</td></tr>
+<tr><th>A small library that other code builds on</th><td><x-ref to="lld-infrastructure"></x-ref></td><td>Interfaces first: observer, strategy and a chain of handlers</td></tr>
+</tbody>
+</table>
+<p>Each chapter follows the seven steps in order, with the problem as an interviewer would state it, the questions to ask, the model and its invariants, the diagram, the code with its tests, and the follow-up questions.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Say the plan in your first minute: “I’ll ask a few questions, list the main objects and the rules they must keep, sketch the classes, then code the central use case and walk through it.” It tells the interviewer you have a method, and it gives them the chance to redirect you before you spend time on a part they do not care about. Then keep talking as you work. A correct design produced in silence is hard to give credit for.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Starting to draw or code at once</th><td>A design for a problem that was not asked</td><td>Two to five minutes of questions, with assumptions written down</td></tr>
+<tr><th>One class named after the system, holding every method</th><td>Entities with no behavior, and one unreadable class</td><td>Entities first. The coordinator last, and thin</td></tr>
+<tr><th>Never stating an invariant</th><td>Nobody, including you, can say what the code must guarantee</td><td>Two to four rules, said aloud, each with an owner</td></tr>
+<tr><th>A pattern for everything: factories, a singleton, three strategies</th><td>Structure with no requirement behind it, and no time left for code</td><td>An interface only where the requirements say behavior varies</td></tr>
+<tr><th>Strings and numbers for every concept</th><td>Identifiers and amounts that can be swapped or malformed</td><td>A few value types for the concepts that have rules</td></tr>
+<tr><th>Code that only handles the success path</th><td>The invariants exist on the board and not in the program</td><td>Write the refusals. They are the design</td></tr>
+<tr><th>Reading the clock or generating random values inside the logic</th><td>The code cannot be tested or traced by hand</td><td>Pass the time and the randomness in</td></tr>
+<tr><th>Treating a follow-up as an attack on the design</th><td>A defensive conversation</td><td>It is an invitation to show how the design absorbs change. Say what would move</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="what-is-system-design"></x-ref>: the same habits at the scale of a whole system.</li>
+  <li><x-ref to="oop-in-typescript"></x-ref> and <x-ref to="solid-principles"></x-ref>: what a well-shaped class looks like.</li>
+  <li><x-ref to="uml-diagrams"></x-ref>: the notation for steps 4 and 7.</li>
+  <li><x-ref to="domain-modeling"></x-ref>: finding entities, values and invariants.</li>
+  <li><x-ref to="behavioral-patterns"></x-ref>: strategy, state and observer, the three patterns these problems use most.</li>
+  <li><x-ref to="errors-and-testing"></x-ref>: answering “how would you test it?”.</li>
+  <li><x-ref to="hld-method"></x-ref>: the companion method for high-level design problems.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A low-level design problem is assessed on scoping, modeling, where the rules live, readiness for change, working code and communication.</li>
+  <li>Work in seven steps: clarify, find the model, state the invariants, draw the classes, decide what varies, code the core, walk it and extend it.</li>
+  <li>Have the class diagram done in about the first half of the time, and stop coding with enough left to trace a scenario.</li>
+  <li>Look for the overloaded noun, such as book for both title and copy, and split it.</li>
+  <li>State two to four invariants and give each exactly one owning class. That table is the design.</li>
+  <li>Draw entities before the coordinating class, and keep the coordinator thin.</li>
+  <li>Add an interface or a pattern only where the requirements say behavior varies.</li>
+  <li>Code the use case with the most rules in it, including every refusal.</li>
+  <li>Prepare the shape of the four standard follow-ups: concurrency, testing, a new feature and storage.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>You are asked to design a hotel’s room reservation system. Which noun in that sentence is overloaded, and how would you split it?</summary><p>“Room”. A guest asks for a kind of room, such as a double with a sea view, for a range of dates. What is finally assigned is one physical room. Rules attach to each differently: availability is counted for each room type and night, while cleaning and maintenance belong to a physical room. Model a room type and a room, with the reservation connecting a guest, a type, dates and, later, a specific room.</p></details>
+<details><summary>In the library design, why does the check “this copy is not already on loan” live in <code>Copy</code> and not in <code>Library.borrow</code>?</summary><p><code>Copy</code> holds the data the rule depends on, its current loan, privately. Placed there, the rule is enforced however a loan is attempted, including by a method added to <code>Library</code> next year. Placed in <code>borrow</code>, it protects only that one path, and the copy itself would accept a second loan from any other caller.</p></details>
+<details><summary>Twenty minutes into a 45-minute round you have twelve classes on the board and no relationships between them. What do you do?</summary><p>Stop adding. Pick the five or six that the main use case needs, draw the lines between them with multiplicities, and say aloud that the rest are deferred. Then state the invariants and move to code. A diagram finished by about the halfway point matters more than a complete inventory of everything that could exist.</p></details>
+<details><summary>The interviewer says: “Fines should be waived for members over 65, and doubled for books that someone else has reserved.” What changes in the library design?</summary><p>The fine stops being a number in the policy and becomes a function of the loan, the member and the day returned: a strategy. <code>giveBack</code> calls it where it now multiplies. <code>Copy</code>, <code>Member</code> and <code>Loan</code> do not change, apart from exposing whatever the new rule needs to read, such as the member’s age band. Say that out loud. It shows the design absorbing the change.</p></details>
+<details><summary>Which of these call for a pattern, and which do not: “the system must support three kinds of member”, “members get an email when a reserved book comes back”, “the library has one catalog”?</summary><p>Three kinds of member with different limits call for a policy for each kind, which is data or a small strategy, and not three subclasses of <code>Member</code>. The email on return is an observer: returning announces an event and the notifier subscribes. One catalog calls for nothing. Create it once and pass it in. It is not a reason for a singleton.</p></details>
+<details><summary>Why code the refusals, such as “already has 3 books”, when time is short?</summary><p>Because they are the invariants, and the invariants are what the design is for. Success-path code shows only that objects can call each other. The checks show that the rule exists, where it lives and that it holds on every path. They also give you the edge cases to name when asked how you would test.</p></details>
+<details><summary>Two desks try to lend the last copy of a title at the same instant, in a system backed by a database. Outline your answer.</summary><p>The shared state is the copy’s availability, and the invariant is one open loan for each copy. Reading “is it free?” and then inserting a loan are two steps with a gap between them. Close the gap in the database: a unique constraint over the copy for loans that have not been returned, so the second insert fails, or a conditional update that marks the copy as lent only if it is free. The loser gets a conflict and is told the copy has already gone.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Craig Larman, <cite>Applying UML and Patterns</cite>, 3rd edition, Prentice Hall, 2004. The classic account of going from use cases to a domain model to classes, and of assigning each responsibility to the class that has the information.</li>
+  <li>Rebecca Wirfs-Brock and Alan McKean, <cite>Object Design: Roles, Responsibilities, and Collaborations</cite>, Addison-Wesley, 2002. Design as deciding who is responsible for what.</li>
+  <li>Eric Evans, <cite>Domain-Driven Design</cite>, Addison-Wesley, 2003. Entities, values and the language of the problem.</li>
+  <li>Sandi Metz, <cite>Practical Object-Oriented Design</cite>, 2nd edition, Addison-Wesley, 2018. Small classes and the cost of the wrong abstraction.</li>
+  <li>Fawaz Bokhari, Desmond Zhou and Alex Xu, <cite>Object Oriented Design Interview: An Insider’s Guide</cite>, ByteByteGo, 2025. A collection of worked class-design problems of the kind in the next nine chapters.</li>
+</ol>
+</section>

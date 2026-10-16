@@ -1,0 +1,921 @@
+<!--meta
+{ "description": "Probabilistic data structures for system design: Bloom filters and their sizing, counting and cuckoo filters, HyperLogLog for distinct counts, the count-min sketch and top-k for frequencies, t-digest and DDSketch for percentiles, and MinHash for similarity, with the errors each one makes.",
+  "lede": "Some questions are cheap to ask and expensive to answer exactly. Has this key ever been stored? How many different people visited today? Which items are the most popular right now? A family of small data structures answers them in a sliver of the memory by accepting a small, known error. This chapter explains how the main ones work, what kind of mistake each can make, and where they sit inside the systems you already use.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Exact answers that cost too much</h2>
+<p>Three questions come up again and again in large systems. Each has an obvious exact answer, and each exact answer needs memory in proportion to the amount of data.</p>
+<table>
+<thead><tr><th>Question</th><th>Exact method</th><th>Cost at scale</th><th>Approximate structure</th><th>Its cost</th></tr></thead>
+<tbody>
+<tr><th>Have I seen this item before?</th><td>Keep every item in a set</td><td>One billion 16-byte keys: 16 GB before overhead</td><td>Bloom filter</td><td>1.2 GB at a 1% error rate</td></tr>
+<tr><th>How many different items have I seen?</th><td>Keep every item in a set and count it</td><td>100 million 8-byte IDs: 800 MB before overhead</td><td>HyperLogLog</td><td>12 KB, whatever the count</td></tr>
+<tr><th>How often has this item appeared?</th><td>Keep a counter for every item</td><td>A map entry for each distinct item, often gigabytes</td><td>Count-min sketch</td><td>Tens of kilobytes</td></tr>
+</tbody>
+</table>
+<p>The structures on the right are called <dfn>probabilistic data structures</dfn>, or <dfn>sketches</dfn>. They do not store the items. They store a small summary from which an answer can be estimated. The answer is sometimes wrong, and the important word is <em>how</em>. Each structure errs in one known direction and by an amount you choose in advance by deciding how much memory to give it.</p>
+<p>That makes them engineering tools and not gambles. A filter that says “definitely not present” or “probably present”, and is never wrong about the first, can be put in front of an expensive lookup with no risk to correctness. A count that is within 1% is as good as an exact one on a dashboard. The skill is in matching the kind of error to a place where it does no harm.</p>
+<p>All of them rest on the hash functions introduced in <x-ref to="partitioning#hash"></x-ref>: a function that turns any item into a number that looks random and is always the same for the same item.</p>
+
+<h2 id="bloom">Bloom filters</h2>
+<p>A <dfn>Bloom filter</dfn> answers one question about a set: is this item in it? It was described by Burton Bloom in 1970 and is the most widely used structure in this chapter.</p>
+<p>The filter is an array of bits, all starting at 0, and a small number of hash functions. To add an item, hash it with each function to get that many positions in the array, and set those bits to 1. To test an item, hash it the same way and look at the same positions. If any of them is 0, the item was never added, because adding it would have set that bit. If all are 1, the item was probably added.</p>
+
+<figure class="fig wide" id="fig-bloom">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f321t f321d">
+<title id="f321t">A 16-bit Bloom filter with three hash functions, after two additions and during two lookups</title>
+<desc id="f321d">Adding ana sets bits 2, 7 and 11. Adding ben sets bits 4, 7 and 14. Looking up chi checks bits 2, 9 and 14, and bit 9 is zero, so chi was definitely never added. Looking up dee checks bits 4, 11 and 14, which are all one because ana and ben set them, so the filter wrongly reports that dee is probably present.</desc>
+<text class="ts mid" x="60.0" y="36">0</text>
+<text class="ts mid" x="100.0" y="36">1</text>
+<text class="ts mid" x="140.0" y="36">2</text>
+<text class="ts mid" x="180.0" y="36">3</text>
+<text class="ts mid" x="220.0" y="36">4</text>
+<text class="ts mid" x="260.0" y="36">5</text>
+<text class="ts mid" x="300.0" y="36">6</text>
+<text class="ts mid" x="340.0" y="36">7</text>
+<text class="ts mid" x="380.0" y="36">8</text>
+<text class="ts mid" x="420.0" y="36">9</text>
+<text class="ts mid" x="460.0" y="36">10</text>
+<text class="ts mid" x="500.0" y="36">11</text>
+<text class="ts mid" x="540.0" y="36">12</text>
+<text class="ts mid" x="580.0" y="36">13</text>
+<text class="ts mid" x="620.0" y="36">14</text>
+<text class="ts mid" x="660.0" y="36">15</text>
+<g data-s="1">
+<text class="tb" x="40" y="16">1. Add “ana”: its three hashes give positions 2, 7 and 11. Set those bits.</text>
+<rect class="n" x="40" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="60" y="60">0</text>
+<rect class="n" x="80" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="100" y="60">0</text>
+<rect class="n sig" x="120" y="42" width="40" height="26" rx="0"/>
+<text class="tb mid" x="140" y="60">1</text>
+<rect class="n" x="160" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="180" y="60">0</text>
+<rect class="n" x="200" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="220" y="60">0</text>
+<rect class="n" x="240" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="260" y="60">0</text>
+<rect class="n" x="280" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="300" y="60">0</text>
+<rect class="n sig" x="320" y="42" width="40" height="26" rx="0"/>
+<text class="tb mid" x="340" y="60">1</text>
+<rect class="n" x="360" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="380" y="60">0</text>
+<rect class="n" x="400" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="420" y="60">0</text>
+<rect class="n" x="440" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="460" y="60">0</text>
+<rect class="n sig" x="480" y="42" width="40" height="26" rx="0"/>
+<text class="tb mid" x="500" y="60">1</text>
+<rect class="n" x="520" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="540" y="60">0</text>
+<rect class="n" x="560" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="580" y="60">0</text>
+<rect class="n" x="600" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="620" y="60">0</text>
+<rect class="n" x="640" y="42" width="40" height="26" rx="0"/>
+<text class="ts mid" x="660" y="60">0</text>
+</g>
+<g data-s="2">
+<text class="tb" x="40" y="96">2. Add “ben”: positions 4, 7 and 14. Bit 7 was already set, which is fine.</text>
+<rect class="n" x="40" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="60" y="122">0</text>
+<rect class="n" x="80" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="100" y="122">0</text>
+<rect class="n" x="120" y="104" width="40" height="26" rx="0"/>
+<text class="tb mid" x="140" y="122">1</text>
+<rect class="n" x="160" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="180" y="122">0</text>
+<rect class="n sig" x="200" y="104" width="40" height="26" rx="0"/>
+<text class="tb mid" x="220" y="122">1</text>
+<rect class="n" x="240" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="260" y="122">0</text>
+<rect class="n" x="280" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="300" y="122">0</text>
+<rect class="n sig" x="320" y="104" width="40" height="26" rx="0"/>
+<text class="tb mid" x="340" y="122">1</text>
+<rect class="n" x="360" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="380" y="122">0</text>
+<rect class="n" x="400" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="420" y="122">0</text>
+<rect class="n" x="440" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="460" y="122">0</text>
+<rect class="n" x="480" y="104" width="40" height="26" rx="0"/>
+<text class="tb mid" x="500" y="122">1</text>
+<rect class="n" x="520" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="540" y="122">0</text>
+<rect class="n" x="560" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="580" y="122">0</text>
+<rect class="n sig" x="600" y="104" width="40" height="26" rx="0"/>
+<text class="tb mid" x="620" y="122">1</text>
+<rect class="n" x="640" y="104" width="40" height="26" rx="0"/>
+<text class="ts mid" x="660" y="122">0</text>
+</g>
+<g data-s="3">
+<text class="tb" x="40" y="158">3. Is “chi” present? Check 2, 9 and 14. Bit 9 is 0, so chi was never added. This answer is always right.</text>
+<rect class="n" x="40" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="60" y="184">0</text>
+<rect class="n" x="80" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="100" y="184">0</text>
+<rect class="n store" x="120" y="166" width="40" height="26" rx="0"/>
+<text class="tb mid" x="140" y="184">1</text>
+<rect class="n" x="160" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="180" y="184">0</text>
+<rect class="n" x="200" y="166" width="40" height="26" rx="0"/>
+<text class="tb mid" x="220" y="184">1</text>
+<rect class="n" x="240" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="260" y="184">0</text>
+<rect class="n" x="280" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="300" y="184">0</text>
+<rect class="n" x="320" y="166" width="40" height="26" rx="0"/>
+<text class="tb mid" x="340" y="184">1</text>
+<rect class="n" x="360" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="380" y="184">0</text>
+<rect class="n fault" x="400" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="420" y="184">0</text>
+<rect class="n" x="440" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="460" y="184">0</text>
+<rect class="n" x="480" y="166" width="40" height="26" rx="0"/>
+<text class="tb mid" x="500" y="184">1</text>
+<rect class="n" x="520" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="540" y="184">0</text>
+<rect class="n" x="560" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="580" y="184">0</text>
+<rect class="n store" x="600" y="166" width="40" height="26" rx="0"/>
+<text class="tb mid" x="620" y="184">1</text>
+<rect class="n" x="640" y="166" width="40" height="26" rx="0"/>
+<text class="ts mid" x="660" y="184">0</text>
+</g>
+<g data-s="4">
+<text class="tb" x="40" y="220">4. Is “dee” present? Check 4, 11 and 14. All are 1, but ana and ben set them. A false positive.</text>
+<rect class="n" x="40" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="60" y="246">0</text>
+<rect class="n" x="80" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="100" y="246">0</text>
+<rect class="n" x="120" y="228" width="40" height="26" rx="0"/>
+<text class="tb mid" x="140" y="246">1</text>
+<rect class="n" x="160" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="180" y="246">0</text>
+<rect class="n async" x="200" y="228" width="40" height="26" rx="0"/>
+<text class="tb mid" x="220" y="246">1</text>
+<rect class="n" x="240" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="260" y="246">0</text>
+<rect class="n" x="280" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="300" y="246">0</text>
+<rect class="n" x="320" y="228" width="40" height="26" rx="0"/>
+<text class="tb mid" x="340" y="246">1</text>
+<rect class="n" x="360" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="380" y="246">0</text>
+<rect class="n" x="400" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="420" y="246">0</text>
+<rect class="n" x="440" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="460" y="246">0</text>
+<rect class="n async" x="480" y="228" width="40" height="26" rx="0"/>
+<text class="tb mid" x="500" y="246">1</text>
+<rect class="n" x="520" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="540" y="246">0</text>
+<rect class="n" x="560" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="580" y="246">0</text>
+<rect class="n async" x="600" y="228" width="40" height="26" rx="0"/>
+<text class="tb mid" x="620" y="246">1</text>
+<rect class="n" x="640" y="228" width="40" height="26" rx="0"/>
+<text class="ts mid" x="660" y="246">0</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Bits set: 2, 7, 11">Add “ana”. Three hash functions turn the name into positions 2, 7 and 11, and those three bits are set.</li>
+  <li data-state="Bits set: 2, 4, 7, 11, 14">Add “ben”. Its positions are 4, 7 and 14. Bit 7 was already set, which is fine.</li>
+  <li data-state="Bits set: 2, 4, 7, 11, 14; chi: certainly absent">Is “chi” present? Check positions 2, 9 and 14. Bit 9 is 0, so chi was never added. A “no” from a Bloom filter is always right.</li>
+  <li data-state="Bits set: 2, 4, 7, 11, 14; dee: “probably present”, wrongly">Is “dee” present? Check 4, 11 and 14. All three are 1, but they were set by ana and ben. The filter answers “probably”, and here it is wrong. This is a false positive.</li>
+</ol>
+<figcaption>A Bloom filter small enough to draw. A 0 at any checked position proves absence. All 1s only suggest presence, because other items may have set those bits.</figcaption>
+</figure>
+
+<p>The fourth lookup in <x-fig to="fig-bloom"></x-fig> shows the one mistake a Bloom filter can make. The bits that “dee” maps to were all set by other items, so the filter reports it as possibly present. This is a <dfn>false positive</dfn>. The opposite mistake, a <dfn>false negative</dfn>, cannot happen: an item that was added always finds its own bits set.</p>
+<p>So the two answers have different strengths.</p>
+<ul>
+  <li><b>“No”</b> is certain. The item is not in the set.</li>
+  <li><b>“Maybe”</b> means the item is in the set, or it is one of the small fraction of absent items that collide.</li>
+</ul>
+<p>Every good use of a Bloom filter is arranged so that the certain answer is the common and valuable one, and the uncertain answer leads to a check that would have happened anyway.</p>
+
+<h3 id="bloom-sizing">Choosing the size</h3>
+<p>Two numbers decide how often false positives happen: how many bits the filter has for each item stored, and how many hash functions it uses. The formulas are short.</p>
+<div class="formula">bits per item    = −ln(p) ÷ (ln 2)²  ≈ 1.44 × log₂(1 ÷ p)
+hash functions   = bits per item × ln 2  ≈ 0.69 × bits per item
+
+p is the false positive rate you will accept, as a fraction</div>
+<p>For a 1% rate that gives 9.6 bits per item and 7 hash functions. Two things about this result are worth remembering. First, the size of the items does not appear. A 2,000-character URL and a 4-byte number each cost the same ten bits, because the filter stores neither. Second, accuracy is cheap. Each additional 4.8 bits per item divides the false positive rate by ten.</p>
+<table>
+<thead><tr><th>Bits per item</th><th>Hash functions</th><th>False positive rate</th></tr></thead>
+<tbody>
+<tr><td>4</td><td>3</td><td>14.7%</td></tr>
+<tr><td>6</td><td>4</td><td>5.6%</td></tr>
+<tr><td>8</td><td>6</td><td>2.2%</td></tr>
+<tr><td>10</td><td>7</td><td>0.82%</td></tr>
+<tr><td>12</td><td>8</td><td>0.31%</td></tr>
+<tr><td>16</td><td>11</td><td>0.046%</td></tr>
+<tr><td>20</td><td>14</td><td>0.0067%</td></tr>
+</tbody>
+</table>
+
+<div class="widget" data-widget="bloom">
+<h4>Sizing a Bloom filter</h4>
+<p>Enter how many items the filter must hold and the false positive rate you can accept. The item size is used only to show what storing the items themselves would cost.</p>
+<div class="controls">
+  <label>Items to store<input type="number" name="n" value="1000000" min="1" step="1"></label>
+  <label>False positive rate, in percent<input type="number" name="p" value="1" min="0.0001" max="50" step="0.1"></label>
+  <label>Average item size, in bytes<input type="number" name="size" value="16" min="1" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 262" role="img" aria-label="Two bars comparing the size of the filter with the size of the items, and a line showing how the false positive rate falls as each item is given more bits, with the chosen point marked."><text x="10" y="22" class="ts">The items themselves</text><rect x="150" y="10" width="470" height="16" rx="3" class="bar mute"></rect><text x="10" y="46" class="ts">The filter</text><rect x="150" y="34" width="35.2" height="16" rx="3" class="bar"></rect><line x1="64" x2="620" y1="78" y2="78" class="grid"></line><text x="56" y="82" class="ts end">100%</text><line x1="64" x2="620" y1="124.7" y2="124.7" class="grid"></line><text x="56" y="128.7" class="ts end">1%</text><line x1="64" x2="620" y1="171.3" y2="171.3" class="grid"></line><text x="56" y="175.3" class="ts end">0.01%</text><line x1="64" x2="620" y1="218" y2="218" class="axis"></line><text x="56" y="222" class="ts end">0.0001%</text><text x="64" y="235" class="ts mid">0</text><text x="249.3" y="235" class="ts mid">10</text><text x="434.7" y="235" class="ts mid">20</text><text x="620" y="235" class="ts mid">30</text><text x="342" y="254" class="ts mid">Bits per item. Every 4.8 bits more makes false positives ten times rarer.</text><path d="M64 78 L596.9 218" class="line"></path><line x1="241.6" x2="241.6" y1="124.7" y2="218" class="axis" stroke-dasharray="4 4"></line><circle cx="241.6" cy="124.7" r="5.5" class="dot"></circle><text x="251.6" y="116.7" class="tb">9.59 bits, 1 wrong “maybe” in 100</text></svg>
+<dl class="results">
+  <div><dt>Bits per item</dt><dd data-out="bits">9.59 bits</dd></div>
+  <div><dt>Hash functions</dt><dd data-out="hashes">7</dd></div>
+  <div><dt>Filter size</dt><dd data-out="memory">1.2 MB</dd></div>
+  <div><dt>The items themselves</dt><dd data-out="raw">16 MB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">The filter needs 1.2 MB, about 7.49% of the 16 MB the items themselves occupy. It never misses an item that is present, and wrongly reports an absent one as possibly present about once in 100 lookups. Halving that error rate costs about 1.44 more bits per item.</p>
+</div>
+
+<p>The number of items is a promise you make when you create the filter. If more arrive than it was sized for, nothing breaks and no error is raised. The bits simply fill up, and the false positive rate climbs.</p>
+
+<figure class="fig wide" id="fig-fill">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 258" role="img" aria-labelledby="f322t f322d">
+<title id="f322t">The false positive rate of a Bloom filter as it is filled beyond the number of items it was sized for</title>
+<desc id="f322d">A line chart. The filter was sized for a 1% false positive rate. At half its designed load the rate is about 0.03%. At the designed load it is 1%. At twice the load it is 15.7%, and at three times the load it is 43.6%.</desc>
+<line class="axis" x1="60" y1="210" x2="700" y2="210"/>
+<text class="ts end" x="52" y="214.0">0%</text>
+<line class="grid" x1="60" y1="172" x2="700" y2="172"/>
+<text class="ts end" x="52" y="176.0">10%</text>
+<line class="grid" x1="60" y1="134" x2="700" y2="134"/>
+<text class="ts end" x="52" y="138.0">20%</text>
+<line class="grid" x1="60" y1="96" x2="700" y2="96"/>
+<text class="ts end" x="52" y="100.0">30%</text>
+<line class="grid" x1="60" y1="58" x2="700" y2="58"/>
+<text class="ts end" x="52" y="62.0">40%</text>
+<line class="grid" x1="60" y1="20" x2="700" y2="20"/>
+<text class="ts end" x="52" y="24.0">50%</text>
+<text class="ts mid" x="60.0" y="228">0</text>
+<text class="ts mid" x="166.66666666666666" y="228">0.5×</text>
+<text class="ts mid" x="273.3333333333333" y="228">1×</text>
+<text class="ts mid" x="380.0" y="228">1.5×</text>
+<text class="ts mid" x="486.66666666666663" y="228">2×</text>
+<text class="ts mid" x="593.3333333333334" y="228">2.5×</text>
+<text class="ts mid" x="700.0" y="228">3×</text>
+<path class="line" d="M60.0 210.0 L70.7 210.0 L81.3 210.0 L92.0 210.0 L102.7 210.0 L113.3 210.0 L124.0 210.0 L134.7 210.0 L145.3 210.0 L156.0 209.9 L166.7 209.9 L177.3 209.8 L188.0 209.7 L198.7 209.6 L209.3 209.4 L220.0 209.1 L230.7 208.7 L241.3 208.3 L252.0 207.7 L262.7 207.0 L273.3 206.2 L284.0 205.2 L294.7 204.1 L305.3 202.7 L316.0 201.2 L326.7 199.5 L337.3 197.6 L348.0 195.5 L358.7 193.2 L369.3 190.7 L380.0 188.0 L390.7 185.1 L401.3 181.9 L412.0 178.6 L422.7 175.1 L433.3 171.4 L444.0 167.5 L454.7 163.4 L465.3 159.1 L476.0 154.7 L486.7 150.2 L497.3 145.5 L508.0 140.7 L518.7 135.7 L529.3 130.7 L540.0 125.6 L550.7 120.4 L561.3 115.1 L572.0 109.7 L582.7 104.3 L593.3 98.9 L604.0 93.4 L614.7 87.9 L625.3 82.4 L636.0 76.9 L646.7 71.4 L657.3 65.9 L668.0 60.5 L678.7 55.1 L689.3 49.7 L700.0 44.3"/>
+<circle class="dot" cx="273.3" cy="206.2" r="5"/>
+<text class="ts end" x="263" y="196">designed load: 1%</text>
+<circle class="dot" cx="486.7" cy="150.2" r="5"/>
+<text class="ts end" x="475" y="144">twice the load: 15.7%</text>
+<circle class="dot" cx="700.0" cy="44.3" r="5"/>
+<text class="ts end" x="688" y="40">three times: 43.6%</text>
+<path class="e none dash" d="M273.3 20V210"/>
+<text class="ts mid" x="380.0" y="250">Items stored, as a multiple of the number the filter was sized for</text>
+<rect class="hit" x="54.7" y="20" width="10.7" height="190" data-tip="0 times the designed load|false positive rate: 0%"/>
+<rect class="hit" x="65.4" y="20" width="10.7" height="190" data-tip="0.05 times the designed load|false positive rate: under 0.01%"/>
+<rect class="hit" x="76.0" y="20" width="10.7" height="190" data-tip="0.1 times the designed load|false positive rate: under 0.01%"/>
+<rect class="hit" x="86.7" y="20" width="10.7" height="190" data-tip="0.15 times the designed load|false positive rate: under 0.01%"/>
+<rect class="hit" x="97.4" y="20" width="10.7" height="190" data-tip="0.2 times the designed load|false positive rate: under 0.01%"/>
+<rect class="hit" x="108.0" y="20" width="10.7" height="190" data-tip="0.25 times the designed load|false positive rate: under 0.01%"/>
+<rect class="hit" x="118.7" y="20" width="10.7" height="190" data-tip="0.3 times the designed load|false positive rate: under 0.01%"/>
+<rect class="hit" x="129.4" y="20" width="10.7" height="190" data-tip="0.35 times the designed load|false positive rate: under 0.01%"/>
+<rect class="hit" x="140.0" y="20" width="10.7" height="190" data-tip="0.4 times the designed load|false positive rate: under 0.01%"/>
+<rect class="hit" x="150.7" y="20" width="10.7" height="190" data-tip="0.45 times the designed load|false positive rate: 0.01%"/>
+<rect class="hit" x="161.4" y="20" width="10.7" height="190" data-tip="0.5 times the designed load|false positive rate: 0.03%"/>
+<rect class="hit" x="172.0" y="20" width="10.7" height="190" data-tip="0.55 times the designed load|false positive rate: 0.04%"/>
+<rect class="hit" x="182.7" y="20" width="10.7" height="190" data-tip="0.6 times the designed load|false positive rate: 0.07%"/>
+<rect class="hit" x="193.4" y="20" width="10.7" height="190" data-tip="0.65 times the designed load|false positive rate: 0.1%"/>
+<rect class="hit" x="204.0" y="20" width="10.7" height="190" data-tip="0.7 times the designed load|false positive rate: 0.2%"/>
+<rect class="hit" x="214.7" y="20" width="10.7" height="190" data-tip="0.75 times the designed load|false positive rate: 0.2%"/>
+<rect class="hit" x="225.4" y="20" width="10.7" height="190" data-tip="0.8 times the designed load|false positive rate: 0.3%"/>
+<rect class="hit" x="236.0" y="20" width="10.7" height="190" data-tip="0.85 times the designed load|false positive rate: 0.5%"/>
+<rect class="hit" x="246.7" y="20" width="10.7" height="190" data-tip="0.9 times the designed load|false positive rate: 0.6%"/>
+<rect class="hit" x="257.4" y="20" width="10.7" height="190" data-tip="0.95 times the designed load|false positive rate: 0.8%"/>
+<rect class="hit" x="268.0" y="20" width="10.7" height="190" data-tip="1 times the designed load|false positive rate: 1.0%"/>
+<rect class="hit" x="278.7" y="20" width="10.7" height="190" data-tip="1.05 times the designed load|false positive rate: 1.3%"/>
+<rect class="hit" x="289.4" y="20" width="10.7" height="190" data-tip="1.1 times the designed load|false positive rate: 1.6%"/>
+<rect class="hit" x="300.0" y="20" width="10.7" height="190" data-tip="1.15 times the designed load|false positive rate: 1.9%"/>
+<rect class="hit" x="310.7" y="20" width="10.7" height="190" data-tip="1.2 times the designed load|false positive rate: 2.3%"/>
+<rect class="hit" x="321.4" y="20" width="10.7" height="190" data-tip="1.25 times the designed load|false positive rate: 2.8%"/>
+<rect class="hit" x="332.0" y="20" width="10.7" height="190" data-tip="1.3 times the designed load|false positive rate: 3.3%"/>
+<rect class="hit" x="342.7" y="20" width="10.7" height="190" data-tip="1.35 times the designed load|false positive rate: 3.8%"/>
+<rect class="hit" x="353.4" y="20" width="10.7" height="190" data-tip="1.4 times the designed load|false positive rate: 4.4%"/>
+<rect class="hit" x="364.0" y="20" width="10.7" height="190" data-tip="1.45 times the designed load|false positive rate: 5.1%"/>
+<rect class="hit" x="374.7" y="20" width="10.7" height="190" data-tip="1.5 times the designed load|false positive rate: 5.8%"/>
+<rect class="hit" x="385.4" y="20" width="10.7" height="190" data-tip="1.55 times the designed load|false positive rate: 6.6%"/>
+<rect class="hit" x="396.0" y="20" width="10.7" height="190" data-tip="1.6 times the designed load|false positive rate: 7.4%"/>
+<rect class="hit" x="406.7" y="20" width="10.7" height="190" data-tip="1.65 times the designed load|false positive rate: 8.3%"/>
+<rect class="hit" x="417.4" y="20" width="10.7" height="190" data-tip="1.7 times the designed load|false positive rate: 9.2%"/>
+<rect class="hit" x="428.0" y="20" width="10.7" height="190" data-tip="1.75 times the designed load|false positive rate: 10.2%"/>
+<rect class="hit" x="438.7" y="20" width="10.7" height="190" data-tip="1.8 times the designed load|false positive rate: 11.2%"/>
+<rect class="hit" x="449.4" y="20" width="10.7" height="190" data-tip="1.85 times the designed load|false positive rate: 12.3%"/>
+<rect class="hit" x="460.0" y="20" width="10.7" height="190" data-tip="1.9 times the designed load|false positive rate: 13.4%"/>
+<rect class="hit" x="470.7" y="20" width="10.7" height="190" data-tip="1.95 times the designed load|false positive rate: 14.5%"/>
+<rect class="hit" x="481.4" y="20" width="10.7" height="190" data-tip="2 times the designed load|false positive rate: 15.7%"/>
+<rect class="hit" x="492.0" y="20" width="10.7" height="190" data-tip="2.05 times the designed load|false positive rate: 17.0%"/>
+<rect class="hit" x="502.7" y="20" width="10.7" height="190" data-tip="2.1 times the designed load|false positive rate: 18.2%"/>
+<rect class="hit" x="513.4" y="20" width="10.7" height="190" data-tip="2.15 times the designed load|false positive rate: 19.5%"/>
+<rect class="hit" x="524.0" y="20" width="10.7" height="190" data-tip="2.2 times the designed load|false positive rate: 20.9%"/>
+<rect class="hit" x="534.7" y="20" width="10.7" height="190" data-tip="2.25 times the designed load|false positive rate: 22.2%"/>
+<rect class="hit" x="545.4" y="20" width="10.7" height="190" data-tip="2.3 times the designed load|false positive rate: 23.6%"/>
+<rect class="hit" x="556.0" y="20" width="10.7" height="190" data-tip="2.35 times the designed load|false positive rate: 25.0%"/>
+<rect class="hit" x="566.7" y="20" width="10.7" height="190" data-tip="2.4 times the designed load|false positive rate: 26.4%"/>
+<rect class="hit" x="577.4" y="20" width="10.7" height="190" data-tip="2.45 times the designed load|false positive rate: 27.8%"/>
+<rect class="hit" x="588.0" y="20" width="10.7" height="190" data-tip="2.5 times the designed load|false positive rate: 29.2%"/>
+<rect class="hit" x="598.7" y="20" width="10.7" height="190" data-tip="2.55 times the designed load|false positive rate: 30.7%"/>
+<rect class="hit" x="609.4" y="20" width="10.7" height="190" data-tip="2.6 times the designed load|false positive rate: 32.1%"/>
+<rect class="hit" x="620.0" y="20" width="10.7" height="190" data-tip="2.65 times the designed load|false positive rate: 33.6%"/>
+<rect class="hit" x="630.7" y="20" width="10.7" height="190" data-tip="2.7 times the designed load|false positive rate: 35.0%"/>
+<rect class="hit" x="641.4" y="20" width="10.7" height="190" data-tip="2.75 times the designed load|false positive rate: 36.5%"/>
+<rect class="hit" x="652.0" y="20" width="10.7" height="190" data-tip="2.8 times the designed load|false positive rate: 37.9%"/>
+<rect class="hit" x="662.7" y="20" width="10.7" height="190" data-tip="2.85 times the designed load|false positive rate: 39.3%"/>
+<rect class="hit" x="673.4" y="20" width="10.7" height="190" data-tip="2.9 times the designed load|false positive rate: 40.8%"/>
+<rect class="hit" x="684.0" y="20" width="10.7" height="190" data-tip="2.95 times the designed load|false positive rate: 42.2%"/>
+<rect class="hit" x="694.7" y="20" width="10.7" height="190" data-tip="3 times the designed load|false positive rate: 43.6%"/>
+</svg>
+</div>
+<figcaption>A filter sized for a 1% false positive rate, loaded past its design. It degrades quietly, so the number of items in a filter is worth monitoring.</figcaption>
+</figure>
+
+<p>A Bloom filter cannot be enlarged afterward, because it does not hold the items needed to fill a bigger one. The choices are to rebuild it from the original data, or to use a <dfn>scalable Bloom filter</dfn>, which adds a second, larger filter when the first is full and checks both. Redis does the latter automatically unless told not to.</p>
+
+<h3 id="bloom-code">In code</h3>
+<p>A working filter is a few dozen lines. The only subtlety is producing several hash values cheaply. A standard technique computes two hashes and combines them, taking the first plus one, two, three times the second, which behaves as well as fully independent functions.</p>
+<pre data-lang="ts" data-title="A Bloom filter">
+// A small non-cryptographic hash: FNV-1a, then a mixing step so that similar
+// strings land far apart. The seed gives independent variants.
+function hash32(text: string, seed: number): number {
+  let h = (0x811c9dc5 ^ seed) >>> 0;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+class BloomFilter {
+  private readonly bits: Uint8Array;
+  readonly size: number;        // m: number of bits
+  readonly hashes: number;      // k: bits set per item
+
+  constructor(expectedItems: number, falsePositiveRate: number) {
+    this.size = Math.ceil(-expectedItems * Math.log(falsePositiveRate) / (Math.LN2 * Math.LN2));
+    this.hashes = Math.max(1, Math.round((this.size / expectedItems) * Math.LN2));
+    this.bits = new Uint8Array(Math.ceil(this.size / 8));
+  }
+
+  // Two real hashes are enough: position i is h1 + i * h2.
+  private positions(item: string): number[] {
+    const h1 = hash32(item, 0);
+    const h2 = (hash32(item, 0x9e3779b9) | 1) >>> 0;  // odd, and kept unsigned
+    const out: number[] = [];
+    for (let i = 0; i < this.hashes; i++) out.push((h1 + i * h2) % this.size);
+    return out;
+  }
+
+  add(item: string): void {
+    for (const p of this.positions(item)) this.bits[p >> 3] |= 1 << (p & 7);
+  }
+
+  // false: definitely never added. true: probably added.
+  mightContain(item: string): boolean {
+    return this.positions(item).every((p) => (this.bits[p >> 3] & (1 << (p & 7))) !== 0);
+  }
+}
+
+const taken = new BloomFilter(1_000_000, 0.01);        // about 1.2 MB
+taken.add("ana");
+taken.mightContain("ana");                             // true
+taken.mightContain("zed");                             // false, or true about 1 time in 100
+</pre>
+<p>Filled with a million keys and tested against half a million keys that were never added, this code reported 1.0% of them as possibly present and missed none of the real ones. Filled with two million, it reported 15.7%, as the curve in <x-fig to="fig-fill"></x-fig> predicts.</p>
+<p>The method is named <code>mightContain</code> on purpose. Calling it <code>contains</code> invites the next reader to trust a “yes”.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> A weak hash function. The formulas assume hash values spread evenly. The first version of the code above lacked the mixing step, and on keys such as <code>user-1</code>, <code>user-2</code> its measured error rate was half the predicted one, which looks like good news and is a sign that the positions were not random. With differently shaped keys the same flaw raises the error rate. Use a well-tested hash such as MurmurHash3 or xxHash, as the libraries do, and measure the false positive rate on your own keys.</p></div>
+
+<h3 id="bloom-uses">Where Bloom filters are used</h3>
+<p>The pattern is always the same: a small filter in memory stands in front of something slow, and turns most pointless trips into an immediate “no”.</p>
+
+<figure class="fig wide" id="fig-gate">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f323t f323d">
+<title id="f323t">A Bloom filter placed in front of an expensive lookup</title>
+<desc id="f323d">A lookup first consults a Bloom filter held in memory. If the filter says the key is definitely absent, the answer not found is returned with no disk read. If it says possibly present, the file or database is read. Usually the key is found. Occasionally it is not, which is a false positive and costs one wasted read.</desc>
+<rect class="n" x="10" y="62" width="110" height="46" rx="6"/>
+<text class="tb mid" x="65" y="81">Lookup</text>
+<text class="ts mid" x="65" y="98">key = k</text>
+<rect class="n sig" x="170" y="52" width="160" height="66" rx="6"/>
+<text class="tb mid" x="250" y="72.5">Bloom filter</text>
+<text class="ts mid" x="250" y="89.5">in memory</text>
+<text class="ts mid" x="250" y="106.5">a few bits per key</text>
+<path class="e" d="M120 85H170"/>
+<rect class="n store" x="480" y="14" width="230" height="46" rx="6"/>
+<text class="tb mid" x="595" y="33">Answer “not found”</text>
+<text class="ts mid" x="595" y="50">no disk read at all</text>
+<rect class="n" x="480" y="110" width="230" height="46" rx="6"/>
+<text class="tb mid" x="595" y="129">Read the file or database</text>
+<text class="ts mid" x="595" y="146">the expensive step</text>
+<path class="e store" d="M330 72C400 72 410 37 480 37"/>
+<path class="e" d="M330 98C400 98 410 133 480 133"/>
+<text class="ts" x="340" y="30">definitely absent</text>
+<text class="ts" x="340" y="150">possibly present</text>
+<rect class="n store" x="360" y="196" width="165" height="40" rx="6"/>
+<text class="ts mid" x="442.5" y="220.5">found: the usual case</text>
+<rect class="n fault" x="545" y="196" width="165" height="40" rx="6"/>
+<text class="ts mid" x="627.5" y="220.5">not there: a wasted read</text>
+<path class="e" d="M560 156C560 176 442 176 442 196"/>
+<path class="e fault" d="M628 156V196"/>
+<text class="ts" x="10" y="188">With a 1% filter, 99 of every 100 lookups for</text>
+<text class="ts" x="10" y="204">absent keys stop at the filter. The other one</text>
+<text class="ts" x="10" y="220">costs what every lookup cost before.</text>
+</svg>
+</div>
+<figcaption>The filter never changes the answer. It only removes most of the work for keys that are not there.</figcaption>
+</figure>
+
+<ul>
+  <li><b>Storage engines.</b> An LSM tree may hold a key in any of several files. Each file carries a Bloom filter of its keys, so a read skips the files that cannot contain the key (<x-ref to="storage-engines#lsm"></x-ref>). RocksDB’s commonly used setting of ten bits per key gives about a 1% false positive rate. Cassandra, HBase and most other LSM stores do the same.</li>
+  <li><b>Caches in front of databases.</b> Requests for keys that do not exist can never be cache hits, so each one reaches the database (<x-ref to="caching#other-failures"></x-ref>). A filter of the keys that do exist rejects most of them first.</li>
+  <li><b>Content delivery.</b> Akamai found that in one group of servers about three-quarters of 400 million objects were requested only once in two days. Writing those to disk was wasted effort. With a Bloom filter remembering which objects had been requested before, servers cached an object only on its second request. Disk writes fell by 44%, and the share of bytes served from cache rose from 74% to 83%, because popular objects were no longer pushed out by ones nobody would ask for again.</li>
+  <li><b>“Is this name taken?”</b> A sign-up form can check a filter of existing usernames as the user types. “No” means the name is free. “Maybe” means ask the database.</li>
+  <li><b>Crawlers and pipelines.</b> A web crawler keeps a filter of URLs it has already fetched (<x-ref to="hld-web-crawler"></x-ref>). Here a false positive means a page is wrongly skipped, which a crawler can tolerate.</li>
+  <li><b>Joins across machines.</b> Before shipping a large table across the network to be joined with a small one, a query engine can send a Bloom filter of the small table’s keys and have the other side drop rows that cannot match.</li>
+</ul>
+<p>The crawler example shows that the direction of the error has to be thought through for each use. In the cache example a false positive costs one unnecessary database query. In the crawler it costs a missed page. In a system that blocks sign-ups from a list of banned email addresses, it would turn away about one innocent person in a hundred, which is not acceptable unless a “maybe” is followed by an exact check.</p>
+<div class="note production"><p><span class="label">In production.</span> A filter is a cache of knowledge about a set, and it goes stale like any cache. If a username is added to the database and not to the filter, the filter now gives a false “no”, the one answer it was supposed to never get wrong. Either update the filter in the same code path as the write, or treat it as a hint and let a unique constraint in the database make the final decision. Always do the second for anything that must be unique.</p></div>
+
+<h3 id="variants">Deleting, and newer filters</h3>
+<p>You cannot remove an item from a Bloom filter. Clearing its bits would also clear them for every other item that shares them, creating false negatives. Where the set shrinks as well as grows, there are three options.</p>
+<ul>
+  <li><b>Rebuild periodically.</b> Create a fresh filter from the current data and swap it in. This is what LSM engines do naturally: each file’s filter is written once and discarded with the file.</li>
+  <li><b>Counting Bloom filter.</b> Replace each bit with a small counter, usually four bits. Adding increments the counters and deleting decrements them. It uses four times the memory, and deleting an item that was never added corrupts it.</li>
+  <li><b>Cuckoo filter.</b> A different design that stores a short fingerprint of each item in one of two possible slots. It supports deletion, and its authors showed that it needs less space than a Bloom filter when the target false positive rate is below about 3%. Insertion can fail when the filter is nearly full.</li>
+</ul>
+<p>Newer static filters, such as the xor filter and the ribbon filter that RocksDB offers, use around 30% less memory than a Bloom filter for the same error rate, at the price of more work to build. They suit data that is written once, which is exactly the case of an LSM file.</p>
+
+<h2 id="hll">Counting distinct items with HyperLogLog</h2>
+<p>How many different users were active today? How many distinct IP addresses hit this endpoint? How many unique search queries were there this month? These are <dfn>cardinality</dfn> questions, and the exact method is to remember every item seen. For a hundred million users that is hundreds of megabytes for each count you want, and a product wants many: per day, per country, per feature.</p>
+<p><dfn>HyperLogLog</dfn>, published by Philippe Flajolet and colleagues in 2007, estimates the count from a fixed, tiny amount of memory. The idea rests on one observation about random bits. If you flip coins and write down the results, a sequence that begins with three tails in a row is unusual: it happens one time in eight. If someone tells you only that the longest run of tails at the start of any of their sequences was ten, you can guess they produced about a thousand sequences, because a run that long turns up about once in 1,024 tries.</p>
+<p>A hash function turns each item into such a sequence of random-looking bits. HyperLogLog remembers only the longest run of leading zeros it has seen. To make the guess stable, it splits the items among many small registers using the first few bits of the hash, keeps a longest run for each, and combines them with a particular kind of average.</p>
+
+<figure class="fig wide" id="fig-hll">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 286" role="img" aria-labelledby="f324t f324d">
+<title id="f324t">How HyperLogLog processes one item</title>
+<desc id="f324d">The item is hashed to a string of bits. The first four bits, 0010, select register 2. The following bits begin with three zeros and then a one, which is recorded as a run of 4. Register 2 previously held 3 and is raised to 4. Each of the sixteen registers keeps the longest run it has seen, and the estimate of the number of distinct items is computed from all of them.</desc>
+<g data-s="1">
+<text class="tb" x="10" y="18">1. Hash the item to a string of bits that looks random.</text>
+<text class="ts" x="10" y="54">hash(“ana”) =</text>
+<rect class="n sig" x="150" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="163" y="54">0</text>
+<rect class="n sig" x="176" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="189" y="54">0</text>
+<rect class="n sig" x="202" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="215" y="54">1</text>
+<rect class="n sig" x="228" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="241" y="54">0</text>
+<rect class="n async" x="254" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="267" y="54">0</text>
+<rect class="n async" x="280" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="293" y="54">0</text>
+<rect class="n async" x="306" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="319" y="54">0</text>
+<rect class="n async" x="332" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="345" y="54">1</text>
+<rect class="n" x="358" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="371" y="54">0</text>
+<rect class="n" x="384" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="397" y="54">1</text>
+<rect class="n" x="410" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="423" y="54">1</text>
+<rect class="n" x="436" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="449" y="54">0</text>
+<rect class="n" x="462" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="475" y="54">1</text>
+<rect class="n" x="488" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="501" y="54">0</text>
+<rect class="n" x="514" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="527" y="54">0</text>
+<rect class="n" x="540" y="36" width="26" height="26" rx="0"/>
+<text class="ts mid" x="553" y="54">1</text>
+<text class="ts" x="576" y="54">… and 48 more bits</text>
+<path class="e none sig" d="M150 70v6h104v-6"/>
+<path class="e none async" d="M256 70v6h102v-6"/>
+<text class="ts" x="110" y="94">first bits choose a</text>
+<text class="ts" x="110" y="109">register: 0010 = 2</text>
+<text class="ts" x="256" y="94">the rest: three zeros, then a 1.</text>
+<text class="ts" x="256" y="109">Call that a run of 4.</text>
+</g>
+<g data-s="2">
+<text class="tb" x="10" y="146">2. Each register keeps the longest run it has ever seen. Register 2 held 3, and now holds 4.</text>
+<text class="ts mid" x="60.0" y="166">0</text>
+<rect class="n" x="40" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="60" y="190">2</text>
+<text class="ts mid" x="100.0" y="166">1</text>
+<rect class="n" x="80" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="100" y="190">1</text>
+<text class="ts mid" x="140.0" y="166">2</text>
+<rect class="n sig" x="120" y="172" width="40" height="26" rx="0"/>
+<text class="tb mid" x="140" y="190">4</text>
+<text class="ts mid" x="180.0" y="166">3</text>
+<rect class="n" x="160" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="180" y="190">3</text>
+<text class="ts mid" x="220.0" y="166">4</text>
+<rect class="n" x="200" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="220" y="190">1</text>
+<text class="ts mid" x="260.0" y="166">5</text>
+<rect class="n" x="240" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="260" y="190">2</text>
+<text class="ts mid" x="300.0" y="166">6</text>
+<rect class="n" x="280" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="300" y="190">5</text>
+<text class="ts mid" x="340.0" y="166">7</text>
+<rect class="n" x="320" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="340" y="190">1</text>
+<text class="ts mid" x="380.0" y="166">8</text>
+<rect class="n" x="360" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="380" y="190">2</text>
+<text class="ts mid" x="420.0" y="166">9</text>
+<rect class="n" x="400" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="420" y="190">3</text>
+<text class="ts mid" x="460.0" y="166">10</text>
+<rect class="n" x="440" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="460" y="190">1</text>
+<text class="ts mid" x="500.0" y="166">11</text>
+<rect class="n" x="480" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="500" y="190">2</text>
+<text class="ts mid" x="540.0" y="166">12</text>
+<rect class="n" x="520" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="540" y="190">1</text>
+<text class="ts mid" x="580.0" y="166">13</text>
+<rect class="n" x="560" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="580" y="190">4</text>
+<text class="ts mid" x="620.0" y="166">14</text>
+<rect class="n" x="600" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="620" y="190">2</text>
+<text class="ts mid" x="660.0" y="166">15</text>
+<rect class="n" x="640" y="172" width="40" height="26" rx="0"/>
+<text class="ts mid" x="660" y="190">1</text>
+</g>
+<g data-s="3">
+<text class="tb" x="10" y="226">3. Long runs are rare, so a register that has seen one has probably seen many items.</text>
+<text class="ts" x="10" y="246">A run of 4 or more turns up for about 1 hash in 8. Averaging over all the registers turns these rough clues into an estimate</text>
+<text class="ts" x="10" y="262">of how many different items there were. Adding “ana” again changes nothing, because its hash is the same.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Register 2: 3">Hash the item into bits that look random. The first four bits choose one of 16 registers: 0010 is register 2. In the bits that follow, count up to and including the first 1. Here that run is 4.</li>
+  <li data-state="Register 2: 4">Each register keeps the longest run it has ever seen. Register 2 held 3, and now holds 4.</li>
+  <li>Long runs are rare, so a register that has seen one has probably seen many different items. Averaging over all the registers gives an estimate of how many distinct items there were. Adding “ana” again changes nothing.</li>
+</ol>
+<figcaption>One item passing through a HyperLogLog with 16 registers. Real ones use thousands of registers of five or six bits each.</figcaption>
+</figure>
+
+<p>Three properties follow from this design.</p>
+<ul>
+  <li><b>Duplicates are free.</b> The same item always produces the same hash, so adding it again changes nothing. The structure counts distinct items without ever recording which ones it has seen.</li>
+  <li><b>The size is fixed.</b> It depends on the number of registers, not on the number of items. Counting a thousand items and counting a billion use the same memory.</li>
+  <li><b>The error is known.</b> With <i>m</i> registers the typical error is 1.04 ÷ √<i>m</i>.</li>
+</ul>
+<table>
+<thead><tr><th>Registers</th><th>Memory at 6 bits each</th><th>Typical error</th></tr></thead>
+<tbody>
+<tr><td>1,024</td><td>768 bytes</td><td>3.25%</td></tr>
+<tr><td>4,096</td><td>3 KB</td><td>1.63%</td></tr>
+<tr><td>16,384</td><td>12 KB</td><td>0.81%</td></tr>
+<tr><td>65,536</td><td>48 KB</td><td>0.41%</td></tr>
+</tbody>
+</table>
+<p>Redis uses 16,384 registers: at most 12 KB for each count, a standard error of 0.81%, and room for more distinct items than any system will see. “Standard error” means that about two estimates in three fall within 0.81% of the truth and nearly all within three times that. For a million real users, expect an answer between about 992,000 and 1,008,000 most of the time. Halving the error takes four times the memory, so there is little point in chasing precision this way. If you need the exact number, you need a different tool.</p>
+<pre data-lang="text" data-title="HyperLogLog in Redis">
+PFADD visitors:2026-10-10 user-ana user-ben      add items; duplicates are ignored
+PFADD visitors:2026-10-10 user-ana
+PFCOUNT visitors:2026-10-10                      returns 2
+
+PFMERGE visitors:week visitors:2026-10-04 visitors:2026-10-05 ... visitors:2026-10-10
+PFCOUNT visitors:week                            distinct visitors over the week
+</pre>
+
+<h3 id="merging">Merging: the property that matters most</h3>
+<p>The last two commands show why HyperLogLog is so useful in distributed systems. Two sketches can be combined into one by keeping the larger value of each register, and the result is identical to the sketch you would have had if a single machine had seen all the items.</p>
+
+<figure class="fig wide" id="fig-merge">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 216" role="img" aria-labelledby="f325t f325d">
+<title id="f325t">Adding distinct counts from three servers compared with merging their sketches</title>
+<desc id="f325d">Three servers saw 4,210, 3,980 and 4,105 distinct visitors. Adding the counts, shown on the left, gives 12,295, which is wrong because a visitor who reached two servers is counted twice. Merging the three sketches, shown on the right, gives 6,120, which is right within the sketch’s error, because merging keeps the larger value of each register and is equivalent to one sketch having seen every visitor.</desc>
+<rect class="n" x="260" y="14" width="200" height="52" rx="6"/>
+<text class="tb mid" x="360" y="36">Server 1</text>
+<text class="ts mid" x="360" y="53">4,210 distinct visitors today</text>
+<rect class="n" x="260" y="80" width="200" height="52" rx="6"/>
+<text class="tb mid" x="360" y="102">Server 2</text>
+<text class="ts mid" x="360" y="119">3,980 distinct visitors today</text>
+<rect class="n" x="260" y="146" width="200" height="52" rx="6"/>
+<text class="tb mid" x="360" y="168">Server 3</text>
+<text class="ts mid" x="360" y="185">4,105 distinct visitors today</text>
+<rect class="n fault" x="10" y="80" width="180" height="52" rx="6"/>
+<text class="tb mid" x="100" y="102">Add the three counts</text>
+<text class="ts mid" x="100" y="119">12,295</text>
+<rect class="n store" x="530" y="80" width="180" height="52" rx="6"/>
+<text class="tb mid" x="620" y="102">Merge the three sketches</text>
+<text class="ts mid" x="620" y="119">6,120</text>
+<path class="e fault" d="M260 40C225 40 225 106 190 106"/>
+<path class="e store" d="M460 40C495 40 495 106 530 106"/>
+<path class="e fault" d="M260 106C225 106 225 106 190 106"/>
+<path class="e store" d="M460 106C495 106 495 106 530 106"/>
+<path class="e fault" d="M260 172C225 172 225 106 190 106"/>
+<path class="e store" d="M460 172C495 172 495 106 530 106"/>
+<text class="ts" x="10" y="158">Wrong. A visitor who reached two</text>
+<text class="ts" x="10" y="174">servers is counted twice.</text>
+<text class="ts" x="530" y="158">Right, within the sketch’s error.</text>
+<text class="ts" x="530" y="174">Merging keeps the larger value</text>
+<text class="ts" x="530" y="190">of each register, as if one</text>
+<text class="ts" x="530" y="206">sketch had seen everyone.</text>
+</svg>
+</div>
+<figcaption>Distinct counts cannot be added. Sketches can be merged, which is what makes distinct counting possible across servers, shards and time periods.</figcaption>
+</figure>
+
+<p>Distinct counts do not add up. The number of unique visitors this week is not the sum of the seven daily numbers, because many people visit on several days. With exact sets, answering for an arbitrary week means going back to the raw data. With sketches, you store one 12 KB sketch for each day, or each hour, or each hour for each country, and merge whichever ones a query covers. The same holds across machines: each shard builds its own sketch and a coordinator merges them. This is how analytical databases compute approximate distinct counts over data spread across hundreds of nodes.</p>
+<p>The limits are these.</p>
+<ul>
+  <li><b>No membership.</b> It cannot tell you whether a particular user was counted.</li>
+  <li><b>No removal.</b> You cannot subtract yesterday’s visitors from a weekly sketch. Keep the daily sketches and merge a different set.</li>
+  <li><b>Weak intersections.</b> “How many users did both A and B?” can be estimated as count(A) + count(B) − count(A or B), but the errors of three estimates combine. When the overlap is small compared with the sets, the result is unreliable.</li>
+</ul>
+<p>You rarely implement HyperLogLog yourself. It is built in: <code>PFCOUNT</code> in Redis, the cardinality aggregation in Elasticsearch and OpenSearch, <code>APPROX_COUNT_DISTINCT</code> in BigQuery, Snowflake and Spark, <code>approx_distinct</code> in Trino, and <code>uniqCombined</code> in ClickHouse. Most use a refined version, often called HyperLogLog++, that is more accurate for small counts. Elasticsearch, for example, counts almost exactly up to a threshold you set, 3,000 by default, and estimates beyond it.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Whenever a design needs “unique” something at scale, such as unique viewers of a video or daily active users, say that exact counting needs a set per counter, and offer HyperLogLog: “about 12 KB per counter, under 1% error, and mergeable across shards and days”. Then say when it is not acceptable: anything billed or audited needs exact counts from the source data.</p></div>
+
+<h2 id="cms">Counting frequencies with a count-min sketch</h2>
+<p>The third question is how many times each item has appeared: views per photo, requests per IP address, occurrences of each search term. The exact answer is a map from item to counter. That works until the number of distinct items is huge, or until you need such a map for every minute of the day.</p>
+<p>A <dfn>count-min sketch</dfn>, introduced by Graham Cormode and S. Muthukrishnan in 2003, uses a fixed grid of counters instead. Each row has its own hash function. To record an item, hash it once for each row and add one to the counter it lands on in that row. To ask how often an item has appeared, read its counter in each row and take the smallest.</p>
+
+<figure class="fig wide" id="fig-cms">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-labelledby="f326t f326d">
+<title id="f326t">Reading one item’s count from a count-min sketch of four rows and ten columns</title>
+<desc id="f326d">The item photo-17 maps to one counter in each of four rows. The counters read 12, 9, 31 and 9. The third is high because a popular item shares that counter. The estimate is the smallest of the four, which is 9.</desc>
+<text class="tb" x="70" y="22">Four rows of counters, each with its own hash function</text>
+<text class="ts end" x="58" y="59">h1</text>
+<rect class="n" x="70" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="92" y="59">3</text>
+<rect class="n" x="114" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="136" y="59">0</text>
+<rect class="n sig" x="158" y="40" width="44" height="28" rx="0"/>
+<text class="tb mid" x="180" y="59">12</text>
+<rect class="n" x="202" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="224" y="59">7</text>
+<rect class="n" x="246" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="268" y="59">1</text>
+<rect class="n" x="290" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="312" y="59">0</text>
+<rect class="n" x="334" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="356" y="59">5</text>
+<rect class="n" x="378" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="400" y="59">2</text>
+<rect class="n" x="422" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="444" y="59">9</text>
+<rect class="n" x="466" y="40" width="44" height="28" rx="0"/>
+<text class="ts mid" x="488" y="59">4</text>
+<text class="ts end" x="58" y="87">h2</text>
+<rect class="n" x="70" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="92" y="87">6</text>
+<rect class="n sig" x="114" y="68" width="44" height="28" rx="0"/>
+<text class="tb mid" x="136" y="87">9</text>
+<rect class="n" x="158" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="180" y="87">0</text>
+<rect class="n" x="202" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="224" y="87">2</text>
+<rect class="n" x="246" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="268" y="87">8</text>
+<rect class="n" x="290" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="312" y="87">1</text>
+<rect class="n" x="334" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="356" y="87">0</text>
+<rect class="n" x="378" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="400" y="87">3</text>
+<rect class="n" x="422" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="444" y="87">4</text>
+<rect class="n" x="466" y="68" width="44" height="28" rx="0"/>
+<text class="ts mid" x="488" y="87">11</text>
+<text class="ts end" x="58" y="115">h3</text>
+<rect class="n" x="70" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="92" y="115">1</text>
+<rect class="n" x="114" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="136" y="115">4</text>
+<rect class="n" x="158" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="180" y="115">2</text>
+<rect class="n" x="202" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="224" y="115">0</text>
+<rect class="n" x="246" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="268" y="115">6</text>
+<rect class="n fault" x="290" y="96" width="44" height="28" rx="0"/>
+<text class="tb mid" x="312" y="115">31</text>
+<rect class="n" x="334" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="356" y="115">3</text>
+<rect class="n" x="378" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="400" y="115">0</text>
+<rect class="n" x="422" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="444" y="115">7</text>
+<rect class="n" x="466" y="96" width="44" height="28" rx="0"/>
+<text class="ts mid" x="488" y="115">5</text>
+<text class="ts end" x="58" y="143">h4</text>
+<rect class="n" x="70" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="92" y="143">0</text>
+<rect class="n" x="114" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="136" y="143">2</text>
+<rect class="n" x="158" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="180" y="143">7</text>
+<rect class="n sig" x="202" y="124" width="44" height="28" rx="0"/>
+<text class="tb mid" x="224" y="143">9</text>
+<rect class="n" x="246" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="268" y="143">1</text>
+<rect class="n" x="290" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="312" y="143">4</text>
+<rect class="n" x="334" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="356" y="143">0</text>
+<rect class="n" x="378" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="400" y="143">6</text>
+<rect class="n" x="422" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="444" y="143">3</text>
+<rect class="n" x="466" y="124" width="44" height="28" rx="0"/>
+<text class="ts mid" x="488" y="143">8</text>
+<text class="ts" x="534" y="48">“photo-17” maps to one</text>
+<text class="ts" x="534" y="64">counter in each row:</text>
+<text class="ts" x="534" y="80">12, 9, 31 and 9.</text>
+<text class="ts" x="534" y="112">Row 3 reads 31 because a</text>
+<text class="ts" x="534" y="128">popular photo shares that</text>
+<text class="ts" x="534" y="144">counter.</text>
+<text class="tb" x="70" y="180">Estimate = the smallest of the four = 9. It can be too high, when every row has a collision, and never too low.</text>
+
+</svg>
+</div>
+<figcaption>Why the minimum is taken. Other items can only add to a counter, so the smallest of an item’s counters is the one least inflated by collisions.</figcaption>
+</figure>
+
+<p>The error again runs one way. Different items share counters, and sharing can only add. So the estimate is never below the true count and is sometimes above it. Taking the minimum across rows picks the counter with the fewest unwanted additions.</p>
+<p>The two dimensions control two different things. Width sets how large the overestimate can be, and depth sets how sure you are of staying within it.</p>
+<div class="formula">width  = e ÷ ε          the overestimate is at most ε × (total events counted)
+depth  = ln(1 ÷ δ)      with probability at least 1 − δ
+
+ε = 0.001 and δ = 0.01:  width 2,719, depth 5, which is 13,595 counters or about 54 KB</div>
+<pre data-lang="ts" data-title="A count-min sketch, using the hash function from the Bloom filter">
+class CountMinSketch {
+  private readonly rows: Uint32Array[];
+
+  constructor(private readonly width: number, depth: number) {
+    this.rows = Array.from({ length: depth }, () => new Uint32Array(width));
+  }
+
+  add(item: string, count = 1): void {
+    this.rows.forEach((row, i) => { row[hash32(item, i * 0x9e3779b9) % this.width] += count; });
+  }
+
+  // Never less than the true count. Collisions can only push it up.
+  estimate(item: string): number {
+    return Math.min(...this.rows.map((row, i) => row[hash32(item, i * 0x9e3779b9) % this.width]));
+  }
+}
+
+const views = new CountMinSketch(2719, 5);             // 13,595 counters, about 54 KB
+views.add("photo-17");
+views.estimate("photo-17");                            // at least 1
+</pre>
+<p>Notice what the error is measured against: the total number of events, not the item’s own count. This decides what the sketch is good for. In a test of this code with one million views spread unevenly over 157,000 photos, the most viewed photo had 130,641 real views and an estimate of 130,837, an error of 0.15%. A photo viewed once had an estimate of about 170. Both errors are within the promised 1,000. One is negligible and the other is useless.</p>
+<p>A count-min sketch is therefore a tool for finding and measuring the large items in a stream. It says nothing reliable about the small ones.</p>
+
+<h3 id="topk">Heavy hitters and top-k</h3>
+<p>The items that dominate a stream are called <dfn>heavy hitters</dfn>, and finding them is the usual reason to count frequencies at all: trending searches, the most viewed photos this hour, the IP addresses sending the most requests, the keys receiving the most traffic.</p>
+<p>The sketch alone cannot list them, since it does not store item names. The common arrangement pairs it with a small list of the current top candidates. For each event, update the sketch, read the item’s new estimate, and if it is larger than the smallest entry in the list, put the item in the list in its place. Memory stays fixed however many distinct items go by. Other algorithms, such as Space-Saving, keep only the list and replace its smallest entry on each miss. Redis provides a ready-made top-k structure built on a similar idea.</p>
+<p>Uses in system design include these.</p>
+<ul>
+  <li><b>Hot key detection.</b> A cache or database node tracks its most requested keys so that they can be split, replicated or cached locally (<x-ref to="partitioning#hot-keys"></x-ref>).</li>
+  <li><b>Abuse detection.</b> Identify the clients sending the most requests without keeping a counter for every client that ever connects (<x-ref to="hld-rate-limiter"></x-ref>).</li>
+  <li><b>Trending lists.</b> Count per time window, then compare windows to find what is rising.</li>
+  <li><b>Cache admission.</b> Some caches keep a compact frequency sketch of recent requests and admit a new entry only if it has been requested more often than the entry it would evict.</li>
+</ul>
+<p>Results near the bottom of a top-k list are approximate. If the tenth and eleventh items have nearly equal counts, either may appear. For a trending list that is fine. For a prize draw it is not.</p>
+
+<h2 id="quantiles">Percentiles from a summary</h2>
+<p>Percentiles were introduced in <x-ref to="latency-and-throughput#percentiles"></x-ref> as the right way to describe response times. Computing one exactly means sorting every measurement. A service handling 10,000 requests per second produces 864 million measurements a day, on many servers, and nobody keeps them all.</p>
+<p>There is a second problem, the same one as with distinct counts. Percentiles cannot be combined. The 99th percentile of a service is not the average of each server’s 99th percentile, and the 99th percentile for an hour is not the average of sixty one-minute values. A dashboard that averages percentiles shows a number with no meaning. What can be combined is a summary of the distribution, from which a percentile is then read.</p>
+<table>
+<thead><tr><th>Summary</th><th>How it works</th><th>Accuracy</th></tr></thead>
+<tbody>
+<tr><th>Fixed-bucket histogram</th><td>Count measurements falling into preset ranges, such as up to 10 ms, 25 ms, 50 ms, 100 ms. Merge by adding counts.</td><td>Depends on where the bucket boundaries are. A percentile inside a wide bucket is a guess.</td></tr>
+<tr><th>t-digest</th><td>Keeps a few hundred clusters, each a mean and a count, small near the extremes and large in the middle</td><td>Most accurate at the tails, such as the 99th and 99.9th percentiles, which is where it is needed</td></tr>
+<tr><th>DDSketch</th><td>Buckets whose widths grow by a fixed ratio, so each covers a constant percentage range</td><td>A guaranteed relative error, for example every percentile within 1% of the true value</td></tr>
+<tr><th>HDR histogram</th><td>Similar growing buckets with a configured number of significant digits</td><td>Fixed relative precision over a preset range</td></tr>
+</tbody>
+</table>
+<p>All four can be merged, a few kilobytes in size. This is the machinery under the latency charts in monitoring systems (<x-ref to="observability"></x-ref>): each server records a histogram or sketch, and the monitoring system merges them across servers and time before computing a percentile. Elasticsearch’s percentile aggregation uses t-digest by default, Redis includes it as a data type, and Prometheus uses bucketed histograms.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Letting each server compute its own 99th percentile and then averaging them, or averaging per-minute percentiles into an hourly one. If one server out of ten is slow, the average hides it. Export the histogram or sketch, merge those, and compute the percentile last.</p></div>
+
+<h2 id="similarity">Similarity, and sampling</h2>
+<p>Two more ideas appear often enough to recognize.</p>
+<p><b>Is this nearly the same as something I already have?</b> Exact duplicates are found by comparing hashes. Near duplicates, such as the same article with a different advertisement or a copied essay with a few words changed, need a measure of similarity, and comparing every pair of documents is impossible at scale. <dfn>MinHash</dfn> reduces each document to a short signature of a few hundred numbers, built so that the fraction of positions at which two signatures agree estimates how much the documents overlap. <dfn>SimHash</dfn> reduces each document to a single 64-bit fingerprint in which similar documents differ in only a few bits. Google described using SimHash to find near-duplicate pages across a crawl of eight billion. Both are forms of <dfn>locality-sensitive hashing</dfn>: hashing designed so that similar inputs collide, the opposite of an ordinary hash. The approximate nearest-neighbor indexes behind vector search (<x-ref to="specialized-databases#vector"></x-ref>) pursue the same goal by other means.</p>
+<p><b>Can I keep a fair sample of a stream whose length I do not know?</b> <dfn>Reservoir sampling</dfn> keeps a fixed number of items, say a thousand, such that at every moment each item seen so far has had the same chance of being in the sample. Keep the first thousand. For item number <i>n</i> after that, keep it with probability 1,000 ÷ <i>n</i>, replacing a randomly chosen member of the sample. It is how a tracing or logging system can keep a representative thousand requests from a day of billions.</p>
+
+<h2 id="choosing">Choosing a structure</h2>
+<table>
+<thead><tr><th>Question</th><th>Structure</th><th>Kind of error</th><th>Typical size</th><th>Merge</th><th>Remove items</th></tr></thead>
+<tbody>
+<tr><th>Is this item in the set?</th><td>Bloom filter</td><td>False positives only</td><td>10 bits per item for 1%</td><td>Yes, if built alike</td><td>No</td></tr>
+<tr><th>The same, with deletion</th><td>Cuckoo or counting filter</td><td>False positives only</td><td>Similar, or up to four times more</td><td>Limited</td><td>Yes</td></tr>
+<tr><th>How many distinct items?</th><td>HyperLogLog</td><td>About ±1%, either way</td><td>12 KB, fixed</td><td>Yes</td><td>No</td></tr>
+<tr><th>How often did this item occur?</th><td>Count-min sketch</td><td>Overestimates only</td><td>Tens of kilobytes</td><td>Yes</td><td>No</td></tr>
+<tr><th>Which items are most frequent?</th><td>Top-k</td><td>Approximate counts and order</td><td>A sketch plus <i>k</i> entries</td><td>Approximately</td><td>No</td></tr>
+<tr><th>What is the 99th percentile?</th><td>t-digest, DDSketch, histogram</td><td>Small, largest where data is sparse</td><td>A few kilobytes</td><td>Yes</td><td>No</td></tr>
+<tr><th>How similar are these two sets?</th><td>MinHash</td><td>A few percent, either way</td><td>A few hundred numbers per set</td><td>Yes</td><td>No</td></tr>
+</tbody>
+</table>
+<p>Before reaching for any of them, ask whether the exact structure is affordable. A million user IDs in an ordinary set take perhaps 50 MB. That fits in memory on any server, gives exact answers, supports deletion and can list its members. Approximation earns its place when the exact structure would not fit, when there are a great many of them, or when results from many machines must be combined.</p>
+<p>Then ask what happens when the answer is wrong.</p>
+<ul>
+  <li><b>Acceptable:</b> dashboards, trend detection, capacity planning, skipping work that would have found nothing, deciding what to cache.</li>
+  <li><b>Acceptable with an exact check behind it:</b> uniqueness tests, deduplication, blocklists. The sketch handles the common case and the database confirms the rest.</li>
+  <li><b>Not acceptable:</b> billing, account balances, quotas that customers pay for, legal or audit counts, and any place where a single wrong answer harms a person.</li>
+</ul>
+<p>Finally, consider who controls the input. Someone who knows your hash function can construct items that collide on purpose, filling a Bloom filter with false positives or inflating a counter. Where the items come from untrusted users and the stakes justify it, use a hash function with a secret key.</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Treating a Bloom filter’s “maybe” as “yes”</th><td>About 1 in 100 absent items is handled as present: a free username refused, a new page never crawled</td><td>Follow every “maybe” with an exact check, unless a false positive is harmless</td></tr>
+<tr><th>Sizing a filter for today’s data</th><td>The error rate climbs silently as the set grows</td><td>Size for expected growth, monitor the item count, and use a scalable filter or rebuild</td></tr>
+<tr><th>Letting the filter drift from the data</th><td>Items missing from the filter produce false negatives, the one error it was meant to exclude</td><td>Update the filter with every write, or rebuild it on a schedule and keep an exact check as the authority</td></tr>
+<tr><th>Clearing bits to delete from a Bloom filter</th><td>Other items lose their bits and vanish</td><td>Rebuild, or use a cuckoo or counting filter</td></tr>
+<tr><th>Adding distinct counts together</th><td>People seen on several days or servers are counted several times</td><td>Store sketches and merge them</td></tr>
+<tr><th>Averaging percentiles</th><td>A number that describes nothing and hides slow servers</td><td>Merge histograms or sketches, then compute the percentile</td></tr>
+<tr><th>Using a count-min sketch for rare items</th><td>Estimates many times larger than the truth</td><td>Use it for heavy hitters. Count rare items exactly if they matter.</td></tr>
+<tr><th>Approximating numbers that people pay for</th><td>Disputes that cannot be settled from the data</td><td>Exact counts from the source records</td></tr>
+<tr><th>Using a sketch where a set would fit</th><td>Error and lost abilities with nothing gained</td><td>Estimate the exact structure’s size first (<x-ref to="estimation"></x-ref>)</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="storage-engines"></x-ref>: Bloom filters on the files of an LSM tree.</li>
+  <li><x-ref to="caching"></x-ref>: protecting a database from lookups of keys that do not exist.</li>
+  <li><x-ref to="cdn-and-edge"></x-ref>: deciding what is worth caching at the edge.</li>
+  <li><x-ref to="partitioning"></x-ref>: hash functions, and detecting hot keys.</li>
+  <li><x-ref to="latency-and-throughput"></x-ref>: the percentiles that quantile sketches compute.</li>
+  <li><x-ref to="batch-and-stream-processing"></x-ref>: sketches as mergeable aggregates in analytics.</li>
+  <li><x-ref to="observability"></x-ref>: histograms and sketches under latency charts.</li>
+  <li><x-ref to="hld-web-crawler"></x-ref>: seen-URL filters and near-duplicate detection in a full design.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Probabilistic structures trade a small, chosen error for memory that is smaller by orders of magnitude.</li>
+  <li>Know the direction of the error. A Bloom filter gives false positives and never false negatives. A count-min sketch overestimates and never underestimates. HyperLogLog can be off either way by about 1%.</li>
+  <li>A Bloom filter needs about 10 bits per item for a 1% false positive rate, whatever the size of the items, and 4.8 more bits for each further factor of ten.</li>
+  <li>Filters degrade quietly when overfilled and cannot be enlarged or have items removed. Plan for growth and rebuilding.</li>
+  <li>HyperLogLog counts distinct items in a fixed 12 KB with under 1% error.</li>
+  <li>Distinct counts and percentiles cannot be added or averaged. Sketches can be merged, across machines and across time, and that is their main value in distributed systems.</li>
+  <li>Count-min sketches and top-k structures are accurate for the heavy hitters and unreliable for rare items.</li>
+  <li>Use an exact structure when it fits, and always when the number is billed, audited or decides something for a person.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A Bloom filter says a key is present. Another says a different key is absent. Which answer can you rely on, and why?</summary><p>The “absent” answer. Adding an item sets all of its bits, so finding any of them at 0 proves it was never added. “Present” only means all the bits are 1, which other items may have caused. With a filter sized for 1%, about one absent item in a hundred gets that answer.</p></details>
+<details><summary>You need a Bloom filter for 50 million keys with a 0.1% false positive rate. Roughly how much memory is that?</summary><p>A 0.1% rate needs about 14.4 bits per item: ten for 1%, plus 4.8 for the next factor of ten. 50 million × 14.4 bits is 720 million bits, or 90 MB, with 10 hash functions. The size of the keys does not matter.</p></details>
+<details><summary>A filter built for one million items at 1% now holds three million. What has happened, and what are the options?</summary><p>The false positive rate has risen to over 40%, with no error or warning. A Bloom filter cannot be resized because it does not contain its items. Rebuild a larger one from the source data, or use a scalable filter that adds further filters as it fills. Monitoring the number of items added would have shown the problem early.</p></details>
+<details><summary>Daily unique visitors for seven days were 40,000 each day. A report gives the weekly unique visitors as 280,000. What is wrong, and how should it be computed?</summary><p>The report added distinct counts, so anyone who visited on several days was counted once for each. The weekly figure is somewhere between 40,000 and 280,000. Keep a HyperLogLog sketch for each day and merge the seven, which gives the count of distinct visitors across the week to within about 1%.</p></details>
+<details><summary>A count-min sketch has counted ten million events with ε = 0.001. It reports 12,000 for one item and 9,000 for another. What can you conclude about each?</summary><p>The possible overestimate is up to 0.001 × 10 million = 10,000. The first item’s true count is between 2,000 and 12,000. The second’s is between 0 and 9,000, so the sketch says almost nothing about it. Estimates are meaningful only for items whose counts are well above the error bound. A wider sketch lowers the bound.</p></details>
+<details><summary>Ten servers each report their 99th percentile latency every minute. Why is the average of those ten numbers not the service’s 99th percentile, and what should be collected instead?</summary><p>A percentile depends on the whole distribution. If nine servers report 50 ms and one reports 2 seconds, the average is 245 ms, but the true 99th percentile depends on how much traffic the slow server took and could be near 2 seconds. Each server should export a histogram or a sketch such as a t-digest. Those are merged, and the percentile is computed from the merged result.</p></details>
+<details><summary>A team proposes HyperLogLog to count API calls per customer for monthly invoices, to save memory. What do you say?</summary><p>It is the wrong tool twice over. HyperLogLog counts distinct items, not events, and it is approximate. Counting calls needs a plain counter for each customer, which is small. Anything billed must be exact and reproducible from stored records, so that a disputed invoice can be checked.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>B. H. Bloom, <a href="https://dl.acm.org/doi/10.1145/362686.362692">Space/Time Trade-offs in Hash Coding with Allowable Errors</a>, Communications of the ACM, 1970. The original Bloom filter paper.</li>
+  <li>A. Kirsch and M. Mitzenmacher, “Less Hashing, Same Performance: Building a Better Bloom Filter”, 2006. Shows that two hash functions combined linearly are enough.</li>
+  <li>B. Fan, D. Andersen, M. Kaminsky and M. Mitzenmacher, <a href="https://www.cs.cmu.edu/~dga/papers/cuckoo-conext2014-abstract.html">Cuckoo Filter: Practically Better Than Bloom</a>, CoNEXT 2014.</li>
+  <li>B. Maggs and R. Sitaraman, <a href="https://people.cs.umass.edu/~ramesh/Site/HOME_files/CCRpaper_1.pdf">Algorithmic Nuggets in Content Delivery</a>, ACM SIGCOMM Computer Communication Review, 2015. The source of the Akamai figures on objects requested once and caching on the second request.</li>
+  <li>P. Flajolet, É. Fusy, O. Gandouet and F. Meunier, <a href="https://dmtcs.episciences.org/3545">HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm</a>, 2007.</li>
+  <li>S. Heule, M. Nunkesser and A. Hall, <a href="https://research.google/pubs/hyperloglog-in-practice-algorithmic-engineering-of-a-state-of-the-art-cardinality-estimation-algorithm/">HyperLogLog in Practice</a>, Google, 2013. The improvements known as HyperLogLog++.</li>
+  <li>G. Cormode and S. Muthukrishnan, <a href="https://dimacs.rutgers.edu/~graham/pubs/html/CormodeMuthukrishnan04CMJalg.html">An Improved Data Stream Summary: The Count-Min Sketch and its Applications</a>, Journal of Algorithms, 2005.</li>
+  <li>T. Dunning and O. Ertl, <a href="https://arxiv.org/abs/1902.04023">Computing Extremely Accurate Quantiles Using t-Digests</a>, 2019.</li>
+  <li>C. Masson, J. Rim and H. Lee, <a href="https://arxiv.org/abs/1908.10693">DDSketch: A Fast and Fully-Mergeable Quantile Sketch with Relative-Error Guarantees</a>, VLDB 2019.</li>
+  <li>G. Manku, A. Jain and A. Das Sarma, <a href="https://www2007.cpsc.ucalgary.ca/paper215.php">Detecting Near-Duplicates for Web Crawling</a>, WWW 2007. SimHash at the scale of eight billion pages.</li>
+  <li>Redis, <a href="https://redis.io/docs/latest/develop/data-types/probabilistic/">Probabilistic data types</a> and <a href="https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/">HyperLogLog</a>. Bloom and cuckoo filters, count-min sketch, top-k and t-digest, which are part of Redis from version 8.</li>
+  <li>RocksDB, <a href="https://rocksdb.org/blog/2021/12/29/ribbon-filter.html">Ribbon Filter</a>, December 2021. The space and CPU trade-off between Bloom and ribbon filters in an LSM engine.</li>
+  <li>Elastic, <a href="https://www.elastic.co/docs/reference/aggregations/search-aggregations-metrics-cardinality-aggregation">Cardinality aggregation</a>. HyperLogLog++ with a precision threshold.</li>
+</ol>
+</section>

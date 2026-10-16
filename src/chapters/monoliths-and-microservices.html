@@ -1,0 +1,522 @@
+<!--meta
+{ "description": "Monoliths, modular monoliths and microservices for system design: what each really is, what a network call costs compared with a function call, Conway’s law, finding service boundaries, the distributed monolith, database per service, migrating with the strangler fig pattern, and evidence from Shopify, Segment, Uber and Prime Video on when splitting pays off.",
+  "lede": "Every system has to be divided into parts, and how you divide it decides who can change what without asking, how failures spread, and how much machinery you have to run. This part of the book is about those divisions. It starts with the question that has caused more argument than any other in the last fifteen years: one deployable unit, or many? The honest answer depends less on technology than on how many people are working on the system.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="question">What is being decided</h2>
+<p>The photo app has grown. It has sign-up and login, uploads, image processing, a social graph, a feed, comments, notifications and billing. All of that code has to be organized into something that can be built, deployed and run. The two ends of the range are these.</p>
+<ul>
+  <li>A <dfn>monolith</dfn>: the whole application is built and deployed as one unit. All of its code runs in the same process and usually shares one database.</li>
+  <li><dfn>Microservices</dfn>: the application is a set of services, each built and deployed on its own, each owning its own data, communicating over the network.</li>
+</ul>
+<p>The word “micro” has misled many teams. Size is not the defining property. The defining property is <b>independent deployment</b>: a team can change its service and release it without coordinating with any other team and without redeploying anything else. A service that can do that is a microservice whether it is 500 lines or 500,000. A system of 40 small services that must all be released together is a monolith with extra steps.</p>
+<p>Between the two lies a third option that is often the right one.</p>
+
+<figure class="fig wide" id="fig-shapes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f401t f401d">
+<title id="f401t">A monolith, a modular monolith and microservices compared</title>
+<desc id="f401d">Three arrangements of the same four capabilities: identity, media, feed and billing. In a monolith they are one deployable with one database, and code calls code freely, which is fast and simple but lets boundaries erode. In a modular monolith they are still one deployable, but each is a module that others call only through its public interface, and each owns its own tables. In microservices they are four deployables with four databases, and calls cross the network.</desc>
+<text class="tb" x="10" y="18">Monolith</text>
+<rect class="grp" x="10" y="28" width="210" height="150" rx="8"/>
+<text class="ts" x="20" y="46">one deployable</text>
+<rect class="n" x="24" y="56" width="182" height="64" rx="6"/>
+<text class="ts" x="34" y="76">identity, media, feed,</text>
+<text class="ts" x="34" y="91">notifications, billing:</text>
+<text class="ts" x="34" y="106">code calls code freely</text>
+<rect class="n store" x="24" y="134" width="182" height="30" rx="6"/>
+<text class="ts mid" x="115" y="153.5">one database</text>
+<path class="e store" d="M115 120V134"/>
+<text class="tb" x="250" y="18">Modular monolith</text>
+<rect class="grp" x="250" y="28" width="220" height="150" rx="8"/>
+<text class="ts" x="260" y="46">one deployable</text>
+<rect class="n sig" x="260" y="56" width="47" height="64" rx="4"/>
+<text class="ts mid" transform="translate(288 88) rotate(-90)">identity</text>
+<rect class="n store" x="260" y="134" width="47" height="30" rx="4"/>
+<path class="e store" d="M283.5 120V134"/>
+<rect class="n sig" x="311" y="56" width="47" height="64" rx="4"/>
+<text class="ts mid" transform="translate(339 88) rotate(-90)">media</text>
+<rect class="n store" x="311" y="134" width="47" height="30" rx="4"/>
+<path class="e store" d="M334.5 120V134"/>
+<rect class="n sig" x="362" y="56" width="47" height="64" rx="4"/>
+<text class="ts mid" transform="translate(390 88) rotate(-90)">feed</text>
+<rect class="n store" x="362" y="134" width="47" height="30" rx="4"/>
+<path class="e store" d="M385.5 120V134"/>
+<rect class="n sig" x="413" y="56" width="47" height="64" rx="4"/>
+<text class="ts mid" transform="translate(441 88) rotate(-90)">billing</text>
+<rect class="n store" x="413" y="134" width="47" height="30" rx="4"/>
+<path class="e store" d="M436.5 120V134"/>
+<text class="ts mid" x="360" y="196">modules call each other only through</text>
+<text class="ts mid" x="360" y="212">public interfaces; each owns its tables</text>
+<text class="tb" x="500" y="18">Microservices</text>
+<rect class="grp" x="498" y="28" width="44" height="150" rx="6"/>
+<rect class="n sig" x="503" y="56" width="34" height="64" rx="4"/>
+<text class="ts mid" transform="translate(524 88) rotate(-90)">identity</text>
+<rect class="n store" x="503" y="134" width="34" height="30" rx="4"/>
+<path class="e store" d="M520 120V134"/>
+<path class="e none async" d="M537 76H558"/>
+<rect class="grp" x="553" y="28" width="44" height="150" rx="6"/>
+<rect class="n sig" x="558" y="56" width="34" height="64" rx="4"/>
+<text class="ts mid" transform="translate(579 88) rotate(-90)">media</text>
+<rect class="n store" x="558" y="134" width="34" height="30" rx="4"/>
+<path class="e store" d="M575 120V134"/>
+<path class="e none async" d="M592 76H613"/>
+<rect class="grp" x="608" y="28" width="44" height="150" rx="6"/>
+<rect class="n sig" x="613" y="56" width="34" height="64" rx="4"/>
+<text class="ts mid" transform="translate(634 88) rotate(-90)">feed</text>
+<rect class="n store" x="613" y="134" width="34" height="30" rx="4"/>
+<path class="e store" d="M630 120V134"/>
+<path class="e none async" d="M647 76H668"/>
+<rect class="grp" x="663" y="28" width="44" height="150" rx="6"/>
+<rect class="n sig" x="668" y="56" width="34" height="64" rx="4"/>
+<text class="ts mid" transform="translate(689 88) rotate(-90)">billing</text>
+<rect class="n store" x="668" y="134" width="34" height="30" rx="4"/>
+<path class="e store" d="M685 120V134"/>
+<text class="ts mid" x="606" y="196">four deployables, four databases,</text>
+<text class="ts mid" x="606" y="212">calls cross the network</text>
+<text class="ts mid" x="115" y="196">fast and simple; boundaries</text>
+<text class="ts mid" x="115" y="212">erode unless defended</text>
+</svg>
+</div>
+<figcaption>Three shapes for the same application. The modular monolith has the boundaries of microservices and the deployment of a monolith.</figcaption>
+</figure>
+
+<h2 id="monolith">What a monolith gives you</h2>
+<p>A monolith is the simplest thing that works, and for a long time it works very well.</p>
+<ul>
+  <li><b>Calls are function calls.</b> They take nanoseconds, cannot time out, and either the whole process is up or it is not.</li>
+  <li><b>Transactions are available.</b> Placing an order and reducing stock can commit or fail together, with no saga (<x-ref to="transactions"></x-ref>).</li>
+  <li><b>Changes that cross boundaries are easy.</b> Renaming a function used in ten places is one commit, checked by the compiler.</li>
+  <li><b>There is one of everything.</b> One build, one pipeline, one deployment, one set of dashboards, one place to look when something breaks.</li>
+  <li><b>It runs on a laptop.</b> A new engineer can start the whole system and step through a request in a debugger.</li>
+</ul>
+<p>Its problems arrive with growth, of the codebase and especially of the team.</p>
+<ul>
+  <li><b>Deployment becomes a queue.</b> Fifty engineers merging into one deployable means every release carries many unrelated changes. One bad change blocks or rolls back all the others.</li>
+  <li><b>Everything fails together.</b> A memory leak in the image-processing code takes down login.</li>
+  <li><b>Everything scales together.</b> If thumbnails need ten times the CPU, you run ten copies of the whole application.</li>
+  <li><b>Boundaries erode.</b> Nothing stops billing code from reaching into the feed’s tables. Under deadline pressure it will, and after a few years every part depends on every other. This state has a name, the big ball of mud.</li>
+  <li><b>Builds and tests slow down</b>, and with them every engineer’s working day.</li>
+</ul>
+<p>Notice that most of these are about people. A monolith worked on by eight engineers has almost none of these problems. The same monolith worked on by eighty has all of them.</p>
+
+<h2 id="microservices">What microservices cost</h2>
+<p>Splitting into services addresses those problems. Each team deploys alone, a failure can be contained, and each service scales to its own load. The price is that every boundary between services becomes a network.</p>
+
+<figure class="fig wide" id="fig-chain">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f402t f402d">
+<title id="f402t">Five steps inside one process compared with the same five steps as five services</title>
+<desc id="f402d">Inside one process, each call between five steps takes well under a microsecond and cannot fail separately from the process. As five services, each hop adds about a millisecond of network time, serialization at both ends, and a way to fail. If each service is available 99.9% of the time and all five are needed, the request succeeds 99.5% of the time. With ten services in the path it is 99.0%, which is 87 hours of failure a year from parts that each fail for under 9.</desc>
+<text class="tb" x="10" y="18">One request, five steps, inside one process</text>
+<rect class="n" x="10" y="30" width="62" height="34" rx="4"/>
+<text class="ts mid" x="41" y="52">step 1</text>
+<path class="e" d="M72 47H84"/>
+<rect class="n" x="84" y="30" width="62" height="34" rx="4"/>
+<text class="ts mid" x="115" y="52">step 2</text>
+<path class="e" d="M146 47H158"/>
+<rect class="n" x="158" y="30" width="62" height="34" rx="4"/>
+<text class="ts mid" x="189" y="52">step 3</text>
+<path class="e" d="M220 47H232"/>
+<rect class="n" x="232" y="30" width="62" height="34" rx="4"/>
+<text class="ts mid" x="263" y="52">step 4</text>
+<path class="e" d="M294 47H306"/>
+<rect class="n" x="306" y="30" width="62" height="34" rx="4"/>
+<text class="ts mid" x="337" y="52">step 5</text>
+<text class="ts" x="400" y="40">Each call takes well under a microsecond and</text>
+<text class="ts" x="400" y="56">cannot fail separately from the process.</text>
+<text class="tb" x="10" y="104">The same five steps as five services</text>
+<rect class="n sig" x="10" y="116" width="62" height="34" rx="4"/>
+<text class="ts mid" x="41" y="138">svc 1</text>
+<path class="e async" d="M72 133H84"/>
+<rect class="n sig" x="84" y="116" width="62" height="34" rx="4"/>
+<text class="ts mid" x="115" y="138">svc 2</text>
+<path class="e async" d="M146 133H158"/>
+<rect class="n sig" x="158" y="116" width="62" height="34" rx="4"/>
+<text class="ts mid" x="189" y="138">svc 3</text>
+<path class="e async" d="M220 133H232"/>
+<rect class="n sig" x="232" y="116" width="62" height="34" rx="4"/>
+<text class="ts mid" x="263" y="138">svc 4</text>
+<path class="e async" d="M294 133H306"/>
+<rect class="n sig" x="306" y="116" width="62" height="34" rx="4"/>
+<text class="ts mid" x="337" y="138">svc 5</text>
+<text class="ts" x="400" y="118">Each hop adds about a millisecond of network time,</text>
+<text class="ts" x="400" y="134">serialization at both ends, and a way to fail:</text>
+<text class="ts" x="400" y="150">a timeout, a refused connection, a slow reply.</text>
+<rect class="n sunk" x="10" y="176" width="700" height="50" rx="6"/>
+<text class="ts" x="22" y="196">If each service is available 99.9% of the time and all five are needed, the request succeeds 99.5% of the time.</text>
+<text class="ts" x="22" y="212">With ten services in the path it is 99.0%, which is 87 hours of failure a year from parts that each fail for under 9.</text>
+
+</svg>
+</div>
+<figcaption>The same work with function calls and with network calls. Reliability multiplies along a chain, as <x-ref to="availability-and-reliability#combining"></x-ref> showed.</figcaption>
+</figure>
+
+<p>Everything in Part IV of this book now applies between your own components.</p>
+<table>
+<thead><tr><th></th><th>Function call</th><th>Call to another service</th></tr></thead>
+<tbody>
+<tr><th>Time</th><td>Nanoseconds</td><td>A millisecond or more, with a long tail</td></tr>
+<tr><th>Can fail on its own</th><td>No</td><td>Yes: timeout, refusal, wrong version, slow reply</td></tr>
+<tr><th>Outcome is always known</th><td>Yes</td><td>No. A timeout does not say whether the work was done (<x-ref to="distributed-fundamentals#messages"></x-ref>).</td></tr>
+<tr><th>Changing the signature</th><td>The compiler finds every caller</td><td>Old and new versions must coexist during rollout</td></tr>
+<tr><th>Atomic with other work</th><td>Yes, in one transaction</td><td>No. Needs a saga or an outbox (<x-ref to="distributed-transactions"></x-ref>).</td></tr>
+<tr><th>Debugging</th><td>One stack trace</td><td>A trace assembled across services (<x-ref to="observability"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>On top of that comes operational weight. Each service needs its own repository or build target, pipeline, deployment configuration, dashboards, alerts, on-call rotation, security patching and capacity planning. That is affordable if a platform team has made each of those cheap, and crushing if every team builds them by hand.</p>
+<p>So microservices exchange one set of problems for another. They trade the problems of many people in one codebase for the problems of a distributed system. That trade is worth making only when the first set has become the more expensive one.</p>
+
+<h2 id="conway">Conway’s law</h2>
+<p>In 1968 Melvin Conway observed that organizations produce designs that copy their own communication structure. If four teams build a compiler, it will have four passes. The observation has held up well enough to be called a law.</p>
+<p>It explains why architecture and team structure cannot be chosen separately. Two teams that share a service must coordinate every release, which is slow, so in practice the code drifts into two halves along the team line whatever the diagram says. A service owned by no team decays. A team that owns six unrelated services cannot hold them all in mind.</p>
+<p>The practical reading is that a service boundary should be a team boundary. The purpose of a microservice is to let one team own something end to end, and change it at its own pace. From that follow some rough guides.</p>
+<ul>
+  <li>The number of services should be comparable to the number of teams, not ten times larger. A handful of services per team at most.</li>
+  <li>If you have one team, you have no need for the independence that services provide, and you will pay their full cost.</li>
+  <li>If you want a different architecture, you may need to change the team structure first. This is sometimes called the inverse Conway maneuver.</li>
+</ul>
+
+<h2 id="modular-monolith">The modular monolith</h2>
+<p>Most of what teams want from microservices is clear boundaries: code that cannot be reached into, data that has one owner, the ability to understand one part without understanding all of it. None of that requires a network. It requires discipline, and tooling that enforces it.</p>
+<p>A <dfn>modular monolith</dfn> is a single deployable divided into modules that obey the same rules services would.</p>
+<ul>
+  <li>Each module has a small public interface. Everything else in it is private.</li>
+  <li>Other modules call only that interface.</li>
+  <li>Each module owns its tables. No other module reads or writes them, or joins against them.</li>
+  <li>The rules are checked automatically on every change. Rules that depend on people remembering them last about a year.</li>
+</ul>
+<p>The check can be as small as a script run in the build.</p>
+<pre data-lang="ts" data-title="Failing the build when one module reaches inside another">
+// Rule: code in one module may import another module only through that module's index file.
+const MODULE = /^src\/modules\/([^/]+)\//;
+
+function moduleOf(path: string): string | undefined {
+  return MODULE.exec(path)?.[1];
+}
+
+function resolve(fromFile: string, specifier: string): string {
+  const parts = fromFile.split("/").slice(0, -1);              // the importing file's folder
+  for (const piece of specifier.split("/")) {
+    if (piece === "..") parts.pop();
+    else if (piece !== ".") parts.push(piece);
+  }
+  return parts.join("/");
+}
+
+function findViolations(files: Map<string, string>): string[] {
+  const violations: string[] = [];
+  for (const [path, source] of files) {
+    const from = moduleOf(path);
+    for (const match of source.matchAll(/from\s+["'](\.[^"']*)["']/g)) {
+      const target = resolve(path, match[1]);
+      const to = moduleOf(target + "/");
+      const isPublicEntry = /^src\/modules\/[^/]+(\/index)?$/.test(target);
+      if (to && to !== from && !isPublicEntry) {
+        violations.push(`${path} reaches inside "${to}" (${match[1]})`);
+      }
+    }
+  }
+  return violations;
+}
+
+// src/modules/orders/refund.ts:   import { db } from "../billing/internal/db";
+//   -> src/modules/orders/refund.ts reaches inside "billing" (../billing/internal/db)
+// src/modules/orders/place-order.ts:   import { chargeCard } from "../billing";
+//   -> allowed: it goes through billing's public entry point
+</pre>
+<p>Lint plugins and dependency-checking tools do the same job more thoroughly. The principle is what matters: the boundary is enforced by a machine.</p>
+<p>The modular monolith keeps the monolith’s advantages: function calls, transactions where they are really needed, one deployment. It removes the worst of its problems, the erosion of boundaries. And it keeps the option of extraction open. A module with a clean interface and its own tables can be moved into a separate service later with modest effort, when there is a concrete reason. A tangled monolith cannot.</p>
+<p>Shopify is the best-documented example. Its core application is one of the largest Ruby on Rails codebases in existence, worked on by more than a thousand developers. In 2019 its engineers described choosing to restructure it into components organized by business domain, each with a public interface and exclusive ownership of its data, in preference to splitting it into microservices. Their reasoning was that microservices would have solved the problems they had and brought “another whole suite of problems” with them.</p>
+
+<h2 id="boundaries">Finding boundaries</h2>
+<p>Whether the parts are modules or services, the hard question is where the lines go. A badly placed boundary is worse than none, because it is expensive to cross and expensive to move.</p>
+
+<figure class="fig wide" id="fig-boundaries">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 202" role="img" aria-labelledby="f403t f403d">
+<title id="f403t">Services split by noun compared with services split by business capability</title>
+<desc id="f403d">On the left, the system is split into a user service, a photo service and a comment service. Showing a photo page needs all three in sequence, so every feature crosses every service and a change to how comments appear needs three teams and three deploys. On the right, the system is split by business capability into identity, media and social. Most features live inside one service, and each has its own data and can change and deploy alone.</desc>
+<text class="tb" x="10" y="18">Split by technical layer or by noun</text>
+<rect class="n" x="10" y="34" width="104" height="40" rx="6"/>
+<text class="ts tb mid" x="62" y="58.5">User service</text>
+<rect class="n" x="122" y="34" width="104" height="40" rx="6"/>
+<text class="ts tb mid" x="174" y="58.5">Photo service</text>
+<rect class="n" x="234" y="34" width="104" height="40" rx="6"/>
+<text class="ts tb mid" x="286" y="58.5">Comment service</text>
+<rect class="n fault" x="10" y="100" width="328" height="36" rx="6"/>
+<text class="ts mid" x="174" y="122.5">“Show a photo page” needs all three, in sequence</text>
+<path class="e fault" d="M62 100V74"/>
+<path class="e fault" d="M174 100V74"/>
+<path class="e fault" d="M286 100V74"/>
+<text class="ts" x="10" y="160">Every feature crosses every service. A change to how</text>
+<text class="ts" x="10" y="176">comments appear needs three teams and three deploys.</text>
+<path class="e none dash" d="M360 8V196"/>
+<text class="tb" x="380" y="18">Split by business capability</text>
+<rect class="n store" x="380" y="34" width="104" height="54" rx="6"/>
+<text class="ts tb mid" x="432" y="48.5">Identity</text>
+<text class="ts mid" x="432" y="65.5">sign-up</text>
+<text class="ts mid" x="432" y="82.5">login, profile</text>
+<rect class="n store" x="492" y="34" width="104" height="54" rx="6"/>
+<text class="ts tb mid" x="544" y="48.5">Media</text>
+<text class="ts mid" x="544" y="65.5">upload</text>
+<text class="ts mid" x="544" y="82.5">store, process</text>
+<rect class="n store" x="604" y="34" width="104" height="54" rx="6"/>
+<text class="ts tb mid" x="656" y="48.5">Social</text>
+<text class="ts mid" x="656" y="65.5">follows</text>
+<text class="ts mid" x="656" y="82.5">feed, comments</text>
+<text class="ts" x="380" y="118">Most features live inside one service. Each has its</text>
+<text class="ts" x="380" y="134">own data and can change and deploy alone.</text>
+<text class="ts" x="380" y="160">The test: how often does one feature need</text>
+<text class="ts" x="380" y="176">coordinated changes in more than one service?</text>
+
+</svg>
+</div>
+<figcaption>The same system divided two ways. Good boundaries put the things that change together in the same place.</figcaption>
+</figure>
+
+<p>The principle is old: <b>high cohesion within a part, low coupling between parts</b>. Things that change for the same reason belong together, and things that change for different reasons belong apart. Several tests help apply it.</p>
+<ul>
+  <li><b>Follow business capabilities, not data tables.</b> “Billing” and “media processing” are capabilities. “The user table” is not. Domain-driven design calls a region with its own consistent vocabulary and model a <dfn>bounded context</dfn>, and these are natural boundaries (<x-ref to="domain-modeling"></x-ref>).</li>
+  <li><b>Look at what changes together.</b> The history of your repository shows which files are edited in the same commits. Draw the line where few commits cross it.</li>
+  <li><b>Look for different rates of change and different needs.</b> Billing changes slowly and must be exact. The feed changes weekly and can be approximate. Image processing needs GPUs. Those differences are reasons for a boundary.</li>
+  <li><b>Count the calls.</b> If serving one request means a dozen calls back and forth between two parts, they are one part.</li>
+  <li><b>Ask whether a part can be useful when its neighbors are down.</b> If notifications cannot do anything without a live call to the user service, the two are coupled more than the diagram admits.</li>
+</ul>
+<p>The commonest error is a service for each noun: a user service, a photo service, a comment service, each a thin wrapper around one table. Nothing useful can be done inside any one of them, so every feature becomes a conversation among several. These are sometimes called entity services, and they produce the system described next.</p>
+<p>Boundaries are hard to see before a system exists. The domain is not yet understood, and the first guess is usually wrong. That is the strongest argument for starting with a monolith: moving a boundary inside one codebase is a refactoring, and moving one between services is a project.</p>
+
+<h2 id="distributed-monolith">The distributed monolith</h2>
+<p>The worst outcome is to split the code and keep the coupling.</p>
+
+<figure class="fig wide" id="fig-distmono">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-labelledby="f404t f404d">
+<title id="f404t">A distributed monolith: four services chained by synchronous calls over one shared database</title>
+<desc id="f404d">Four services, orders, payments, inventory and shipping, call each other synchronously in a chain and all read and write one shared database. A column rename breaks four services. If shipping is slow, orders is slow. All four are released together to be safe. It has the costs of a distributed system and none of the benefits.</desc>
+<rect class="n sig" x="20" y="24" width="110" height="40" rx="6"/>
+<text class="tb mid" x="75" y="48.5">Orders</text>
+<path class="e fault" d="M130 44H170"/>
+<text class="ts mid" x="150" y="36">sync</text>
+<path class="e fault" d="M75 64C75 96 300 80 279 112"/>
+<rect class="n sig" x="170" y="24" width="110" height="40" rx="6"/>
+<text class="tb mid" x="225" y="48.5">Payments</text>
+<path class="e fault" d="M280 44H320"/>
+<text class="ts mid" x="300" y="36">sync</text>
+<path class="e fault" d="M225 64C225 96 300 80 293 112"/>
+<rect class="n sig" x="320" y="24" width="110" height="40" rx="6"/>
+<text class="tb mid" x="375" y="48.5">Inventory</text>
+<path class="e fault" d="M430 44H470"/>
+<text class="ts mid" x="450" y="36">sync</text>
+<path class="e fault" d="M375 64C375 96 300 80 307 112"/>
+<rect class="n sig" x="470" y="24" width="110" height="40" rx="6"/>
+<text class="tb mid" x="525" y="48.5">Shipping</text>
+<path class="e fault" d="M525 64C525 96 300 80 321 112"/>
+<rect class="n fault" x="190" y="112" width="220" height="40" rx="6"/>
+<text class="ts tb mid" x="300" y="128">One shared database</text>
+<text class="ts mid" x="300" y="145">every service reads every table</text>
+<text class="ts" x="470" y="96">A column rename breaks four services.</text>
+<text class="ts" x="470" y="112">If Shipping is slow, Orders is slow.</text>
+<text class="ts" x="470" y="128">All four are released together,</text>
+<text class="ts" x="470" y="144">“to be safe”.</text>
+<text class="ts" x="20" y="186">Four deployables with the coupling of one. This has the costs of a distributed system (network calls, partial failure, operational</text>
+<text class="ts" x="20" y="202">overhead) and none of the benefits (independent deployment, isolation). It is usually reached by splitting code without splitting data.</text>
+
+</svg>
+</div>
+<figcaption>Separate deployables that cannot be deployed separately. It is usually reached by splitting code without splitting data.</figcaption>
+</figure>
+
+<p>The signs are easy to recognize once named.</p>
+<table>
+<thead><tr><th>Symptom</th><th>What it shows</th></tr></thead>
+<tbody>
+<tr><th>Services must be released in a particular order, or all at once</th><td>Their interfaces are not independently versioned</td></tr>
+<tr><th>Several services read and write the same tables</th><td>The database is the real interface, and nobody owns it</td></tr>
+<tr><th>One user request passes through a long chain of synchronous calls</th><td>Availability and latency multiply down the chain</td></tr>
+<tr><th>A shared library holding business logic must be upgraded everywhere at once</th><td>Coupling has moved into the library</td></tr>
+<tr><th>Most features need changes in several services</th><td>The boundaries are in the wrong place</td></tr>
+<tr><th>No service can be tested without starting most of the others</th><td>They are one system</td></tr>
+</tbody>
+</table>
+<p>The shared database is the usual root. A database is an excellent integration mechanism within one service and a poor one between services, because every table and column becomes a public interface that some unknown number of readers depend on. The rule that prevents it is strict: <b>a service’s data is reached only through that service</b>.</p>
+
+<h2 id="data">Data when every service owns its own</h2>
+<p>That rule removes two things a monolith provided for free, and both need a replacement.</p>
+<p><b>Queries that join across services.</b> The feed needs the names of the people whose photos it shows, and names belong to the identity service. Three options, from simplest to most dependable:</p>
+<ul>
+  <li><b>Ask at read time.</b> Fetch the photos, then ask identity for the names in one batched call. Simple, and it couples the feed’s availability and latency to identity’s.</li>
+  <li><b>Keep a copy.</b> The feed service subscribes to events from identity and stores the names it needs. Reads are local and survive an identity outage. The copy lags slightly (<x-ref to="event-driven-architecture#styles"></x-ref>).</li>
+  <li><b>Build a read model.</b> For complex views, a separate store fed by events from several services (<x-ref to="event-driven-architecture#cqrs"></x-ref>).</li>
+</ul>
+<p><b>Changes that span services.</b> Placing an order touches orders, payment and stock. There is no transaction across them. The answer is a saga with compensating steps (<x-ref to="distributed-transactions#sagas"></x-ref>), with events published through an outbox.</p>
+<p>Reporting across everything is done outside the services altogether, in a warehouse fed by change data capture (<x-ref to="change-data-capture#pipelines"></x-ref>).</p>
+<p>If a design needs many synchronous joins or many multi-service transactions, treat that as information. The parts involved probably belong together.</p>
+
+<h2 id="migrating">Getting from one to the other</h2>
+<p>Rewriting a working system from scratch as microservices is the approach with the worst record. The old system keeps changing while the new one is built, the new one must match years of accumulated behavior, and nothing is delivered until the end. The alternative is incremental and has a name, the <dfn>strangler fig</dfn> pattern, after a plant that grows around a tree and gradually replaces it.</p>
+
+<figure class="fig wide" id="fig-strangler">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 228" role="img" aria-labelledby="f405t f405d">
+<title id="f405t">The strangler fig pattern in three stages</title>
+<desc id="f405d">Stage one puts a router in front of the monolith, with all traffic still going to the monolith. Stage two moves one capability, notifications, into a new service and routes its paths there, with rollback by changing a route. Stage three repeats for further capabilities, leaving the core in the monolith. Each step is small and reversible, and stopping halfway is a good place to end up.</desc>
+<g data-s="1">
+<text class="tb" x="10" y="18">1. Put a router in front</text>
+<rect class="n sig" x="70" y="30" width="100" height="34" rx="6"/>
+<text class="ts tb mid" x="120" y="51.5">Router</text>
+<rect class="n" x="10" y="96" width="126" height="56" rx="6"/>
+<text class="ts tb mid" x="73" y="120">Monolith</text>
+<text class="ts mid" x="73" y="137">everything</text>
+<path class="e" d="M100 64C100 80 73 80 73 96"/>
+<text class="ts" x="10" y="176">All traffic still goes to the</text>
+<text class="ts" x="10" y="191">monolith. Nothing has changed</text>
+<text class="ts" x="10" y="206">except that you can now steer.</text>
+</g>
+<g data-s="2">
+<text class="tb" x="250" y="18">2. Move one capability</text>
+<rect class="n sig" x="310" y="30" width="100" height="34" rx="6"/>
+<text class="ts tb mid" x="360" y="51.5">Router</text>
+<rect class="n" x="250" y="96" width="126" height="56" rx="6"/>
+<text class="ts tb mid" x="313" y="120">Monolith</text>
+<text class="ts mid" x="313" y="137">everything else</text>
+<path class="e" d="M340 64C340 80 313 80 313 96"/>
+<rect class="n store" x="386" y="96" width="88" height="56" rx="6"/>
+<text class="ts tb mid" x="430" y="120">New</text>
+<text class="ts mid" x="430" y="137">notifications</text>
+<path class="e store" d="M380 64C380 80 430 80 430 96"/>
+<text class="ts" x="250" y="176">Route its paths to the new</text>
+<text class="ts" x="250" y="191">service. Compare, then cut over.</text>
+<text class="ts" x="250" y="206">Roll back by changing a route.</text>
+</g>
+<g data-s="3">
+<text class="tb" x="490" y="18">3. Repeat, or stop</text>
+<rect class="n sig" x="550" y="30" width="100" height="34" rx="6"/>
+<text class="ts tb mid" x="600" y="51.5">Router</text>
+<rect class="n" x="490" y="96" width="126" height="56" rx="6"/>
+<text class="ts tb mid" x="553" y="120">Monolith</text>
+<text class="ts mid" x="553" y="137">the core</text>
+<path class="e" d="M580 64C580 80 553 80 553 96"/>
+<rect class="n store" x="626" y="96" width="88" height="56" rx="6"/>
+<text class="ts tb mid" x="670" y="120">New</text>
+<text class="ts mid" x="670" y="137">several</text>
+<path class="e store" d="M620 64C620 80 670 80 670 96"/>
+<text class="ts" x="490" y="176">Each step is small and reversible.</text>
+<text class="ts" x="490" y="191">Stopping halfway is a perfectly</text>
+<text class="ts" x="490" y="206">good place to end up.</text>
+</g>
+<path class="e none dash" d="M240 8V222"/>
+<path class="e none dash" d="M480 8V222"/>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="all traffic" data-state="The monolith serves: everything; New services serve: nothing">Put a router in front of the monolith. All traffic still goes to the monolith. Nothing has changed, except that you can now steer.</li>
+  <li data-state="The monolith serves: everything else; New services serve: notifications">Build one capability, here notifications, as a new service. Route its paths to it, compare the results, then cut over. Rolling back is a change of route.</li>
+  <li data-state="The monolith serves: the core; New services serve: several capabilities">Repeat with the next capability, or stop. Each step is small and reversible, and stopping halfway is a perfectly good place to end up.</li>
+</ol>
+<figcaption>Extraction one capability at a time. At every stage the system is working and the step can be undone.</figcaption>
+</figure>
+
+<p>For each capability to be extracted, the order of work matters.</p>
+<ol>
+  <li><b>Draw the boundary inside the monolith first.</b> Give the capability a clean interface and stop other code from reaching past it. If this cannot be done in one codebase, it will not become easier across a network.</li>
+  <li><b>Separate its data.</b> Stop other code from touching its tables, remove joins and foreign keys that cross the line, then move the tables to their own database. This is the hardest step and the one most often skipped.</li>
+  <li><b>Move the code</b> to its own deployable, behind the same interface.</li>
+  <li><b>Shift traffic gradually</b>, comparing results, with the old path kept until confidence is high (<x-ref to="deployment-strategies"></x-ref>).</li>
+</ol>
+<p>Choose the first extraction for learning, not for importance: something with few dependencies and a clear edge, such as notifications. And remember that the pattern does not require finishing. A monolith with three services split off for good reasons is a legitimate architecture.</p>
+
+<h2 id="cases">What the evidence says</h2>
+<p>Public accounts from companies that have gone in both directions are more useful than opinion.</p>
+<ul>
+  <li><b>Uber, toward more structure.</b> By 2020 Uber had about 2,200 critical microservices and found the result hard to work in: a single feature could touch dozens of services owned by many teams. Its response was to group services into about 70 domains, each with one gateway as its entry point, and to restrict which domains may depend on which. The services remained. The lesson was that thousands of services need the same modular structure that code does.</li>
+  <li><b>Segment, back to one service.</b> Segment ran a separate service and repository for each of its many integrations. Shared libraries drifted to different versions in each, and in its engineers’ words velocity plummeted while the defect rate exploded. In 2018 it described consolidating them into one service and one repository. It accepted the loss of fault isolation between integrations as the price.</li>
+  <li><b>Prime Video, one component.</b> In 2023 a Prime Video team described a monitoring tool built from serverless functions and a workflow service, passing video frames between steps through object storage. It reached about 5% of the load it needed, and the orchestration and storage calls dominated its cost. Moving the steps into a single process, with frames passed in memory, cut its cost by 90%. This was one tool within a company that runs a very large number of services, and it shows a boundary drawn in the wrong place, not a verdict on services in general. <x-ref to="serverless#prime-video"></x-ref> looks at it more closely.</li>
+  <li><b>Shopify, a modular monolith</b>, as described above.</li>
+</ul>
+<p>The common thread is that the companies which did well chose their boundaries for stated reasons and revisited them when the reasons changed. The ones that suffered had adopted a shape because it was the fashion.</p>
+
+<h2 id="choosing">Choosing</h2>
+<table>
+<thead><tr><th>Situation</th><th>Reasonable shape</th></tr></thead>
+<tbody>
+<tr><th>A new product, a small team, a domain still being learned</th><td>A monolith, kept modular from the first day</td></tr>
+<tr><th>One codebase, several teams, releases beginning to collide</th><td>A modular monolith with enforced boundaries, and faster builds and tests</td></tr>
+<tr><th>One part has very different needs: scaling, hardware, release pace, compliance</th><td>Extract that part as a service</td></tr>
+<tr><th>Many teams, each owning a clear capability, held back by shared releases</th><td>Services along team lines, with a platform that makes each one cheap to run</td></tr>
+<tr><th>Hundreds of services and nobody can follow a request</th><td>Group services into domains with gateways, and consider merging the chattiest</td></tr>
+</tbody>
+</table>
+<p>A fair default is to begin with a modular monolith and extract a service when you can name the specific pressure that the extraction relieves: this team is blocked by that release train, this workload needs to scale on its own, this component must be isolated for compliance. “Microservices are best practice” is not such a pressure.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> A system design answer is normally drawn as services, and that is fine: the boxes show responsibilities. Be ready for “would you really build it as microservices?” A strong answer separates the logical design from the deployment: “These are the capabilities and their data ownership. With one team I would ship them as modules in one deployable and split out media processing first, because it scales differently. With ten teams, each box becomes a service.” That shows you know what the split costs and what it buys.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Starting a new product with microservices</th><td>Boundaries guessed before the domain is understood, and the full operational cost from day one</td><td>Start with a modular monolith</td></tr>
+<tr><th>Splitting code and sharing the database</th><td>A distributed monolith</td><td>Each service owns its data. Separate the data first.</td></tr>
+<tr><th>A service for every noun</th><td>Every feature spans several services</td><td>Boundaries around business capabilities</td></tr>
+<tr><th>More services than the teams can own</th><td>Orphaned services and constant context switching</td><td>Match services to teams</td></tr>
+<tr><th>Long chains of synchronous calls</th><td>Latency adds and availability multiplies downward</td><td>Fewer hops, local copies of data, asynchronous messaging</td></tr>
+<tr><th>Module boundaries kept by convention only</th><td>They erode within a year</td><td>Enforce them in the build</td></tr>
+<tr><th>A rewrite from scratch</th><td>Years of work delivering nothing until the end, chasing a moving target</td><td>Incremental extraction behind a router</td></tr>
+<tr><th>Shared libraries that carry business logic</th><td>Every service must upgrade together</td><td>Share only stable, generic code. Put logic behind a service or duplicate it.</td></tr>
+<tr><th>Microservices without the platform to support them</th><td>Each team rebuilds deployment, monitoring and security</td><td>Invest in the platform before multiplying services</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="availability-and-reliability"></x-ref>: how availability combines along a chain of dependencies.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: what becomes true the moment a call crosses a network.</li>
+  <li><x-ref to="distributed-transactions"></x-ref> and <x-ref to="event-driven-architecture"></x-ref>: consistency and data sharing without a shared database.</li>
+  <li><x-ref to="service-communication"></x-ref>: how services find and call each other.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: keeping one service’s failure from becoming everyone’s.</li>
+  <li><x-ref to="domain-modeling"></x-ref>: bounded contexts and aggregates as the source of boundaries.</li>
+  <li><x-ref to="application-architecture"></x-ref>: structuring the inside of a module or service.</li>
+  <li><x-ref to="deployment-strategies"></x-ref>: releasing parts independently and safely.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A microservice is defined by independent deployment and ownership of its data, not by size.</li>
+  <li>A monolith’s strengths are function calls, transactions and one of everything. Its problems come mainly from many people working in one deployable.</li>
+  <li>Microservices replace those problems with the problems of a distributed system. Every boundary becomes a network call that is slower, can fail alone and cannot join a transaction.</li>
+  <li>Service boundaries should follow team boundaries. Architecture and organization are chosen together.</li>
+  <li>A modular monolith gives clear, enforced boundaries without the network, and keeps extraction possible.</li>
+  <li>Draw boundaries around business capabilities, where things that change together sit together.</li>
+  <li>Splitting code while sharing a database produces a distributed monolith, the worst of both.</li>
+  <li>Migrate incrementally behind a router, separating data before code. Extract a service when you can name the pressure it relieves.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A system has 30 small services that are always released together on Thursdays. Is it a microservice architecture?</summary><p>No. The defining property of a microservice is that it can be deployed independently. Services that must be released together have the operational cost of thirty deployables and the coupling of one. It is a distributed monolith, and the reason they cannot be released separately, usually shared data or unversioned interfaces, is what needs fixing.</p></details>
+<details><summary>A request passes through eight services in sequence, each available 99.95% of the time. Roughly what availability does the request see, and what are two ways to improve it without making any service more reliable?</summary><p>About 99.6%, since 0.9995 to the eighth power is 0.996. That is around 35 hours of failure a year. Shorten the chain, by merging services that always call each other or by having services keep local copies of the data they need. Or make steps asynchronous, so that the request does not depend on all eight being up at that moment.</p></details>
+<details><summary>What does a modular monolith keep from a monolith, what does it take from microservices, and what does it give up?</summary><p>It keeps one deployable, in-process calls and the availability of transactions. It takes enforced boundaries: public interfaces between modules and each module owning its tables. It gives up independent deployment, independent scaling and failure isolation between modules.</p></details>
+<details><summary>Why is “one service per database table” a poor way to draw boundaries?</summary><p>A table is a storage detail, not a capability. Almost every feature needs several tables, so almost every feature needs several of those services, called in sequence. Changes span many services and teams, latency and failure multiply, and no service can do anything useful alone. Boundaries should surround business capabilities, so that most features stay inside one.</p></details>
+<details><summary>A team wants to extract billing from a monolith. In what order should they do the work, and which step is most often skipped?</summary><p>First establish the boundary inside the monolith: a clean interface, with no other code reaching past it. Then separate the data: no outside access to billing’s tables, no joins or foreign keys across the line, and then a separate database. Then move the code to its own deployable and shift traffic gradually. Separating the data is the step most often skipped, and skipping it yields a shared database.</p></details>
+<details><summary>What does Conway’s law predict about a service owned jointly by three teams?</summary><p>That it will not stay one coherent service. Every change needs agreement among three teams, so the code will divide along team lines into parts that each team treats as its own, with awkward interfaces between them, or one team will stop contributing. Ownership should be one team for each service.</p></details>
+<details><summary>A founder with four engineers asks whether to build the new product as microservices “so that it scales”. What do you say?</summary><p>That services help organizations scale more than they help traffic scale. Four engineers have no coordination problem to solve and would take on the full cost of a distributed system: network failures, no transactions, many pipelines. A monolith scales to very large traffic by running more copies. Build a modular monolith, learn where the real boundaries are, and extract services when a specific pressure appears.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Melvin Conway, <a href="https://www.melconway.com/Home/Committees_Paper.html">How Do Committees Invent?</a>, Datamation, 1968. The origin of Conway’s law.</li>
+  <li>Martin Fowler and James Lewis, <a href="https://martinfowler.com/articles/microservices.html">Microservices</a>, 2014. The article that defined the term’s common meaning.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/bliki/MonolithFirst.html">MonolithFirst</a>, 2015, and <a href="https://martinfowler.com/bliki/StranglerFigApplication.html">StranglerFigApplication</a>.</li>
+  <li>Kirsten Westeinde, <a href="https://shopify.engineering/deconstructing-monolith-designing-software-maximizes-developer-productivity">Deconstructing the Monolith: Designing Software that Maximizes Developer Productivity</a>, Shopify Engineering, February 2019.</li>
+  <li>Adam Gluck, <a href="https://www.uber.com/blog/microservice-architecture/">Introducing Domain-Oriented Microservice Architecture</a>, Uber Engineering, July 2020.</li>
+  <li>Mark Little, <a href="https://www.infoq.com/news/2018/07/segment-microservices">InfoQ report on Segment’s return from microservices to a monolith</a>, July 2018. A summary of Alexandra Noonan’s account.</li>
+  <li>InfoQ, <a href="https://www.infoq.com/news/2023/05/prime-ec2-ecs-saves-costs">report on Prime Video moving a monitoring service from serverless functions to a single process</a>, May 2023.</li>
+  <li>Sam Newman, <cite>Monolith to Microservices</cite>, O’Reilly, 2019. Patterns for incremental migration, including separating data.</li>
+  <li>Matthew Skelton and Manuel Pais, <cite>Team Topologies</cite>, IT Revolution, 2019. Team structure as an architectural decision.</li>
+</ol>
+</section>

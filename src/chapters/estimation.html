@@ -1,0 +1,353 @@
+<!--meta
+{ "description": "How to do back-of-the-envelope estimation for system design: powers of ten, seconds in a day, typical data sizes, latency numbers, and a worked capacity estimate for requests per second, storage and bandwidth, with an interactive calculator.",
+  "lede": "Before choosing an architecture you need to know roughly how big the problem is. A few multiplications on scrap paper are enough to tell a one-server problem from a hundred-server problem.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Why a rough number is enough</h2>
+<p>“Ten million users” does not tell you what to build. It could mean ten million people who each load one page a month, or ten million who stream video all evening. The first fits on a single modest server. The second needs a global delivery network. You find out which one you have by turning the user count into the three quantities machines care about: operations per second, bytes stored, and bytes sent per second.</p>
+<p>This is called <dfn>back-of-the-envelope estimation</dfn>, after the habit of doing it on whatever paper is nearby. The aim is an <dfn>order of magnitude</dfn>, a power of ten, and nothing finer. Whether you will handle 20 writes per second or 30 changes nothing. Whether it is 20 or 20,000 changes almost every decision, and a two-minute calculation tells you which.</p>
+<p>An estimate earns its place when it settles a question such as these:</p>
+<ul>
+  <li>Does all the data fit on one machine, or must it be split across several?</li>
+  <li>Can the database keep up with the write rate by itself?</li>
+  <li>Does the hot data fit in memory, so that a cache is practical?</li>
+  <li>Is the outbound traffic small enough to serve from our own servers?</li>
+  <li>Roughly what will this cost per month?</li>
+</ul>
+
+<h2 id="arithmetic">The only arithmetic you need</h2>
+<p>Estimation is multiplication and division of round numbers. Three sets of facts make it quick enough to do in your head.</p>
+
+<h3>Powers of ten, and their names</h3>
+<table>
+<thead><tr><th>Number</th><th>Power of ten</th><th>Name</th><th>As bytes</th><th>Nearest power of two</th></tr></thead>
+<tbody>
+<tr><td class="r">1,000</td><td>10<sup>3</sup></td><td>thousand</td><td>1 KB (kilobyte)</td><td>2<sup>10</sup> = 1,024</td></tr>
+<tr><td class="r">1,000,000</td><td>10<sup>6</sup></td><td>million</td><td>1 MB (megabyte)</td><td>2<sup>20</sup></td></tr>
+<tr><td class="r">1,000,000,000</td><td>10<sup>9</sup></td><td>billion</td><td>1 GB (gigabyte)</td><td>2<sup>30</sup></td></tr>
+<tr><td class="r">1,000,000,000,000</td><td>10<sup>12</sup></td><td>trillion</td><td>1 TB (terabyte)</td><td>2<sup>40</sup></td></tr>
+<tr><td class="r">10<sup>15</sup></td><td>10<sup>15</sup></td><td>quadrillion</td><td>1 PB (petabyte)</td><td>2<sup>50</sup></td></tr>
+</tbody>
+</table>
+<aside class="sn"><b>KB or KiB?</b>Strictly, 1 KB is 1,000 bytes and 1 KiB (kibibyte) is 1,024. Memory is usually sold in the binary units and disks and networks in the decimal ones. The gap is 2.4% at the kilobyte and about 10% at the terabyte. For estimation, treat them as the same and move on.</aside>
+<p>To multiply, add the exponents: a million users times a thousand bytes each is 10<sup>6</sup> × 10<sup>3</sup> = 10<sup>9</sup> bytes, or 1 GB. To divide, subtract them. Keep the leading digits small and round freely. 86,400 becomes 10<sup>5</sup>, and 365 becomes 400 when you only need the magnitude.</p>
+<p>One trap deserves a warning. Storage is measured in <b>bytes</b> and network speed in <b>bits</b> per second, and a byte is eight bits. A “1 gigabit” link moves 125 megabytes per second, not 1,000.</p>
+
+<h3>Seconds in a day</h3>
+<p>Product numbers arrive per day or per month. Machines are sized per second. The conversion factor is worth memorizing.</p>
+<table>
+<thead><tr><th>Period</th><th>Seconds</th><th>Round figure</th></tr></thead>
+<tbody>
+<tr><td>1 day</td><td class="r">86,400</td><td>about 10<sup>5</sup></td></tr>
+<tr><td>1 month (30 days)</td><td class="r">2,592,000</td><td>about 2.5 million</td></tr>
+<tr><td>1 year</td><td class="r">31,536,000</td><td>about 30 million</td></tr>
+</tbody>
+</table>
+<p>From the first row comes the most useful shortcut in this chapter: <b>one million events per day is about 12 per second</b>. So a billion per day is about 12,000 per second, and 100,000 per day is about one per second. In the other direction, one event per second is 86,400 a day, or about 2.6 million a month.</p>
+
+<h3>Average and peak</h3>
+<p>Dividing a daily total by 86,400 gives the <b>average</b> rate, as if traffic were spread evenly over 24 hours. It never is. People are awake at the same time, and a system sized for the average fails every evening. Multiply by a <dfn>peak factor</dfn> to get the rate you must actually survive. For a service used through the day in one region, 2 to 3 times the average is a common planning figure. A ticket sale or a breaking news alert can be ten times or more, and those need their own estimate.</p>
+
+<h2 id="sizes">How big things are</h2>
+<p>The second ingredient is the size of one item. You will not know it exactly at design time, and you do not need to. These figures are close enough for planning:</p>
+<table>
+<thead><tr><th>Item</th><th>Approximate size</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>One character of English text</td><td class="r">1 byte</td><td>Other scripts take 2 to 4 bytes per character in UTF-8</td></tr>
+<tr><td>An integer, a timestamp</td><td class="r">8 bytes</td><td>64 bits</td></tr>
+<tr><td>A UUID</td><td class="r">16 bytes</td><td>36 bytes when written out as text</td></tr>
+<tr><td>A short text post</td><td class="r">300 bytes</td><td>A few hundred characters</td></tr>
+<tr><td>A database row of metadata</td><td class="r">1 KB</td><td>Several fields plus index overhead</td></tr>
+<tr><td>A JSON API response</td><td class="r">1 to 10 KB</td><td>Before compression</td></tr>
+<tr><td>A thumbnail image</td><td class="r">20 KB</td><td></td></tr>
+<tr><td>A photo resized for a feed</td><td class="r">200 KB</td><td></td></tr>
+<tr><td>A photo from a phone camera</td><td class="r">2 to 5 MB</td><td>Compressed, full resolution</td></tr>
+<tr><td>One minute of compressed audio</td><td class="r">1 MB</td><td>At 128 kbit/s</td></tr>
+<tr><td>One minute of 1080p video</td><td class="r">40 MB</td><td>At about 5 Mbit/s. An hour is over 2 GB</td></tr>
+</tbody>
+</table>
+<p>The table shows something that shapes many architectures: sizes span seven orders of magnitude. One minute of video outweighs the metadata rows of forty thousand users. Whenever a system handles media, the media dominates storage and bandwidth and the rest is rounding error. That is why media goes to object storage and a CDN, and why the database that holds everything else stays small for much longer than people expect.</p>
+<aside class="sn"><b>Two billion is not a large number</b>A signed 32-bit integer tops out at 2,147,483,647. A busy table that numbers its rows with one will run out, and production outages have been caused by exactly that. Estimating how many rows you will create over the system’s life tells you to use a 64-bit key from the start. See <x-ref to="unique-ids"></x-ref>.</aside>
+
+<h2 id="latency-numbers">How long things take</h2>
+<p>The third ingredient is time. Computers work across a range of speeds so wide that intuition fails, so engineers keep a short list of reference times. A version of this list was made popular by Jeff Dean of Google in a 2009 talk. Hardware has moved since, mainly because solid-state drives replaced spinning disks, and the proportions still hold.</p>
+
+<figure class="fig wide" id="fig-latency">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 318" role="img" aria-labelledby="f31t f31d">
+<title id="f31t">Typical times for common operations on a logarithmic scale</title>
+<desc id="f31d">From fastest to slowest: a CPU cache reference at about 1 nanosecond, a main memory reference at about 100 nanoseconds, a random read from a solid-state drive at about 100 microseconds, a round trip inside a data center at about half a millisecond, a hard disk seek at about 10 milliseconds, a round trip within a continent at about 40 milliseconds, and a round trip between continents at about 150 milliseconds. Scaled so one nanosecond is one second, these become one second, two minutes, a day, six days, four months, over a year, and nearly five years.</desc>
+<text class="tb" x="10" y="24">Operation</text>
+<text class="tb" x="210" y="24">Time, each gridline is 1,000 times the last</text>
+<text class="tb" x="604" y="24">If 1 ns = 1 s</text>
+<line class="grid" x1="210" x2="210" y1="40" y2="282"/>
+<line class="grid" x1="330" x2="330" y1="40" y2="282"/>
+<line class="grid" x1="450" x2="450" y1="40" y2="282"/>
+<line class="grid" x1="570" x2="570" y1="40" y2="282"/>
+<text class="ts mid" x="210" y="300">1 ns</text>
+<text class="ts mid" x="330" y="300">1 µs</text>
+<text class="ts mid" x="450" y="300">1 ms</text>
+<text class="ts mid" x="570" y="300">1 s</text>
+<g>
+<text x="10" y="64">CPU cache reference</text>
+<line class="axis" x1="210" x2="210" y1="60" y2="60"/>
+<circle class="dot" cx="210" cy="60" r="5.5"/>
+<text class="ts" x="222" y="64">1 ns</text>
+<text class="ts" x="604" y="64">1 second</text>
+<text x="10" y="98">Main memory reference</text>
+<line class="axis" x1="210" x2="290" y1="94" y2="94"/>
+<circle class="dot" cx="290" cy="94" r="5.5"/>
+<text class="ts" x="302" y="98">100 ns</text>
+<text class="ts" x="604" y="98">2 minutes</text>
+<text x="10" y="132">SSD random read</text>
+<line class="axis" x1="210" x2="410" y1="128" y2="128"/>
+<circle class="dot" cx="410" cy="128" r="5.5"/>
+<text class="ts" x="422" y="132">100 µs</text>
+<text class="ts" x="604" y="132">1 day</text>
+<text x="10" y="166">Round trip in a data center</text>
+<line class="axis" x1="210" x2="438" y1="162" y2="162"/>
+<circle class="dot" cx="438" cy="162" r="5.5"/>
+<text class="ts" x="450" y="166">0.5 ms</text>
+<text class="ts" x="604" y="166">6 days</text>
+<text x="10" y="200">Hard disk seek</text>
+<line class="axis" x1="210" x2="490" y1="196" y2="196"/>
+<circle class="dot" cx="490" cy="196" r="5.5"/>
+<text class="ts" x="502" y="200">10 ms</text>
+<text class="ts" x="604" y="200">4 months</text>
+<text x="10" y="234">Round trip in a continent</text>
+<line class="axis" x1="210" x2="514" y1="230" y2="230"/>
+<circle class="dot" cx="514" cy="230" r="5.5"/>
+<text class="ts" x="526" y="234">40 ms</text>
+<text class="ts" x="604" y="234">15 months</text>
+<text x="10" y="268">Round trip across oceans</text>
+<line class="axis" x1="210" x2="537" y1="264" y2="264"/>
+<circle class="dot" cx="537" cy="264" r="5.5"/>
+<text class="ts" x="549" y="268">150 ms</text>
+<text class="ts" x="604" y="268">almost 5 years</text>
+</g>
+<rect class="hit" x="4" y="44" width="712" height="32" data-tip="CPU cache reference|about 1 ns|1 second, if 1 ns took 1 second"/>
+<rect class="hit" x="4" y="78" width="712" height="32" data-tip="Main memory reference|about 100 ns|2 minutes, if 1 ns took 1 second"/>
+<rect class="hit" x="4" y="112" width="712" height="32" data-tip="SSD random read|about 100 µs|1 day, if 1 ns took 1 second"/>
+<rect class="hit" x="4" y="146" width="712" height="32" data-tip="Round trip in a data center|about 0.5 ms|6 days, if 1 ns took 1 second"/>
+<rect class="hit" x="4" y="180" width="712" height="32" data-tip="Hard disk seek|about 10 ms|4 months, if 1 ns took 1 second"/>
+<rect class="hit" x="4" y="214" width="712" height="32" data-tip="Round trip in a continent|about 40 ms|15 months, if 1 ns took 1 second"/>
+<rect class="hit" x="4" y="248" width="712" height="32" data-tip="Round trip across oceans|about 150 ms|almost 5 years, if 1 ns took 1 second"/>
+</svg>
+</div>
+<figcaption>Reference times, to the nearest order of magnitude. The right-hand column stretches everything by a billion so the ratios can be felt: if reading from the CPU cache took a second, a request to another continent would take almost five years.</figcaption>
+</figure>
+
+<p>Four lessons from the figure come up again and again:</p>
+<ul>
+  <li><b>Memory is about a thousand times faster than a fast disk.</b> This is the whole case for caching, and for databases keeping their hot data in RAM.</li>
+  <li><b>A network call inside a data center costs about as much as several disk reads.</b> Splitting one program into ten services that call each other adds a cost that was zero before. Twenty such calls in sequence add about 10 ms.</li>
+  <li><b>Crossing the world costs as much as a million memory reads.</b> Nothing in software fixes this, because it is set by the speed of light. Only placing data nearer the user does.</li>
+  <li><b>Spinning disks are slow at jumping around and fine at reading straight through.</b> Much of storage-engine design, covered in <x-ref to="storage-engines"></x-ref>, comes from turning random access into sequential access.</li>
+</ul>
+
+<h2 id="capacity">What one machine can do</h2>
+<p>To turn a rate into a number of servers you need a rough idea of what a single one handles. This is the least reliable part of any estimate, because it depends on what each request does. Treat the figures below as starting assumptions to be replaced by measurement.</p>
+<table>
+<thead><tr><th>Component, on one ordinary server</th><th>Planning figure</th></tr></thead>
+<tbody>
+<tr><td>Application server running typical business logic</td><td>Hundreds to a few thousand requests per second</td></tr>
+<tr><td>Relational database, simple indexed reads</td><td>Thousands to tens of thousands per second</td></tr>
+<tr><td>Relational database, writes</td><td>Hundreds to a few thousand per second</td></tr>
+<tr><td>In-memory key-value store</td><td>Around 100,000 simple operations per second</td></tr>
+<tr><td>Message log, small messages</td><td>Hundreds of thousands per second</td></tr>
+<tr><td>Memory</td><td>Tens to hundreds of gigabytes</td></tr>
+<tr><td>A 10 Gbit/s network link</td><td>1.25 GB per second</td></tr>
+</tbody>
+</table>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Quoting a benchmark as if it were your capacity. “PostgreSQL does 50,000 queries per second” is true of some query on some machine. Your query joins four tables and returns 200 rows. Use round planning figures to choose an architecture, then load test the real thing before you promise anything. See <x-ref to="capacity-and-cost"></x-ref>.</p></div>
+
+<h2 id="method">The method: five quantities</h2>
+<p>Every estimate in this book produces the same five numbers, in the same order, because each one feeds the next.</p>
+<ol>
+  <li><b>Traffic.</b> Requests per second, average and peak, with reads and writes counted separately.</li>
+  <li><b>Storage.</b> New bytes per day, then the total over the period you must keep data, times the number of copies.</li>
+  <li><b>Bandwidth.</b> Bytes per second in and out, which is traffic times the size of each request or response.</li>
+  <li><b>Memory.</b> How much hot data would have to sit in RAM for a cache to be effective.</li>
+  <li><b>Machines.</b> Peak traffic divided by what one server handles, plus spare capacity for failures.</li>
+</ol>
+
+<figure class="fig wide" id="fig-chain">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 312" role="img" aria-labelledby="f32t f32d">
+<title id="f32t">Three chains of multiplication that turn a user count into traffic, storage and bandwidth</title>
+<desc id="f32d">Traffic: 10 million daily users times 50 views each is 500 million views per day, divided by 86,400 is 5,800 per second, times 3 is 17,400 at peak. Storage: 10 million daily users times 0.2 uploads each is 2 million uploads per day, times 2.5 megabytes is 5 terabytes per day, times 365 days and 3 copies is 5.5 petabytes per year. Bandwidth: 5,800 views per second times 200 kilobytes is 1.16 gigabytes per second, times 8 is 9.3 gigabits per second.</desc>
+<text class="tb" x="10" y="20">Traffic</text>
+<rect class="n" x="10" y="30" width="115" height="48" rx="6"/><text class="ts mid" x="67.5" y="50">Daily users</text><text class="tb mid" x="67.5" y="68">10 million</text>
+<rect class="n" x="205" y="30" width="115" height="48" rx="6"/><text class="ts mid" x="262.5" y="50">Views per day</text><text class="tb mid" x="262.5" y="68">500 million</text>
+<rect class="n" x="400" y="30" width="115" height="48" rx="6"/><text class="ts mid" x="457.5" y="50">Views per second</text><text class="tb mid" x="457.5" y="68">5,800</text>
+<rect class="n sig" x="595" y="30" width="115" height="48" rx="6"/><text class="ts mid" x="652.5" y="50">At peak</text><text class="tb mid" x="652.5" y="68">17,400 /s</text>
+<path class="e" d="M125 54H205M320 54H400M515 54H595"/>
+<text class="ts mid" x="165" y="47">× 50 views</text><text class="ts mid" x="165" y="70">per user</text>
+<text class="ts mid" x="360" y="47">÷ 86,400</text><text class="ts mid" x="360" y="70">seconds</text>
+<text class="ts mid" x="555" y="47">× 3</text><text class="ts mid" x="555" y="70">peak factor</text>
+
+<text class="tb" x="10" y="124">Storage</text>
+<rect class="n" x="10" y="134" width="115" height="48" rx="6"/><text class="ts mid" x="67.5" y="154">Daily users</text><text class="tb mid" x="67.5" y="172">10 million</text>
+<rect class="n" x="205" y="134" width="115" height="48" rx="6"/><text class="ts mid" x="262.5" y="154">Uploads per day</text><text class="tb mid" x="262.5" y="172">2 million</text>
+<rect class="n" x="400" y="134" width="115" height="48" rx="6"/><text class="ts mid" x="457.5" y="154">New data per day</text><text class="tb mid" x="457.5" y="172">5 TB</text>
+<rect class="n store" x="595" y="134" width="115" height="48" rx="6"/><text class="ts mid" x="652.5" y="154">Stored per year</text><text class="tb mid" x="652.5" y="172">5.5 PB</text>
+<path class="e" d="M125 158H205M320 158H400M515 158H595"/>
+<text class="ts mid" x="165" y="151">× 0.2 uploads</text><text class="ts mid" x="165" y="174">per user</text>
+<text class="ts mid" x="360" y="151">× 2.5 MB</text><text class="ts mid" x="360" y="174">each</text>
+<text class="ts mid" x="555" y="151">× 365 days</text><text class="ts mid" x="555" y="174">× 3 copies</text>
+
+<text class="tb" x="10" y="228">Bandwidth</text>
+<rect class="n" x="10" y="238" width="115" height="48" rx="6"/><text class="ts mid" x="67.5" y="258">Views per second</text><text class="tb mid" x="67.5" y="276">5,800</text>
+<rect class="n" x="205" y="238" width="115" height="48" rx="6"/><text class="ts mid" x="262.5" y="258">Bytes out</text><text class="tb mid" x="262.5" y="276">1.16 GB/s</text>
+<rect class="n sig" x="400" y="238" width="115" height="48" rx="6"/><text class="ts mid" x="457.5" y="258">Bits out</text><text class="tb mid" x="457.5" y="276">9.3 Gbit/s</text>
+<path class="e" d="M125 262H205M320 262H400"/>
+<text class="ts mid" x="165" y="255">× 200 KB</text><text class="ts mid" x="165" y="278">per view</text>
+<text class="ts mid" x="360" y="255">× 8</text><text class="ts mid" x="360" y="278">bits per byte</text>
+</svg>
+</div>
+<figcaption>The three chains of multiplication behind most estimates, filled in with the photo app’s numbers from the next section.</figcaption>
+</figure>
+
+<h2 id="worked-example">A worked example: the photo app</h2>
+<p>Here is the full estimate for the photo-sharing app from <x-ref to="what-is-system-design">Chapter 1</x-ref>. Start by writing down the assumptions, because they are the part other people can challenge.</p>
+<table>
+<thead><tr><th>Assumption</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Daily active users</td><td class="r">10 million</td></tr>
+<tr><td>Photos viewed per user per day</td><td class="r">50</td></tr>
+<tr><td>Photos uploaded per user per day</td><td class="r">0.2 (one upload every five days)</td></tr>
+<tr><td>Stored per upload: the original plus resized versions</td><td class="r">2.5 MB</td></tr>
+<tr><td>Sent per view: the feed-sized version</td><td class="r">200 KB</td></tr>
+<tr><td>Metadata per photo</td><td class="r">1 KB</td></tr>
+<tr><td>Peak factor</td><td class="r">3</td></tr>
+<tr><td>Copies kept of every stored byte</td><td class="r">3</td></tr>
+<tr><td>Retention</td><td class="r">5 years</td></tr>
+</tbody>
+</table>
+
+<h3>1. Traffic</h3>
+<div class="formula">uploads   10,000,000 × 0.2 = 2,000,000 per day  ÷ 86,400 ≈ 23 per second    peak ≈ 70
+views     10,000,000 × 50  = 500,000,000 per day ÷ 86,400 ≈ 5,800 per second  peak ≈ 17,400
+ratio     500,000,000 ÷ 2,000,000 = 250 reads for every write</div>
+<p>A view of a photo is a request for an image file. The calls to our own API are fewer. If the feed loads ten photos per page, 50 views is five page loads per user per day:</p>
+<div class="formula">feed API  10,000,000 × 5 = 50,000,000 per day ÷ 86,400 ≈ 580 per second   peak ≈ 1,740</div>
+
+<h3>2. Storage</h3>
+<div class="formula">images    2,000,000 × 2.5 MB = 5 TB per day
+          5 TB × 365 ≈ 1.8 PB per year     × 3 copies ≈ 5.5 PB per year
+          over 5 years ≈ 27 PB
+metadata  2,000,000 × 1 KB = 2 GB per day ≈ 730 GB per year ≈ 3.7 TB over 5 years
+photos    2,000,000 × 365 × 5 ≈ 3.65 billion rows after 5 years</div>
+
+<h3>3. Bandwidth</h3>
+<div class="formula">in        23 uploads/s × 2 MB ≈ 46 MB/s ≈ 370 Mbit/s
+out       5,800 views/s × 200 KB ≈ 1.16 GB/s ≈ 9.3 Gbit/s     peak ≈ 28 Gbit/s</div>
+
+<h3>4. Memory</h3>
+<p>Requests are rarely spread evenly over the data. A small share of items draws most of the attention, and a common assumption is that 20% of the items receive 80% of the requests. Suppose 100 million distinct photos are viewed on a given day. Caching the metadata for the most popular fifth of them takes:</p>
+<div class="formula">cache     100,000,000 × 20% × 1 KB = 20 GB</div>
+<p>That fits in the memory of one server, with room to spare.</p>
+
+<h3>5. Machines</h3>
+<p>Assume one application server handles 1,000 feed requests per second. The peak of 1,740 needs two. Running exactly two leaves nothing for a server failing or a deployment in progress, so plan for four and expect them to sit below half load most of the day. <x-ref to="latency-and-throughput"></x-ref> explains why that spare capacity is necessary and not waste.</p>
+
+<h2 id="decisions">What the numbers decide</h2>
+<p>The estimate took a few minutes. Look at how much of the architecture it settles.</p>
+<table>
+<thead><tr><th>The number</th><th>What it tells you</th></tr></thead>
+<tbody>
+<tr><td>250 reads per write</td><td>Optimize the read path. Caches, replicas and precomputed feeds pay off, and the write path can stay simple.</td></tr>
+<tr><td>23 uploads per second, 70 at peak</td><td>One relational database handles the write rate easily. Sharding for write volume is not needed.</td></tr>
+<tr><td>3.7 TB of metadata in 5 years</td><td>Fits on one large database server. It will need attention eventually, and not on day one.</td></tr>
+<tr><td>3.65 billion photo rows</td><td>The photo ID must be 64-bit. Queries on this table must use indexes, since scanning it is never an option.</td></tr>
+<tr><td>27 PB of images</td><td>Far beyond any single machine or any database. Use object storage, and think about cheaper storage tiers for old photos, since this is where the money goes.</td></tr>
+<tr><td>9 Gbit/s outbound, 28 at peak</td><td>Do not serve images from application servers. A CDN is required, both for speed and to carry the traffic.</td></tr>
+<tr><td>20 GB of hot metadata</td><td>A cache is cheap and practical.</td></tr>
+<tr><td>1,740 API requests per second at peak</td><td>A handful of stateless application servers behind a load balancer.</td></tr>
+</tbody>
+</table>
+<p>Just as useful is what the numbers say you can ignore. Nothing here calls for a distributed database, a fleet of hundreds of servers or a custom storage engine. The hard parts of this system are storing and delivering images cheaply and building the feed quickly. Everything else is ordinary, and should be built in the most ordinary way available.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Say your assumptions aloud and round hard. “Ten million daily users, each viewing about fifty photos, so five hundred million views a day, which is about six thousand a second” takes fifteen seconds and shows the skill being tested. Then use the result: “so this is read-heavy and bandwidth-heavy, and I’ll put a CDN in front of the images.” An estimate that does not change the design was not worth doing.</p></div>
+
+<h2 id="calculator">Try your own numbers</h2>
+<p>The panel below repeats the calculation with any inputs. It starts with the photo app’s assumptions. Change one value at a time and watch which outputs move. Halving the photo size, for example, halves the storage bill and leaves the request rate untouched.</p>
+
+<div class="widget wide" data-widget="estimator">
+<h4>Capacity estimator</h4>
+<p>Rates are averages over a day unless marked as peak. Sizes use decimal units, so 1 MB is 1,000 KB.</p>
+<div class="controls">
+  <label>Daily active users<input type="number" name="dau" value="10000000" min="0" step="1000"></label>
+  <label>Reads per user per day<input type="number" name="reads" value="50" min="0" step="1"></label>
+  <label>Writes per user per day<input type="number" name="writes" value="0.2" min="0" step="0.1"></label>
+  <label>Stored per write, in KB<input type="number" name="writeKb" value="2500" min="0" step="1"></label>
+  <label>Sent per read, in KB<input type="number" name="readKb" value="200" min="0" step="1"></label>
+  <label>Peak factor<input type="number" name="peak" value="3" min="1" step="0.5"></label>
+  <label>Years of data kept<input type="number" name="years" value="5" min="0" step="1"></label>
+  <label>Copies of each byte<input type="number" name="copies" value="3" min="1" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Reads, average</dt><dd data-out="readQps">5,787 /s</dd></div>
+  <div><dt>Reads, peak</dt><dd data-out="readPeak">17.4 thousand /s</dd></div>
+  <div><dt>Writes, average</dt><dd data-out="writeQps">23.1 /s</dd></div>
+  <div><dt>Writes, peak</dt><dd data-out="writePeak">69.4 /s</dd></div>
+  <div><dt>New data per day</dt><dd data-out="storageDay">5 TB</dd></div>
+  <div><dt>Total stored, all copies</dt><dd data-out="storageTotal">27.4 PB</dd></div>
+  <div><dt>Outbound, average</dt><dd data-out="egress">9.26 Gbit/s</dd></div>
+  <div><dt>Outbound, peak</dt><dd data-out="egressPeak">27.8 Gbit/s</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Reads outnumber writes about 250 to 1. That is a read-heavy system: caching, replicas and a CDN will do most of the work.</p>
+</div>
+
+<h2 id="mistakes">Mistakes to avoid</h2>
+<ul>
+  <li><b>False precision.</b> Writing 5,787.04 requests per second claims knowledge you do not have. The inputs are guesses, so the output is good to one significant digit at best. Say “about 6,000”.</li>
+  <li><b>Sizing for the average.</b> The average is what you pay for over a month. The peak is what takes you down. Always compute both.</li>
+  <li><b>Mixing bits and bytes.</b> Off by a factor of eight. Write the unit beside every number.</li>
+  <li><b>Forgetting the copies.</b> Stored data is replicated, backed up and indexed. Raw size times three is a reasonable floor for what you will pay for.</li>
+  <li><b>Forgetting growth.</b> A system designed for exactly today’s load is full on the day it launches. Estimate for where you expect to be in a year or two, and state the growth rate you assumed.</li>
+  <li><b>Estimating what does not matter.</b> If the metadata is a thousandth of the image data, do not spend time refining the metadata estimate. Find the dominant term and get that one right.</li>
+  <li><b>Hiding the assumptions.</b> An estimate is only as good as its inputs. List them first so that someone who knows better can correct one, and the correction flows through.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> At work you often have real data, so use it. Last month’s request logs beat any assumption about user behavior. Estimation still matters there for the things you cannot measure yet: a feature that does not exist, a tenfold growth target, or the cost of a migration. A good habit is to write the estimate in the design document and, after launch, compare it with what happened. That is how the planning figures in your head get better.</p></div>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>Cost and finance.</b> Storage in petabytes and bandwidth in gigabits per second convert directly into a monthly bill using a cloud provider’s price list. <x-ref to="capacity-and-cost"></x-ref> does this conversion.</li>
+  <li><b>Data storage.</b> Row counts and data sizes decide when one database stops being enough. See <x-ref to="partitioning"></x-ref>.</li>
+  <li><b>Physics and queueing theory.</b> The latency figures come from hardware and the speed of light. What happens to them under load is the subject of <x-ref to="latency-and-throughput"></x-ref>.</li>
+  <li><b>Case studies.</b> Every design in Part XI opens with an estimate built exactly this way.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Estimation aims for the right power of ten. That is enough to choose between kinds of architecture.</li>
+  <li>A day has about 10<sup>5</sup> seconds, so a million events per day is about 12 per second.</li>
+  <li>Always compute the peak as well as the average, and keep reads and writes separate.</li>
+  <li>Media sizes are thousands of times larger than metadata. Find the dominant term first.</li>
+  <li>Memory is about a thousand times faster than a fast disk, and a trip across the world costs about 150 ms that no software can remove.</li>
+  <li>Produce the same five numbers every time: traffic, storage, bandwidth, memory, machines. Then say what each one decides.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A service receives 250 million requests per day. Roughly how many per second on average, and what would you plan for at peak?</summary><p>One million per day is about 12 per second, so 250 million is about 3,000 per second (2,894 exactly). With a peak factor of 3, plan for roughly 9,000 per second.</p></details>
+<details><summary>A chat app has 50 million daily users who each send 40 messages of about 200 bytes. How much new message data per day, before replication?</summary><p>50,000,000 × 40 = 2 billion messages per day. At 200 bytes each that is 400 GB per day, or about 146 TB per year. Text is small, and at this scale it still adds up to something that needs a plan.</p></details>
+<details><summary>Your link is rated at 1 Gbit/s. A colleague says it can serve 1,000 downloads per second of a 1 MB file. Is that right?</summary><p>No. 1 Gbit/s is 125 MB per second, so the link can carry at most about 125 such downloads per second. The colleague mixed up bits and bytes.</p></details>
+<details><summary>In the photo app, which single assumption would change the storage cost the most if it were wrong by a factor of two?</summary><p>Anything in the image chain: uploads per user, bytes stored per upload, or the number of copies. Storage is the product of those, so doubling any one doubles the 27 PB. The metadata size could be wrong by ten times and the total would barely move.</p></details>
+<details><summary>Why is “one server handles 1,000 requests per second” the weakest number in the estimate?</summary><p>Because it depends on what each request does, on the hardware and on the code, none of which exist yet. The other inputs are counts and sizes that can be reasoned about. This one can only be confirmed by measuring the real system under load.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Jeff Dean, <a href="https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf">“Designs, Lessons and Advice from Building Large Distributed Systems”</a>, keynote at LADIS 2009. Its slide “Numbers Everyone Should Know” is the origin of the list.</li>
+  <li>Colin Scott, <a href="https://colin-scott.github.io/personal_website/research/interactive_latency.html">“Numbers Every Programmer Should Know By Year”</a>. An interactive version that extrapolates the figures over time.</li>
+  <li>Jon Bentley, “The Back of the Envelope”, in <i>Programming Pearls</i> (Addison-Wesley). The classic essay on quick estimation for programmers.</li>
+  <li>Brendan Gregg, <i>Systems Performance</i> (Addison-Wesley). The source of the “scaled to human time” comparison used in the figure.</li>
+</ol>
+</section>

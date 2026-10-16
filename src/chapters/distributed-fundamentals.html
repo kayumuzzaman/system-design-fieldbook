@@ -1,0 +1,496 @@
+<!--meta
+{ "description": "The foundations of distributed systems: partial failure, the fallacies of distributed computing, why a timeout cannot tell a slow node from a dead one, failure models, process pauses, wall clocks and monotonic clocks, clock skew, and Lamport and vector clocks.",
+  "lede": "A program on one computer either works or it stops. A system spread over many computers can be half working: one machine has done its part, another has not, and a third cannot tell which. This chapter is about the three facts that make distributed systems hard, an unreliable network, unreliable clocks and machines that stop without knowing it, and the habits of design that follow from them.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="different">What changes when there is more than one machine</h2>
+<p>Part III ended with data copied and split across many machines. Each of those chapters met the same difficulties from a different side: a follower that falls behind, a failover that cannot tell a dead leader from a slow one, a cache that disagrees with its database. Part IV studies those difficulties directly.</p>
+<p>A <dfn>distributed system</dfn> is a set of computers that work together by exchanging messages over a network. Three things that a single computer gives you for free are missing.</p>
+<ul>
+  <li><b>Failure is all or nothing on one machine.</b> If the power fails, everything stops together. Across machines, any subset can fail while the rest carry on. This is <dfn>partial failure</dfn>, and it is the defining difficulty of the field.</li>
+  <li><b>There is no shared memory.</b> One machine can learn about another only by receiving a message from it, and the message may be late, lost or out of date by the time it arrives.</li>
+  <li><b>There is no shared clock.</b> Every machine has its own idea of the time, and the ideas differ.</li>
+</ul>
+<p>The practical consequence is that no machine ever knows the current state of the whole system. It knows what it was told, some time ago, by whoever managed to reach it. Every technique in this part is a way of acting correctly on that kind of knowledge.</p>
+
+<h2 id="fallacies">Eight assumptions that are false</h2>
+<p>In the 1990s engineers at Sun Microsystems listed the assumptions that newcomers to networked programming make without noticing. They are known as the <dfn>fallacies of distributed computing</dfn>, and code that looks correct usually fails because it relies on one of them.</p>
+<table>
+<thead><tr><th>The assumption</th><th>The reality</th><th>What it breaks</th></tr></thead>
+<tbody>
+<tr><th>The network is reliable</th><td>Packets are lost, connections reset, cables are cut</td><td>Calls with no timeout and no retry</td></tr>
+<tr><th>Latency is zero</th><td>Every call takes time, and sometimes a great deal</td><td>Chatty designs that make hundreds of small calls</td></tr>
+<tr><th>Bandwidth is infinite</th><td>Links saturate</td><td>Sending whole objects where a small change would do</td></tr>
+<tr><th>The network is secure</th><td>Anything on the wire can be read or forged unless protected</td><td>Trusting internal traffic</td></tr>
+<tr><th>Topology does not change</th><td>Machines are added, moved and replaced constantly</td><td>Hard-coded addresses</td></tr>
+<tr><th>There is one administrator</th><td>Parts of the path belong to other teams and other companies</td><td>Assuming you can fix or even see every problem</td></tr>
+<tr><th>Transport cost is zero</th><td>Serializing data and moving it costs CPU and money</td><td>Ignoring data transfer in the bill</td></tr>
+<tr><th>The network is homogeneous</th><td>Different hardware, software versions and configurations coexist</td><td>Assuming every node behaves like the one you tested</td></tr>
+</tbody>
+</table>
+<p>A local function call obeys all eight. A remote call obeys none, and looks exactly the same in code. That resemblance is the trap.</p>
+
+<h2 id="messages">What can happen to a message</h2>
+<p>When one machine sends a request to another and waits for the reply, six things can go wrong, and the sender can observe none of them directly.</p>
+<ul>
+  <li>The request is lost on the way.</li>
+  <li>The request is delayed, in a queue or on a congested link.</li>
+  <li>The receiver has crashed, or crashes while handling it.</li>
+  <li>The receiver is alive and has stopped responding for a while.</li>
+  <li>The receiver handled the request and the reply is lost.</li>
+  <li>The reply is delayed.</li>
+</ul>
+
+<figure class="fig wide" id="fig-indistinguishable">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f261t f261d">
+<title id="f261t">Three failures that look the same to the client</title>
+<desc id="f261d">Three panels, each showing a client and a server. In the first the request is lost before reaching the server. In the second the request arrives and the server crashes. In the third the server completes the work and the response is lost on the way back. In all three the client observes only a timeout.</desc>
+<g data-scene="req">
+<text class="tb mid" x="115" y="18">The request was lost</text>
+<text class="ts mid" x="40" y="42">client</text>
+<text class="ts mid" x="190" y="42">server</text>
+<line class="axis" x1="40" y1="50" x2="40" y2="150"/>
+<line class="axis" x1="190" y1="50" x2="190" y2="150"/>
+<g data-s="1">
+<path class="e sig" d="M41 70H125"/>
+</g>
+<g data-s="2">
+<path class="x" d="M131 63l14 14M145 63l-14 14"/>
+</g>
+<g data-s="1">
+<text class="ts mid" x="84" y="62">request</text>
+</g>
+<g data-s="3">
+<text class="ts tb mid" x="40" y="172">timeout</text>
+</g>
+</g>
+<g data-scene="srv">
+<text class="tb mid" x="355" y="18">The server failed</text>
+<text class="ts mid" x="280" y="42">client</text>
+<text class="ts mid" x="430" y="42">server</text>
+<line class="axis" x1="280" y1="50" x2="280" y2="150"/>
+<line class="axis" x1="430" y1="50" x2="430" y2="150"/>
+<g data-s="1">
+<path class="e sig" d="M281 70H429"/>
+<text class="ts mid" x="355" y="62">request</text>
+</g>
+<g data-s="2">
+<path class="x" d="M423 89l14 14M437 89l-14 14"/>
+<text class="ts end" x="416" y="100">crashes</text>
+</g>
+<g data-s="3">
+<text class="ts tb mid" x="280" y="172">timeout</text>
+</g>
+</g>
+<g data-scene="resp">
+<text class="tb mid" x="595" y="18">The response was lost</text>
+<text class="ts mid" x="520" y="42">client</text>
+<text class="ts mid" x="670" y="42">server</text>
+<line class="axis" x1="520" y1="50" x2="520" y2="150"/>
+<line class="axis" x1="670" y1="50" x2="670" y2="150"/>
+<g data-s="1">
+<path class="e sig" d="M521 70H669"/>
+<text class="ts mid" x="595" y="62">request</text>
+</g>
+<g data-s="2">
+<text class="ts end" x="656" y="96">done</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M669 132H585"/>
+<path class="x" d="M565 125l14 14M579 125l-14 14"/>
+<text class="ts mid" x="630" y="124">response</text>
+</g>
+<g data-s="4">
+<text class="ts tb mid" x="520" y="172">timeout</text>
+</g>
+</g>
+<path class="e none dash" d="M240 8V180"/>
+<path class="e none dash" d="M480 8V180"/>
+<text class="ts" x="10" y="204">From the client’s side these are identical: it sent a request and nothing came back. Only in the third case was the work done,</text>
+<text class="ts" x="10" y="220">so a retry there performs it a second time.</text>
+</svg>
+</div>
+<ol class="steps" data-scene="req" data-label="Request lost">
+  <li data-state="Work done: no; Client sees: nothing yet">The client sends a request.</li>
+  <li>It is lost on the way. The server never sees it.</li>
+  <li data-state="Work done: no; Client sees: a timeout">The client waits, hears nothing, and times out. The work was not done.</li>
+</ol>
+<ol class="steps" data-scene="srv" data-label="Server failed">
+  <li data-state="Work done: no; Client sees: nothing yet">The client sends a request, and it arrives.</li>
+  <li data-state="Work done: perhaps half; Client sees: nothing yet">The server crashes while handling it. The work may be half done.</li>
+  <li data-state="Work done: perhaps half; Client sees: a timeout">The client waits, hears nothing, and times out.</li>
+</ol>
+<ol class="steps" data-scene="resp" data-label="Response lost">
+  <li data-state="Work done: no; Client sees: nothing yet">The client sends a request, and it arrives.</li>
+  <li data-state="Work done: yes; Client sees: nothing yet">The server does the work.</li>
+  <li>It sends a response, which is lost on the way back.</li>
+  <li data-state="Work done: yes; Client sees: a timeout">The client times out exactly as in the other two cases. This time the work was done, so a retry would do it a second time.</li>
+</ol>
+<figcaption>The central fact of distributed systems. A missing reply does not say whether the work was done.</figcaption>
+</figure>
+
+<p>The sender’s only evidence in every case is silence. It cannot tell “the work was not done” from “the work was done and I was not told”. This single ambiguity is why retries can duplicate work, why payments can be charged twice, and why <x-ref to="idempotency-and-delivery"></x-ref> exists as a chapter.</p>
+<p>Networks do fail in practice. Published surveys of real incidents record data centers split in two by a misconfigured switch, links that passed traffic in one direction only, and network cards that corrupted a fraction of packets. A network fault that cuts some machines off from others while both groups keep running is called a <dfn>network partition</dfn>.</p>
+
+<h2 id="timeouts">The timeout is the only detector</h2>
+<p>Since a failed machine sends no announcement, the only way to detect failure is to wait for a reply and give up after some time. That time is a <dfn>timeout</dfn>, and choosing it is a compromise with no correct answer.</p>
+<ul>
+  <li><b>Too short</b>, and healthy machines that are briefly slow are declared dead. The work is retried elsewhere, adding load to a system that was slow because it was already loaded, and possibly being done twice.</li>
+  <li><b>Too long</b>, and every real failure costs that much waiting before anything reacts.</li>
+</ul>
+<p>There is no safe value because delays have no upper limit. A packet can sit in a queue. A machine can freeze for seconds, as a later section shows. On an ordinary network and ordinary hardware, anything that usually takes a millisecond will occasionally take a second.</p>
+<p>The conclusion to hold on to is that <b>a timeout tells you a machine is unresponsive. It never tells you the machine is dead.</b> A design that acts as if the two were the same will, sooner or later, have two machines doing a job meant for one. This was the split brain of <x-ref to="replication#failover"></x-ref>. In practice, systems measure response times and set timeouts from the observed distribution, such as a high percentile with a margin, and combine them with retries and limits on retries (<x-ref to="resilience-patterns"></x-ref>).</p>
+
+<h2 id="models">Kinds of failure</h2>
+<p>To reason about a system, you need to say which failures it is expected to survive. The standard categories, from mildest to worst:</p>
+<table>
+<thead><tr><th>Failure model</th><th>The node</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>Crash-stop</th><td>Stops and never returns</td><td>A machine is destroyed</td></tr>
+<tr><th>Crash-recovery</th><td>Stops, and may return later having lost whatever was only in memory</td><td>A process restarts after a power cut</td></tr>
+<tr><th>Omission</th><td>Runs and fails to send or receive some messages</td><td>A full queue drops requests</td></tr>
+<tr><th>Timing</th><td>Responds correctly and too late</td><td>A long pause, an overloaded disk</td></tr>
+<tr><th>Byzantine</th><td>Does anything at all, including sending wrong or contradictory answers</td><td>Corrupted memory, a bug, a compromised machine</td></tr>
+</tbody>
+</table>
+<p>Most systems inside one organization are designed for crash-recovery failures and an unreliable network, and assume that a node which responds is telling the truth. Tolerating <dfn>Byzantine</dfn> failures, where nodes may lie, costs far more machines and messages. It is the province of blockchains and of some aerospace systems, and this book does not go further into it.</p>
+<p>The failures that cause the longest outages are often none of the clean cases above. A machine that is slow, that drops one request in ten, or that is reachable from some peers and not others, passes its health checks and keeps receiving work. These are sometimes called gray failures. They are the reason for the passive health checks in <x-ref to="proxies-and-load-balancers#health"></x-ref>: judge a machine by what happens to real requests.</p>
+
+<h2 id="pauses">A machine can stop without knowing</h2>
+<p>One failure deserves its own section because it defeats code that looks obviously correct. A running program can be suspended for seconds at any point, between any two lines, and has no way of noticing.</p>
+<ul>
+  <li><b>Garbage collection.</b> Some language runtimes stop all application threads to reclaim memory. Pauses are usually milliseconds and can reach seconds with large heaps.</li>
+  <li><b>Virtual machines.</b> The hypervisor can suspend a virtual machine, for example to move it to another host.</li>
+  <li><b>The operating system.</b> A process can be descheduled in favor of others, or stall while waiting for a slow disk or for memory that was swapped out.</li>
+</ul>
+
+<figure class="fig wide" id="fig-pause">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 228" role="img" aria-labelledby="f262t f262d">
+<title id="f262t">A process pause that outlasts a lease</title>
+<desc id="f262d">Node A holds a lease valid for 10 seconds. It checks that the lease is valid and is then paused for 15 seconds without knowing. During the pause the lease expires and node B takes it and writes. Node A then resumes and writes as well, still believing its earlier check.</desc>
+<text class="tb" x="10" y="22">Node A</text>
+<text class="tb" x="10" y="112">Node B</text>
+<line class="axis" x1="90" y1="40" x2="700" y2="40"/>
+<line class="axis" x1="90" y1="130" x2="700" y2="130"/>
+<g data-s="1">
+<rect x="90" y="50" width="250" height="12" rx="4" fill="var(--sig-tint)" stroke="var(--sig)"/>
+<text class="ts" x="94" y="78">A’s lease, 10 seconds</text>
+</g>
+<g data-s="4">
+<rect x="370" y="140" width="250" height="12" rx="4" fill="var(--store-tint)" stroke="var(--store)"/>
+<text class="ts" x="374" y="168">B’s lease</text>
+</g>
+<g data-s="2">
+<circle class="n sig" cx="290" cy="40" r="6"/>
+<text class="ts end" x="296" y="26">checks: lease is valid</text>
+</g>
+<g data-s="3">
+<rect x="302" y="30" width="286" height="20" rx="4" fill="var(--fault-tint)" stroke="var(--fault)" stroke-dasharray="4 3"/>
+<text class="ts mid" x="445" y="44">paused for 15 seconds, and unaware of it</text>
+</g>
+<g data-s="6">
+<circle class="n fault" cx="610" cy="40" r="6"/>
+<text class="ts mid" x="610" y="26">writes</text>
+</g>
+<g data-s="4">
+<circle class="n store" cx="390" cy="130" r="6"/>
+<text class="ts mid" x="390" y="116">takes the lease</text>
+</g>
+<g data-s="5">
+<circle class="n store" cx="510" cy="130" r="6"/>
+<text class="ts mid" x="510" y="116">writes</text>
+</g>
+<g data-s="6">
+<text class="ts" x="10" y="200">A checked its lease, was frozen past the expiry, and woke up still believing the check. Both nodes wrote. A’s own clock</text>
+<text class="ts" x="10" y="216">and its own memory gave it no warning.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Lease holder: A; Node A: running; Writes accepted: none">Node A holds a lease for 10 seconds. While it holds the lease, only A may write.</li>
+  <li data-state="Lease holder: A; Node A: has checked, lease valid; Writes accepted: none">A checks its lease before writing. The lease is valid.</li>
+  <li data-state="Lease holder: A; Node A: paused; Writes accepted: none">Before A can act, it is paused for 15 seconds, for example by garbage collection. It has no idea that time is passing.</li>
+  <li data-state="Lease holder: B; Node A: paused; Writes accepted: none">A’s lease runs out, and node B takes it.</li>
+  <li data-state="Lease holder: B; Node A: paused; Writes accepted: from B">B writes, as it is entitled to.</li>
+  <li data-state="Lease holder: B; Node A: awake, trusting its old check; Writes accepted: from B and from A">A wakes up still believing the check it made, and writes too. Two nodes have each written as the only writer.</li>
+</ol>
+<figcaption>Checking and then acting is not atomic across a pause. The check was true when it was made.</figcaption>
+</figure>
+
+<p>A <dfn>lease</dfn> is a lock with an expiry time: “you are the leader for the next ten seconds”. The figure shows why a node’s own belief that it still holds one is worthless. The fix cannot be on the paused node, since it does not know it was paused. It has to be on the receiving side: the storage system must be able to recognize and reject a write from a holder whose lease has passed. The mechanism is a <dfn>fencing token</dfn>, a number that increases every time the lease is granted, and <x-ref to="consensus#fencing"></x-ref> explains it.</p>
+<p>The general lesson is that a node cannot trust its own view of its role. Whether a node is the leader, holds a lock or is even considered alive is decided by the rest of the system, usually by a majority vote, and a node must be prepared to discover that the decision changed while it was not looking.</p>
+
+<h2 id="clocks">Two kinds of clock</h2>
+<p>Every computer has a clock, driven by a quartz crystal that counts oscillations. Operating systems expose it in two forms, and using the wrong one is a classic bug.</p>
+<table>
+<thead><tr><th></th><th>Time-of-day clock</th><th>Monotonic clock</th></tr></thead>
+<tbody>
+<tr><th>Answers</th><td>What time is it?</td><td>How long since I last asked?</td></tr>
+<tr><th>Value</th><td>Seconds since 1 January 1970, UTC</td><td>An arbitrary counter, meaningless on its own</td></tr>
+<tr><th>Can jump backward</th><td>Yes, when it is corrected</td><td>No</td></tr>
+<tr><th>Comparable between machines</th><td>Roughly</td><td>Not at all</td></tr>
+<tr><th>Use for</th><td>Timestamps shown to people, expiry dates</td><td>Timeouts, durations, rate limits</td></tr>
+</tbody>
+</table>
+<pre data-lang="ts" data-title="Measuring a duration">
+// Wrong: the time-of-day clock can be adjusted while the work runs
+const start = Date.now();
+await doWork();
+const elapsedMs = Date.now() - start;        // can be negative, or far too large
+
+// Right: a monotonic clock only moves forward
+const t0 = performance.now();
+await doWork();
+const elapsed = performance.now() - t0;
+</pre>
+<p>The time-of-day clock is kept roughly correct by the Network Time Protocol (NTP), in which each machine periodically asks time servers and adjusts itself. An adjustment can move the clock backward. So can a <dfn>leap second</dfn>, an extra second occasionally added to the world’s official time to keep it in step with the Earth’s rotation.</p>
+<p>At midnight UTC on 1 January 2017 a leap second was inserted. Cloudflare’s DNS software computed how long a lookup had taken by subtracting one time-of-day reading from another. For some lookups that straddled the leap second, the answer was negative. The negative number eventually reached a random number function that does not accept negative input, and the code failed. At the peak about 0.2% of DNS queries to Cloudflare were affected, and the fix took until 06:45 UTC to reach every data center. The root cause, in Cloudflare’s words, was the belief that time cannot go backward.</p>
+<aside class="sn"><b>The end of leap seconds</b>Leap seconds have caused enough trouble that the international body responsible for time standards voted in 2022 to stop inserting them by 2035. Until then, many large operators avoid the jump by “smearing” the extra second: running their clocks very slightly slow for a day so that no single second repeats.</aside>
+
+<h2 id="skew">Clocks disagree</h2>
+<p>Quartz crystals do not all run at the same rate, and the rate changes with temperature. The gradual divergence is <dfn>clock drift</dfn>, and the difference between two clocks at a given moment is <dfn>clock skew</dfn>. Synchronization keeps skew bounded and never removes it.</p>
+<ul>
+  <li>Over the public internet, NTP typically keeps a machine within some tens of milliseconds of true time, and worse when the network is congested.</li>
+  <li>Inside a well-run data center, a few milliseconds or better is usual.</li>
+  <li>Cloud providers now offer much tighter synchronization from their own reference clocks. AWS reported in 2023 that its time service keeps instances within 100 microseconds over NTP, and within 40 with hardware support.</li>
+  <li>A misconfigured or isolated machine can be wrong by seconds, minutes or years, and nothing on the machine itself will say so.</li>
+</ul>
+<p>Even a small skew makes timestamps from different machines unsafe for deciding which of two events came first.</p>
+
+<figure class="fig wide" id="fig-lww">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 152" role="img" aria-labelledby="f263t f263d">
+<title id="f263t">Clock skew causing last-write-wins to discard the later write</title>
+<desc id="f263d">Ana sets a caption to Sunset at real time 10:00:00.000 on node 1, whose clock is 150 milliseconds fast, so the write is stamped 10:00:00.150. Ben sets the caption to Dusk 100 milliseconds later on node 2, whose clock is correct, so his write is stamped 10:00:00.100. Comparing timestamps, the system keeps Ana’s earlier write and discards Ben’s later one.</desc>
+<rect class="n sunk" x="10" y="14" width="210" height="28" rx="0"/>
+<text class="ts tb" x="17" y="32">Write</text>
+<rect class="n sunk" x="220" y="14" width="130" height="28" rx="0"/>
+<text class="ts tb" x="227" y="32">Real time</text>
+<rect class="n sunk" x="350" y="14" width="200" height="28" rx="0"/>
+<text class="ts tb" x="357" y="32">Arrives at</text>
+<rect class="n sunk" x="550" y="14" width="150" height="28" rx="0"/>
+<text class="ts tb" x="557" y="32">Timestamp recorded</text>
+<g data-s="1">
+<rect class="n" x="10" y="42" width="210" height="28" rx="0"/>
+<text class="ts" x="17" y="60">Ana sets caption = “Sunset”</text>
+<rect class="n" x="220" y="42" width="130" height="28" rx="0"/>
+<text class="ts" x="227" y="60">10:00:00.000</text>
+<rect class="n" x="350" y="42" width="200" height="28" rx="0"/>
+<text class="ts" x="357" y="60">Node 1, clock 150 ms fast</text>
+<rect class="n fault" x="550" y="42" width="150" height="28" rx="0"/>
+<text class="ts" x="557" y="60">10:00:00.150</text>
+</g>
+<g data-s="2">
+<rect class="n" x="10" y="70" width="210" height="28" rx="0"/>
+<text class="ts" x="17" y="88">Ben sets caption = “Dusk”</text>
+<rect class="n" x="220" y="70" width="130" height="28" rx="0"/>
+<text class="ts" x="227" y="88">10:00:00.100</text>
+<rect class="n" x="350" y="70" width="200" height="28" rx="0"/>
+<text class="ts" x="357" y="88">Node 2, clock correct</text>
+<rect class="n" x="550" y="70" width="150" height="28" rx="0"/>
+<text class="ts" x="557" y="88">10:00:00.100</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="122">Ben’s write happened later. “Last write wins” compares the recorded timestamps, keeps Ana’s, and silently</text>
+<text class="ts" x="10" y="138">discards Ben’s. Nothing reports an error.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Node 1 has: “Sunset”, stamped .150; Node 2 has: nothing yet">Ana sets the caption to “Sunset” at exactly 10:00:00.000. Her write arrives at node 1, whose clock runs 150 ms fast, so it is stamped 10:00:00.150.</li>
+  <li data-state="Node 1 has: “Sunset”, stamped .150; Node 2 has: “Dusk”, stamped .100">A tenth of a second later Ben sets the caption to “Dusk”. His write arrives at node 2, whose clock is correct, and is stamped 10:00:00.100.</li>
+  <li data-state="Kept: “Sunset”, the earlier write; Discarded: “Dusk”, the later write">“Last write wins” compares the two stamps and keeps Ana’s, because .150 is later than .100. Ben’s write really happened later. It is discarded, and nothing reports an error.</li>
+</ol>
+<figcaption>A skew of 150 ms, well within what ordinary synchronization allows, is enough to keep the wrong write.</figcaption>
+</figure>
+
+<p>This is the weakness of the “last write wins” rule from <x-ref to="replication#multi-leader"></x-ref>: “last” is judged by clocks that do not agree. Rules to take from it:</p>
+<ul>
+  <li><b>Never order events on different machines by their wall-clock timestamps</b> when the order affects correctness.</li>
+  <li><b>Never use a timestamp alone as a unique identifier or a version number.</b> Two events can share one.</li>
+  <li><b>Expiry by wall-clock time needs a margin</b> at least as large as the worst skew you are prepared to tolerate.</li>
+  <li><b>Monitor clock offset</b> on every machine and remove from service any that drift too far.</li>
+</ul>
+
+<h2 id="logical">Logical clocks: order without time</h2>
+<p>If physical time cannot order events, something else must. The insight, due to Leslie Lamport in 1978, is that for correctness we rarely need to know <em>when</em> something happened. We need to know what could have influenced what. Event A <dfn>happened before</dfn> event B if they occurred in that order on the same machine, or if A was the sending of a message and B was its receipt, or through a chain of such steps. If neither happened before the other, they are <dfn>concurrent</dfn>: neither could have known about the other.</p>
+<p>A <dfn>Lamport clock</dfn> captures this with one counter per machine and two rules. Increase the counter for every local event and every message sent, and attach it to the message. On receiving a message, set the counter to one more than the larger of its own value and the value in the message.</p>
+
+<figure class="fig wide" id="fig-lamport">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f264t f264d">
+<title id="f264t">Lamport clock values across three processes exchanging messages</title>
+<desc id="f264d">Three processes A, B and C, each with a timeline of numbered events. A sends a message at count 2, which B receives and numbers 3. B sends at 4 and C, whose count was 1, receives and numbers 5. C sends at 6 and A, whose count was 3, receives and numbers 7. A’s event 3 and B’s event 4 are highlighted as concurrent.</desc>
+<text class="tb mid" x="18" y="49">A</text>
+<line class="axis" x1="40" y1="44" x2="700" y2="44"/>
+<text class="tb mid" x="18" y="109">B</text>
+<line class="axis" x1="40" y1="104" x2="700" y2="104"/>
+<text class="tb mid" x="18" y="169">C</text>
+<line class="axis" x1="40" y1="164" x2="700" y2="164"/>
+<g data-s="2">
+<path class="e async" d="M210.4 51.8 268.8 95.6"/>
+</g>
+<g data-s="4">
+<path class="e async" d="M370.8 111.2 438.4 156.2"/>
+</g>
+<g data-s="7">
+<path class="e async" d="M527.2 153.2 592.2 55.6"/>
+</g>
+<g data-s="1">
+<circle class="n sig" cx="120" cy="44" r="12"/>
+<text class="tb mid" x="120" y="48.5">1</text>
+<circle class="n sig" cx="200" cy="44" r="12"/>
+<text class="tb mid" x="200" y="48.5">2</text>
+</g>
+<g data-s="5">
+<circle class="n fault" cx="420" cy="44" r="12"/>
+<text class="tb mid" x="420" y="48.5">3</text>
+</g>
+<g data-s="7">
+<circle class="n sig" cx="600" cy="44" r="12"/>
+<text class="tb mid" x="600" y="48.5">7</text>
+</g>
+<g data-s="1">
+<circle class="n sig" cx="150" cy="104" r="12"/>
+<text class="tb mid" x="150" y="108.5">1</text>
+</g>
+<g data-s="2">
+<circle class="n sig" cx="280" cy="104" r="12"/>
+<text class="tb mid" x="280" y="108.5">3</text>
+</g>
+<g data-s="3">
+<circle class="n fault" cx="360" cy="104" r="12"/>
+<text class="tb mid" x="360" y="108.5">4</text>
+</g>
+<g data-s="1">
+<circle class="n sig" cx="220" cy="164" r="12"/>
+<text class="tb mid" x="220" y="168.5">1</text>
+</g>
+<g data-s="4">
+<circle class="n sig" cx="450" cy="164" r="12"/>
+<text class="tb mid" x="450" y="168.5">5</text>
+</g>
+<g data-s="6">
+<circle class="n sig" cx="520" cy="164" r="12"/>
+<text class="tb mid" x="520" y="168.5">6</text>
+</g>
+<g data-s="7">
+<text class="ts" x="40" y="204">Each process counts its own events. A message carries the sender’s count, and the receiver jumps ahead of it.</text>
+<text class="ts" x="40" y="220">The two red events are concurrent: 3 is less than 4, yet neither could have influenced the other.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="A: 2; B: 1; C: 1">Each process numbers its own events. A reaches 1 and then 2, while B and C each have a first event, numbered 1.</li>
+  <li data-msg="count 2" data-state="A: 2; B: 3; C: 1">A sends a message that carries its count, 2. B takes the larger of its own count and the one it received, and adds one: 3.</li>
+  <li data-state="A: 2; B: 4; C: 1">B has another event of its own: 4.</li>
+  <li data-msg="count 4" data-state="A: 2; B: 4; C: 5">B sends a message carrying 4 to C, whose count was 1. C moves to 5.</li>
+  <li data-state="A: 3; B: 4; C: 5">Meanwhile A has an event numbered 3. It is concurrent with B’s event 4. Neither could have influenced the other, even though 3 is less than 4.</li>
+  <li data-state="A: 3; B: 4; C: 6">C has another event: 6.</li>
+  <li data-msg="count 6" data-state="A: 7; B: 4; C: 6">C’s message carries 6 to A, which jumps from 3 to 7. If one event happened before another, its number is smaller. A smaller number does not prove that an event happened first.</li>
+</ol>
+<figcaption>Lamport clocks. If one event happened before another, its number is smaller. The reverse does not hold.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="A Lamport clock">
+class LamportClock {
+  private time = 0;
+
+  tick(): number {                       // before a local event, or before sending
+    return ++this.time;
+  }
+
+  receive(remote: number): number {      // on receiving a message stamped `remote`
+    this.time = Math.max(this.time, remote) + 1;
+    return this.time;
+  }
+}
+</pre>
+<p>Lamport timestamps give every event a number such that causes always have smaller numbers than their effects. Break ties with a machine ID and you have a total order that all machines agree on, which is enough to build many protocols. What they cannot do is run the inference backward. From the numbers 3 and 4 alone, you cannot tell whether the events were related or concurrent.</p>
+<p>A <dfn>vector clock</dfn> can. Each machine keeps a counter for every machine, not only itself, and messages carry the whole list. Comparing two lists entry by entry shows whether one event preceded the other or whether they were concurrent. That is exactly what a replicated database needs to know when it finds two versions of a value: if one descends from the other, keep the newer, and if they are concurrent, there is a real conflict to resolve. The cost is a list that grows with the number of participants.</p>
+<p>Modern databases often combine physical and logical time. A <dfn>hybrid logical clock</dfn> stays close to wall-clock time, so timestamps are meaningful to people, and adds a logical counter that preserves the ordering guarantees of a Lamport clock when physical clocks are tied or run backward. CockroachDB and YugabyteDB work this way. Google’s Spanner takes another route: its clock service reports an interval that is guaranteed to contain the true time, using GPS receivers and atomic clocks to keep the interval to a few milliseconds, and a transaction waits out the uncertainty before committing so that timestamp order matches real order.</p>
+
+<h2 id="design">Designing for an unreliable world</h2>
+<p>The facts of this chapter translate into a short list of habits that appear in every later chapter.</p>
+<table>
+<thead><tr><th>Because</th><th>Do this</th><th>Covered in</th></tr></thead>
+<tbody>
+<tr><th>Any call can fail or hang</th><td>Put a timeout on every remote call, and decide what happens when it fires</td><td><x-ch to="resilience-patterns"></x-ch></td></tr>
+<tr><th>A missing reply does not mean the work was not done</th><td>Make operations safe to repeat, then retry</td><td><x-ch to="idempotency-and-delivery"></x-ch></td></tr>
+<tr><th>Messages arrive late, twice and out of order</th><td>Number them, and make receivers tolerate all three</td><td><x-ch to="message-queues"></x-ch></td></tr>
+<tr><th>Clocks disagree</th><td>Order by sequence numbers or logical clocks, not wall time</td><td>This chapter</td></tr>
+<tr><th>A node cannot judge its own status</th><td>Decide by majority, and fence out stale holders</td><td><x-ch to="consensus"></x-ch></td></tr>
+<tr><th>Failures are partial</th><td>Limit what one failure can affect, and degrade instead of stopping</td><td><x-ch to="resilience-patterns"></x-ch></td></tr>
+<tr><th>You cannot foresee every interleaving</th><td>Test by injecting faults: kill nodes, delay and drop messages, skew clocks</td><td><x-ch to="observability"></x-ch></td></tr>
+</tbody>
+</table>
+<p>The last row matters more than it looks. Distributed bugs live in rare orderings of events that ordinary testing never produces. The teams that run these systems well test them by breaking them deliberately, and independent analyses such as the Jepsen project have found correctness bugs in most distributed databases they have examined, including widely used ones.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Treating a remote call as a function call. A library that makes a network request look like <code>user.getOrders()</code> hides that the line can take thirty seconds, fail halfway, or succeed on the other side while failing on yours. Keep remote calls visible in the code, and give each one a timeout and an answer to “what if this never returns?”.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> When a design has two services talking, expect the question “what if this call fails?”. A strong answer distinguishes the cases: “if the request never arrived, a retry is harmless, and if it arrived and the reply was lost, a retry would repeat it, so the operation carries an idempotency key”. Saying that a timeout cannot distinguish slow from dead, and designing so that it does not need to, shows you understand the field.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Remote calls with no timeout.</b></li>
+  <li><b>Assuming a timeout means the operation did not happen.</b></li>
+  <li><b>Retrying operations that are not safe to repeat.</b></li>
+  <li><b>Measuring durations with the time-of-day clock.</b></li>
+  <li><b>Ordering events from different machines by timestamp</b>, or resolving conflicts by “latest timestamp”.</li>
+  <li><b>Check-then-act on a lease or lock</b> with nothing on the other side to reject a stale holder.</li>
+  <li><b>Assuming a node that answers its health check is healthy.</b></li>
+  <li><b>Testing only the case where everything works.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="replication"></x-ref>: failover, lag and conflicts are these problems applied to data.</li>
+  <li><x-ref to="consistency-models"></x-ref>: what can be promised to clients despite them.</li>
+  <li><x-ref to="consensus"></x-ref>: how machines agree when messages and nodes fail.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: living with the lost-reply ambiguity.</li>
+  <li><x-ref to="membership-and-coordination"></x-ref>: failure detectors, leases and locks in practice.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: timeouts, retries, circuit breakers and load shedding.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Distributed systems fail partially. No machine knows the current state of the whole.</li>
+  <li>A missing reply does not reveal whether the request was lost, the receiver failed, or the work was done and the reply lost.</li>
+  <li>A timeout detects unresponsiveness and cannot distinguish a slow machine from a dead one.</li>
+  <li>A process can be paused for seconds without knowing, so a node’s belief about its own role may be out of date.</li>
+  <li>Use monotonic clocks for durations. Time-of-day clocks can jump, and they differ between machines.</li>
+  <li>Do not order events across machines by wall-clock time. Logical clocks order events by causality instead.</li>
+  <li>Design for it: timeouts on every call, operations that are safe to repeat, decisions by majority, and testing by fault injection.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A service calls a payment provider and the call times out. Has the customer been charged?</summary><p>It is impossible to know from the timeout. The request may never have arrived, the provider may have failed before charging, or the charge may have succeeded and the reply been lost. The safe designs are to send the request with an idempotency key so it can be repeated without charging twice, or to query the provider for the outcome.</p></details>
+<details><summary>Why is there no correct value for a timeout?</summary><p>Network and processing delays have no fixed upper bound. Any finite timeout will sometimes fire for a machine that is merely slow. Shortening it detects real failures sooner and wrongly condemns more healthy machines. Lengthening it does the opposite.</p></details>
+<details><summary>A function logs <code>Date.now()</code> before and after an operation and occasionally reports a negative duration. What happened, and what should it use?</summary><p>The time-of-day clock was adjusted backward between the two readings, by a time synchronization correction or a leap second. Durations should be measured with a monotonic clock, such as <code>performance.now()</code>, which never goes backward.</p></details>
+<details><summary>Two replicas accept writes to the same key 50 ms apart and resolve the conflict by keeping the higher timestamp. Under what condition is the later write lost?</summary><p>When the clock of the replica that took the earlier write is more than 50 ms ahead of the other. Its timestamp is then higher although its write came first, and the later write is discarded.</p></details>
+<details><summary>Event X has Lamport timestamp 12 and event Y has 15. What can you conclude?</summary><p>Only that Y did not happen before X. X may have happened before Y, or the two may be concurrent. Lamport timestamps guarantee that a cause has a smaller number than its effect, and a smaller number does not prove causation. Vector clocks are needed to tell the two cases apart.</p></details>
+<details><summary>A worker checks that it holds a lock, then writes to storage. How can two workers both write, and where must the fix be applied?</summary><p>The first worker can be paused after the check, for longer than the lock’s expiry. The lock is given to a second worker, and when the first resumes it writes as well. The paused worker cannot detect this, so the storage system must reject writes carrying an older fencing token than one it has already seen.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 8, “The Trouble with Distributed Systems”. The best single treatment of this material.</li>
+  <li>Leslie Lamport, <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Time, Clocks, and the Ordering of Events in a Distributed System</a>, Communications of the ACM, 1978.</li>
+  <li>Peter Bailis and Kyle Kingsbury, <a href="https://queue.acm.org/detail.cfm?id=2655736">The Network is Reliable</a>, ACM Queue, 2014. A survey of real network failures.</li>
+  <li>John Graham-Cumming, <a href="https://blog.cloudflare.com/how-and-why-the-leap-second-affected-cloudflare-dns/">How and why the leap second affected Cloudflare DNS</a>, January 2017.</li>
+  <li>AWS, <a href="https://aws.amazon.com/blogs/compute/its-about-time-microsecond-accurate-clocks-on-amazon-ec2-instances/">It’s About Time: Microsecond-Accurate Clocks on Amazon EC2 Instances</a>, November 2023.</li>
+  <li>James Corbett and others, <a href="https://research.google/pubs/spanner-googles-globally-distributed-database-2/">Spanner: Google’s Globally-Distributed Database</a>, OSDI 2012. TrueTime and commit wait.</li>
+  <li>Sandeep Kulkarni and others, <a href="https://www.cse.buffalo.edu/~demirbas/publications/hlc.pdf">Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases</a>, 2014. Hybrid logical clocks.</li>
+  <li>Jepsen, <a href="https://jepsen.io/analyses">Analyses</a>. Fault-injection tests of distributed databases, with the bugs they found.</li>
+  <li>Peng Huang and others, <a href="https://www.microsoft.com/en-us/research/publication/gray-failure-achilles-heel-cloud-scale-systems/">Gray Failure: The Achilles’ Heel of Cloud-Scale Systems</a>, HotOS 2017.</li>
+</ol>
+</section>

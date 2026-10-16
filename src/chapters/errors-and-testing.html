@@ -1,0 +1,793 @@
+<!--meta
+{ "description": "Error handling and testable design in TypeScript, with tested code: the three kinds of failure and how to represent each, errors as values with a result type, error classes with causes, translating and handling errors at the right layer, the return-await trap, dependency injection, pure decisions inside a thin shell, the five kinds of test double, property checks, and the levels of testing with measured costs.",
+  "lede": "Two things are left out of most designs until late: what happens when something goes wrong, and how anyone will know that the code is right. They are the same subject seen from two sides. A function whose failures are part of its interface, and whose collaborators are handed to it, is one that can be tested completely. This chapter closes the foundations of low-level design with both halves, and every claim in it was checked by running the code.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">Three kinds of failure</h2>
+<p>“Error handling” covers three situations that have little in common. Treating them alike is the root of most bad error handling, so the first step is to tell them apart.</p>
+<table>
+<thead><tr><th></th><th>An expected outcome</th><th>An infrastructure failure</th><th>A bug</th></tr></thead>
+<tbody>
+<tr><th>Example</th><td>The card was declined. The order is already placed. No such photo</td><td>The database timed out. The disk is full. The mail service returned 503</td><td>A field read from <code>undefined</code>. An impossible state. A wrong assumption</td></tr>
+<tr><th>Whose fault</th><td>Nobody’s. The request cannot be granted</td><td>The environment’s</td><td>The program’s</td></tr>
+<tr><th>Who can act on it</th><td>The caller, and usually the user</td><td>Sometimes a retry. Otherwise an operator</td><td>A programmer, later</td></tr>
+<tr><th>The right response</th><td>Say so plainly, as a normal result</td><td>Retry if it is safe to. Otherwise fail the request cleanly</td><td>Stop the operation, record everything, hide the details from the client</td></tr>
+<tr><th>To the client</th><td>A 4xx status and a specific message</td><td>A 503, or a 500</td><td>A 500 with no internal detail</td></tr>
+<tr><th>In the log</th><td>Information, if anything</td><td>A warning or an error</td><td>An error, with the stack trace</td></tr>
+</tbody>
+</table>
+<p>The first column is not exceptional at all. A declined card is one of the things a payment does, and code that calls a payment function has to deal with it as surely as it deals with success. The last column is the opposite: there is nothing the surrounding code can sensibly do about a bug except stop and report.</p>
+
+<h2 id="interface">Errors as part of the interface</h2>
+<p>TypeScript has one mechanism for failure built in, <code>throw</code>, and it has a weakness for the first kind of failure. A function’s type says what it returns and nothing about what it throws. The compiler does not check that a caller handles anything, and inside a <code>catch</code> block the error has the type <code>unknown</code> in strict mode.</p>
+<p>For outcomes that every caller must handle, there is an alternative: return them. A <dfn>result type</dfn> is a union of a success carrying a value and a failure carrying an error, so that the possible failures appear in the function’s signature.</p>
+<pre data-lang="ts" data-title="Paying for an order: every outcome is in the return type">
+// A result is either a value or an error, and the type says which errors are possible.
+export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+export const ok = <T>(value: T): Result<T, never> => ({ ok: true, value });
+export const err = <E>(error: E): Result<never, E> => ({ ok: false, error });
+
+// Every way that paying for an order can turn out badly, as data.
+export type PayError =
+  | { kind: "order-not-found"; orderId: string }
+  | { kind: "already-paid"; orderId: string }
+  | { kind: "card-declined"; reason: "insufficient-funds" | "expired" | "suspected-fraud" }
+  | { kind: "gateway-unavailable"; retryAfterSeconds: number };
+
+export interface Receipt {
+  orderId: string;
+  amountCents: number;
+  reference: string;
+}
+
+// The signature is the documentation: callers can see every outcome, and must deal with the union to reach the value.
+export async function payForOrder(orderId: string, charge: Gateway): Promise<Result<Receipt, PayError>> {
+  const order = orders.get(orderId);
+  if (!order) return err({ kind: "order-not-found", orderId });
+  if (order.paid) return err({ kind: "already-paid", orderId });
+  const outcome = await charge(order.amountCents);
+  if (outcome.status === "declined") return err({ kind: "card-declined", reason: outcome.reason });
+  if (outcome.status === "down") return err({ kind: "gateway-unavailable", retryAfterSeconds: 30 });
+  order.paid = true;
+  return ok({ orderId, amountCents: order.amountCents, reference: outcome.reference });
+}
+
+// One place decides what each outcome means to the user. A new kind of error will not compile until it is added here.
+export function toHttp(result: Result<Receipt, PayError>): { status: number; body: unknown } {
+  if (result.ok) return { status: 200, body: result.value };
+  const error = result.error;
+  switch (error.kind) {
+    case "order-not-found": return { status: 404, body: { error: `no order ${error.orderId}` } };
+    case "already-paid": return { status: 409, body: { error: "this order has already been paid" } };
+    case "card-declined": return { status: 402, body: { error: `card declined: ${error.reason}` } };
+    case "gateway-unavailable": return { status: 503, body: { error: "payments are briefly unavailable", retryAfter: error.retryAfterSeconds } };
+    default: { const missed: never = error; throw new Error(`unhandled: ${JSON.stringify(missed)}`); }
+  }
+}
+</pre>
+<p>In a test, five calls produced the statuses 200, 409, 404, 402 and 503, one for success and one for each kind of error. Three properties of this style matter.</p>
+<ul>
+  <li><b>The caller cannot forget.</b> The value is reachable only by first checking <code>ok</code>. Code that reads <code>result.value</code> without checking does not compile.</li>
+  <li><b>The list of errors is closed and checked.</b> If a fifth kind is added to <code>PayError</code>, the <code>switch</code> in <code>toHttp</code> stops compiling at the <code>never</code> line until someone decides what the new kind means to the user (<x-ref to="oop-in-typescript#unions"></x-ref>).</li>
+  <li><b>Errors carry data.</b> A declined card has a reason, and an unavailable gateway says when to retry. They are fields, not text to be parsed out of a message.</li>
+</ul>
+<p>Results have a cost: every caller between the failure and its handler must pass the result along explicitly, where an exception would travel unaided. That suggests a division of labor.</p>
+<table>
+<thead><tr><th>Use</th><th>For</th><th>Because</th></tr></thead>
+<tbody>
+<tr><th>A returned result or union</th><td>Expected outcomes that the immediate caller should decide about</td><td>The compiler makes the caller look</td></tr>
+<tr><th>A thrown error</th><td>Infrastructure failures and bugs, and expected outcomes that are handled several layers away</td><td>It travels through layers that have nothing to add, and no one has to remember to pass it on</td></tr>
+</tbody>
+</table>
+<p>Both styles appear in good codebases, and the previous chapters used thrown <code>DomainError</code>s caught at the HTTP adapter. What matters is that the choice is deliberate and that expected outcomes are distinguishable from bugs, whichever carrier they use.</p>
+
+<h3 id="classes">Error classes</h3>
+<p>When errors are thrown, give them types of their own. An error is then recognized by what it is, with <code>instanceof</code>, and never by matching the text of its message.</p>
+<pre data-lang="ts" data-title="Application errors: a code for programs, a message for people, a cause for engineers">
+// A base class for the application's own errors: a stable code for programs, a message for people, the cause for engineers.
+export class AppError extends Error {
+  readonly code: string;
+  readonly status: number;
+
+  constructor(code: string, status: number, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = new.target.name; // "ConflictError", not "Error", in logs and stack traces
+    this.code = code;
+    this.status = status;
+  }
+}
+export class NotFoundError extends AppError {
+  constructor(what: string, options?: { cause?: unknown }) { super("not-found", 404, `${what} does not exist`, options); }
+}
+export class ConflictError extends AppError {
+  constructor(message: string, options?: { cause?: unknown }) { super("conflict", 409, message, options); }
+}
+export class RuleError extends AppError {
+  constructor(message: string) { super("rule-violated", 422, message); }
+}
+
+// At a boundary: turn a low-level failure into one of ours, and keep the original attached as the cause.
+export async function savingOrder<T>(orderId: string, write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (error) {
+    if (error instanceof Error && /UNIQUE constraint failed/.test(error.message)) {
+      throw new ConflictError(`order ${orderId} already exists`, { cause: error });
+    }
+    throw error; // not ours to interpret: let it travel
+  }
+}
+</pre>
+<p>Two details in the listing repay attention.</p>
+<ul>
+  <li><b>The cause.</b> Since ECMAScript 2022 an error can be created with a <code>cause</code>, the lower-level error that led to it. Wrapping without it throws away the one piece of information an engineer needs. In the test, the <code>ConflictError</code> carried the original database error, and the log line showed both.</li>
+  <li><b>The narrow catch.</b> <code>savingOrder</code> translates exactly one failure, the uniqueness violation it understands, and rethrows everything else untouched. A “disk I/O error” passed straight through it in the test. Catching broadly and converting every failure into “conflict” would turn an outage into a stream of misleading 409s.</li>
+</ul>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Logging an error with <code>JSON.stringify</code>. An <code>Error</code>’s message and stack are not enumerable properties, so <code>JSON.stringify(new Error("lost"))</code> produces <code>{}</code>, as the test confirmed, and the log records that something happened and nothing about what. Use a logger that knows about errors, or copy <code>name</code>, <code>message</code>, <code>stack</code> and <code>cause</code> out by hand (<x-ref to="observability#logs"></x-ref>).</p></div>
+
+<h2 id="where">Where to handle an error</h2>
+<p>An error should be dealt with at the first place that can do something useful about it, and nowhere before. In the layered application of <x-ref to="application-architecture#request"></x-ref>, that gives each layer a small, fixed job.</p>
+
+<figure class="fig wide" id="fig-travel">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 470" role="img" aria-labelledby="f651t f651d">
+<title id="f651t">An expected error and a bug, traveling out through the layers</title>
+<desc id="f651d">Two sequences across a client, the HTTP adapter, the application, the SQLite adapter and the database. In the first, a client creates an order with an identifier that already exists. The database reports a failed uniqueness constraint. The SQLite adapter turns that into a ConflictError and keeps the original as its cause. The application lets it pass, and the HTTP adapter turns it into a 409 response with a clear message, logged for information. In the second, a bug inside the application throws a TypeError. Nothing in between can handle it, so it travels untouched to the outer handler, which logs it as an error with its stack and answers 500 with no internal detail.</desc>
+<text class="tb" x="10" y="16">An expected outcome: the order already exists</text>
+<g data-scene="expected">
+<text class="tb mid" x="46" y="36">Client</text>
+<line class="axis" x1="46" y1="44" x2="46" y2="252"/>
+<text class="tb mid" x="186" y="36">HTTP adapter</text>
+<line class="axis" x1="186" y1="44" x2="186" y2="252"/>
+<text class="tb mid" x="336" y="36">Application</text>
+<line class="axis" x1="336" y1="44" x2="336" y2="252"/>
+<text class="tb mid" x="496" y="36">SqliteOrders</text>
+<line class="axis" x1="496" y1="44" x2="496" y2="252"/>
+<text class="tb mid" x="652" y="36">Database</text>
+<line class="axis" x1="652" y1="44" x2="652" y2="252"/>
+<g data-s="1">
+<path class="e sig" d="M47 70H185"/>
+<text class="ts mid" x="116.0" y="64">1. PUT /orders/o1</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M187 95H335"/>
+<text class="ts mid" x="261.0" y="89">2. startOrder(…)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M337 120H495"/>
+<text class="ts mid" x="416.0" y="114">orders.save(order)</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M651 145H497"/>
+<text class="ts mid" x="574.0" y="139">3. UNIQUE constraint failed</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M495 170H337"/>
+<text class="ts mid" x="416.0" y="164">4. ConflictError + cause</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M335 195H187"/>
+<text class="ts mid" x="261.0" y="189">5. ConflictError, as is</text>
+</g>
+<g data-s="6">
+<path class="e uses" d="M185 220H47"/>
+<text class="ts mid" x="116.0" y="214">6. 409 and a message</text>
+</g>
+</g>
+<path class="e none dash" d="M10 266H710"/>
+<text class="tb" x="10" y="286">A bug: code that reads a field of undefined</text>
+<g data-scene="bug">
+<text class="tb mid" x="46" y="306">Client</text>
+<line class="axis" x1="46" y1="314" x2="46" y2="456"/>
+<text class="tb mid" x="186" y="306">HTTP adapter</text>
+<line class="axis" x1="186" y1="314" x2="186" y2="456"/>
+<text class="tb mid" x="336" y="306">Application</text>
+<line class="axis" x1="336" y1="314" x2="336" y2="456"/>
+<text class="tb mid" x="496" y="306">SqliteOrders</text>
+<line class="axis" x1="496" y1="314" x2="496" y2="456"/>
+<text class="tb mid" x="652" y="306">Database</text>
+<line class="axis" x1="652" y1="314" x2="652" y2="456"/>
+<g data-s="1">
+<path class="e sig" d="M47 340H185"/>
+<text class="ts mid" x="116.0" y="334">1. POST …/o1/place</text>
+</g>
+<g data-s="1">
+<path class="e sig" d="M187 365H335"/>
+<text class="ts mid" x="261.0" y="359">placeOrder(…)</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n fault" x="344" y="376" width="219.3" height="22" rx="4"/>
+<text class="ts mid" x="453.65" y="391">2. TypeError: cannot read “total”</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M335 415H187"/>
+<text class="ts mid" x="261.0" y="409">3. TypeError, untouched</text>
+</g>
+<g data-s="4">
+<path class="e uses" d="M185 440H47"/>
+<text class="ts mid" x="116.0" y="434">4. 500, no details</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="expected" data-label="An expected outcome">
+  <li data-msg="PUT" data-state="The error is now: none yet; logged: nothing">A client asks to create order o1. It does not know that an order with that identifier is already stored.</li>
+  <li data-msg="startOrder|save">The adapter calls the use case, which builds a new Order and saves it through the repository port.</li>
+  <li data-msg="error" data-state="The error is now: a database error; logged: nothing">The database refuses the INSERT. Its error speaks of constraints and column names, which mean nothing outside this adapter.</li>
+  <li data-msg="ConflictError" data-state="The error is now: ConflictError, caused by the database error; logged: nothing">The adapter recognizes this one failure and rethrows it in the application’s terms. The database error rides along as the cause.</li>
+  <li data-msg="ConflictError">The use case has nothing useful to do about it, so it does not catch it. The error passes through.</li>
+  <li data-msg="409" data-state="The error is now: a 409 response; logged: info, with the cause">The outer handler knows this type. It answers 409 with a message the client can act on, and logs one line for information.</li>
+</ol>
+<ol class="steps" data-scene="bug" data-label="A bug">
+  <li data-msg="POST|placeOrder" data-state="The error is now: none yet; logged: nothing">Another request arrives, and the adapter calls the use case as before.</li>
+  <li data-msg="none" data-state="The error is now: TypeError; logged: nothing">A line in the application reads a property of something that is undefined. No one planned for this. It is a mistake in the code.</li>
+  <li data-msg="TypeError">No layer on the way out recognizes it, and none pretends to. Catching it here and carrying on would hide the bug.</li>
+  <li data-msg="500" data-state="The error is now: a 500 response; logged: error, with the stack trace">The outer handler does not know this type. It logs the message, the stack and the request, and tells the client only that something failed.</li>
+</ol>
+<figcaption>Translate an error where its meaning changes, handle it where something useful can be done, and otherwise let it pass. One outer handler decides what the client is told and what is logged.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Layer</th><th>Its job with errors</th></tr></thead>
+<tbody>
+<tr><th>Domain</th><td>Detect broken rules and throw or return an error in business terms. Never catch</td></tr>
+<tr><th>Driven adapters</th><td>Translate the specific failures of their technology into the application’s terms, keeping the cause. Let the rest pass</td></tr>
+<tr><th>Application</th><td>Handle what it can truly handle: retry a version conflict, undo a reservation. Let the rest pass</td></tr>
+<tr><th>Driving adapters</th><td>One outer handler: turn known errors into specific responses, turn unknown ones into a generic failure, and log</td></tr>
+</tbody>
+</table>
+<pre data-lang="ts" data-title="The outer handler: the one place that produces responses and log lines from errors">
+export interface Problem {
+  type: string;
+  title: string;
+  status: number;
+  detail?: string;
+}
+export interface LogEntry {
+  level: "info" | "error";
+  code: string;
+  message: string;
+  causes: string[];
+  stack?: string;
+}
+
+// The outermost handler: the only place that turns an error into a response and a log line.
+export function toResponse(error: unknown, log: (entry: LogEntry) => void): { status: number; body: Problem } {
+  const causes: string[] = [];
+  for (let e = error instanceof Error ? error.cause : undefined; e instanceof Error; e = e.cause) causes.push(`${e.name}: ${e.message}`);
+  if (error instanceof AppError) {
+    // An expected outcome. The client is told what happened, and the log records it without alarm.
+    log({ level: "info", code: error.code, message: error.message, causes });
+    return { status: error.status, body: { type: `https://photos.example/problems/${error.code}`, title: error.name, status: error.status, detail: error.message } };
+  }
+  // Anything else is a bug or a broken dependency. Log everything, and tell the client nothing about the inside.
+  const unknown = error instanceof Error ? error : new Error(String(error));
+  log({ level: "error", code: "internal", message: unknown.message, causes, ...(unknown.stack ? { stack: unknown.stack } : {}) });
+  return { status: 500, body: { type: "https://photos.example/problems/internal", title: "Internal error", status: 500 } };
+}
+</pre>
+<p>Given the wrapped conflict, the handler answered 409 with a body in the problem details format of <x-ref to="api-styles#errors"></x-ref> and logged one line at the information level, including the cause. Given a <code>TypeError</code> from a real bug, it answered 500 with a body that said only “Internal error”, and logged the message and the full stack. The response to the bug contained no word of the internal message, which matters: error text routinely includes table names, file paths and fragments of data (<x-ref to="threats-and-defenses"></x-ref>).</p>
+<p>A few rules cover most of the remaining decisions.</p>
+<ul>
+  <li><b>Fail early.</b> Check inputs at the edge and turn them into types that cannot be invalid (<x-ref to="domain-modeling#values"></x-ref>). An error found at the door is cheap. The same error found three layers in, after two writes, is not.</li>
+  <li><b>Never swallow.</b> An empty <code>catch</code> block is a decision that this failure does not matter, made for every failure that will ever reach it. If ignoring is right, say why in a comment and log it.</li>
+  <li><b>Do not catch what you cannot handle.</b> Catching only to log and rethrow at every layer produces five log entries for one failure. Log once, at the outer handler.</li>
+  <li><b>Retry only what is transient and safe to repeat</b> (<x-ref to="resilience-patterns#retries"></x-ref>, <x-ref to="idempotency-and-delivery#retries"></x-ref>). A declined card will be declined again. A bug will fail the same way every time.</li>
+  <li><b>Clean up in <code>finally</code>.</b> Locks, file handles and transactions must be released on every path out.</li>
+</ul>
+
+<h3 id="return-await">A trap in asynchronous code</h3>
+<p>One asynchronous detail defeats error handling that looks correct.</p>
+<pre data-lang="ts" data-title="Two functions that differ by one word">
+const fragile = async (): Promise<string> => {
+  throw new Error("the database is down");
+};
+
+// The promise is returned before it rejects, so this try block has already been left. The catch never runs.
+export async function withoutAwait(): Promise<string> {
+  try {
+    return fragile();
+  } catch {
+    return "fallback";
+  }
+}
+
+// Awaiting inside the try keeps the function here until the promise settles, so the catch can see the failure.
+export async function withAwait(): Promise<string> {
+  try {
+    return await fragile();
+  } catch {
+    return "fallback";
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-return">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 350" role="img" aria-labelledby="f652t f652d">
+<title id="f652t">Returning a promise from inside a try block, with and without await</title>
+<desc id="f652d">Two sequences between a caller, an async function containing a try and catch, and a helper named fragile that fails. In the first, the function writes return fragile(). It receives a pending promise and returns it at once, which ends the function and its try block. When the promise later rejects, the rejection goes to the caller, and the catch never runs. In the second, the function writes return await fragile(). It stays inside the try block until the promise settles. The rejection arrives there, the catch runs, and the caller receives the fallback value.</desc>
+<text class="tb mono" x="10" y="16">return fragile()</text>
+<g data-scene="lost">
+<text class="tb mid" x="90" y="36">Caller</text>
+<line class="axis" x1="90" y1="44" x2="90" y2="168"/>
+<text class="tb mid" x="340" y="36">The function, in its try block</text>
+<line class="axis" x1="340" y1="44" x2="340" y2="168"/>
+<text class="tb mid" x="610" y="36">fragile()</text>
+<line class="axis" x1="610" y1="44" x2="610" y2="168"/>
+<g data-s="1">
+<path class="e sig" d="M91 70H339"/>
+<text class="ts mid" x="215.0" y="64">1. call</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M341 96H609"/>
+<text class="ts mid" x="475.0" y="90">2. fragile()</text>
+</g>
+<g data-s="3">
+<path class="e uses" d="M339 122H91"/>
+<text class="ts mid" x="215.0" y="116">3. the pending promise</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M609 148H91"/>
+<text class="ts mid" x="350.0" y="142">4. rejects: the database is down</text>
+</g>
+</g>
+<path class="e none dash" d="M10 184H710"/>
+<text class="tb mono" x="10" y="204">return await fragile()</text>
+<g data-scene="caught">
+<text class="tb mid" x="90" y="224">Caller</text>
+<line class="axis" x1="90" y1="232" x2="90" y2="350"/>
+<text class="tb mid" x="340" y="224">The function, in its try block</text>
+<line class="axis" x1="340" y1="232" x2="340" y2="350"/>
+<text class="tb mid" x="610" y="224">fragile()</text>
+<line class="axis" x1="610" y1="232" x2="610" y2="350"/>
+<g data-s="1">
+<path class="e sig" d="M91 258H339"/>
+<text class="ts mid" x="215.0" y="252">1. call</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M341 284H609"/>
+<text class="ts mid" x="475.0" y="278">2. fragile()</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M609 310H341"/>
+<text class="ts mid" x="475.0" y="304">3. rejects: the database is down</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M339 336H91"/>
+<text class="ts mid" x="215.0" y="330">4. “fallback”</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="lost" data-label="Without await">
+  <li data-state="The function is: inside the try block">The caller calls the function and waits for its result.</li>
+  <li data-msg="fragile()" data-state="The function is: inside the try block, holding a pending promise">The function calls the helper, which starts its work and immediately returns a promise that has not settled yet.</li>
+  <li data-msg="promise" data-state="The function is: finished">return hands that promise to the caller. The function has now finished, and its try block finished with it.</li>
+  <li data-msg="rejection" data-state="The function is: finished. Its catch never ran">The helper fails. The rejection is delivered to whoever holds the promise, which is the caller. The catch block was left behind two steps ago.</li>
+</ol>
+<ol class="steps" data-scene="caught" data-label="With await">
+  <li data-state="The function is: inside the try block">The caller makes the same call as before.</li>
+  <li data-msg="fragile()" data-state="The function is: inside the try block, waiting">The function calls the helper and, because of await, stays where it is until the promise settles.</li>
+  <li data-msg="rejection" data-state="The function is: in its catch block">The rejection arrives while the function is still inside its try block, so it is thrown there and the catch block runs.</li>
+  <li data-msg="fallback" data-state="The function is: finished, with the fallback">The catch returns the fallback value, and the caller never sees the failure.</li>
+</ol>
+<figcaption>A <code>try</code> block protects only what happens while the function is still inside it. Awaiting is what keeps it there.</figcaption>
+</figure>
+
+<p>In the test, <code>withoutAwait()</code> rejected with “the database is down” and its <code>catch</code> never ran, while <code>withAwait()</code> returned “fallback”. The rule: inside a <code>try</code> block, always <code>await</code> a promise before returning it. The same reasoning explains the floating promises of <x-ref to="concurrency-in-code#await"></x-ref>. A <code>try</code> only covers what is awaited inside it.</p>
+
+<h2 id="testable">What makes code testable</h2>
+<p>A test does three things: it arranges a situation, performs one action and checks the outcome. Code is hard to test exactly when one of those is hard: the situation cannot be arranged, or the outcome cannot be observed. Both come from the same cause, which is a dependency the code reaches for itself.</p>
+<pre data-lang="ts" data-title="Is this order late? One version that cannot be tested, and one that can">
+export interface Shipment {
+  orderId: string;
+  placedAt: Date;
+  shippedAt: Date | null;
+}
+
+// Hard to test. The answer depends on two things that do not appear in the signature: today's date and a remote service.
+export async function isLateHidden(orderId: string): Promise<boolean> {
+  const response = await fetch(`https://shipping.example/orders/${orderId}`);
+  const shipment = (await response.json()) as { placedAt: string; shippedAt: string | null };
+  const days = (Date.now() - new Date(shipment.placedAt).getTime()) / 86_400_000;
+  return shipment.shippedAt === null && days > 3;
+}
+
+// The decision, as a pure function: everything it needs comes in as arguments, and the answer is its only effect.
+export function isLate(shipment: Shipment, now: Date, allowedDays = 3): boolean {
+  if (shipment.shippedAt !== null) return false;
+  const days = (now.getTime() - shipment.placedAt.getTime()) / 86_400_000;
+  return days > allowedDays;
+}
+
+// The shell: fetches what the decision needs, calls it, and acts. Its collaborators are passed in.
+export interface LateDeps {
+  loadShipment(orderId: string): Promise<Shipment>;
+  now(): Date;
+  notify(orderId: string, message: string): Promise<void>;
+}
+export async function chaseLateOrder(orderId: string, deps: LateDeps): Promise<boolean> {
+  const shipment = await deps.loadShipment(orderId);
+  if (!isLate(shipment, deps.now())) return false;
+  await deps.notify(orderId, "Your prints are taking longer than usual. We are on it.");
+  return true;
+}
+</pre>
+
+<figure class="fig wide" id="fig-seams">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 292" role="img" aria-labelledby="f653t f653d">
+<title id="f653t">Hidden dependencies, and the same logic with its dependencies passed in</title>
+<desc id="f653d">On the left, a function isLateHidden that takes only an order identifier. Inside it are two things a test cannot reach: a call to the system clock and a network request to a shipping service. On the right, the logic is split. A pure function isLate takes a shipment and the current time and returns true or false. Around it, a small function chaseLateOrder receives three collaborators: one that loads a shipment, one that tells the time and one that notifies. In production these are an HTTP client, the system clock and a mailer. In a test they are three one-line functions.</desc>
+<text class="tb" x="10" y="18">Dependencies reached for from inside</text>
+<text class="tb" x="380" y="18">Dependencies passed in</text>
+<rect class="n fault" x="10" y="34" width="330" height="150" rx="8" style="fill-opacity:.12"/>
+<text class="ts mono tb" x="22" y="56">isLateHidden(orderId)</text>
+<rect class="n" x="24" y="70" width="140" height="38" rx="5"/>
+<text class="ts mono mid" x="94" y="86">Date.now()</text>
+<text class="ts mid" x="94" y="101">the real clock</text>
+<rect class="n" x="24" y="120" width="140" height="50" rx="5"/>
+<text class="ts mono mid" x="94" y="138">fetch(…)</text>
+<text class="ts mid" x="94" y="153">the real shipping</text>
+<text class="ts mid" x="94" y="166">service</text>
+<text class="ts" x="182" y="92">A test cannot choose</text>
+<text class="ts" x="182" y="108">what time it is.</text>
+<text class="ts" x="182" y="140">A test needs the</text>
+<text class="ts" x="182" y="156">network, and a late</text>
+<text class="ts" x="182" y="172">order to exist.</text>
+<text class="ts" x="10" y="208">The signature says one input. There are three,</text>
+<text class="ts" x="10" y="224">and two of them change by themselves.</text>
+<rect class="n sig" x="380" y="34" width="330" height="54" rx="8"/>
+<text class="ts mono tb" x="392" y="56">isLate(shipment, now)</text>
+<text class="ts" x="392" y="76">pure: the same arguments always give the same answer</text>
+<rect class="n sunk" x="380" y="104" width="330" height="80" rx="8"/>
+<text class="ts mono tb" x="392" y="124">chaseLateOrder(orderId, deps)</text>
+<rect class="n store" x="392" y="138" width="95.2" height="30" rx="4"/>
+<text class="ts mono mid" x="439.6" y="157">loadShipment</text>
+<rect class="n store" x="500" y="138" width="35.8" height="30" rx="4"/>
+<text class="ts mono mid" x="517.9" y="157">now</text>
+<rect class="n store" x="574" y="138" width="55.6" height="30" rx="4"/>
+<text class="ts mono mid" x="601.8" y="157">notify</text>
+<path class="e" d="M545 104V90"/>
+<text class="ts" x="380" y="208">In production: an HTTP client, the system clock, a mailer.</text>
+<text class="ts" x="380" y="224">In a test: three one-line functions.</text>
+<text class="ts" x="380" y="252">Five cases of the rule were tested by calling isLate with</text>
+<text class="ts" x="380" y="268">dates, at about a quarter of a microsecond each.</text>
+<path class="e none dash" d="M362 8V284"/>
+</svg>
+</div>
+<figcaption>Code is easy to test when everything it depends on comes in through its parameters. The decision is then a pure function, and the part that touches the world is a thin shell around it.</figcaption>
+</figure>
+
+<p>The first function has one parameter and three inputs. Two of them, the current time and the reply of a remote service, are invisible in its signature and outside a test’s control. To test “three days and one second is late” you would have to wait three days, or own the shipping service.</p>
+<p><dfn>Dependency injection</dfn> is the practice of giving a piece of code its collaborators from outside, as parameters, where it would otherwise create or find them itself. It needs no framework. A constructor parameter or a function argument is the whole mechanism, and the wiring happens once, in the composition root of <x-ref to="application-architecture#wiring"></x-ref>.</p>
+<p>The listing goes one step further than injecting, and the step is worth more than the injection. It separates the decision from the effects.</p>
+<ul>
+  <li><b>The decision is a <dfn>pure function</dfn>:</b> its result depends only on its arguments, and it changes nothing. <code>isLate</code> was tested with a table of five cases, including the boundary at exactly three days, by passing dates. No doubles, no setup, about a quarter of a microsecond a call.</li>
+  <li><b>The effects are a thin shell</b> that gathers inputs, calls the decision and acts on the answer. <code>chaseLateOrder</code> has one branch. Two tests cover it.</li>
+</ul>
+<p>This arrangement is known as “functional core, imperative shell”. The more of a program’s logic that can be moved into functions of that first kind, the less of it needs anything but plain values to test. The usual hidden inputs to look for are the same in every codebase.</p>
+<table>
+<thead><tr><th>Hidden dependency</th><th>Why it hurts a test</th><th>Pass in instead</th></tr></thead>
+<tbody>
+<tr><th>The clock: <code>new Date()</code>, <code>Date.now()</code></th><td>Results change with the day the test is run</td><td>A <code>now</code> value, or a <code>Clock</code></td></tr>
+<tr><th>Randomness: <code>Math.random()</code>, generated identifiers</th><td>A failure cannot be reproduced</td><td>A generator, seeded in tests</td></tr>
+<tr><th>The network, the database, the file system</th><td>Slow, needs setup, fails for unrelated reasons</td><td>A port, with a fake behind it</td></tr>
+<tr><th>Global state: singletons, module-level variables, environment variables</th><td>Tests affect each other, and must run in a particular order</td><td>The value or object itself</td></tr>
+<tr><th><code>new ConcreteThing()</code> in the middle of the logic</th><td>The collaborator cannot be replaced</td><td>The thing, or a factory for it</td></tr>
+</tbody>
+</table>
+
+<h2 id="doubles">Test doubles</h2>
+<p>When the unit being tested needs a collaborator, the test supplies a stand-in. The general term is <dfn>test double</dfn>, and there are five kinds, named in Gerard Meszaros’s <cite>xUnit Test Patterns</cite>. “Mock” is often used loosely for all of them, which hides useful differences.</p>
+<table>
+<thead><tr><th>Double</th><th>What it does</th><th>Use it to</th></tr></thead>
+<tbody>
+<tr><th>Dummy</th><td>Nothing. It fills a parameter</td><td>Satisfy a signature when the collaborator is irrelevant to this test</td></tr>
+<tr><th>Stub</th><td>Returns canned answers</td><td>Put the unit in a situation: “the gateway declines”</td></tr>
+<tr><th>Spy</th><td>Records how it was called</td><td>Check an effect: “one receipt was sent, to Ana”</td></tr>
+<tr><th>Mock</th><td>Is told in advance which calls to expect, and fails the test itself if they differ</td><td>The same as a spy, with the checking built in. Usually created by a mocking library</td></tr>
+<tr><th>Fake</th><td>A working implementation with a shortcut, such as a repository in memory</td><td>Run realistic scenarios quickly. The most valuable kind</td></tr>
+</tbody>
+</table>
+<pre data-lang="ts" data-title="A unit with three collaborators, and four doubles for them">
+export interface PaymentGateway {
+  charge(customer: string, cents: number): Promise<{ ok: true; reference: string } | { ok: false; reason: string }>;
+}
+export interface Mailer {
+  send(to: string, subject: string): Promise<void>;
+}
+export interface AuditLog {
+  record(entry: string): void;
+}
+
+// The unit under test. It has three collaborators and receives all of them.
+export class Checkout {
+  private readonly gateway: PaymentGateway;
+  private readonly mailer: Mailer;
+  private readonly audit: AuditLog;
+
+  constructor(gateway: PaymentGateway, mailer: Mailer, audit: AuditLog) {
+    this.gateway = gateway;
+    this.mailer = mailer;
+    this.audit = audit;
+  }
+
+  async pay(customer: string, cents: number): Promise<"paid" | "declined"> {
+    const outcome = await this.gateway.charge(customer, cents);
+    if (!outcome.ok) return "declined";
+    await this.mailer.send(customer, `Receipt ${outcome.reference}`);
+    return "paid";
+  }
+}
+
+// A dummy fills a parameter that this test never exercises.
+export const dummyAudit: AuditLog = { record: () => {} };
+
+// A stub returns a canned answer, to steer the unit down one path.
+export const stubGateway = (answer: Awaited<ReturnType<PaymentGateway["charge"]>>): PaymentGateway => ({ charge: async () => answer });
+
+// A spy also remembers how it was called, so that the test can ask afterward.
+export class SpyMailer implements Mailer {
+  readonly sent: { to: string; subject: string }[] = [];
+  async send(to: string, subject: string): Promise<void> {
+    this.sent.push({ to, subject });
+  }
+}
+
+// A fake is a working implementation that takes a shortcut: here, balances in a map where the real one calls a bank.
+export class FakeGateway implements PaymentGateway {
+  private readonly balances: Map<string, number>;
+  private count = 0;
+  constructor(balances: Record<string, number>) {
+    this.balances = new Map(Object.entries(balances));
+  }
+  async charge(customer: string, cents: number): Promise<{ ok: true; reference: string } | { ok: false; reason: string }> {
+    const balance = this.balances.get(customer) ?? 0;
+    if (balance < cents) return { ok: false, reason: "insufficient-funds" };
+    this.balances.set(customer, balance - cents);
+    this.count += 1;
+    return { ok: true, reference: `ref-${this.count}` };
+  }
+  balanceOf(customer: string): number {
+    return this.balances.get(customer) ?? 0;
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-doubles">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 264" role="img" aria-labelledby="f654t f654d">
+<title id="f654t">A test using a stub and a spy in place of real collaborators</title>
+<desc id="f654d">A sequence between a test, the Checkout object under test, a stub payment gateway and a spy mailer. The test calls pay. Checkout asks the gateway to charge, and the stub returns a canned approval with reference ref-7. Checkout asks the mailer to send a receipt, and the spy records the call. Checkout returns paid to the test. The test then asks the spy what it was sent and checks that it was one receipt to Ana.</desc>
+<text class="tb mid" x="60" y="20">The test</text>
+<line class="axis" x1="60" y1="28" x2="60" y2="208"/>
+<text class="tb mid" x="230" y="20">Checkout</text>
+<line class="axis" x1="230" y1="28" x2="230" y2="208"/>
+<text class="tb mid" x="420" y="20">Stub gateway</text>
+<line class="axis" x1="420" y1="28" x2="420" y2="208"/>
+<text class="tb mid" x="610" y="20">Spy mailer</text>
+<line class="axis" x1="610" y1="28" x2="610" y2="208"/>
+<g data-s="1">
+<path class="e sig" d="M61 54H229"/>
+<text class="ts mid" x="145.0" y="48">1. pay("ana", 550)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M231 82H419"/>
+<text class="ts mid" x="325.0" y="76">2. charge("ana", 550)</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M419 110H231"/>
+<text class="ts mid" x="325.0" y="104">3. ok, reference ref-7</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M231 138H609"/>
+<text class="ts mid" x="420.0" y="132">4. send("ana", "Receipt ref-7")</text>
+</g>
+<g data-s="5">
+<path class="e uses" d="M229 166H61"/>
+<text class="ts mid" x="145.0" y="160">5. “paid”</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M61 194H609"/>
+<text class="ts mid" x="335.0" y="188">6. what were you sent?</text>
+</g>
+<text class="ts" x="10" y="240">The test runs in memory, and can force outcomes that a real bank would not produce on request.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="pay" data-state="The spy has recorded: nothing">The test has built a Checkout from a stub gateway, a spy mailer and a dummy audit log. Now it acts: one call.</li>
+  <li data-msg="charge">Checkout asks its gateway to charge. It cannot tell that this one has no bank behind it.</li>
+  <li data-msg="ok">The stub returns the answer the test gave it. Its purpose is to steer Checkout down the “payment approved” path.</li>
+  <li data-msg="send" data-state="The spy has recorded: 1 message, to ana, “Receipt ref-7”">On that path Checkout sends a receipt. The spy sends nothing. It writes down what it was asked.</li>
+  <li data-msg="paid">The result comes back, and the test checks it. That is state verification: looking at what came out.</li>
+  <li data-msg="sent?">The test then asks the spy, and checks that exactly one receipt went to Ana. That is behavior verification: looking at what was done to a collaborator.</li>
+</ol>
+<figcaption>A stub supplies inputs, a spy observes outputs. Between them the unit is exercised alone, on exactly the path the test wants.</figcaption>
+</figure>
+
+<p>Three tests were run with these. With a stub that approves, <code>pay</code> returned “paid” and the spy held one receipt. With a stub that declines, it returned “declined” and the spy held none. With the fake bank holding 10.00 for Ana, charges of 5.50, 3.00 and 3.00 came back paid, paid and declined, leaving 1.50.</p>
+<p>The third test shows why fakes are worth the effort of writing. No stub was told what to answer. The fake has behavior, so the test describes a scenario and checks its outcome, and stays valid if <code>Checkout</code> is rewritten to call its collaborators differently. Tests built from many stubs and mocks tend to restate the implementation call by call, and then every refactoring breaks them while no bug does.</p>
+<p>Two guidelines keep doubles honest.</p>
+<ul>
+  <li><b>Double your own interfaces, not other people’s.</b> A stub of a vendor’s client encodes your guess about how it behaves. Wrap the vendor in an adapter behind your own port (<x-ref to="structural-patterns#adapter"></x-ref>), fake the port, and test the adapter against the real thing.</li>
+  <li><b>Keep fakes and real adapters in agreement</b> with the contract tests of <x-ref to="application-architecture#hexagon"></x-ref>, which run one set of expectations against both.</li>
+</ul>
+
+<h2 id="levels">Levels of testing</h2>
+<p>Tests differ in how much of the system they exercise at once, and that determines what they cost and what a failure tells you.</p>
+
+<figure class="fig wide" id="fig-pyramid">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f655t f655d">
+<title id="f655t">Three levels of test, by number, speed and scope</title>
+<desc id="f655d">A pyramid with three levels. The wide base is unit tests: rules, calculations and state changes, run inside one process with fakes, about a twentieth of a millisecond each in this book’s measurements, and numbering in the thousands. The middle is integration tests: one adapter against its real technology, such as SQL or HTTP, about five milliseconds each as measured, numbering in the hundreds. The narrow top is end-to-end tests: a whole deployed system driven through its interface, seconds each, a handful. Going up, tests are slower and more realistic and their failures are harder to pin down. Going down, they are faster and more precise.</desc>
+<path class="n fault" d="M285 30H435L470 88H250Z"/>
+<text class="tb mid" x="360" y="52">End to end</text>
+<text class="ts mid" x="360" y="70">a handful, seconds each</text>
+<path class="n async" d="M215 96H505L540 154H180Z"/>
+<text class="tb mid" x="360" y="118">Integration</text>
+<text class="ts mid" x="360" y="136">hundreds, about 5 ms each, measured</text>
+<path class="n store" d="M145 162H575L610 220H110Z"/>
+<text class="tb mid" x="360" y="184">Unit</text>
+<text class="ts mid" x="360" y="202">thousands, about 0.05 ms each, measured</text>
+<text class="ts" x="10" y="54">Proves the parts</text>
+<text class="ts" x="10" y="70">work together</text>
+<text class="ts" x="10" y="120">Proves each adapter</text>
+<text class="ts" x="10" y="136">keeps its contract</text>
+<text class="ts" x="10" y="186">Proves each</text>
+<text class="ts" x="10" y="202">rule</text>
+<path class="e" d="M650 214V40"/>
+<text class="ts" x="664" y="60">slower</text>
+<text class="ts" x="664" y="76">broader</text>
+<text class="ts" x="664" y="92">vaguer</text>
+<text class="ts" x="664" y="108">failures</text>
+<text class="ts" x="664" y="180">faster</text>
+<text class="ts" x="664" y="196">precise</text>
+<text class="ts" x="10" y="240">The two measured times are from the previous chapter’s code.</text>
+<text class="ts" x="10" y="256">The time for end-to-end tests is typical, and was not measured here.</text>
+</svg>
+</div>
+<figcaption>Put each check at the lowest level that can prove it. The shape is a consequence of cost: a suite that is slow is run less often, and then finds problems later.</figcaption>
+</figure>
+
+<ul>
+  <li>A <dfn>unit test</dfn> checks one small piece, a function or a class or an aggregate, in memory, with doubles for anything slow.</li>
+  <li>An <dfn>integration test</dfn> checks that a piece works with a real external technology: that the SQL is valid, that the HTTP adapter maps errors to the right statuses.</li>
+  <li>An <dfn>end-to-end test</dfn> drives the whole deployed system the way a user would.</li>
+</ul>
+<p>The classical advice, the <dfn>test pyramid</dfn>, is to have many of the first, fewer of the second and only a handful of the third. The reason is arithmetic.</p>
+<div class="widget" data-widget="suite">
+<h4>How long does the test suite take?</h4>
+<p>Total running time for a suite, from the number of tests at each level and the time one test takes.</p>
+<div class="controls">
+  <label>Unit tests<input type="number" name="units" value="3000" min="0" max="1000000" step="1"></label>
+  <label>One unit test, ms<input type="number" name="unitMs" value="1" min="0.01" max="10000" step="0.01"></label>
+  <label>Integration tests<input type="number" name="ints" value="300" min="0" max="1000000" step="1"></label>
+  <label>One integration test, ms<input type="number" name="intMs" value="50" min="0.01" max="100000" step="0.01"></label>
+  <label>End-to-end tests<input type="number" name="e2es" value="20" min="0" max="100000" step="1"></label>
+  <label>One end-to-end test, seconds<input type="number" name="e2eS" value="10" min="0.01" max="3600" step="0.01"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 120" role="img" aria-label="Two bars divided into three parts for unit, integration and end-to-end tests. The first bar shows each level’s share of the number of tests, the second its share of the running time."><text x="10" y="21" class="ts">Number of tests</text><rect x="130" y="8" width="450.8" height="18" rx="2" class="bar store"></rect><rect x="581.8" y="8" width="44.2" height="18" rx="2" class="bar async"></rect><rect x="627" y="8" width="2" height="18" rx="2" class="bar fault"></rect><text x="10" y="53" class="ts">Running time</text><rect x="130" y="40" width="5.9" height="18" rx="2" class="bar store"></rect><rect x="136.9" y="40" width="33.4" height="18" rx="2" class="bar async"></rect><rect x="171.3" y="40" width="457.7" height="18" rx="2" class="bar fault"></rect><text x="10" y="86" class="ts">Share of the time</text><rect x="130" y="76" width="12" height="12" rx="3" class="bar store"></rect><text x="148" y="86" class="ts">unit: 1.38%</text><rect x="300" y="76" width="12" height="12" rx="3" class="bar async"></rect><text x="318" y="86" class="ts">integration: 6.88%</text><rect x="470" y="76" width="12" height="12" rx="3" class="bar fault"></rect><text x="488" y="86" class="ts">end to end: 91.7%</text><text x="10" y="112" class="ts">The two bars describe the same suite: how many tests each level has, and how much of the clock it takes.</text></svg>
+<dl class="results">
+  <div><dt>Whole suite, one after another</dt><dd data-out="total">3.63 min</dd></div>
+  <div><dt>Share of tests that are end to end</dt><dd data-out="shareCount">0.602%</dd></div>
+  <div><dt>Share of time they take</dt><dd data-out="shareTime">91.7%</dd></div>
+  <div><dt>If every test were end to end</dt><dd data-out="allE2e">9.22 hours</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">3,320 tests take 3.63 min run one after another. The end-to-end tests account for 91.7% of that, though they are only 0.602% of the tests. If every one of these checks were made end to end, the suite would take 9.22 hours. This suite can run before every commit, but not on every save.</p>
+</div>
+<p>The pyramid is a default, not a law. A service that is mostly glue between a database and an API has few rules to unit test and much wiring that can only be checked with the real parts, and for such code a suite weighted toward integration tests is the better shape. The principle underneath every shape is the same: <b>check each thing at the lowest level that can prove it.</b> A pricing rule needs a unit test. A SQL query needs a database. That the login page leads to the dashboard needs a browser, once.</p>
+<p>Whatever the level, a few properties separate tests that help from tests that are merely present.</p>
+<ul>
+  <li><b>Test behavior, through the public interface.</b> “Placing an empty order is refused” survives any rewrite of <code>Order</code>. “<code>place</code> calls <code>validateLines</code> once” does not.</li>
+  <li><b>One reason to fail.</b> A test with a name that states a rule, and a failure that points at it.</li>
+  <li><b>Deterministic.</b> A <dfn>flaky test</dfn> passes and fails on the same code. The causes are the hidden inputs in the table above, plus timing and shared state between tests. A flaky test teaches a team to ignore failures, which is worse than having no test.</li>
+  <li><b>Fast enough to run constantly.</b> Feedback that takes seconds is used while writing code. Feedback that takes an hour is used once a day.</li>
+</ul>
+
+<h3 id="property">Checking a property</h3>
+<p>An example-based test checks the cases its author thought of. A <dfn>property-based test</dfn> states something that must be true for every input and lets the machine search for a counterexample. <code>Money.split</code> from <x-ref to="domain-modeling#values"></x-ref> makes two such promises: the shares add up to the original amount, and no two shares differ by more than a cent.</p>
+<pre data-lang="ts" data-title="A property checked on thousands of generated inputs">
+// A property: a statement that must hold for every input. Here, two of them, for any amount and any number of shares.
+export function checkSplit(runs: number, seed: number): { runs: number; failure: string | null } {
+  const random = seeded(seed);
+  for (let i = 0; i < runs; i += 1) {
+    const cents = Math.floor(random() * 10_000_000);
+    const shares = 1 + Math.floor(random() * 50);
+    const parts = Money.of(cents, "EUR").split(shares).map((money) => money.cents);
+    const sum = parts.reduce((a, b) => a + b, 0);
+    const spread = Math.max(...parts) - Math.min(...parts);
+    if (sum !== cents) return { runs: i + 1, failure: `${cents} split ${shares} ways adds up to ${sum}` };
+    if (spread > 1) return { runs: i + 1, failure: `${cents} split ${shares} ways has shares ${spread} cents apart` };
+  }
+  return { runs, failure: null };
+}
+
+// The same property against the obvious wrong implementation, to show that the check can fail.
+export function checkNaiveSplit(runs: number, seed: number): { runs: number; failure: string | null } {
+  const random = seeded(seed);
+  for (let i = 0; i < runs; i += 1) {
+    const cents = Math.floor(random() * 10_000_000);
+    const shares = 1 + Math.floor(random() * 50);
+    const sum = Math.round(cents / shares) * shares;
+    if (sum !== cents) return { runs: i + 1, failure: `${cents} split ${shares} ways adds up to ${sum}` };
+  }
+  return { runs, failure: null };
+}
+</pre>
+<p>The property held for 10,000 random amounts and share counts. Run against the obvious wrong implementation, rounding each share, the same check failed on the first input it tried: 60,110.37 split 23 ways added up to 60,110.27. The generator is seeded, so the failing case can be replayed exactly, and a second run with the same seed failed in the same place. Libraries such as fast-check add smarter generators and reduce a failing input to the smallest one that still fails.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> “How would you test this?” is asked at the end of most low-level design rounds, and a design that has followed this part of the book answers it by construction. Point to the rules, and say they are tested directly on the domain classes with no doubles. Point to each interface you passed in, such as the clock, the repository and the payment gateway, and say what fake stands behind it in a test. Name two or three cases at the edges: the last free spot, exactly at the limit, the same request twice. Then say what you would not unit test: the real database adapter and the HTTP mapping get a few integration tests.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>One mechanism and one status for every failure</th><td>A declined card is logged as a crash, and a crash is shown to the user as “declined”</td><td>Tell expected outcomes, infrastructure failures and bugs apart</td></tr>
+<tr><th><code>catch (e) {}</code></th><td>Failures vanish, and the damage appears somewhere unrelated later</td><td>Handle it, or let it pass. Never neither</td></tr>
+<tr><th>Recognizing errors by their message text</th><td>Rewording a message changes behavior</td><td>Error classes or a <code>kind</code> field</td></tr>
+<tr><th>Wrapping an error without its cause</th><td>The log says “save failed” and nothing about why</td><td><code>new AppError(…, { cause })</code></td></tr>
+<tr><th>Returning internal error messages to clients</th><td>Leaked table names, paths and data</td><td>Specific messages for expected outcomes, a generic one for everything else</td></tr>
+<tr><th><code>return promise</code> inside a <code>try</code></th><td>The <code>catch</code> never sees the rejection</td><td><code>return await promise</code></td></tr>
+<tr><th>Reading the clock, the environment or a singleton inside logic</th><td>Tests that depend on the date, the machine and each other</td><td>Pass them in</td></tr>
+<tr><th>A mock for every collaborator, with every call verified</th><td>Tests that fail on refactoring and pass on bugs</td><td>Fakes where there is behavior, and assertions on outcomes</td></tr>
+<tr><th>Most checks made through the user interface</th><td>A suite that takes hours and fails for unrelated reasons</td><td>Push each check down to the lowest level that can prove it</td></tr>
+<tr><th>Tolerating a flaky test</th><td>Real failures are dismissed as “that one again”</td><td>Fix it or delete it the day it appears</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="application-architecture"></x-ref>: the ports and adapters that make substitution possible, and contract tests.</li>
+  <li><x-ref to="domain-modeling"></x-ref>: value objects that cannot be invalid, and rules that live where they can be tested alone.</li>
+  <li><x-ref to="solid-principles"></x-ref>: dependency inversion, the principle behind injection.</li>
+  <li><x-ref to="concurrency-in-code"></x-ref>: promises that are not awaited, and errors that are lost with them.</li>
+  <li><x-ref to="api-styles"></x-ref>: status codes and the problem details format for error responses.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: what to do about infrastructure failures: timeouts, retries, circuit breakers.</li>
+  <li><x-ref to="observability"></x-ref>: structured logs, where the outer handler’s entries go.</li>
+  <li><x-ref to="deployment-strategies"></x-ref>: the pipeline that runs these tests before every release.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Expected outcomes, infrastructure failures and bugs are different things. Represent, report and log each in its own way.</li>
+  <li>An expected outcome is part of a function’s interface. A result type puts it in the signature and makes the compiler check that callers deal with it.</li>
+  <li>Give thrown errors types, stable codes and causes. Recognize them by type, never by message.</li>
+  <li>Translate an error where its meaning changes, handle it where something useful can be done, and let it pass everywhere else. One outer handler responds and logs.</li>
+  <li>Inside a <code>try</code>, await a promise before returning it.</li>
+  <li>Code is testable when its dependencies are passed in. Clocks, randomness, networks and globals are the usual hidden ones.</li>
+  <li>Keep decisions in pure functions and effects in a thin shell around them.</li>
+  <li>Stubs supply inputs, spies observe outputs, and fakes are working substitutes. Prefer fakes, and keep them honest with contract tests.</li>
+  <li>Check each thing at the lowest level that can prove it, and keep every test deterministic.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Classify each failure and say what the client should receive: the user’s storage quota is full, the database connection pool is exhausted, and a function received <code>null</code> where its type says it cannot.</summary><p>A full quota is an expected outcome: a 4xx response with a specific message, since the user can act on it. An exhausted pool is an infrastructure failure: a 503, possibly after a retry, with nothing internal revealed, and an alert for operators. The <code>null</code> is a bug: a 500 with a generic body, and an error log with the stack trace for a programmer.</p></details>
+<details><summary>A function is declared <code>charge(card): Promise&lt;Result&lt;Receipt, "declined" | "expired"&gt;&gt;</code>. What does a caller gain compared with a version that throws for a declined card?</summary><p>The possible failures are visible in the signature, so the caller knows them without reading the implementation. The compiler will not allow the receipt to be used until the caller has checked which branch it has. And if a third failure is added to the union later, every exhaustive <code>switch</code> over it stops compiling until it is handled.</p></details>
+<details><summary>A repository adapter catches every error from the database driver and rethrows <code>new Error("save failed")</code>. Name two things wrong with that.</summary><p>It discards the cause, so nobody can tell from the log whether the disk was full, a constraint failed or the connection dropped. And it erases the distinctions callers need: a version conflict that could be retried, a duplicate that should be a 409 and an outage that should be a 503 all become the same anonymous error. Translate only the failures the adapter understands, attach the original as the cause, and let the rest pass unchanged.</p></details>
+<details><summary>What does this function return when <code>load()</code> rejects, and why? <code>async function f() { try { return load(); } catch { return null; } }</code></summary><p>It returns a promise that rejects. The <code>catch</code> does not run. <code>return load()</code> hands the pending promise back and leaves the <code>try</code> block before the rejection happens, so there is no longer a handler in place when it does. Writing <code>return await load()</code> keeps the function inside the <code>try</code> until the promise settles, and then <code>null</code> is returned.</p></details>
+<details><summary>A function decides whether a discount code is still valid by comparing its expiry with <code>new Date()</code>. Why is that a problem for testing, and what are two ways to fix it?</summary><p>The current time is an input the test cannot set, so “expires in one second” and “expired yesterday” cannot both be tested reliably, and results depend on when the suite runs. Either pass the current time in as an argument, which makes the function pure, or pass in a clock object and give tests a fixed one.</p></details>
+<details><summary>For each need, name the kind of double: making the payment gateway time out, checking that no email was sent, running twenty checkout scenarios against something that behaves like a bank, filling a required logger argument in a test about arithmetic.</summary><p>A stub, set up to fail with a timeout. A spy on the mailer, whose record of calls should be empty. A fake gateway with real balance logic in memory. A dummy logger that does nothing.</p></details>
+<details><summary>A team has 150 end-to-end tests that take 40 minutes and fail at random about one run in five. What would you change first?</summary><p>Sort the tests by what they prove. Most will be checking business rules and error cases that need no browser or network, and those should move down to unit tests against the domain and use cases, where they run in milliseconds and cannot flake. Keep a small set of end-to-end tests for the critical journeys. For the flaky ones that remain, find the uncontrolled input, usually timing, shared data or an external service, and remove it.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Joe Duffy, <a href="https://joeduffyblog.com/2016/02/07/the-error-model/">The Error Model</a>, 2016. A long and careful argument for treating recoverable errors and bugs as different things.</li>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc9457">RFC 9457: Problem Details for HTTP APIs</a>, 2023. The response format used by this chapter’s outer handler.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error/cause">Error: cause</a>.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/articles/mocksArentStubs.html">Mocks Aren’t Stubs</a>, 2007. The five kinds of double, and state against behavior verification.</li>
+  <li>Gerard Meszaros, <cite>xUnit Test Patterns: Refactoring Test Code</cite>, Addison-Wesley, 2007. The source of the vocabulary of test doubles.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/bliki/TestPyramid.html">Test Pyramid</a>, 2012, crediting Mike Cohn’s <cite>Succeeding with Agile</cite>, 2009. And Ham Vocke, <a href="https://martinfowler.com/articles/practical-test-pyramid.html">The Practical Test Pyramid</a>, 2018.</li>
+  <li>Gary Bernhardt, <a href="https://www.destroyallsoftware.com/talks/boundaries">Boundaries</a>, a talk given in 2012. Values as the boundaries between components, the idea behind a functional core and an imperative shell.</li>
+  <li><a href="https://fast-check.dev/">fast-check</a>. A property-based testing library for TypeScript.</li>
+</ol>
+</section>

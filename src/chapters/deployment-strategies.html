@@ -1,0 +1,744 @@
+<!--meta
+{ "description": "Deployment and release strategies explained for system design: delivery pipelines, immutable artifacts, compatibility between versions that run side by side, rolling, blue-green and canary releases, canary analysis, feature flags, shadow traffic, rollbacks, and progressive rollout across cells and regions.",
+  "lede": "Most outages begin with a change. Somebody ships new code, edits a configuration value or pushes a data update, and something that worked stops working. The answer cannot be to stop changing things, so it has to be changing them safely: in small pieces, to a few users first, while watching, with a fast way back. This chapter covers the techniques that make that routine.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Change is the main cause of failure</h2>
+<p><x-ref to="availability-and-reliability#outages"></x-ref> ended with an uncomfortable observation: redundancy protects against things breaking, and most large incidents are caused by changes that reached every copy at once. A team that deploys rarely does not escape this. It makes each deployment larger, harder to understand and harder to undo.</p>
+<p>The strategies in this chapter all pursue four properties.</p>
+<table>
+<thead><tr><th>Property</th><th>Means</th><th>Achieved by</th></tr></thead>
+<tbody>
+<tr><th>Small</th><td>Each change does little, so its effect is easy to predict and its cause easy to find</td><td>Frequent releases from one main branch</td></tr>
+<tr><th>Gradual</th><td>A fault reaches a few users before it can reach all</td><td>Rolling, canary and staged releases</td></tr>
+<tr><th>Observed</th><td>A fault is noticed by a machine in minutes</td><td>Automatic comparison of new against old</td></tr>
+<tr><th>Reversible</th><td>Going back is fast and has been practiced</td><td>Rollback, feature flags, compatible changes</td></tr>
+</tbody>
+</table>
+<p>Research on software delivery supports the first row. The DORA program has surveyed engineering teams for over a decade, and it consistently finds that speed and stability go together: teams that release often also fail less and recover faster. It measures delivery with five metrics, in two groups. Throughput is change lead time, deployment frequency and failed deployment recovery time. Instability is change fail rate and deployment rework rate.</p>
+
+<h2 id="pipeline">The delivery pipeline</h2>
+<p>A <dfn>delivery pipeline</dfn> is the automated path from a commit to production. <dfn>Continuous integration</dfn> is the first half: every change is merged into one main branch and automatically built and tested, many times a day. <dfn>Continuous delivery</dfn> is the second half: every change that passes is ready to release, and releasing is a routine, push-button or fully automatic act.</p>
+
+<figure class="fig wide" id="fig-pipeline">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 180" role="img" aria-labelledby="f471t f471d">
+<title id="f471t">A delivery pipeline from commit to production</title>
+<desc id="f471d">Six stages in a row: commit to main, build one image, unit and integration tests, deploy to staging and check, canary with a little real traffic, and production for everyone. A band under the stages from build to production says the same image, built once, moves through every stage. Every stage can stop the line. A failure anywhere means the change goes no further, and the fix starts again from a new commit. From staging onward nothing is rebuilt: what was tested is byte for byte what runs in production.</desc>
+<g data-s="1">
+<rect class="n" x="10" y="24" width="104" height="50" rx="6"/>
+<text class="ts tb mid" x="62" y="45">Commit</text>
+<text class="ts mid" x="62" y="62">to main</text>
+</g>
+<g data-s="2">
+<path class="e" d="M114 49H131"/>
+<rect class="n sig" x="131" y="24" width="104" height="50" rx="6"/>
+<text class="ts tb mid" x="183" y="45">Build</text>
+<text class="ts mid" x="183" y="62">one image</text>
+</g>
+<g data-s="3">
+<path class="e" d="M235 49H252"/>
+<rect class="n" x="252" y="24" width="104" height="50" rx="6"/>
+<text class="ts tb mid" x="304" y="45">Test</text>
+<text class="ts mid" x="304" y="62">unit, integration</text>
+</g>
+<g data-s="4">
+<path class="e" d="M356 49H373"/>
+<rect class="n" x="373" y="24" width="104" height="50" rx="6"/>
+<text class="ts tb mid" x="425" y="45">Staging</text>
+<text class="ts mid" x="425" y="62">deploy and check</text>
+</g>
+<g data-s="5">
+<path class="e" d="M477 49H494"/>
+<rect class="n async" x="494" y="24" width="104" height="50" rx="6"/>
+<text class="ts tb mid" x="546" y="45">Canary</text>
+<text class="ts mid" x="546" y="62">a little real traffic</text>
+</g>
+<g data-s="6">
+<path class="e" d="M598 49H615"/>
+<rect class="n store" x="615" y="24" width="104" height="50" rx="6"/>
+<text class="ts tb mid" x="667" y="45">Production</text>
+<text class="ts mid" x="667" y="62">everyone</text>
+</g>
+<g data-s="7">
+<rect class="n sig" x="131" y="92" width="588" height="26" rx="4"/>
+<text class="ts mid" x="425.0" y="109">the same image, built once, moves through every stage</text>
+</g>
+<text class="ts" x="10" y="144">Every stage can stop the line. A failure anywhere means the change goes no further, and the fix starts again from a new commit.</text>
+<text class="ts" x="10" y="160">From Staging onward nothing is rebuilt: what was tested is byte for byte what runs in production.</text>
+
+</svg>
+</div>
+<ol class="steps">
+  <li>A change is merged. From here on a machine does the work, the same way every time.</li>
+  <li data-msg="commit">The pipeline builds one image from that commit and gives it an identity that never changes.</li>
+  <li data-msg="image">Unit and integration tests run against that image. A failure stops the line here, minutes after the commit.</li>
+  <li data-msg="image">The image is deployed to staging, an environment shaped like production, and checked there.</li>
+  <li data-msg="image">The canary stage gives it a small share of real traffic and compares it with the version already running.</li>
+  <li data-msg="image">Only then does it go to everyone.</li>
+  <li>One image traveled the whole way. Nothing was rebuilt after the tests, so what was tested is what runs in production.</li>
+</ol>
+<figcaption>The pipeline is the only route to production. A change that cannot pass it does not ship, and nobody ships around it.</figcaption>
+</figure>
+
+<p>The stages are ordered by cost. Fast, cheap checks come first, so that most mistakes are caught in the minute after a commit. Slow, realistic ones come later and see only changes that survived the earlier ones. The last check is production itself, taken in small steps, which is what most of this chapter is about. No test environment reproduces real traffic, real data and real scale, so careful exposure to production is a testing stage in its own right.</p>
+
+<h2 id="artifact">Build once, promote the same thing</h2>
+<p>The output of the build stage is an <dfn>artifact</dfn>: the container image from <x-ref to="containers-and-orchestration#images"></x-ref>, with a unique version. One rule governs it. The artifact that reaches production is the same artifact that was tested, not a second build from the same source.</p>
+<p>A rebuild can differ from the first build in ways nobody intended: a dependency published a patch in between, a base image was updated, the build machine has a different compiler. Any such difference is untested. Promoting one immutable artifact through every environment removes the question.</p>
+<p>For one artifact to run everywhere, whatever differs between environments must come from outside it: database addresses, credentials, feature settings. Those are supplied as configuration at start-up. The consequence is easy to miss: configuration is now a second thing that changes production, and it needs the same care as code. The largest outages of recent years were configuration changes, and a later section returns to them.</p>
+<p>An immutable, versioned artifact also makes rollback simple. Going back means running the previous version, which still exists and was already proven in production.</p>
+
+<h2 id="compatibility">Two versions at once</h2>
+<p>However a new version is introduced, there is a period when old and new run side by side. During a rolling update that period lasts minutes. With a canary it lasts hours. If a rollback happens, the old version comes back after the new one has already been writing data.</p>
+
+<figure class="fig wide" id="fig-compat">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 208" role="img" aria-labelledby="f472t f472d">
+<title id="f472t">The four combinations of code version and data version during a rollout</title>
+<desc id="f472d">A two by two grid. Version 1 code reading data written by version 1 works as before. Version 1 code reading data written by version 2 must tolerate what version 2 adds, which is forward compatibility. Version 2 code reading data written by version 1 must still understand version 1, which is backward compatibility. Version 2 code reading data written by version 2 is the new behavior. Data means rows, cached values, queued messages, cookies and API responses. A change is safe to roll out, and to roll back, only if the two off-diagonal cells both work.</desc>
+<text class="tb" x="10" y="18">During a rollout, four combinations exist at once</text>
+<text class="ts tb mid" x="270" y="48">reads data written by v1</text>
+<text class="ts tb mid" x="520" y="48">reads data written by v2</text>
+<text class="ts tb" x="10" y="86">v1 code, still running</text>
+<text class="ts tb" x="10" y="136">v2 code, arriving</text>
+<rect class="n sunk" x="170" y="58" width="200" height="46" rx="6"/>
+<text class="ts mid" x="270" y="85.5">as before</text>
+<rect class="n fault" x="420" y="58" width="200" height="46" rx="6"/>
+<text class="ts tb mid" x="520" y="77">must tolerate what v2 adds</text>
+<text class="ts mid" x="520" y="94">forward compatibility</text>
+<rect class="n async" x="170" y="110" width="200" height="46" rx="6"/>
+<text class="ts tb mid" x="270" y="129">must still understand v1</text>
+<text class="ts mid" x="270" y="146">backward compatibility</text>
+<rect class="n sunk" x="420" y="110" width="200" height="46" rx="6"/>
+<text class="ts mid" x="520" y="137.5">the new behavior</text>
+<text class="ts" x="10" y="180">“Data” means rows, cached values, queued messages, cookies and API responses. A change is safe to roll out, and to roll back,</text>
+<text class="ts" x="10" y="196">only if the two colored cells both work. If either cannot, split the change into steps that each can.</text>
+</svg>
+</div>
+<figcaption>Tests usually cover the two gray cells. Outages during deployment come from the other two.</figcaption>
+</figure>
+
+<p>The rule that follows is short: every release must work alongside the release before it. In practice it rules out a family of changes when they are made in one step.</p>
+<table>
+<thead><tr><th>One-step change</th><th>What breaks</th><th>Where the safe version is described</th></tr></thead>
+<tbody>
+<tr><th>Rename or drop a database column</th><td>Old code queries a column that is gone</td><td><x-ref to="schema-design#migrations"></x-ref></td></tr>
+<tr><th>Add a required field to an API request</th><td>Old clients do not send it</td><td><x-ref to="api-styles#versioning"></x-ref></td></tr>
+<tr><th>Change the meaning or format of a message field</th><td>Old consumers misread new messages still in the queue</td><td><x-ref to="event-driven-architecture#versioning"></x-ref></td></tr>
+<tr><th>Change the shape of a cached value</th><td>Each version reads entries written by the other</td><td>Put a version in the cache key</td></tr>
+<tr><th>Change two services that call each other together</th><td>They cannot be deployed at the same instant</td><td>Deploy the tolerant side first</td></tr>
+</tbody>
+</table>
+<p>The general method is expand and contract, introduced for database schemas in the chapter on schema design. First release a version that understands both the old form and the new. When it is everywhere, start using the new form. When nothing uses the old form any more, and you are sure you will not roll back past this point, remove it. One risky change becomes three dull ones.</p>
+
+<h2 id="rolling">Rolling updates</h2>
+<p>A <dfn>rolling update</dfn> replaces copies of a service a few at a time. It is what an orchestrator does by default, and it needs no extra machinery.</p>
+
+<figure class="fig wide" id="fig-rolling">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f473t f473d">
+<title id="f473t">A rolling update of four copies, one step at a time</title>
+<desc id="f473d">Nine steps of a rolling update of four copies, with one extra copy allowed and none allowed to be unavailable. Step 1: four copies of version 1. Step 2: a fifth copy, version 2, is starting. Step 3: it is ready and one version 1 copy has been removed, leaving three old and one new. The pattern repeats: start one, remove one, until step 9 has four copies of version 2. A new copy joins only when it passes its readiness check. From step 2 to step 8 both versions serve users at the same time, and ready copies never drop below four.</desc>
+<text class="tb" x="10" y="18">Four copies, one extra allowed, none unavailable</text>
+<g data-s="1">
+<rect class="n sig" x="20" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="46" y="50">v1</text>
+<rect class="n sig" x="20" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="46" y="74">v1</text>
+<rect class="n sig" x="20" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="46" y="98">v1</text>
+<rect class="n sig" x="20" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="46" y="122">v1</text>
+<text class="ts mid" x="46" y="172">1</text>
+</g>
+<g data-s="2">
+<rect class="n sig" x="96" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="122" y="50">v1</text>
+<rect class="n sig" x="96" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="122" y="74">v1</text>
+<rect class="n sig" x="96" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="122" y="98">v1</text>
+<rect class="n sig" x="96" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="122" y="122">v1</text>
+<rect class="n ghost" x="96" y="132" width="52" height="20" rx="3"/>
+<text class="ts mid" x="122" y="146">v2…</text>
+<text class="ts mid" x="122" y="172">2</text>
+</g>
+<g data-s="3">
+<rect class="n sig" x="172" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="198" y="50">v1</text>
+<rect class="n sig" x="172" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="198" y="74">v1</text>
+<rect class="n sig" x="172" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="198" y="98">v1</text>
+<rect class="n store" x="172" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="198" y="122">v2</text>
+<text class="ts mid" x="198" y="172">3</text>
+</g>
+<g data-s="4">
+<rect class="n sig" x="248" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="274" y="50">v1</text>
+<rect class="n sig" x="248" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="274" y="74">v1</text>
+<rect class="n sig" x="248" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="274" y="98">v1</text>
+<rect class="n store" x="248" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="274" y="122">v2</text>
+<rect class="n ghost" x="248" y="132" width="52" height="20" rx="3"/>
+<text class="ts mid" x="274" y="146">v2…</text>
+<text class="ts mid" x="274" y="172">4</text>
+</g>
+<g data-s="5">
+<rect class="n sig" x="324" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="350" y="50">v1</text>
+<rect class="n sig" x="324" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="350" y="74">v1</text>
+<rect class="n store" x="324" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="350" y="98">v2</text>
+<rect class="n store" x="324" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="350" y="122">v2</text>
+<text class="ts mid" x="350" y="172">5</text>
+</g>
+<g data-s="6">
+<rect class="n sig" x="400" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="426" y="50">v1</text>
+<rect class="n sig" x="400" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="426" y="74">v1</text>
+<rect class="n store" x="400" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="426" y="98">v2</text>
+<rect class="n store" x="400" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="426" y="122">v2</text>
+<rect class="n ghost" x="400" y="132" width="52" height="20" rx="3"/>
+<text class="ts mid" x="426" y="146">v2…</text>
+<text class="ts mid" x="426" y="172">6</text>
+</g>
+<g data-s="7">
+<rect class="n sig" x="476" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="502" y="50">v1</text>
+<rect class="n store" x="476" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="502" y="74">v2</text>
+<rect class="n store" x="476" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="502" y="98">v2</text>
+<rect class="n store" x="476" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="502" y="122">v2</text>
+<text class="ts mid" x="502" y="172">7</text>
+</g>
+<g data-s="8">
+<rect class="n sig" x="552" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="578" y="50">v1</text>
+<rect class="n store" x="552" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="578" y="74">v2</text>
+<rect class="n store" x="552" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="578" y="98">v2</text>
+<rect class="n store" x="552" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="578" y="122">v2</text>
+<rect class="n ghost" x="552" y="132" width="52" height="20" rx="3"/>
+<text class="ts mid" x="578" y="146">v2…</text>
+<text class="ts mid" x="578" y="172">8</text>
+</g>
+<g data-s="9">
+<rect class="n store" x="628" y="36" width="52" height="20" rx="3"/>
+<text class="ts mid" x="654" y="50">v2</text>
+<rect class="n store" x="628" y="60" width="52" height="20" rx="3"/>
+<text class="ts mid" x="654" y="74">v2</text>
+<rect class="n store" x="628" y="84" width="52" height="20" rx="3"/>
+<text class="ts mid" x="654" y="98">v2</text>
+<rect class="n store" x="628" y="108" width="52" height="20" rx="3"/>
+<text class="ts mid" x="654" y="122">v2</text>
+<text class="ts mid" x="654" y="172">9</text>
+</g>
+<text class="ts" x="10" y="172"></text>
+<g data-s="9">
+<text class="ts" x="10" y="198">A new copy is started (dashed) and joins only when it passes its readiness check. Then one old copy is removed.</text>
+<text class="ts" x="10" y="214">From step 2 to step 8 both versions serve users at the same time. Ready copies never drop below four.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Serving on version 1: 4; Serving on version 2: 0">Four copies run version 1 and serve all the traffic.</li>
+  <li data-state="Serving on version 1: 4; Serving on version 2: 0, 1 starting">One copy of version 2 is started. It is not ready yet, so it receives no traffic.</li>
+  <li data-state="Serving on version 1: 3; Serving on version 2: 1">The new copy passes its readiness check and starts serving. Only then is one old copy removed.</li>
+  <li data-state="Serving on version 1: 3; Serving on version 2: 1, 1 starting">A second new copy is started.</li>
+  <li data-state="Serving on version 1: 2; Serving on version 2: 2">It becomes ready, and another old copy is removed. Half the traffic now reaches version 2.</li>
+  <li data-state="Serving on version 1: 2; Serving on version 2: 2, 1 starting">A third new copy is started.</li>
+  <li data-state="Serving on version 1: 1; Serving on version 2: 3">It becomes ready, and a third old copy is removed.</li>
+  <li data-state="Serving on version 1: 1; Serving on version 2: 3, 1 starting">The last new copy is started.</li>
+  <li data-state="Serving on version 1: 0; Serving on version 2: 4">All four copies run version 2. From step 2 to step 8 both versions served users at the same time, and the number of ready copies never dropped below four.</li>
+</ol>
+<figcaption>The sequence comes from the simulator below, with a surge of one and nothing unavailable.</figcaption>
+</figure>
+
+<p>Two numbers control the pace. The <dfn>surge</dfn> is how many copies beyond the normal count may exist during the update. The <dfn>unavailable</dfn> count is how many below the normal count may be ready. Kubernetes defaults both to 25%.</p>
+
+<pre data-lang="ts" data-title="rolling-update.ts">type Step = { old: number; fresh: number; ready: number };
+
+/**
+ * Replaces `replicas` old pods with new ones. Never more than replicas + maxSurge pods exist,
+ * and never fewer than replicas - maxUnavailable are ready. New pods count once they are ready.
+ */
+export function rollingUpdate(replicas: number, maxSurge: number, maxUnavailable: number): Step[] {
+  if (maxSurge === 0 && maxUnavailable === 0) throw new Error("the rollout could never move");
+  const steps: Step[] = [];
+  let old = replicas, fresh = 0;
+  steps.push({ old, fresh, ready: old });
+  while (old > 0 || fresh < replicas) {
+    // start as many new pods as the surge allows
+    const starting = Math.min(replicas - fresh, replicas + maxSurge - (old + fresh));
+    // while they start, they are not ready: only old pods and earlier new pods serve
+    const readyDuring = old + fresh;
+    if (starting > 0) { steps.push({ old, fresh: fresh + starting, ready: readyDuring }); fresh += starting; }
+    // now remove old pods, keeping at least replicas - maxUnavailable ready
+    const removable = Math.min(old, old + fresh - (replicas - maxUnavailable));
+    if (removable > 0) { old -= removable; steps.push({ old, fresh, ready: old + fresh }); }
+    if (starting <= 0 && removable <= 0) throw new Error("stuck");
+  }
+  if (steps.at(-1)!.ready < replicas) steps.push({ old: 0, fresh: replicas, ready: replicas });
+  return steps;
+}</pre>
+
+<table>
+<thead><tr><th>Setting, for 4 copies</th><th>Behavior</th><th>Trade</th></tr></thead>
+<tbody>
+<tr><th>Surge 1, unavailable 0</th><td>Start one, then remove one. Capacity never drops</td><td>Needs room for one extra copy. Slowest</td></tr>
+<tr><th>Surge 0, unavailable 1</th><td>Remove one, then start one. Runs at three of four throughout</td><td>No extra room needed. Less capacity during the update</td></tr>
+<tr><th>Surge 4, unavailable 0</th><td>Start all four new copies, then remove all four old</td><td>Fast. Needs double the capacity for a moment</td></tr>
+</tbody>
+</table>
+<p>A rolling update depends entirely on readiness checks. The orchestrator moves on when a new copy reports ready, so a version that starts, reports ready and then fails every real request will be rolled out to the whole fleet, quickly and smoothly. A readiness check should exercise enough of the service to mean something, and a rollout should pause and reverse when new copies do not become ready.</p>
+<p>Its weakness is that it is not selective. Every user is gradually moved onto the new version, and the only thing being judged is whether copies start. To judge whether the new version is actually <em>better or worse</em>, a release has to compare.</p>
+
+<h2 id="blue-green">Blue-green</h2>
+<p>A <dfn>blue-green deployment</dfn> runs two complete environments. One, call it blue, serves all traffic. The new version is installed on the other, green, and tested there with no users. Then the router is switched.</p>
+
+<figure class="fig wide" id="fig-bluegreen">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-labelledby="f474t f474d">
+<title id="f474t">Blue-green deployment before and after the switch</title>
+<desc id="f474d">Before the switch, a router sends 100 percent of traffic to the blue environment, four copies of version 1, while the green environment, four copies of version 2, receives tests only. Green runs the new version beside the old and is tested with no users on it. After the switch, the router sends 100 percent to green, and blue is kept warm. One change at the router moves everyone, and blue stays for a while as the way back.</desc>
+<text class="tb" x="10" y="18">Before the switch</text>
+<g data-s="1">
+<rect class="n" x="120" y="30" width="100" height="34" rx="6"/>
+<text class="ts tb mid" x="170" y="51.5">Router</text>
+<rect class="n sig" x="10" y="100" width="150" height="50" rx="6"/>
+<text class="ts tb mid" x="85" y="121">Blue: v1</text>
+<text class="ts mid" x="85" y="138">4 copies</text>
+</g>
+<g data-s="2">
+<rect class="n store" x="180" y="100" width="150" height="50" rx="6"/>
+<text class="ts tb mid" x="255" y="121">Green: v2</text>
+<text class="ts mid" x="255" y="138">4 copies</text>
+</g>
+<g data-s="1">
+<path class="e sig" d="M150 64L95 100"/>
+<text class="ts end" x="80" y="82">100%</text>
+</g>
+<g data-s="2">
+<path class="e none dash" d="M190 64L245 100"/>
+<text class="ts" x="260" y="82">tests only</text>
+<text class="ts" x="10" y="176">Green runs the new version beside the old and</text>
+<text class="ts" x="10" y="191">is tested with no users on it.</text>
+</g>
+<path class="e none dash" d="M360 8V212"/>
+<text class="tb" x="380" y="18">After the switch</text>
+<g data-s="3">
+<rect class="n" x="490" y="30" width="100" height="34" rx="6"/>
+<text class="ts tb mid" x="540" y="51.5">Router</text>
+</g>
+<g data-s="4">
+<rect class="n sig" x="380" y="100" width="150" height="50" rx="6"/>
+<text class="ts tb mid" x="455" y="121">Blue: v1</text>
+<text class="ts mid" x="455" y="138">4 copies</text>
+</g>
+<g data-s="3">
+<rect class="n store" x="550" y="100" width="150" height="50" rx="6"/>
+<text class="ts tb mid" x="625" y="121">Green: v2</text>
+<text class="ts mid" x="625" y="138">4 copies</text>
+</g>
+<g data-s="4">
+<path class="e none dash" d="M520 64L465 100"/>
+<text class="ts end" x="450" y="82">kept warm</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M560 64L615 100"/>
+<text class="ts" x="630" y="82">100%</text>
+</g>
+<g data-s="4">
+<text class="ts" x="380" y="176">One change at the router moves everyone. Blue</text>
+<text class="ts" x="380" y="191">stays for a while as the way back.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="all traffic" data-state="Traffic to blue (v1): 100%; Traffic to green (v2): none">Blue, the current version, has four copies and takes all the traffic.</li>
+  <li data-state="Traffic to blue (v1): 100%; Traffic to green (v2): tests only">Green is a complete second set running the new version. It is tested with no users on it, so a failure here costs nothing.</li>
+  <li data-msg="all traffic" data-state="Traffic to blue (v1): none, kept warm; Traffic to green (v2): 100%">One change at the router moves everyone to green at once. Users are not served by a mixture of versions for more than a moment.</li>
+  <li>Blue is kept running for a while. Going back is the same single change in the other direction, which is why rolling back is so fast, and why this strategy needs double the capacity.</li>
+</ol>
+<figcaption>The switch is a routing change of the kind described in <x-ref to="proxies-and-load-balancers#algorithms"></x-ref>, so it takes seconds in either direction.</figcaption>
+</figure>
+
+<p>Its strengths are a clean cutover and the fastest possible rollback: switch back. Users are never served by a mixture of versions for more than a moment.</p>
+<p>Its costs are the second environment, which doubles capacity while both exist, and the fact that everyone moves at once. A fault that only appears under real traffic appears for all users together. Two more details need care. The environments usually share one database, so the compatibility rules above still apply in full. And requests in flight at the moment of the switch must be allowed to finish on the old side, using the connection draining from <x-ref to="proxies-and-load-balancers#draining"></x-ref>.</p>
+
+<h2 id="canary">Canary releases</h2>
+<p>A <dfn>canary release</dfn> sends a small share of real traffic to the new version, compares its behavior with the old version’s, and widens the share only if the comparison is good. The name comes from the birds once carried into coal mines to give early warning of bad air.</p>
+
+<figure class="fig wide" id="fig-canary">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 212" role="img" aria-labelledby="f475t f475d">
+<title id="f475t">A canary release with a baseline group and automated comparison</title>
+<desc id="f475d">A router sends 90 percent of requests to the main fleet on version 1, 5 percent to a baseline group also on version 1, and 5 percent to the canary on version 2. A comparison step looks at errors, latency and saturation for the baseline and the canary, and leads either to promote or to roll back. The canary is judged against a baseline: the same number of old-version copies, started at the same time, taking the same share. Comparing with the whole fleet would mix in differences that have nothing to do with the new code, such as warm caches.</desc>
+<rect class="n" x="10" y="56" width="100" height="40" rx="6"/>
+<text class="ts tb mid" x="60" y="80.5">Router</text>
+<g data-s="1">
+<rect class="n sig" x="190" y="20" width="170" height="44" rx="6"/>
+<text class="ts tb mid" x="275" y="38">v1, the fleet</text>
+<text class="ts mid" x="275" y="55">90% of requests</text>
+</g>
+<g data-s="3">
+<rect class="n sig" x="190" y="72" width="170" height="34" rx="6"/>
+<text class="ts tb mid" x="275" y="93.5">v1, baseline: 5%</text>
+</g>
+<g data-s="2">
+<rect class="n store" x="190" y="114" width="170" height="34" rx="6"/>
+<text class="ts tb mid" x="275" y="135.5">v2, canary: 5%</text>
+</g>
+<g data-s="1">
+<path class="e" d="M110 66C150 66 150 42 190 42"/>
+</g>
+<g data-s="3">
+<path class="e sig" d="M110 78H190"/>
+</g>
+<g data-s="2">
+<path class="e store" d="M110 88C150 88 150 131 190 131"/>
+</g>
+<g data-s="4">
+<rect class="n async" x="440" y="80" width="120" height="60" rx="6"/>
+<text class="ts tb mid" x="500" y="97.5">Compare</text>
+<text class="ts mid" x="500" y="114.5">errors, latency,</text>
+<text class="ts mid" x="500" y="131.5">saturation</text>
+<path class="e sig" d="M360 89C400 89 400 100 440 100"/>
+<path class="e store" d="M360 131C400 131 400 120 440 120"/>
+</g>
+<g data-s="5">
+<rect class="n store" x="620" y="60" width="90" height="34" rx="6"/>
+<text class="ts tb mid" x="665" y="81.5">Promote</text>
+</g>
+<g data-s="6">
+<rect class="n fault" x="620" y="126" width="90" height="34" rx="6"/>
+<text class="ts tb mid" x="665" y="147.5">Roll back</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M560 100C590 100 590 77 620 77"/>
+</g>
+<g data-s="6">
+<path class="e fault" d="M560 120C590 120 590 143 620 143"/>
+</g>
+<text class="ts" x="10" y="184">The canary is judged against a baseline: the same number of old-version copies, started at the same time, taking the same share.</text>
+<text class="ts" x="10" y="200">Comparing with the whole fleet would mix in differences that have nothing to do with the new code, such as warm caches.</text>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="90%">Most traffic, 90% here, stays on the existing fleet and is not part of the experiment.</li>
+  <li data-msg="5%">The canary, a few copies of the new version, takes 5% of real traffic. If it is bad, one user in twenty is affected, briefly.</li>
+  <li data-msg="5%">A baseline of the same size runs the old version, started at the same moment. It is the fair comparison: same age, same cold caches, same share.</li>
+  <li data-msg="metrics">An automatic check compares the two on errors, latency and saturation for long enough to see a real difference.</li>
+  <li data-msg="no worse">No worse than the baseline: the new version is promoted and the rollout continues to a larger share.</li>
+  <li data-msg="worse">Worse: traffic is taken away from the canary and the rollout stops, with nobody having to decide at 3 a.m.</li>
+</ol>
+<figcaption>A canary turns “did it start?” into “is it worse than what we have?”, answered with real traffic and a small blast radius.</figcaption>
+</figure>
+
+<p>Four choices define a canary.</p>
+<p><b>What to compare.</b> The signals that show harm to users: error rate, latency at the 99th percentile, and resource use such as memory and CPU for each request. Business signals, such as completed uploads or checkouts, catch faults that return a cheerful <code>200 OK</code> with the wrong content.</p>
+<p><b>Against what.</b> Against old-version copies that are otherwise identical, as the figure explains. Comparing with fixed thresholds works too, and misses a version that is worse than before and still under the threshold.</p>
+<p><b>How to split.</b> By request is simplest. By user is better for anything visible, so that one person does not flip between versions from click to click. By tenant or by cell fits systems built as in <x-ref to="multi-tenancy#cells"></x-ref>.</p>
+<p><b>How long.</b> Long enough to see enough requests for the difference to be real and not chance. That depends on how rare the errors are and how much traffic the canary gets.</p>
+
+<div class="widget" data-widget="canary">
+<h4>How long a canary must run</h4>
+<p>The traffic a canary needs before a rise in errors can be told from chance.</p>
+<div class="controls">
+  <label>Total requests per second<input type="number" name="rps" value="500" min="0" step="50"></label>
+  <label>Canary share, %<input type="number" name="share" value="5" min="0.1" max="100" step="1"></label>
+  <label>Normal error rate, %<input type="number" name="base" value="0.1" min="0.001" step="0.05"></label>
+  <label>Error rate to catch, %<input type="number" name="bad" value="0.5" min="0.002" step="0.1"></label>
+</div>
+<dl class="results">
+  <div><dt>Requests needed</dt><dd data-out="needed">1,268</dd></div>
+  <div><dt>Time at this share</dt><dd data-out="time">50.7 s</dd></div>
+  <div><dt>Extra failures if it is bad</dt><dd data-out="exposed">5</dd></div>
+  <div><dt>The same, released to all</dt><dd data-out="everyone">101</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">To tell an error rate of 0.5% from the usual 0.1%, with a 5% chance of a false alarm and a 90% chance of catching it, the canary needs about 1,268 requests. With 5% of 500 requests a second it receives 25 a second, so that takes 50.7 s. If the new version is bad, about 5 extra requests fail during the test. Released to everyone for the same time, about 101 would have. The statistics are satisfied quickly at this traffic. Keep the canary running for several minutes anyway, because some faults, such as memory leaks and slow queries, take time to appear.</p>
+</div>
+
+<p>Change the error rate to catch from 0.5% to 0.2% and the requirement rises from about 1,300 requests to about 12,000. Small regressions are expensive to detect, and a service with ten requests a minute cannot detect them with a canary at all in any useful time. For low-traffic services, lean on the earlier pipeline stages, on synthetic requests, and on a longer bake.</p>
+<p>The decision itself can be automated. This function compares the two groups and returns one of three answers.</p>
+
+<pre data-lang="ts" data-title="canary.ts">/** Requests a canary needs to tell error rate `bad` from `base`: 5% false alarms, 90% detection. */
+export function canarySampleSize(base: number, bad: number): number {
+  const z = 1.645 * Math.sqrt(base * (1 - base)) + 1.282 * Math.sqrt(bad * (1 - bad));
+  return Math.ceil((z / (bad - base)) ** 2);
+}
+
+type Counts = { requests: number; errors: number };
+type Verdict = "promote" | "rollback" | "wait";
+
+/** Compares the canary with a baseline group of the old version that ran over the same period. */
+export function judge(baseline: Counts, canary: Counts, minRequests: number): Verdict {
+  if (canary.requests < minRequests) return "wait";
+  const p1 = baseline.errors / baseline.requests, p2 = canary.errors / canary.requests;
+  const pooled = (baseline.errors + canary.errors) / (baseline.requests + canary.requests);
+  const se = Math.sqrt(pooled * (1 - pooled) * (1 / baseline.requests + 1 / canary.requests));
+  const z = se === 0 ? 0 : (p2 - p1) / se;
+  return z > 1.645 ? "rollback" : "promote";      // one-sided: only "worse" matters
+}</pre>
+
+<p>To check that the two functions agree, 4,000 canaries of each kind were simulated at the sample size above, against a baseline drawn from the rest of the traffic. A canary with a true error rate of 0.5% was rolled back 89.8% of the time. A canary no worse than the old version was rolled back 6.7% of the time. Both are close to the 90% and 5% the formula promises. A real analysis looks at several metrics at once, which catches more and raises the false alarm rate, so thresholds need tuning against your own history.</p>
+
+<div class="note pitfall"><p><span class="label">Common mistake.</span> A canary that nobody is judging. Sending 5% of traffic to a new version and then promoting it after ten minutes because no one complained is a slow rolling update with extra steps. The value is in the comparison and in the automatic stop.</p></div>
+
+<h2 id="flags">Feature flags: separating deploy from release</h2>
+<p>So far, new code reaching a server and new behavior reaching a user have been the same event. A <dfn>feature flag</dfn> separates them. The new code path ships switched off, behind a condition that is read from configuration at run time. <dfn>Deploying</dfn> puts the code on the servers. <dfn>Releasing</dfn> turns it on for users, later and by degrees.</p>
+
+<figure class="fig wide" id="fig-flags">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 224" role="img" aria-labelledby="f476t f476d">
+<title id="f476t">A feature deployed on Monday and released gradually over a week</title>
+<desc id="f476d">A timeline from Monday to the following Tuesday. On Monday the code is deployed with its flag off, so nobody sees it. On Tuesday it is turned on for staff and then 2 percent of users. On Wednesday it goes to 10 percent, on Thursday to 50 percent, and on Friday to 100 percent. The next week the flag is deleted. Each step up is a setting changed in seconds, with no deployment, and each can be undone as fast. The risky moment, exposure to users, has been separated from the mechanical one, shipping code.</desc>
+<line class="axis" x1="40" y1="150" x2="700" y2="150"/>
+<line class="axis" x1="40" y1="150" x2="40" y2="155"/>
+<text class="ts mid" x="40.0" y="170">Mon</text>
+<line class="axis" x1="150" y1="150" x2="150" y2="155"/>
+<text class="ts mid" x="150.0" y="170">Tue</text>
+<line class="axis" x1="260" y1="150" x2="260" y2="155"/>
+<text class="ts mid" x="260.0" y="170">Wed</text>
+<line class="axis" x1="370" y1="150" x2="370" y2="155"/>
+<text class="ts mid" x="370.0" y="170">Thu</text>
+<line class="axis" x1="480" y1="150" x2="480" y2="155"/>
+<text class="ts mid" x="480.0" y="170">Fri</text>
+<line class="axis" x1="590" y1="150" x2="590" y2="155"/>
+<text class="ts mid" x="590.0" y="170">Mon</text>
+<line class="axis" x1="700" y1="150" x2="700" y2="155"/>
+<text class="ts mid" x="700.0" y="170">Tue</text>
+<text class="tb" x="10" y="18">Deployed on Monday, released over a week</text>
+<path class="e none sig" d="M40 40V150"/>
+<text class="ts" x="46.0" y="48">code deployed, flag off: nobody sees it</text>
+<path class="line" style="stroke:var(--store)" d="M40 150 L150 150 L150 148 L260 148 L260 141 L370 141 L370 105 L480 105 L480 60 L700 60"/>
+<text class="ts" x="158.0" y="136.2">staff, then 2%</text>
+<text class="ts" x="268.0" y="135.0">10%</text>
+<text class="ts" x="378.0" y="99.0">50%</text>
+<text class="ts" x="488.0" y="74.0">100%</text>
+<text class="ts end" x="700.0" y="52.0">next week: delete the flag</text>
+<text class="ts" x="10" y="196">Each step up is a setting changed in seconds, with no deployment, and each can be undone as fast.</text>
+<text class="ts" x="10" y="212">The risky moment, exposure to users, has been separated from the mechanical one, shipping code.</text>
+</svg>
+</div>
+<figcaption>With flags, a deployment that changes nothing visible becomes the normal case, and a release becomes an edit to a setting.</figcaption>
+</figure>
+
+<p>A percentage rollout must give each user a stable answer, so that a feature does not appear and vanish between page loads, and raising the percentage must only add users. Hashing the flag name with the user’s identifier does both.</p>
+
+<pre data-lang="ts" data-title="flags.ts">import { createHash } from "node:crypto";
+
+/** Maps a user to a bucket from 0 to 9,999 that is fixed for this flag. */
+export function bucket(flag: string, userId: string): number {
+  const h = createHash("sha256").update(`${flag}:${userId}`).digest();
+  return h.readUInt32BE(0) % 10_000;
+}
+
+export function isEnabled(flag: string, userId: string, percent: number): boolean {
+  return bucket(flag, userId) < percent * 100;
+}
+
+type Flag = { key: string; killed: boolean; allow: Set<string>; percent: number };
+
+export function evaluate(flag: Flag, userId: string): boolean {
+  if (flag.killed) return false;                 // the off switch always wins
+  if (flag.allow.has(userId)) return true;       // staff and testers first
+  return isEnabled(flag.key, userId, flag.percent);
+}</pre>
+
+<p>Over 100,000 test users, a flag at 1%, 10% and 50% enabled 1,012, 9,962 and 50,134 of them, and every user enabled at a lower percentage was still enabled at each higher one. Including the flag’s name in the hash matters: two different flags at 10% shared only 962 users, about a tenth of a tenth. Without it the same unlucky tenth of users would receive every experiment.</p>
+<p>Flags are used for several different jobs, and it helps to keep them apart.</p>
+<table>
+<thead><tr><th>Kind</th><th>Purpose</th><th>Lifetime</th></tr></thead>
+<tbody>
+<tr><th>Release flag</th><td>Roll a new feature out gradually</td><td>Days or weeks, then deleted</td></tr>
+<tr><th>Kill switch</th><td>Turn off an optional feature under load or during an incident, as in <x-ref to="resilience-patterns#degradation"></x-ref></td><td>Permanent</td></tr>
+<tr><th>Experiment</th><td>Show variants to different users and measure which does better</td><td>The length of the experiment</td></tr>
+<tr><th>Permission</th><td>Make a feature available to certain plans or customers</td><td>Permanent, and better kept in the product’s own data</td></tr>
+</tbody>
+</table>
+<p>Flags have a cost that grows quietly. Each one doubles the number of paths through the code, and old flags that nobody dares remove pile up until no one can say which combinations are live. Give every release flag an owner and a removal date, and delete it once the feature is fully on. Remember also that a flag change alters production behavior as surely as a deployment does. It deserves an audit trail, a gradual rollout of its own, and the same suspicion during an incident.</p>
+
+<h2 id="shadow">Testing with real traffic and no users</h2>
+<p>Two further techniques expose new code to production conditions before any user depends on it.</p>
+<p>A <dfn>dark launch</dfn> runs the new code path for real requests and throws the result away. The photo app could compute a new feed ranking for every request, log how long it took and how it differed, and still return the old ranking. This reveals performance under real load and real data, with no user-visible risk.</p>
+<p><dfn>Shadow traffic</dfn>, also called mirroring, copies live requests to a new version of a service and discards its responses. It is the standard way to prove a rewrite, and it is the comparison step in the migration method of <x-ref to="monoliths-and-microservices#migrating"></x-ref>. One caution applies to both: the shadow path must not have side effects. A mirrored request that sends a second email or charges a card a second time is not a test.</p>
+
+<h2 id="rollback">Going back</h2>
+<p>When a release goes wrong, the first aim is to stop the harm, and understanding comes later. There are three ways to stop it, from fastest to slowest.</p>
+<ol>
+  <li><b>Turn it off.</b> If the change is behind a flag, switch the flag. Seconds.</li>
+  <li><b>Roll back.</b> Redeploy the previous artifact, or switch a blue-green router back. Minutes.</li>
+  <li><b>Roll forward.</b> Write a fix and ship it through the pipeline. Tens of minutes at best, and it means shipping new, hurried code during an incident.</li>
+</ol>
+<p>Prefer the earliest option that applies. Rolling forward is right mainly when going back is impossible, and the list of things that cannot be rolled back is worth knowing before the incident.</p>
+<ul>
+  <li><b>Destructive schema changes.</b> A dropped column does not return with the old code. This is why the contracting step waits.</li>
+  <li><b>Data written in a new format</b> that the old version cannot read.</li>
+  <li><b>Effects outside the system.</b> Emails sent, payments made, events consumed by other teams.</li>
+</ul>
+<p>A rollback that has never been exercised is a hope. Some teams run one on purpose now and then, and the best signal is the simplest: how long did the last real one take? That figure, the failed deployment recovery time, is one of the five delivery metrics for good reason.</p>
+
+<h2 id="progressive">Releasing in waves</h2>
+<p>A canary limits exposure within one deployment. Large systems apply the same idea one level up, across the units they are divided into: cells, availability zones and regions.</p>
+
+<figure class="fig wide" id="fig-progressive">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-labelledby="f477t f477d">
+<title id="f477t">A release applied in four waves over 24 hours with bake time between them</title>
+<desc id="f477d">A schedule over 24 hours. The change is applied to one canary cell in the first hour, reaching 1 percent of users, and is then watched. At hour 2 it goes to one small region, reaching 5 percent, and is watched. At hour 6 it goes to two more regions, reaching 30 percent, and is watched. At hour 12 it goes everywhere else, reaching 100 percent by hour 14. Bake time is the period when the change is only being watched. Each wave is larger than the last, and a problem found in any of them stops the rest. The same schedule applies to configuration and data updates.</desc>
+<line class="grid" x1="170" y1="24" x2="170" y2="150"/>
+<text class="ts mid" x="170.0" y="166">0 h</text>
+<line class="grid" x1="258" y1="24" x2="258" y2="150"/>
+<text class="ts mid" x="258.3333333333333" y="166">4 h</text>
+<line class="grid" x1="347" y1="24" x2="347" y2="150"/>
+<text class="ts mid" x="346.66666666666663" y="166">8 h</text>
+<line class="grid" x1="435" y1="24" x2="435" y2="150"/>
+<text class="ts mid" x="435.0" y="166">12 h</text>
+<line class="grid" x1="523" y1="24" x2="523" y2="150"/>
+<text class="ts mid" x="523.3333333333333" y="166">16 h</text>
+<line class="grid" x1="612" y1="24" x2="612" y2="150"/>
+<text class="ts mid" x="611.6666666666667" y="166">20 h</text>
+<line class="grid" x1="700" y1="24" x2="700" y2="150"/>
+<text class="ts mid" x="700.0" y="166">24 h</text>
+<text class="ts" x="10" y="46">One canary cell</text>
+<rect class="n store" x="170" y="30" width="22" height="22" rx="3"/>
+<rect class="n ghost" x="192" y="30" width="22" height="22" rx="3"/>
+<text class="ts" x="222.16666666666666" y="45">1% of users</text>
+<text class="ts" x="10" y="76">One small region</text>
+<rect class="n store" x="214" y="60" width="22" height="22" rx="3"/>
+<rect class="n ghost" x="236" y="60" width="66" height="22" rx="3"/>
+<text class="ts" x="242.25" y="75">watch</text>
+<text class="ts" x="310.5" y="75">5%</text>
+<text class="ts" x="10" y="106">Two more regions</text>
+<rect class="n store" x="302" y="90" width="33" height="22" rx="3"/>
+<rect class="n ghost" x="336" y="90" width="99" height="22" rx="3"/>
+<text class="ts" x="341.625" y="105">watch</text>
+<text class="ts" x="443.0" y="105">30%</text>
+<text class="ts" x="10" y="136">Everywhere else</text>
+<rect class="n store" x="435" y="120" width="44" height="22" rx="3"/>
+<rect class="n ghost" x="479" y="120" width="221" height="22" rx="3"/>
+<text class="ts" x="485.1666666666667" y="135">watch: 100% of users</text>
+<text class="ts" x="10" y="192">Solid: the change is being applied. Dashed: bake time, when it is only being watched. Each wave is larger than the last,</text>
+<text class="ts" x="10" y="208">and a problem found in any of them stops the rest. The same schedule applies to configuration and data updates.</text>
+</svg>
+</div>
+<figcaption>An illustrative schedule. The waves grow, and the waits between them, called bake time, are long enough for slow problems to show.</figcaption>
+</figure>
+
+<p>Bake time exists because some faults are slow: a memory leak, a cache that fills, a job that runs nightly, a customer in another time zone. The schedule also follows the sun where it can, so that each wave lands in that region’s working hours with engineers awake.</p>
+<p>The discipline has to cover everything that changes production, and the costliest incidents have been the exceptions.</p>
+<p>On 19 July 2024 the security company CrowdStrike published a content update for its Falcon sensor on Windows. According to its root cause analysis, the update supplied 20 input values where a newer template defined 21. Reading the missing one was an out-of-bounds memory access inside a component running in the operating system kernel, and the machine crashed. No test covered the mismatch. The update went to every eligible sensor at once, and about 8.5 million Windows machines failed and could not restart unaided. Airlines, hospitals and banks were affected for days. Among the changes the company announced were releasing content updates in stages and letting customers control when they receive them.</p>
+<p>The update was data, not a program, and data updates had been treated as low-risk and exempt from the staged rollout that code received. The Google Cloud outage in <x-ref to="resilience-patterns#google-2025"></x-ref> had the same shape with a policy record, and <x-ref to="multi-region#global-changes"></x-ref> drew the general rule: whatever is applied to all places at once is not contained by any boundary. Configuration, rule sets, machine-learning models, certificates and feature flags all change behavior, and each needs a small first step and a way back.</p>
+
+<h2 id="gitops">Keeping it honest</h2>
+<p>A few practices keep a delivery process trustworthy as it grows.</p>
+<ul>
+  <li><b>Everything in version control.</b> Not only code: infrastructure definitions, deployment manifests, configuration, alert rules. Production is changed by merging, and the history shows who changed what and why. When an agent in the cluster continuously applies whatever the repository says, in the reconciliation style of <x-ref to="containers-and-orchestration#desired-state"></x-ref>, the arrangement is called <dfn>GitOps</dfn>.</li>
+  <li><b>No manual changes.</b> A fix applied by hand on a server is lost at the next deployment and is invisible to everyone else. During an emergency it may be necessary. Afterward it goes back through the pipeline.</li>
+  <li><b>Release in working hours.</b> Deploy when the people who can fix it are awake and present. A process that is safe only at 3 a.m. on a Sunday is not safe.</li>
+  <li><b>Mark deployments on dashboards.</b> The first question in any incident is “what changed?”. <x-ref to="observability"></x-ref> returns to this.</li>
+  <li><b>Freeze sparingly.</b> Stopping all changes before a major event is sensible. Long freezes build up a backlog that is released all at once afterward, which is the large, risky change the whole approach is meant to avoid.</li>
+</ul>
+
+<div class="note interview"><p><span class="label">In an interview.</span> When a design is otherwise complete, a sentence on how it changes safely stands out. Say that services deploy by rolling update behind readiness checks, that risky changes go to a canary compared against a baseline, and that features are released by flag. If the design has a schema change or a new message format, say it is done in compatible steps because old and new versions overlap. For a global system, say that code and configuration go out one region at a time.</p></div>
+
+<h2 id="choosing">Choosing</h2>
+<table>
+<thead><tr><th>Situation</th><th>Reasonable approach</th></tr></thead>
+<tbody>
+<tr><th>An ordinary stateless service</th><td>Rolling update with meaningful readiness checks</td></tr>
+<tr><th>A change with real risk on a busy service</th><td>Canary with automated comparison, then a rolling update</td></tr>
+<tr><th>A low-traffic service</th><td>Rolling update, synthetic checks and a longer watch. A canary cannot see enough</td></tr>
+<tr><th>A release that must switch all users at one moment</th><td>Blue-green</td></tr>
+<tr><th>A new user-facing feature</th><td>Deploy dark behind a flag, then release by percentage</td></tr>
+<tr><th>A rewrite or a new data store</th><td>Shadow traffic and comparison before any cutover</td></tr>
+<tr><th>Anything applied across cells or regions</th><td>Waves with bake time, for code and for configuration</td></tr>
+</tbody>
+</table>
+<p>These combine. A mature setup deploys by rolling update inside each cell, gates the first cell with a canary, proceeds in waves, and releases features by flag on top.</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Large, infrequent releases.</b> Many changes at once, so that nobody knows which one broke things.</li>
+  <li><b>Rebuilding for each environment.</b> What ships is not what was tested.</li>
+  <li><b>Assuming a deployment is instantaneous.</b> Incompatible changes to schemas, messages or caches made in one step.</li>
+  <li><b>Readiness checks that always pass.</b> The rollout proceeds over a broken version.</li>
+  <li><b>A canary without a comparison or an automatic stop.</b></li>
+  <li><b>Comparing the canary with the whole fleet.</b> Differences in age and warmth drown the signal.</li>
+  <li><b>Treating configuration and data as safe.</b> Pushing them everywhere at once because they are “not code”.</li>
+  <li><b>Flags that are never removed.</b> The number of untested combinations grows until one of them fails.</li>
+  <li><b>An untested rollback.</b> Discovered to be broken on the day it is needed.</li>
+  <li><b>Contracting too early.</b> Dropping the old column or the old code path while rolling back is still possible.</li>
+  <li><b>Shadow traffic with side effects.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="availability-and-reliability"></x-ref>: why changes dominate outages, and error budgets as the brake on release speed.</li>
+  <li><x-ref to="schema-design"></x-ref>, <x-ref to="api-styles"></x-ref> and <x-ref to="event-driven-architecture"></x-ref>: compatible evolution of tables, interfaces and messages.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref> and <x-ref to="service-communication"></x-ref>: weighted routing, the mechanism under canary and blue-green.</li>
+  <li><x-ref to="containers-and-orchestration"></x-ref>: images, readiness and the rolling update controller.</li>
+  <li><x-ref to="observability"></x-ref>: the signals a canary compares and the alerts that trigger a rollback.</li>
+  <li><x-ref to="multi-tenancy"></x-ref> and <x-ref to="multi-region"></x-ref>: cells and regions as the units of a staged rollout.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Changes cause most outages. The defense is to make them small, gradual, observed and reversible.</li>
+  <li>Build one immutable artifact and promote it through every stage. Keep environment differences in configuration, and treat configuration as a change too.</li>
+  <li>Old and new versions always overlap. Every release must work with the one before it, in both directions, across data, messages, caches and APIs.</li>
+  <li>A rolling update replaces copies gradually and judges only whether they become ready. Blue-green switches everyone at once with an instant way back.</li>
+  <li>A canary compares new against old on a small share of real traffic and stops automatically. How long it must run depends on how rare errors are.</li>
+  <li>Feature flags separate deploying code from releasing behavior. Stable hashing gives each user a consistent answer. Remove flags when they are done.</li>
+  <li>The fastest recovery is turning a flag off, then rolling back, then rolling forward. Know in advance what cannot be undone.</li>
+  <li>Apply every kind of change in waves across cells and regions, with bake time between them.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why is rebuilding from the same commit for production riskier than promoting the artifact that was tested?</summary><p>A second build can differ from the first without any change to your source: a dependency or base image was updated in between, or the build environment differs. That difference reaches production untested. Promoting one immutable artifact guarantees that what runs is what was tested.</p></details>
+<details><summary>A release changes a JSON field stored in a cache from a number to an object. The rollout is a rolling update. What goes wrong, and how is it avoided?</summary><p>For some minutes old and new copies both run. New copies write objects that old copies cannot parse, and old copies write numbers that new copies may not expect. Avoid it by putting a version in the cache key so the two never read each other’s entries, or by first shipping a version that reads both forms.</p></details>
+<details><summary>Six copies are updated with a surge of 2 and nothing unavailable. What is the largest number of copies running at once and the smallest number ready?</summary><p>At most 6 + 2 = 8 copies exist at once, and at least 6 are ready throughout, because an old copy is removed only after a new one is ready. The cluster needs room for two extra copies during the update.</p></details>
+<details><summary>Why is a canary compared with a baseline group of the old version and not with the rest of the fleet?</summary><p>The rest of the fleet has been running for hours or days, with warm caches, full connection pools and a different mix of traffic. Differences from those causes would be mistaken for effects of the new code. A baseline started at the same time, at the same size and share, differs from the canary only in the version.</p></details>
+<details><summary>A service receives 20 requests a second with a normal error rate of 0.1%. You want to catch a rise to 0.2% with a 10% canary. Roughly how long must it run, and what does that suggest?</summary><p>About 11,940 requests are needed. At 2 requests a second to the canary, that is about 100 minutes. For a change that small on a service this quiet, a canary is slow, so rely on other checks or accept detecting only larger regressions. The widget gives the same figure.</p></details>
+<details><summary>Why include the flag’s name in the hash that assigns users to a percentage rollout?</summary><p>Without it every flag would put the same users in its first 10%, so one group would receive every experimental feature at once, and the effects of different flags could not be told apart. Hashing the name with the user ID gives each flag an independent sample while keeping each user’s answer stable.</p></details>
+<details><summary>List the three ways to stop a bad release, fastest first, and one kind of change none of them can undo.</summary><p>Turn off the feature flag, roll back to the previous artifact, or roll forward with a fix. None of them undoes a destructive schema change such as a dropped column, data already written in a form the old version cannot read, or effects outside the system such as emails sent.</p></details>
+<details><summary>What do the CrowdStrike incident of July 2024 and the Google Cloud incident of June 2025 have in common, and what practice addresses both?</summary><p>In both, a change that was not ordinary code, a content update in one and a policy record in the other, reached every place at once and triggered a crash in software already running everywhere. Staged rollout with bake time for every kind of change, not only code, would have confined each to the first wave.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Jez Humble and David Farley, <cite>Continuous Delivery</cite>, Addison-Wesley, 2010. The pipeline, the single artifact and the argument that frequent release is safer.</li>
+  <li>DORA, <a href="https://dora.dev/guides/dora-metrics/history/">A history of DORA’s software delivery metrics</a>. The five current metrics and how they changed.</li>
+  <li>Kubernetes documentation, <a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Deployments</a>. Rolling update strategy, surge and unavailability.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/bliki/BlueGreenDeployment.html">BlueGreenDeployment</a>, and Danilo Sato, <a href="https://martinfowler.com/bliki/CanaryRelease.html">CanaryRelease</a>.</li>
+  <li>Pete Hodgson, <a href="https://martinfowler.com/articles/feature-toggles.html">Feature Toggles</a>, 2017. The kinds of flag and how to manage them.</li>
+  <li><a href="https://sre.google/workbook/canarying-releases/">Canarying Releases</a>, a chapter of <cite>The Site Reliability Workbook</cite>, Google, 2018.</li>
+  <li>Clare Liguori, <a href="https://aws.amazon.com/builders-library/automating-safe-hands-off-deployments/">Automating safe, hands-off deployments</a>, Amazon Builders’ Library. Waves, bake time and automatic rollback at Amazon.</li>
+  <li>CrowdStrike, <a href="https://crowdstrike.com/wp-content/uploads/2024/08/Executive-Summary_Root-Cause-Analysis_Channel-File-291.pdf">Channel File 291 incident: root cause analysis, executive summary</a>, August 2024.</li>
+</ol>
+</section>

@@ -1,0 +1,627 @@
+<!--meta
+{ "description": "A high-level design of a marketplace’s payment system: a payment provider with hosted pages, authorize then capture, idempotency keys carried end to end (double charges simulated with and without them), a double-entry ledger in whole cents that balances after every transaction and replays to the same state, payouts to sellers, webhooks and unknown outcomes, and daily reconciliation against settlement files.",
+  "lede": "Most systems can retry a failed request and move on. A payment system cannot, because a retry might charge a card twice, and not retrying might lose a payment that went through. The money also moves through companies that the system does not control and that answer late, out of order or not at all. This chapter designs payments around three ideas that make that safe: a key that follows each intent all the way to the provider, a ledger in which every movement of money is written twice and never changed, and a daily check that the company’s books agree with everyone else’s.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the payment system of an online marketplace. Customers pay for orders by card; the card is charged when the order ships; sellers are paid every week, less a commission; customers can be refunded. Nobody may be charged twice, no payment may be lost, and the company’s books must agree with the payment provider’s and the bank’s to the cent.</p></div>
+<p>Payments look like a simple request: charge this card this amount. What makes them hard is that the effect happens elsewhere. A <dfn>payment service provider</dfn> is a company that accepts card and other payments on a merchant’s behalf, talks to the card networks and banks, and pays the collected money out to the merchant’s bank account later. Every call to it can succeed, fail, or time out with the outcome unknown, and its own confirmation may come minutes later by webhook. Exactly-once delivery does not exist (<x-ref to="idempotency-and-delivery#guarantees"></x-ref>), so the design has to make repeated attempts harmless and then prove, every day, that nothing slipped through. In the terms of <x-ref to="hld-method#shapes"></x-ref>, this is a money problem: each payment taking effect exactly once, and books that reconcile.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Pay for an order by card, on a page that the provider hosts</th><td>Yes</td></tr>
+<tr><th>Reserve the amount at checkout; charge it when the order ships</th><td>Yes</td></tr>
+<tr><th>Full and partial refunds</th><td>Yes</td></tr>
+<tr><th>Weekly payouts to sellers, less a 10% commission</th><td>Yes</td></tr>
+<tr><th>A ledger of every movement of money; balances for every seller</th><td>Yes</td></tr>
+<tr><th>Daily reconciliation with the provider and the bank</th><td>Yes</td></tr>
+<tr><th>Several currencies; disputes and chargebacks</th><td>Follow-up questions</td></tr>
+<tr><th>Fraud scoring; being a card network or a bank</th><td>No</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>2 million orders a day; 200,000 sellers</td></tr>
+<tr><th>Correctness</th><td>No double charge, no lost payment; the ledger balances after every transaction; reconciliation finds every difference</td></tr>
+<tr><th>Latency</th><td>Checkout in a few seconds, most of it the provider’s; nothing else is urgent</td></tr>
+<tr><th>Availability</th><td>99.95% for taking payments; payouts and reports can wait hours</td></tr>
+<tr><th>Durability and audit</th><td>Ledger entries kept for 10 years, never edited, with who did what</td></tr>
+<tr><th>Security</th><td>No card numbers on our servers</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">payments: 2 million ÷ 86,400 s ≈ 23 a second, about 116 at a peak of five times that<br>
+calls to the provider: about 3 per order (a payment page, a capture, now and then a refund) ≈ 70 a second<br>
+ledger: about 10 lines per order × 150 bytes = 3 GB a day, about 1.1 TB a year and 11 TB over 10 years<br>
+payouts: 200,000 sellers a week, a few a second if spread over a working day</div>
+<p>Payments are not a scale problem (<x-ref to="estimation#method"></x-ref>). A hundred writes a second is easy for one relational database, and that is where the ledger belongs: one database, with transactions, constraints and serializable checks where needed (<x-ref to="transactions"></x-ref>). The number that matters is the cost of a mistake. If one message in a hundred is lost on each hop and nobody uses keys, the chapter’s simulation charges about 2% of payments twice: forty thousand customers a day.</p>
+
+<div class="widget" data-widget="payments94">
+<h4>Size of a payment system, and the cost of retries</h4>
+<p>Load and ledger storage, and how many orders a day would be charged twice when messages are lost, by the simulation’s rates.</p>
+<div class="controls">
+  <label>Orders a day, millions<input type="number" name="orders" value="2" min="0.001" max="1000" step="0.5"></label>
+  <label>Peak over average<input type="number" name="peak" value="5" min="1" max="50" step="0.5"></label>
+  <label>Years the ledger is kept<input type="number" name="years" value="10" min="1" max="50" step="1"></label>
+  <label>Messages lost on each hop, %<input type="number" name="lost" value="1" min="0" max="5" step="0.1"></label>
+</div>
+<dl class="results">
+  <div><dt>Payments a second at the peak</dt><dd data-out="rate">116</dd></div>
+  <div><dt>Ledger, per year and in all</dt><dd data-out="ledger">1.09 TB, 10.9 TB</dd></div>
+  <div><dt>Charged twice a day, no keys</dt><dd data-out="none">39.9 thousand</dd></div>
+  <div><dt>Charged twice a day, key from the app only</dt><dd data-out="app">19.6 thousand</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At the peak, 116 payments a second, which one database handles. The ledger grows by 1.09 TB a year. Losing 1% of messages on each hop, retries without keys would charge about 39.9 thousand orders twice every day, and a key from the app alone about 19.6 thousand. With one key carried to the provider, none.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Internal: the order service asks for money">
+POST /v1/payments
+Idempotency-Key: pay-o-5521
+{ "order": "o-5521", "amount": 10000, "currency": "EUR", "seller": "s-118",
+  "capture": "on_shipment", "return_url": "https://shop.example/orders/o-5521" }
+
+201 Created
+{ "payment": "pmt_8c1f", "status": "created", "redirect": "https://pay.provider.example/s/cs_live_…" }
+
+POST /v1/payments/pmt_8c1f/capture      Idempotency-Key: cap-o-5521      → { "status": "captured" }
+POST /v1/payments/pmt_8c1f/refunds      Idempotency-Key: ref-o-5521-1    { "amount": 2500 }
+</pre>
+<pre data-lang="http" data-title="From the provider: webhooks, signed">
+POST /v1/provider/webhooks
+Provider-Signature: t=1792000000,v1=5f2a…
+{ "id": "evt_771", "type": "payment.authorized", "payment": "pmt_8c1f", "amount": 10000 }
+
+200 OK          ← only after the event is stored; a repeat of evt_771 is acknowledged and ignored
+</pre>
+<p>Amounts are integers in the currency’s minor unit, cents here, so 100.00 euros is <code>10000</code>; a float cannot hold 0.10 exactly, and the test summed a million payments of 0.10 as floats to 100,000.00000133. Every request that moves money has an idempotency key made from the business intent, the order and the step, not from the request, so that whoever retries, from wherever, sends the same key (<x-ref to="idempotency-and-delivery#keys"></x-ref>). Webhooks are verified by signature (<x-ref to="cryptography-in-practice#macs"></x-ref>), stored before they are acknowledged, and ignored if their event id has been seen.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>Payments</th><td>payment id; unique idempotency key</td><td>Order, amount, currency, state: created, authorized, captured, refunded, failed; the provider’s reference</td><td>Relational</td></tr>
+<tr><th>Payment attempts</th><td>payment, step, key</td><td>Each call to the provider and its outcome, including “unknown”</td><td>Same database</td></tr>
+<tr><th>Ledger transactions</th><td>transaction id, unique</td><td>Time, description, the payment it belongs to; lines that add up to zero</td><td>Same database, insert only</td></tr>
+<tr><th>Ledger lines</th><td>transaction, line</td><td>Account and signed amount in cents</td><td>Same database</td></tr>
+<tr><th>Provider events</th><td>event id, unique</td><td>The webhook as received</td><td>Same database: the inbox (<x-ref to="idempotency-and-delivery#consumers"></x-ref>)</td></tr>
+<tr><th>Settlement files, statements</th><td>source, date</td><td>The provider’s and the bank’s records, as received</td><td>Object storage, then loaded for matching</td></tr>
+</tbody>
+</table>
+<p>The payment’s state, its attempts, the ledger and the inbox share one database so that “mark captured and post to the ledger” is one local transaction, and events for other services leave through an outbox in the same transaction (<x-ref to="distributed-transactions#outbox"></x-ref>). Balances are not stored as numbers someone can overwrite: an account’s balance is the sum of its lines, with snapshots for speed if needed.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 400" role="img" aria-labelledby="f941t f941d">
+<title id="f941t">A payment system: money in, the ledger, money out, and the check</title>
+<desc id="f941d">The order service asks the payment service to collect an order. The payment service records a payment with an idempotency key and asks the payment provider for a hosted payment page; the customer types card details on the provider’s page, never on ours. The provider authorizes the card and tells the payment service by webhook. The payment service records every movement of money in an append-only double-entry ledger and publishes payment events through an outbox. A payout service pays sellers from the ledger’s balances through the provider or the bank. Every day a reconciliation job compares the ledger with the provider’s settlement files and the bank statement.</desc>
+<text class="tb" x="10" y="18">Money in: the card never touches our servers</text>
+<g transform="translate(0 16)">
+<rect class="n " x="10" y="32" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="54.0">Customer</text>
+<text class="ts mid" x="60" y="71.0">browser</text>
+<rect class="n sig" x="160" y="32" width="140" height="50" rx="6"/>
+<text class="tb mid" x="230" y="54.0">Order service</text>
+<text class="ts mid" x="230" y="71.0">checkout</text>
+<rect class="n sig" x="350" y="32" width="150" height="50" rx="6"/>
+<text class="tb mid" x="425" y="54.0">Payment service</text>
+<text class="ts mid" x="425" y="71.0">payments, keys</text>
+<rect class="n " x="560" y="32" width="150" height="50" rx="6"/>
+<text class="tb mid" x="635" y="54.0">Payment provider</text>
+<text class="ts mid" x="635" y="71.0">cards, banks</text>
+<path class="e sig both" d="M110 57H160"/>
+<path class="e sig both" d="M300 57H350"/>
+<text class="ts mid" x="325" y="51">pay</text>
+<path class="e sig both" d="M500 50H560"/>
+<text class="ts mid" x="530" y="44">key</text>
+<path class="e async" d="M560 70H500"/>
+<text class="ts mid" x="530" y="84">webhook</text>
+<path class="e sig both" d="M60 32V18H635V32"/>
+<text class="ts mid" x="480" y="14">card details, on the provider’s hosted page</text>
+<path class="e none dash" d="M10 112H710"/>
+<text class="tb" x="10" y="134">The record: every movement of money, twice, never edited</text>
+<rect class="n store" x="350" y="146" width="150" height="54" rx="6"/>
+<text class="tb mid" x="425" y="170.0">Ledger</text>
+<text class="ts mid" x="425" y="187.0">double entry, append only</text>
+<rect class="n async" x="560" y="146" width="150" height="54" rx="6"/>
+<text class="tb mid" x="635" y="170.0">Payment events</text>
+<text class="ts mid" x="635" y="187.0">outbox → orders, email</text>
+<rect class="n sig" x="160" y="146" width="140" height="54" rx="6"/>
+<text class="tb mid" x="230" y="170.0">Payout service</text>
+<text class="ts mid" x="230" y="187.0">weekly, to sellers</text>
+<path class="e store" d="M425 82V146"/>
+<text class="ts" x="432" y="136">post</text>
+<path class="e async" d="M500 173H560"/>
+<path class="e sig" d="M300 173H350"/>
+<text class="ts mid" x="325" y="167">balances</text>
+<path class="e none dash" d="M10 226H710"/>
+<text class="tb" x="10" y="248">The check: three records of the same money must agree</text>
+<rect class="n store" x="10" y="262" width="140" height="50" rx="6"/>
+<text class="tb mid" x="80" y="284.0">Settlement files</text>
+<text class="ts mid" x="80" y="301.0">from the provider</text>
+<rect class="n async" x="350" y="262" width="150" height="50" rx="6"/>
+<text class="tb mid" x="425" y="284.0">Reconciliation</text>
+<text class="ts mid" x="425" y="301.0">daily</text>
+<rect class="n store" x="560" y="262" width="150" height="50" rx="6"/>
+<text class="tb mid" x="635" y="284.0">Bank statement</text>
+<text class="ts mid" x="635" y="301.0">deposits, payouts</text>
+<rect class="n fault" x="350" y="330" width="150" height="40" rx="6"/>
+<text class="tb mid" x="425" y="347.0">Exceptions</text>
+<text class="ts mid" x="425" y="364.0">for people to resolve</text>
+<path class="e async" d="M150 287H350"/>
+<path class="e async" d="M560 287H500"/>
+<path class="e async" d="M425 200V262"/>
+<path class="e fault" d="M425 312V330"/>
+<path class="e sig" d="M230 200V240H160V262"/>
+<text class="ts" x="238" y="222">payouts</text>
+</g>
+</svg>
+</div>
+<figcaption>The payment service talks to the provider; the ledger records what happened; reconciliation proves that our record and the provider’s and the bank’s agree.</figcaption>
+</figure>
+
+<p><b>Money in.</b> The order service asks the payment service for money. The payment service records the payment with its key, then asks the provider for a hosted payment page; the customer types the card number on the provider’s page, so our servers never see it, which keeps them outside most of the card industry’s security rules. A card payment happens in two steps here. Authorizing asks the card’s bank to reserve the amount; to <dfn>capture</dfn> is to tell it to take the money that was reserved, which a marketplace does when the order ships, as the vending machine chapter did with coins (<x-ref to="lld-vending-machine"></x-ref>).</p>
+<p><b>The record.</b> Every movement of money becomes a ledger transaction in the same database transaction as the state change that caused it. Other services learn about payments from events, never by reading the ledger’s tables.</p>
+<p><b>Money out and the check.</b> A payout service pays each seller what the ledger says they are owed, weekly. A reconciliation job compares the ledger, the provider’s settlement files and the bank statement every day, and sends every difference to a queue that people work through.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 444" role="img" aria-labelledby="f942t f942d">
+<title id="f942t">Paying for an order, and a lost answer</title>
+<desc id="f942d">Two sequences. Paying: the order service asks the payment service to collect 100.00 for order o-5521 with key pay-o-5521; the payment service stores a payment in state created and asks the provider for a hosted payment page with the same key; the customer enters card details on the provider’s page; the provider authorizes and sends a webhook; the payment service marks the payment authorized and posts nothing to the ledger yet, and tells the order service. A lost answer: when the order ships, the payment service asks the provider to capture with key cap-o-5521; the provider captures but the answer is lost; the payment service retries with the same key and gets the saved result; it posts the capture to the ledger once.</desc>
+<text class="tb" x="10" y="16">Paying</text>
+<g data-scene="pay">
+<text class="tb mid" x="50" y="36">Order service</text>
+<line class="axis" x1="50" y1="44" x2="50" y2="212"/>
+<text class="tb mid" x="220" y="36">Payment service</text>
+<line class="axis" x1="220" y1="44" x2="220" y2="212"/>
+<text class="tb mid" x="420" y="36">Provider</text>
+<line class="axis" x1="420" y1="44" x2="420" y2="212"/>
+<text class="tb mid" x="600" y="36">Customer</text>
+<line class="axis" x1="600" y1="44" x2="600" y2="212"/>
+<g data-s="1">
+<path class="e sig" d="M51 64H219"/>
+<text class="ts mid" x="135.0" y="58">1. collect 100.00, key pay-o-5521</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M221 90H419"/>
+<text class="ts mid" x="320.0" y="84">2. create session, same key</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M421 116H599"/>
+<text class="ts mid" x="510.0" y="110">3. hosted payment page</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M599 142H421"/>
+<text class="ts mid" x="510.0" y="136">4. card details</text>
+</g>
+<g data-s="5">
+<path class="e async" d="M419 168H221"/>
+<text class="ts mid" x="320.0" y="162">5. webhook: authorized</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M219 194H51"/>
+<text class="ts mid" x="135.0" y="188">6. authorized</text>
+</g>
+</g>
+<path class="e none dash" d="M10 226H710"/>
+<text class="tb" x="10" y="248">A lost answer</text>
+<g data-scene="capture">
+<text class="tb mid" x="50" y="268">Order service</text>
+<line class="axis" x1="50" y1="276" x2="50" y2="434"/>
+<text class="tb mid" x="220" y="268">Payment service</text>
+<line class="axis" x1="220" y1="276" x2="220" y2="434"/>
+<text class="tb mid" x="420" y="268">Provider</text>
+<line class="axis" x1="420" y1="276" x2="420" y2="434"/>
+<text class="tb mid" x="600" y="268">Ledger</text>
+<line class="axis" x1="600" y1="276" x2="600" y2="434"/>
+<g data-s="1">
+<path class="e sig" d="M51 296H219"/>
+<text class="ts mid" x="135.0" y="290">1. shipped: capture o-5521</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M221 322H419"/>
+<text class="ts mid" x="320.0" y="316">2. capture, key cap-o-5521</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M419 348H288"/>
+<path class="x" d="M273 341l14 14M287 341l-14 14"/>
+<text class="ts mid" x="354.0" y="342">3. captured (lost)</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M221 374H419"/>
+<text class="ts mid" x="320.0" y="368">4. capture, key cap-o-5521</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M419 400H221"/>
+<text class="ts mid" x="320.0" y="394">5. saved result: captured</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M221 426H599"/>
+<text class="ts mid" x="410.0" y="420">6. post capture:o-5521</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="pay" data-label="Paying">
+  <li data-msg="POST /payments" data-state="Payment: created; ledger: nothing">The order service asks for 100.00 with a key derived from the order, so asking twice is asking once.</li>
+  <li data-msg="POST /sessions">The payment service records the payment first, then asks the provider for a hosted payment page.</li>
+  <li data-msg="redirect">The customer is redirected to the provider’s page and types the card number there.</li>
+  <li data-msg="card">Card data goes only to the provider, which keeps our systems out of most card-security rules.</li>
+  <li data-msg="authorized" data-state="Payment: authorized; ledger: nothing">The provider authorizes the card and says so by webhook, which it repeats until acknowledged.</li>
+  <li data-msg="event">The order is confirmed. No money has moved yet: it is reserved on the card.</li>
+</ol>
+<ol class="steps" data-scene="capture" data-label="A lost answer">
+  <li data-msg="capture" data-state="Captures at the provider: 0; ledger: nothing">When the order ships, the payment service is asked to take the money.</li>
+  <li data-msg="POST /capture" data-state="Captures at the provider: 1; ledger: nothing">It asks the provider to capture, with a key of its own for this step.</li>
+  <li data-msg="lost">The provider captures, but the answer never arrives. The payment service sees a timeout.</li>
+  <li data-msg="POST /capture" data-state="Captures at the provider: 1; ledger: nothing">It retries with the same key.</li>
+  <li data-msg="captured">The provider recognizes the key and returns the saved result instead of capturing again.</li>
+  <li data-msg="post" data-state="Captures at the provider: 1; ledger: capture 100.00">The capture is posted once, under a transaction id the ledger also refuses to repeat.</li>
+</ol>
+<figcaption>Each step that moves money carries a key, from the place the intent starts to the provider. A retry then finds the first attempt’s result instead of repeating it.</figcaption>
+</figure>
+
+<h2 id="idempotency">Step 6a: Exactly once, built from retries</h2>
+<p>A payment crosses two hops: the app or the order service calls the payment service, and the payment service calls the provider. On either hop a request can be lost, so the far side never acts, or the response can be lost, so the far side acted and the caller does not know. To the caller both look the same, a timeout, and the only safe reaction is to ask again. The chapter simulated 100,000 payments in which each message on each hop is lost with some probability, and every caller tries three times.</p>
+<pre data-lang="ts" data-title="Two hops, two callers that retry, and where the keys go">
+for (let a = 0; a < 3 && !success; a += 1) {    // the app tries three times
+      if (lost()) continue;                         // request to the payment service lost
+      // --- inside the payment service
+      let result: string | undefined = keys === "no keys" ? undefined : done.get(appKey);
+      for (let s = 0; s < 3 && result === undefined; s += 1) {   // the service tries the provider three times
+        if (lost()) continue;                       // request to the provider lost
+        const providerKey = keys === "one key, end to end" ? appKey : undefined;
+        const id = provider.charge(order, providerKey);
+        if (lost()) continue;                       // the provider charged, but its answer was lost
+        result = id;
+      }
+      if (result !== undefined && keys !== "no keys") done.set(appKey, result);
+      // --- back to the app
+      if (result === undefined) continue;           // the service answers 504: outcome unknown
+      if (lost()) continue;                         // the answer to the app was lost
+      success = true;
+    }
+</pre>
+
+<figure class="fig wide" id="fig-retries">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 308" role="img" aria-labelledby="f944t f944d">
+<title id="f944t">Orders charged more than once, per 100,000 payments</title>
+<desc id="f944d">Simulated payments in which each request or response on each hop is lost with the given probability, and callers retry three times. 0.5% lost: no keys 961, key from the app only 482, one key, end to end 0; 1% lost: no keys 1,996, key from the app only 980, one key, end to end 0; 2% lost: no keys 3,909, key from the app only 1,929, one key, end to end 0; 5% lost: no keys 9,555, key from the app only 4,960, one key, end to end 0.</desc>
+<text class="tb" x="10" y="18">Orders charged twice or more, of 100,000, when each hop loses this share of messages</text>
+<rect class="bar" x="10" y="32" width="14" height="12" rx="2"/>
+<text class="ts" x="30" y="42">no keys</text>
+<rect class="bar mute" x="110" y="32" width="14" height="12" rx="2"/>
+<text class="ts" x="130" y="42">key from the app only</text>
+<rect class="bar store" x="290" y="32" width="14" height="12" rx="2"/>
+<text class="ts" x="310" y="42">one key, end to end: none at any rate</text>
+<text class="ts end" x="100" y="80">0.5% lost</text>
+<rect class="bar " x="110" y="60" width="45.2" height="13" rx="3"/>
+<text class="ts tb" x="163.2" y="71">961</text>
+<rect class="hit" x="10" y="58" width="700" height="16" data-tip="0.5% of messages lost on each hop|no keys: 961 orders charged twice or more|969 extra charges; 0 charged but told it failed"/>
+<rect class="bar mute" x="110" y="76" width="22.7" height="13" rx="3"/>
+<text class="ts tb" x="140.7" y="87">482</text>
+<rect class="hit" x="10" y="74" width="700" height="16" data-tip="0.5% of messages lost on each hop|key from the app only: 482 orders charged twice or more|483 extra charges; 0 charged but told it failed"/>
+<rect class="bar store" x="110" y="92" width="1.5" height="13" rx="3"/>
+<text class="ts tb" x="119.5" y="103">0</text>
+<rect class="hit" x="10" y="90" width="700" height="16" data-tip="0.5% of messages lost on each hop|one key, end to end: 0 orders charged twice or more|0 extra charges; 0 charged but told it failed"/>
+<text class="ts end" x="100" y="140">1% lost</text>
+<rect class="bar " x="110" y="120" width="93.8" height="13" rx="3"/>
+<text class="ts tb" x="211.8" y="131">1,996</text>
+<rect class="hit" x="10" y="118" width="700" height="16" data-tip="1% of messages lost on each hop|no keys: 1,996 orders charged twice or more|2,036 extra charges; 0 charged but told it failed"/>
+<rect class="bar mute" x="110" y="136" width="46.1" height="13" rx="3"/>
+<text class="ts tb" x="164.1" y="147">980</text>
+<rect class="hit" x="10" y="134" width="700" height="16" data-tip="1% of messages lost on each hop|key from the app only: 980 orders charged twice or more|988 extra charges; 0 charged but told it failed"/>
+<rect class="bar store" x="110" y="152" width="1.5" height="13" rx="3"/>
+<text class="ts tb" x="119.5" y="163">0</text>
+<rect class="hit" x="10" y="150" width="700" height="16" data-tip="1% of messages lost on each hop|one key, end to end: 0 orders charged twice or more|0 extra charges; 0 charged but told it failed"/>
+<text class="ts end" x="100" y="200">2% lost</text>
+<rect class="bar " x="110" y="180" width="183.7" height="13" rx="3"/>
+<text class="ts tb" x="301.7" y="191">3,909</text>
+<rect class="hit" x="10" y="178" width="700" height="16" data-tip="2% of messages lost on each hop|no keys: 3,909 orders charged twice or more|4,065 extra charges; 5 charged but told it failed"/>
+<rect class="bar mute" x="110" y="196" width="90.7" height="13" rx="3"/>
+<text class="ts tb" x="208.7" y="207">1,929</text>
+<rect class="hit" x="10" y="194" width="700" height="16" data-tip="2% of messages lost on each hop|key from the app only: 1,929 orders charged twice or more|1,964 extra charges; 1 charged but told it failed"/>
+<rect class="bar store" x="110" y="212" width="1.5" height="13" rx="3"/>
+<text class="ts tb" x="119.5" y="223">0</text>
+<rect class="hit" x="10" y="210" width="700" height="16" data-tip="2% of messages lost on each hop|one key, end to end: 0 orders charged twice or more|0 extra charges; 1 charged but told it failed"/>
+<text class="ts end" x="100" y="260">5% lost</text>
+<rect class="bar " x="110" y="240" width="449.1" height="13" rx="3"/>
+<text class="ts tb" x="567.1" y="251">9,555</text>
+<rect class="hit" x="10" y="238" width="700" height="16" data-tip="5% of messages lost on each hop|no keys: 9,555 orders charged twice or more|10,500 extra charges; 78 charged but told it failed"/>
+<rect class="bar mute" x="110" y="256" width="233.1" height="13" rx="3"/>
+<text class="ts tb" x="351.1" y="267">4,960</text>
+<rect class="hit" x="10" y="254" width="700" height="16" data-tip="5% of messages lost on each hop|key from the app only: 4,960 orders charged twice or more|5,197 extra charges; 78 charged but told it failed"/>
+<rect class="bar store" x="110" y="272" width="1.5" height="13" rx="3"/>
+<text class="ts tb" x="119.5" y="283">0</text>
+<rect class="hit" x="10" y="270" width="700" height="16" data-tip="5% of messages lost on each hop|one key, end to end: 0 orders charged twice or more|0 extra charges; 78 charged but told it failed"/>
+<line class="axis" x1="110" y1="56" x2="110" y2="290"/>
+</svg>
+</div>
+<figcaption>A key from the app stops the app’s retries from charging twice, but not the payment service’s own retries to the provider. Only a key carried all the way to the provider stops both.</figcaption>
+</figure>
+
+<p>With no keys, about twice the loss rate of orders were charged more than once: 1,996 of 100,000 when one message in a hundred is lost on each hop. A key sent by the app to the payment service halved that, to 980, because the payment service now recognized the app’s retries. It did not stop the payment service’s own retries to the provider, which charged again whenever the provider’s answer was lost. Only the same key carried all the way to the provider, which then returns its saved result for a repeated key, brought double charges to zero at every loss rate tested. This is the end-to-end argument in money (<x-ref to="idempotency-and-delivery#end-to-end"></x-ref>): each layer that retries must pass the key down, and the layer where the effect happens must check it.</p>
+<p>Keys solve repeats; they do not solve not knowing. At 5% loss, 78 payments in 100,000 ended with the card charged and the app told that it failed, because all three of the app’s attempts timed out. So a timeout must never be recorded as a failure. The payment stays in a state that says “unknown”, and two things resolve it: the provider’s webhook, which arrives when it arrives, and a job that asks the provider for the outcome of every payment unknown for more than a few minutes, by the same id. The order service shows “payment processing” meanwhile, and the customer is not invited to pay again.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Generating a fresh key for each attempt. A key made per HTTP request protects nothing, because a retry is a new request. Make the key from the intent, such as the order and the step, and store it before the first attempt.</p></div>
+
+<h2 id="ledger">Step 6b: The ledger</h2>
+<p><dfn>Double-entry bookkeeping</dfn> records every movement of money as a transaction of two or more lines on different accounts whose amounts add up to zero, so that money is only ever moved, never created or lost, and the sum of all balances is always zero. Debits are positive and credits negative. The marketplace’s accounts are what the provider owes it, what it owes each seller, its commission, the provider’s fees as an expense, and its bank account.</p>
+
+<figure class="fig wide" id="fig-ledger">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f943t f943d">
+<title id="f943t">One order’s money, entry by entry</title>
+<desc id="f943d">A table with five accounts as rows: what the provider owes us, what we owe seller s1, our commission, the provider’s fees, and our bank account. Four transactions in columns, each adding up to zero. Capture of 100.00: provider owes us +100.00, seller −90.00, commission −10.00. Provider fee: fees +3.20, provider owes us −3.20. Settlement: bank +96.80, provider owes us −96.80. Payout: seller +90.00, bank −90.00. At the end the provider owes nothing, the seller is paid, the commission is 10.00, fees 3.20, and the bank holds 6.80, which is the commission less the fees.</desc>
+<text class="ts" x="10" y="20">account</text>
+<text class="ts" x="10" y="36">debit +, credit −</text>
+<text class="tb mid" x="216.0" y="26">capture o1</text>
+<text class="tb mid" x="328.0" y="26">provider fee</text>
+<text class="tb mid" x="440.0" y="26">settlement</text>
+<text class="tb mid" x="552.0" y="26">payout to s1</text>
+<text class="tb mid" x="648" y="26">balance</text>
+<line class="grid" x1="10" y1="70" x2="710" y2="70"/>
+<text class="tb" x="10" y="64">Provider owes us</text>
+<line class="grid" x1="10" y1="100" x2="710" y2="100"/>
+<text class="tb" x="10" y="94">Seller s1</text>
+<line class="grid" x1="10" y1="130" x2="710" y2="130"/>
+<text class="tb" x="10" y="124">Commission</text>
+<line class="grid" x1="10" y1="160" x2="710" y2="160"/>
+<text class="tb" x="10" y="154">Provider fees</text>
+<line class="grid" x1="10" y1="190" x2="710" y2="190"/>
+<text class="tb" x="10" y="184">Bank</text>
+<g data-s="1" data-packet="none">
+<rect class="n sig" x="166" y="44" width="100" height="154" rx="4" style="fill-opacity:.35"/>
+<text class="ts mono mid tb" x="216.0" y="64">+100.00</text>
+<text class="ts mono mid tb" x="216.0" y="94">−90.00</text>
+<text class="ts mono mid tb" x="216.0" y="124">−10.00</text>
+<text class="ts mid" x="216.0" y="224">sums to 0</text>
+</g>
+<g class="hide" data-s="1" data-e="1" data-packet="none">
+<text class="ts mono mid" x="648" y="64">+100.00</text>
+<text class="ts mono mid" x="648" y="94">−90.00</text>
+<text class="ts mono mid" x="648" y="124">−10.00</text>
+<text class="ts mono mid" x="648" y="154">0.00</text>
+<text class="ts mono mid" x="648" y="184">0.00</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n sig" x="278" y="44" width="100" height="154" rx="4" style="fill-opacity:.35"/>
+<text class="ts mono mid tb" x="328.0" y="154">+3.20</text>
+<text class="ts mono mid tb" x="328.0" y="64">−3.20</text>
+<text class="ts mid" x="328.0" y="224">sums to 0</text>
+</g>
+<g class="hide" data-s="2" data-e="2" data-packet="none">
+<text class="ts mono mid" x="648" y="64">+96.80</text>
+<text class="ts mono mid" x="648" y="94">−90.00</text>
+<text class="ts mono mid" x="648" y="124">−10.00</text>
+<text class="ts mono mid" x="648" y="154">+3.20</text>
+<text class="ts mono mid" x="648" y="184">0.00</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n sig" x="390" y="44" width="100" height="154" rx="4" style="fill-opacity:.35"/>
+<text class="ts mono mid tb" x="440.0" y="184">+96.80</text>
+<text class="ts mono mid tb" x="440.0" y="64">−96.80</text>
+<text class="ts mid" x="440.0" y="224">sums to 0</text>
+</g>
+<g class="hide" data-s="3" data-e="3" data-packet="none">
+<text class="ts mono mid" x="648" y="64">0.00</text>
+<text class="ts mono mid" x="648" y="94">−90.00</text>
+<text class="ts mono mid" x="648" y="124">−10.00</text>
+<text class="ts mono mid" x="648" y="154">+3.20</text>
+<text class="ts mono mid" x="648" y="184">+96.80</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n sig" x="502" y="44" width="100" height="154" rx="4" style="fill-opacity:.35"/>
+<text class="ts mono mid tb" x="552.0" y="94">+90.00</text>
+<text class="ts mono mid tb" x="552.0" y="184">−90.00</text>
+<text class="ts mid" x="552.0" y="224">sums to 0</text>
+</g>
+<g class="hide" data-s="4" data-packet="none">
+<text class="ts mono mid" x="648" y="64">0.00</text>
+<text class="ts mono mid" x="648" y="94">0.00</text>
+<text class="ts mono mid" x="648" y="124">−10.00</text>
+<text class="ts mono mid" x="648" y="154">+3.20</text>
+<text class="ts mono mid" x="648" y="184">+6.80</text>
+</g>
+<text class="ts" x="10" y="252">The bank’s 6.80 is the commission, 10.00, less the provider’s fees, 3.20. The five balances always add up to zero.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Provider owes us: 100.00; Seller s1: -90.00; Commission: -10.00; Provider fees: 0.00; Bank: 0.00">The order ships and 100.00 is captured. The provider now owes us 100.00, of which 90.00 belongs to the seller and 10.00 is our commission.</li>
+  <li data-msg="none" data-state="Provider owes us: 96.80; Seller s1: -90.00; Commission: -10.00; Provider fees: 3.20; Bank: 0.00">The provider charges its fee, 2.9% plus 30 cents: 3.20, an expense that reduces what it owes us.</li>
+  <li data-msg="none" data-state="Provider owes us: 0.00; Seller s1: -90.00; Commission: -10.00; Provider fees: 3.20; Bank: 96.80">The provider settles: 96.80 arrives in our bank, and it owes us nothing.</li>
+  <li data-msg="none" data-state="Provider owes us: 0.00; Seller s1: 0.00; Commission: -10.00; Provider fees: 3.20; Bank: 6.80">The weekly payout sends the seller 90.00 from the bank. What is left, 6.80, is ours.</li>
+</ol>
+<figcaption>Each transaction moves money between accounts and adds up to zero, so the books balance after every one. Balances are sums of entries, recorded in the chapter’s test.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Post: refuse anything that does not balance, record each id once, never edit">
+// Posting is idempotent by transaction id: the same id twice records it once.
+  post(id: string, at: number, memo: string, lines: Line[]): boolean {
+    if (this.ids.has(id)) return false;
+    if (lines.length < 2) throw new LedgerError("a transaction needs at least two lines");
+    for (const l of lines) if (!Number.isSafeInteger(l.amount) || l.amount === 0) throw new LedgerError(`not a whole, non-zero amount: ${l.amount}`);
+    if (lines.reduce((sum, l) => sum + l.amount, 0) !== 0) throw new LedgerError(`lines of ${id} do not add up to zero`);
+    const previous = this.journal.length ? (this.journal[this.journal.length - 1] as Transaction).hash : "";
+    const tx: Transaction = { id, at, memo, lines: lines.map((l) => ({ ...l })), previous, hash: "" };
+    tx.hash = hashOf(tx);
+    this.journal.push(tx);
+    this.ids.add(id);
+    for (const l of lines) this.balances.set(l.account, (this.balances.get(l.account) ?? 0) + l.amount);
+    return true;
+  }
+</pre>
+<p>The rules live in the one method that writes. A transaction whose lines do not add up to zero is refused; so is an amount that is not a whole number of cents. A transaction id seen before is recorded once, so a retried webhook cannot post a capture twice. Nothing updates or deletes a line: a mistake is corrected by a new transaction that reverses it, and the history shows both, the same append-only discipline as the expense-sharing chapter (<x-ref to="lld-splitwise#group"></x-ref>) at the scale of a company.</p>
+<p>The test ran 100,000 random operations, captures, refunds, settlements and payouts, producing 152,283 transactions. The trial balance, the sum of every account, was zero after every one. Replaying the journal from the start produced the same 54 balances, and replaying it up to any moment gives the books as they stood then, which is what an auditor asks for (<x-ref to="event-driven-architecture#event-sourcing"></x-ref>). Each transaction also carries a hash of the one before it, so the journal is a chain: the test changed two lines of transaction 1,234 by a cent each, keeping it balanced, and the chain check pointed to exactly that transaction. Ledger databases offer this tamper evidence as a feature (<x-ref to="specialized-databases#others"></x-ref>); in an ordinary database it is a column and a check.</p>
+<p>Two practical points keep a ledger fast. Balances needed on every request, such as what a seller is owed, are kept in a balance table updated in the same transaction as the lines, and rebuilt from the lines to check it. And the ledger is written by one service only; everyone else reads events or reports, so that the rules cannot be bypassed.</p>
+
+<h2 id="reconciliation">Step 6c: Reconciliation</h2>
+<p><dfn>Settlement</dfn> is the provider paying out the money it has collected for a merchant, less its fees, together with a file that lists every payment, refund and fee included. Matching that file, line by line, against the ledger is the daily reconciliation that <x-ref to="distributed-transactions#reconciliation"></x-ref> introduced. The bank statement is the third record: the provider’s deposit must equal the file’s total.</p>
+<pre data-lang="ts" data-title="Match by our payment id, with a day of slack for the cutoff">
+for (const o of ours.filter((x) => x.day === day)) {
+    seen.add(o.payment);
+    const lines = byPayment.get(o.payment) ?? [];
+    if (lines.length === 0) { add("in ours, not in their file"); continue; }
+    if (lines.length > 1) { add("charged twice"); continue; }
+    const t = lines[0] as Theirs;
+    if (t.gross !== o.amount) add("amount differs");
+    else if (t.fee !== fee(t.gross)) add("fee differs");
+    else add(t.day === day ? "matched" : "matched a day late");
+  }
+  for (const [payment, lines] of byPayment) if (!seen.has(payment) && lines.some((l) => l.day === day)) add("in their file, not in ours");
+</pre>
+<p>The match key is our own payment id, which the payment service sends to the provider with every call and which the provider prints in its file. The test built a day of 10,000 payments with problems put in on purpose, in known numbers, and the job found each one and reported nothing else.</p>
+
+<figure class="fig wide" id="fig-reconcile">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f945t f945d">
+<title id="f945t">Reconciling one day against the provider’s file</title>
+<desc id="f945d">Our 9,990 records of captured payments matched against the provider’s settlement file of 9,999 lines, by our payment id, looking one day ahead for payments captured shortly before the cutoff. Results: matched 9,921, in ours, not in their file 8, matched a day late 42, amount differs 11, charged twice 7, fee differs 1, in their file, not in ours 10. Every problem found was one that the test had put in, and nothing else was reported.</desc>
+<rect class="n store" x="10" y="30" width="200" height="60" rx="6"/>
+<text class="tb mid" x="110" y="57.0">Our ledger</text>
+<text class="ts mid" x="110" y="74.0">9,990 captures today</text>
+<rect class="n store" x="10" y="190" width="200" height="60" rx="6"/>
+<text class="tb mid" x="110" y="217.0">Provider’s files</text>
+<text class="ts mid" x="110" y="234.0">9,999 lines today, and tomorrow’s</text>
+<rect class="n async" x="260" y="110" width="150" height="60" rx="6"/>
+<text class="tb mid" x="335" y="137.0">Match by payment id</text>
+<text class="ts mid" x="335" y="154.0">one day of slack</text>
+<path class="e async" d="M210 60H335V110"/>
+<path class="e async" d="M210 220H335V170"/>
+<rect class="n store" x="450" y="26" width="64" height="26" rx="4"/>
+<text class="tb mid" x="482" y="43">9,921</text>
+<text class="ts tb" x="524" y="38">matched</text>
+<text class="ts" x="524" y="52">nothing to do</text>
+<rect class="n store" x="450" y="62" width="64" height="26" rx="4"/>
+<text class="tb mid" x="482" y="79">42</text>
+<text class="ts tb" x="524" y="74">matched a day late</text>
+<text class="ts" x="524" y="88">captured shortly before the cutoff</text>
+<rect class="n fault" x="450" y="98" width="64" height="26" rx="4"/>
+<text class="tb mid" x="482" y="115">10</text>
+<text class="ts tb" x="524" y="110">in their file, not in ours</text>
+<text class="ts" x="524" y="124">a webhook we missed: record it</text>
+<rect class="n fault" x="450" y="134" width="64" height="26" rx="4"/>
+<text class="tb mid" x="482" y="151">8</text>
+<text class="ts tb" x="524" y="146">in ours, not in their file</text>
+<text class="ts" x="524" y="160">we recorded a capture that failed</text>
+<rect class="n fault" x="450" y="170" width="64" height="26" rx="4"/>
+<text class="tb mid" x="482" y="187">7</text>
+<text class="ts tb" x="524" y="182">charged twice</text>
+<text class="ts" x="524" y="196">refund the second charge</text>
+<rect class="n fault" x="450" y="206" width="64" height="26" rx="4"/>
+<text class="tb mid" x="482" y="223">11</text>
+<text class="ts tb" x="524" y="218">amount differs</text>
+<text class="ts" x="524" y="232">find which side is wrong</text>
+<rect class="n fault" x="450" y="242" width="64" height="26" rx="4"/>
+<text class="tb mid" x="482" y="259">1</text>
+<text class="ts tb" x="524" y="254">fee differs</text>
+<text class="ts" x="524" y="268">the provider changed its fee</text>
+<path class="e async" d="M410 140H440"/>
+</svg>
+</div>
+<figcaption>Most lines match, some match a day late, and a few dozen need a person. A reconciliation job is judged by whether it finds every problem, and reports nothing that is not one.</figcaption>
+</figure>
+
+<p>The 42 payments captured shortly before the provider’s daily cutoff appeared in the next day’s file. Matched against today’s file alone, they were reported missing, 50 alarms instead of 8, which is how reconciliation jobs drown their readers in false alarms until nobody looks. The other categories each have their own repair: a missed webhook is recorded from the file; a capture we recorded that the provider does not have is reversed in the ledger and the order is checked; a second charge is refunded at once.</p>
+<p>Some differences arrive weeks later. A <dfn>chargeback</dfn> is the reversal of a card payment by the customer’s bank after the customer disputes it, which takes the money back from the merchant along with a fee, whatever the merchant’s own records say. It appears in a settlement file as a negative line, is posted to the ledger as its own transaction against the seller or the marketplace, and is reconciled like everything else.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A call to the provider times out</th><td>“Payment processing”</td><td>The payment stays unknown; retries carry the same key; a job asks the provider for the outcome</td></tr>
+<tr><th>The provider is down</th><td>Checkout fails, or offers another method</td><td>A second provider for new payments; payments already made stay with the first</td></tr>
+<tr><th>Webhooks stop arriving</th><td>Orders stay “processing”</td><td>The status job asks the provider; the reconciliation finds anything still missing</td></tr>
+<tr><th>A webhook arrives twice, or before our own record</th><td>Nothing</td><td>The inbox ignores repeated event ids; an event for an unknown payment is kept and retried</td></tr>
+<tr><th>The payments database</th><td>Checkout fails for minutes</td><td>Synchronous replica and failover; correctness over availability (<x-ref to="replication#sync-async"></x-ref>)</td></tr>
+<tr><th>A payout job runs twice</th><td>Nothing</td><td>Each payout is a ledger transaction with an id per seller and week, and a key at the bank</td></tr>
+</tbody>
+</table>
+<p>At ten times the orders, about a thousand payments a second at the peak, one database still holds the ledger, with read replicas for reports. At a hundred times, the ledger is partitioned, and the natural key is the account that most transactions touch, such as the seller, so that most transactions stay on one partition; a transaction across partitions then needs the techniques of the next chapter (<x-ref to="hld-digital-wallet"></x-ref>). Reconciliation grows with volume but stays a daily batch job, run in parallel by provider and by day (<x-ref to="batch-and-stream-processing#batch"></x-ref>).</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li>Stripe’s API documentation (as of October 2026) saves the status code and body of the first request made with an idempotency key, including errors, and returns them for retries; keys are up to 255 characters, may be removed after 24 hours, and a reused key with different parameters is an error.</li>
+  <li>Stripe’s documentation on placing holds (as of October 2026) says an authorization for an online card payment is usually valid for 7 days (5 for some merchant-initiated Visa payments), after which the funds are released and the payment canceled, and that capturing less than was authorized releases the rest.</li>
+  <li>Under the card industry’s security standard, PCI DSS 4.0.1, merchants that fully outsource payment processing, such as through a provider’s hosted page, qualify for the shortest self-assessment questionnaire, SAQ A, as an article of 11 March 2025 summarizes the standards council’s clarification.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Several currencies</th><td>Accounts per currency; a conversion is a transaction across two currency accounts at a recorded rate</td><td>Each currency’s lines add up to zero</td></tr>
+<tr><th>Customers keep a stored balance</th><td>A wallet account per customer in the ledger; paying from it is a transfer (<x-ref to="hld-digital-wallet"></x-ref>)</td><td>Double entry</td></tr>
+<tr><th>Two payment providers</th><td>Routing per payment; each provider reconciled separately; keys per provider</td><td>The ledger</td></tr>
+<tr><th>Instant payouts to sellers</th><td>A payout on request, limited to settled funds, with a fee</td><td>A payout is a ledger transaction with a key</td></tr>
+<tr><th>Subscriptions</th><td>A scheduler creates a payment each period with a key per subscription and period (<x-ref to="scheduling-and-workflows"></x-ref>)</td><td>Everything after the payment is created</td></tr>
+<tr><th>Split one order between several sellers</th><td>One capture, one transaction with a line per seller, divided without losing a cent (<x-ref to="lld-splitwise#allocate"></x-ref>)</td><td>Lines add up to zero</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Draw the provider early and say the card never touches your servers. Then spend the time on correctness: a key per intent carried to the provider, a payment state for “unknown”, webhooks through an inbox, a double-entry ledger in integer cents written in the same transaction as the state change, and a daily reconciliation with a day of slack. Throughput will not be the question; double charges will.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Amounts as floating point</th><td>Totals that drift: a million payments of 0.10 summed to 100,000.00000133</td><td>Integers in minor units</td></tr>
+<tr><th>Retrying without a key, or with a key only on the first hop</th><td>1,996 or 980 double charges per 100,000 at 1% loss, in the simulation</td><td>One key per intent, carried to the provider</td></tr>
+<tr><th>Treating a timeout as a failure</th><td>Charged customers told to pay again</td><td>An “unknown” state, resolved by webhook or status query</td></tr>
+<tr><th>A balance column that code updates directly</th><td>Balances nobody can explain</td><td>Balances as sums of ledger lines, written by one service</td></tr>
+<tr><th>Editing or deleting ledger lines</th><td>An audit trail that cannot be trusted</td><td>Reversing transactions</td></tr>
+<tr><th>Reconciling only against the same day’s file</th><td>False alarms for every payment near the cutoff: 50 instead of 8, in the test</td><td>A window of a day or two</td></tr>
+<tr><th>Card numbers through our own servers</th><td>The full weight of card security rules on every system they touch</td><td>The provider’s hosted page or fields</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="idempotency-and-delivery#end-to-end"></x-ref>: why the key must reach the provider.</li>
+  <li><x-ref to="distributed-transactions#reconciliation"></x-ref>: the backstop, built out here.</li>
+  <li><x-ref to="event-driven-architecture#event-sourcing"></x-ref>: a ledger is the oldest event log.</li>
+  <li><x-ref to="lld-splitwise"></x-ref>: whole cents, and dividing without losing one.</li>
+  <li><x-ref to="hld-digital-wallet"></x-ref>: the ledger at a million transfers a second.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A provider’s hosted page keeps card numbers off your servers; authorize at checkout and capture on shipment.</li>
+  <li>Every step that moves money carries a key derived from the intent, passed through every hop to the provider. Anything less leaves double charges.</li>
+  <li>A timeout means unknown, not failed. Resolve it with webhooks and status queries.</li>
+  <li>Record money in a double-entry ledger in whole cents: transactions that add up to zero, posted once by id, never edited, written in the same transaction as the state change.</li>
+  <li>Replaying the journal reproduces any past balance; a hash chain shows if history was altered.</li>
+  <li>Reconcile every day against the provider’s files and the bank, with a window for the cutoff, and treat each difference as work for a person.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>The payment service passes the app’s key check, then calls the provider without a key and retries on timeout. Where can a double charge still come from?</summary><p>From its own retries: if the provider charged but the answer was lost, the retry is a new charge. In the simulation that left 980 double charges per 100,000 at 1% loss. The key must be passed to the provider.</p></details>
+<details><summary>Why should the idempotency key be derived from the order and the step rather than generated per request?</summary><p>Because a retry, from any caller, must send the same key. A key per request changes with every attempt and so never matches; a key from the intent is the same however often, and from wherever, the step is attempted.</p></details>
+<details><summary>Why is authorize-then-capture useful to a marketplace?</summary><p>It reserves the money at checkout without taking it, so an order that cannot ship is released rather than refunded, and the customer is charged only when the goods leave. The authorization lapses after about a week, so capture must happen within that time.</p></details>
+<details><summary>Every transaction’s lines add up to zero. What does that guarantee about the whole ledger, and how is it checked?</summary><p>That the sum of all account balances is zero: money moves between accounts but is never created or lost. The trial balance, the sum of every balance, is checked; in the test it was zero after each of 152,283 transactions.</p></details>
+<details><summary>A support agent wants to fix a wrong capture by changing its amount. What should happen instead?</summary><p>A new transaction that reverses the wrong one, and another with the right amount. History then shows the mistake, the correction and who made it, and replaying the journal still reproduces every past state.</p></details>
+<details><summary>Why match against tomorrow’s settlement file as well as today’s?</summary><p>Payments captured shortly before the provider’s cutoff appear in the next day’s file. Without that slack they look missing; in the test, 42 such payments turned 8 real alarms into 50.</p></details>
+<details><summary>The provider’s webhook for a payment arrives before the payment service has stored the payment. What should happen?</summary><p>Store the event in the inbox and acknowledge it; process it when the payment exists, or retry later. Dropping it would lose the outcome; failing it would make the provider retry, which is acceptable but noisy. Its event id makes processing it twice harmless.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Stripe, <a href="https://docs.stripe.com/api/idempotent_requests">Idempotent requests</a>, API reference, consulted October 2026.</li>
+  <li>Stripe, <a href="https://docs.stripe.com/payments/place-a-hold-on-a-payment-method">Place a hold on a payment method</a>, documentation, consulted October 2026. Authorization windows and partial capture.</li>
+  <li>Today’s General Counsel, <a href="https://todaysgeneralcounsel.com/the-payment-card-industry-security-standards-council-clarifies-self-assessment-eligibility-for-e-commerce-merchants/">The Payment Card Industry Security Standards Council Clarifies Self-Assessment Eligibility for E-commerce Merchants</a>, 11 March 2025.</li>
+  <li>Jerome H. Saltzer, David P. Reed and David D. Clark, <a href="https://web.mit.edu/Saltzer/www/publications/endtoend/endtoend.pdf">End-to-End Arguments in System Design</a>, <cite>ACM Transactions on Computer Systems</cite>, 1984.</li>
+</ol>
+</section>

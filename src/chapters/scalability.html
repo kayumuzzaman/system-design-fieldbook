@@ -1,0 +1,494 @@
+<!--meta
+{ "description": "Scalability in system design: vertical and horizontal scaling, stateless services and session storage, the stages an architecture grows through from one server to many regions, scaling reads versus writes, the scale cube, Amdahl's law and autoscaling.",
+  "lede": "A scalable system handles more load when you give it more resources. This chapter covers the two ways to add resources, the property that makes the second one possible, and the order in which a real architecture grows.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="meaning">What scalability means</h2>
+<p>A system is <dfn>scalable</dfn> if adding resources lets it handle proportionally more load. Double the servers and it should serve close to double the traffic, at the same response time. A system that does this is said to scale <dfn>linearly</dfn>, and that is the ideal every design is measured against.</p>
+<p>The definition has two words that need pinning down before it is useful.</p>
+<p><b>Load</b> is not one number. A system can be stressed along several independent dimensions, and it may cope well with one and badly with another:</p>
+<ul>
+  <li>requests per second, with reads and writes counted separately,</li>
+  <li>the total volume of data stored,</li>
+  <li>the number of connections held open at once,</li>
+  <li>the size of the largest single item, such as the user with the most followers,</li>
+  <li>the number of tenants, regions or teams sharing the system.</li>
+</ul>
+<p>“Does it scale?” is therefore an incomplete question. The complete one is “if this particular dimension grows tenfold, what do we add, and what breaks first?”</p>
+<p><b>Scalability</b> is also not the same as <b>performance</b>. Performance is how fast the system is for one user at today’s load. Scalability is how that changes as load grows. A program can be very fast and not scalable at all, if its speed depends on everything living in the memory of one machine. Another can be slow and perfectly scalable. If the system is slow for a single user on an idle server, you have a performance problem, and adding machines will not help. If it is fast when idle and slow when busy, you have a scalability problem.</p>
+
+<h2 id="vertical">Scaling up: a bigger machine</h2>
+<p>The first way to add resources is to replace the machine with a larger one: more CPU cores, more memory, faster disks. This is <dfn>vertical scaling</dfn>, or scaling up.</p>
+<p>It is the most underrated tool in the field. Nothing about the software has to change. There is still one copy of the data, so there is nothing to keep in sync. Every technique in the second half of this book that deals with machines disagreeing with each other is simply not needed. And the ceiling is far higher than most people assume.</p>
+<aside class="sn"><b>How big can one machine be?</b>In October 2026 the largest instance in Amazon’s EC2 catalog, <code>u7inh-32tb.480xlarge</code>, offered 1,920 virtual CPUs and 32 TiB of memory. Few datasets outgrow 32 TiB of RAM. The price of such a machine is another matter, and that is usually the constraint that bites first.</aside>
+<p>Scaling up has four limits, and you should know which one you will hit.</p>
+<ul>
+  <li><b>A hard ceiling.</b> Eventually there is no larger machine to buy.</li>
+  <li><b>Cost that ignores demand.</b> Within a family of cloud machines, twice the size costs about twice the price, so size brings no discount. A machine large enough for the evening peak is paid for at four in the morning too.</li>
+  <li><b>A single point of failure.</b> One machine, however large, is down when it is down. Scaling up does nothing for availability.</li>
+  <li><b>Disruptive upgrades.</b> Moving to a bigger machine usually means stopping the old one. As the system grows, the maintenance window becomes harder to find.</li>
+</ul>
+
+<h2 id="horizontal">Scaling out: more machines</h2>
+<p>The second way is to add more machines of ordinary size and spread the work across them. This is <dfn>horizontal scaling</dfn>, or scaling out.</p>
+
+<figure class="fig" id="fig-up-out">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f51t f51d">
+<title id="f51t">Scaling up compared with scaling out</title>
+<desc id="f51d">Left: one small server is replaced by one much larger server. Right: one small server becomes four servers of the same size behind a load balancer.</desc>
+<text class="tl" x="10" y="22">Scale up</text>
+<rect class="n" x="20" y="96" width="84" height="52" rx="6"/><text class="tb mid" x="62" y="118">1 server</text><text class="ts mid" x="62" y="135">4 CPU, 16 GB</text>
+<path class="e" d="M112 122H166"/>
+<rect class="n sig" x="174" y="50" width="150" height="144" rx="6"/><text class="tb mid" x="249" y="116">1 larger server</text><text class="ts mid" x="249" y="134">64 CPU, 512 GB</text>
+<path class="e none dash" d="M352 10V204"/>
+<text class="tl" x="380" y="22">Scale out</text>
+<rect class="n" x="390" y="96" width="84" height="52" rx="6"/><text class="tb mid" x="432" y="118">1 server</text><text class="ts mid" x="432" y="135">4 CPU, 16 GB</text>
+<path class="e" d="M482 122H520"/>
+<rect class="n sig" x="530" y="46" width="180" height="32" rx="6"/><text class="tb mid" x="620" y="67">Load balancer</text>
+<rect class="n" x="530" y="118" width="39" height="52" rx="4"/><rect class="n" x="577" y="118" width="39" height="52" rx="4"/><rect class="n" x="624" y="118" width="39" height="52" rx="4"/><rect class="n" x="671" y="118" width="39" height="52" rx="4"/>
+<path class="e sig" d="M560 78 550 118"/><path class="e sig" d="M600 78 597 118"/><path class="e sig" d="M640 78 643 118"/><path class="e sig" d="M680 78 690 118"/>
+<text class="ts mid" x="620" y="190">4 servers of the original size</text>
+</svg>
+</div>
+<figcaption>Two ways to add capacity. Scaling up changes the machine and leaves the architecture alone. Scaling out leaves the machine alone and changes the architecture.</figcaption>
+</figure>
+
+<p>Scaling out has no ceiling in principle, uses ordinary hardware, and gives you redundancy as a side effect: with ten servers, losing one costs a tenth of your capacity instead of all of it. It also lets capacity follow demand hour by hour, which a single large machine cannot do.</p>
+<p>The price is that you now run a <dfn>distributed system</dfn>. Something must route each request to a server. The servers must not depend on anything stored only in one of them. Where they share data, they must agree on it, and the network between them can delay or drop messages. Part IV of this book exists because of these problems.</p>
+<table>
+<thead><tr><th></th><th>Scale up</th><th>Scale out</th></tr></thead>
+<tbody>
+<tr><th>Change to the software</th><td>None</td><td>Often significant</td></tr>
+<tr><th>Upper limit</th><td>The largest machine available</td><td>None in principle</td></tr>
+<tr><th>Effect on availability</th><td>None: still one machine</td><td>Improves: survives the loss of a machine</td></tr>
+<tr><th>Follows demand through the day</th><td>No</td><td>Yes, with autoscaling</td></tr>
+<tr><th>Data consistency</th><td>Simple: one copy</td><td>Harder: several copies must agree</td></tr>
+<tr><th>Operational effort</th><td>Low</td><td>Higher: deployment, monitoring and debugging across many machines</td></tr>
+<tr><th>Works best for</th><td>Databases, early-stage systems, anything hard to split</td><td>Stateless application servers, caches, large data sets</td></tr>
+</tbody>
+</table>
+<p>The two are not rivals. A sensible system scales up while that is cheap and simple, and scales out the parts where it is easy, which usually means the stateless application servers first and the database last.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Distributing too early. A team with two thousand users adopts a sharded database and a dozen services because large companies use them. It now has the hardest problems in computing and none of the load that justifies them. One well-chosen server with a standby replica carries most products much further than their builders expect. Know the next step, and take it when a measurement tells you to.</p></div>
+
+<h2 id="stateless">The precondition: stateless servers</h2>
+<p>A load balancer can send a request to any server only if every server can handle it equally well. That holds when the servers are <dfn>stateless</dfn>: each request carries or can look up everything needed to process it, and the server keeps nothing between requests that another server would need.</p>
+<p>The classic way to break this is the login session. A user signs in, and the server remembers them by storing a session object in its own memory. It works with one server. With two, the trouble in <x-fig to="fig-state"></x-fig> appears.</p>
+
+<figure class="fig" id="fig-state">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f52t f52d">
+<title id="f52t">Session state kept in one server compared with a shared store</title>
+<desc id="f52d">Left: a session is stored in server A’s memory. The first request goes to server A and works. The second goes to server B, which has no record of the session, and the user appears logged out. Right: both servers read sessions from a shared store, so either can handle any request.</desc>
+<text class="tl" x="10" y="22">State inside one server</text>
+<rect class="n" x="12" y="100" width="108" height="44" rx="6"/><text class="tb mid" x="66" y="127">Load balancer</text>
+<rect class="n" x="196" y="48" width="140" height="56" rx="6"/><text class="tb mid" x="266" y="72">Server A</text><text class="ts mid" x="266" y="90">holds session 8f3a</text>
+<rect class="n fault" x="196" y="142" width="140" height="56" rx="6"/><text class="tb mid" x="266" y="166">Server B</text><text class="ts mid" x="266" y="184">“who is 8f3a?”</text>
+<path class="e sig" d="M120 114 196 82"/><text class="ts" x="122" y="86">request 1</text>
+<path class="e fault" d="M120 130 196 164"/><text class="ts" x="122" y="168">request 2</text>
+<text class="ts" x="20" y="222">The user is logged out at random.</text>
+<path class="e none dash" d="M360 10V224"/>
+<text class="tl" x="384" y="22">State in a shared store</text>
+<rect class="n" x="380" y="100" width="108" height="44" rx="6"/><text class="tb mid" x="434" y="127">Load balancer</text>
+<rect class="n" x="524" y="52" width="80" height="44" rx="6"/><text class="tb mid" x="564" y="79">Server A</text>
+<rect class="n" x="524" y="148" width="80" height="44" rx="6"/><text class="tb mid" x="564" y="175">Server B</text>
+<rect class="n store" x="632" y="94" width="80" height="56" rx="6"/><text class="tb mid" x="672" y="118">Session</text><text class="tb mid" x="672" y="135">store</text>
+<path class="e sig" d="M488 114 524 84"/><path class="e sig" d="M488 130 524 160"/>
+<path class="e store both" d="M604 82 632 108"/><path class="e store both" d="M604 162 632 138"/>
+<text class="ts" x="384" y="222">Any server can serve any request.</text>
+</svg>
+</div>
+<figcaption>Where session state lives decides whether servers are interchangeable. Kept in one server’s memory, it ties each user to that server.</figcaption>
+</figure>
+
+<p>There are three ways out, and each trades something.</p>
+<table>
+<thead><tr><th>Approach</th><th>How it works</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><th>Sticky sessions</th><td>The load balancer always sends a given user to the same server.</td><td>Load spreads unevenly. When that server dies or is replaced, its users lose their sessions. Scaling in becomes painful.</td></tr>
+<tr><th>Shared session store</th><td>Sessions live in a fast store that all servers read, such as Redis.</td><td>One extra lookup per request, and a new component that must itself be highly available.</td></tr>
+<tr><th>State held by the client</th><td>The session data travels with each request in a signed cookie or token that any server can verify.</td><td>Hard to revoke before it expires. Size limits. The signing key must be protected and rotated.</td></tr>
+</tbody>
+</table>
+<p>The second and third are the common choices today, and <x-ref to="authentication"></x-ref> compares them in depth. Sessions are only the most visible kind of server state. Before you scale an application out, look for these others:</p>
+<ul>
+  <li><b>Files written to local disk.</b> An upload saved on server A is not there when the next request lands on server B. Store files in object storage.</li>
+  <li><b>In-memory caches.</b> Each server builds its own, so they disagree with each other and all start empty after a deployment. That is acceptable for some data and wrong for other data, and it should be a decision.</li>
+  <li><b>Scheduled jobs.</b> A nightly job configured on “the server” runs ten times when there are ten servers. Move scheduling to one place. See <x-ref to="scheduling-and-workflows"></x-ref>.</li>
+  <li><b>Long-lived connections.</b> A WebSocket is attached to one server for its whole life. To send a message to a user you must find the server holding their connection. See <x-ref to="realtime-communication"></x-ref>.</li>
+  <li><b>Counters and rate limits.</b> A limit of 100 requests per minute enforced in each server’s memory becomes 100 times the number of servers.</li>
+</ul>
+<p>The rule that covers all of them: <b>push state out of the application servers and into systems built to hold it.</b> The servers become disposable, and the difficulty of scaling moves to the data stores, which is where the rest of the book spends most of its effort.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> “I’ll add more servers behind a load balancer” earns nothing unless you also say why that works here. State it: “the application servers are stateless, session data is in a signed token, uploads go straight to object storage, so any server can take any request.” Then turn to the database at once, since that is where the interviewer will look next.</p></div>
+
+<h2 id="evolution">How an architecture grows</h2>
+<p>Systems do not start distributed. They start as one server and acquire parts one at a time, each added to relieve a specific pressure. The order below is typical. The trigger for each step is a symptom you can observe, never a user count, because how much load a stage can carry depends entirely on what the application does.</p>
+
+<figure class="fig wide" id="fig-evolution">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 356" role="img" aria-labelledby="f53t f53d">
+<title id="f53t">Eight stages in the growth of an architecture</title>
+<desc id="f53d">Stage 1: one server runs the application and the database. Stage 2: the database moves to its own machine. Stage 3: a load balancer spreads requests across several application servers. Stage 4: a cache and a CDN are added. Stage 5: the database gains read replicas. Stage 6: slow work moves to a queue and workers. Stage 7: data is partitioned across several databases. Stage 8: the whole system runs in more than one region.</desc>
+<g data-s="1">
+<rect class="grp" x="4" y="4" width="172" height="168" rx="8"/>
+<text class="tb" x="14" y="24"><tspan class="ts">1</tspan> One server</text>
+<rect class="n sig" x="40" y="70" width="100" height="48" rx="4"/>
+<text class="ts mid tb" x="90" y="92">App and</text>
+<text class="ts mid" x="90" y="105">database</text>
+</g>
+<g data-s="2">
+<rect class="grp" x="183" y="4" width="172" height="168" rx="8"/>
+<text class="tb" x="193" y="24"><tspan class="ts">2</tspan> Separate database</text>
+<rect class="n" x="195" y="74" width="56" height="40" rx="4"/>
+<text class="ts mid" x="223" y="98">App</text>
+<rect class="n store" x="275" y="74" width="68" height="40" rx="4"/>
+<text class="ts mid tb" x="309" y="98">Database</text>
+<path class="e store" d="M251 94 275 94"/>
+</g>
+<g data-s="3">
+<rect class="grp" x="362" y="4" width="172" height="168" rx="8"/>
+<text class="tb" x="372" y="24"><tspan class="ts">3</tspan> Load balancer</text>
+<rect class="n sig" x="370" y="76" width="44" height="36" rx="4"/>
+<text class="ts mid tb" x="392" y="98">LB</text>
+<rect class="n" x="428" y="46" width="42" height="30" rx="4"/>
+<text class="ts mid" x="449" y="65">App</text>
+<rect class="n" x="428" y="112" width="42" height="30" rx="4"/>
+<text class="ts mid" x="449" y="131">App</text>
+<rect class="n store" x="484" y="76" width="42" height="36" rx="4"/>
+<text class="ts mid" x="505" y="98">DB</text>
+<path class="e sig" d="M414 88 428 64"/>
+<path class="e sig" d="M414 100 428 124"/>
+<path class="e store" d="M470 64 484 86"/>
+<path class="e store" d="M470 124 484 102"/>
+</g>
+<g data-s="4">
+<rect class="grp" x="541" y="4" width="172" height="168" rx="8"/>
+<text class="tb" x="551" y="24"><tspan class="ts">4</tspan> Cache and CDN</text>
+<rect class="n sig" x="549" y="38" width="44" height="26" rx="4"/>
+<text class="ts mid tb" x="571" y="55">CDN</text>
+<rect class="n" x="549" y="86" width="44" height="30" rx="4"/>
+<text class="ts mid" x="571" y="105">LB</text>
+<rect class="n" x="607" y="56" width="40" height="28" rx="4"/>
+<text class="ts mid" x="627" y="74">App</text>
+<rect class="n" x="607" y="116" width="40" height="28" rx="4"/>
+<text class="ts mid" x="627" y="134">App</text>
+<rect class="n store" x="659" y="42" width="48" height="28" rx="4"/>
+<text class="ts mid tb" x="683" y="60">Cache</text>
+<rect class="n store" x="659" y="108" width="48" height="30" rx="4"/>
+<text class="ts mid" x="683" y="127">DB</text>
+<path class="e sig" d="M571 64 571 86"/>
+<path class="e sig" d="M593 96 607 74"/>
+<path class="e sig" d="M593 106 607 126"/>
+<path class="e store" d="M647 66 659 58"/>
+<path class="e store" d="M647 128 659 124"/>
+</g>
+<g data-s="5">
+<rect class="grp" x="4" y="182" width="172" height="168" rx="8"/>
+<text class="tb" x="14" y="202"><tspan class="ts">5</tspan> Read replicas</text>
+<rect class="n" x="10" y="254" width="38" height="36" rx="4"/>
+<text class="ts mid" x="29" y="276">Apps</text>
+<rect class="n store" x="60" y="254" width="50" height="36" rx="4"/>
+<text class="ts mid" x="85" y="276">Primary</text>
+<rect class="n store" x="118" y="220" width="52" height="28" rx="4"/>
+<text class="ts mid tb" x="144" y="238">Replica</text>
+<rect class="n store" x="118" y="296" width="52" height="28" rx="4"/>
+<text class="ts mid tb" x="144" y="314">Replica</text>
+<path class="e store" d="M48 272 60 272"/>
+<path class="e store" d="M100 254 118 240"/>
+<path class="e store" d="M100 290 118 304"/>
+<text class="ts mid" x="90" y="340">writes to one, reads from many</text>
+</g>
+<g data-s="6">
+<rect class="grp" x="183" y="182" width="172" height="168" rx="8"/>
+<text class="tb" x="193" y="202"><tspan class="ts">6</tspan> Queue and workers</text>
+<rect class="n" x="189" y="254" width="38" height="36" rx="4"/>
+<text class="ts mid" x="208" y="276">Apps</text>
+<rect class="n async" x="239" y="254" width="46" height="36" rx="4"/>
+<text class="ts mid tb" x="262" y="276">Queue</text>
+<rect class="n async" x="297" y="254" width="52" height="36" rx="4"/>
+<text class="ts mid tb" x="323" y="276">Workers</text>
+<path class="e async" d="M227 272 239 272"/>
+<path class="e async" d="M285 272 297 272"/>
+<text class="ts mid" x="269" y="318">slow work happens later</text>
+</g>
+<g data-s="7">
+<rect class="grp" x="362" y="182" width="172" height="168" rx="8"/>
+<text class="tb" x="372" y="202"><tspan class="ts">7</tspan> Partitioned data</text>
+<rect class="n" x="370" y="254" width="40" height="36" rx="4"/>
+<text class="ts mid" x="390" y="276">Apps</text>
+<rect class="n store" x="436" y="220" width="90" height="28" rx="4"/>
+<text class="ts mid tb" x="481" y="238">Users A to H</text>
+<rect class="n store" x="436" y="259" width="90" height="28" rx="4"/>
+<text class="ts mid tb" x="481" y="277">Users I to P</text>
+<rect class="n store" x="436" y="298" width="90" height="28" rx="4"/>
+<text class="ts mid tb" x="481" y="316">Users Q to Z</text>
+<path class="e store" d="M410 264 436 236"/>
+<path class="e store" d="M410 272 436 273"/>
+<path class="e store" d="M410 280 436 310"/>
+</g>
+<g data-s="8">
+<rect class="grp" x="541" y="182" width="172" height="168" rx="8"/>
+<text class="tb" x="551" y="202"><tspan class="ts">8</tspan> More regions</text>
+<rect class="n ghost" x="549" y="216" width="70" height="112" rx="6"/><text class="ts mid" x="584" y="232">Europe</text>
+<rect class="n ghost" x="635" y="216" width="70" height="112" rx="6"/><text class="ts mid" x="670" y="232">Asia</text>
+<rect class="n" x="559" y="242" width="50" height="28" rx="4"/>
+<text class="ts mid" x="584" y="260">Apps</text>
+<rect class="n store" x="559" y="288" width="50" height="28" rx="4"/>
+<text class="ts mid" x="584" y="306">Data</text>
+<rect class="n" x="645" y="242" width="50" height="28" rx="4"/>
+<text class="ts mid tb" x="670" y="260">Apps</text>
+<rect class="n store" x="645" y="288" width="50" height="28" rx="4"/>
+<text class="ts mid tb" x="670" y="306">Data</text>
+<path class="e store" d="M584 270 584 288"/>
+<path class="e store" d="M670 270 670 288"/>
+<path class="e store both" d="M609 302H645"/>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>Everything runs on one server: the application and its database.</li>
+  <li>The database moves to its own machine. The two stop competing for memory and disk, and each can be sized on its own.</li>
+  <li>A load balancer spreads requests over several application servers. From here on, the application must keep no state of its own.</li>
+  <li>A cache answers repeated reads from memory, and a CDN serves images and other static files from close to the user.</li>
+  <li data-msg="">Read replicas take read traffic off the primary database. Writes still go to one place.</li>
+  <li>Slow work moves to a queue and is done later by workers, so requests can return quickly.</li>
+  <li>When one database can no longer hold the data or absorb the writes, the data is partitioned across several.</li>
+  <li>The system is deployed in more regions, closer to its users and able to survive the loss of a whole region.</li>
+</ol>
+<figcaption>The usual order of growth. In each panel the bold labels mark the parts that are new. Many successful products stop at stage 4 or 5.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Stage</th><th>Symptom that triggers it</th><th>What it buys</th><th>New problem it brings</th></tr></thead>
+<tbody>
+<tr><th>1 One server</th><td>The beginning</td><td>Simplicity. One thing to deploy, back up and debug.</td><td>Application and database compete for the same CPU and memory.</td></tr>
+<tr><th>2 Separate database</th><td>The two compete for resources, or you want to scale them differently</td><td>Each can be sized for its own workload.</td><td>A network hop on every query.</td></tr>
+<tr><th>3 Load balancer</th><td>Application CPU is the limit, or a deploy or crash takes the site down</td><td>More capacity and no single application server to lose.</td><td>Servers must be stateless. Deployments become rolling.</td></tr>
+<tr><th>4 Cache and CDN</th><td>The same data is read again and again. Static files use your bandwidth.</td><td>Most reads never touch the database. Files are served near the user.</td><td>Stale data and cache invalidation.</td></tr>
+<tr><th>5 Read replicas</th><td>Read queries saturate the database even with a cache. You need a standby.</td><td>Read capacity that grows with the number of replicas, and a machine ready to take over.</td><td>Replicas lag. A user may not see their own write.</td></tr>
+<tr><th>6 Queue and workers</th><td>Some requests are slow or bursty: sending email, resizing images, calling a partner</td><td>Fast responses, and work that survives a spike by waiting.</td><td>Work happens later and may happen twice.</td></tr>
+<tr><th>7 Partitioned data</th><td>Writes or data volume exceed one database server</td><td>Write capacity and storage that grow with the number of partitions.</td><td>Queries across partitions, rebalancing, uneven partitions.</td></tr>
+<tr><th>8 More regions</th><td>Users far away are slow. A whole data center failing is unacceptable. Law requires local storage.</td><td>Low latency everywhere and survival of a regional outage.</td><td>Data in several places must be reconciled. Everything costs more.</td></tr>
+</tbody>
+</table>
+<p>Three observations about this sequence are worth more than the sequence itself.</p>
+<p><b>Each stage removes one bottleneck and reveals the next.</b> Adding application servers in stage 3 does not make the system ten times faster. It moves the limit to the database. This is why you measure before each step: the purpose is always to relieve the current constraint, and there is only ever one of those at a time.</p>
+<p><b>The cheap steps come first.</b> Stages 2 to 4 are routine and reversible, and a managed cloud service provides each of them in an afternoon. Stage 5 introduces the first real consistency problem. Stages 7 and 8 change how every query is written and are hard to undo. The cost rises steeply toward the end, which is the argument for getting everything possible out of the earlier stages.</p>
+<p><b>Every stage adds a way to be wrong.</b> Look at the last column. Stale caches, lagging replicas, duplicate messages and cross-partition queries are what the middle of this book is about. Scalability is bought with complexity, and each purchase should be forced by evidence.</p>
+<p>Each stage has its own chapter: <x-ref to="proxies-and-load-balancers"></x-ref>, <x-ref to="caching"></x-ref>, <x-ref to="cdn-and-edge"></x-ref>, <x-ref to="replication"></x-ref>, <x-ref to="message-queues"></x-ref>, <x-ref to="partitioning"></x-ref> and <x-ref to="multi-region"></x-ref>.</p>
+
+<h2 id="reads-writes">Reads, writes and storage scale differently</h2>
+<p>The estimate in <x-ref to="estimation"></x-ref> separated reads from writes for a reason. They are relieved by different techniques, and a technique that helps one often hurts the other.</p>
+<table>
+<thead><tr><th>If the pressure is on…</th><th>These help</th><th>Because</th></tr></thead>
+<tbody>
+<tr><th>Reads</th><td>Caching, CDN, read replicas, indexes, precomputed views</td><td>A read can be answered from any copy, so you add copies.</td></tr>
+<tr><th>Writes</th><td>Partitioning, queues that absorb bursts, batching, append-only storage</td><td>A write must reach the authoritative copy, so you split the data so that there are several authoritative copies of different parts.</td></tr>
+<tr><th>Data volume</th><td>Partitioning, object storage for large items, moving old data to cheaper tiers, deletion policies</td><td>No machine holds everything, so you divide it and stop paying top price for what is rarely read.</td></tr>
+<tr><th>Open connections</th><td>Event-driven servers, connection pooling, dedicated gateway servers</td><td>Each connection costs memory even when idle.</td></tr>
+</tbody>
+</table>
+<p>Reads are the easy case, and most systems are read-heavy, which is fortunate. Copies are cheap to add, and the only cost is that a copy may be slightly out of date. Writes are the hard case. Every extra index, replica and cached view that speeds up reads is one more thing each write has to update, so the techniques in the first row make the second row worse. A design has to decide which side it favors, and the read-to-write ratio from the estimate is what decides it.</p>
+
+<h2 id="scale-cube">Three directions of scaling out</h2>
+<p>“Add more machines” can mean three different things. Martin Abbott and Michael Fisher describe them as three axes of a cube, a model that helps when deciding what kind of split a problem calls for.</p>
+<table>
+<thead><tr><th>Axis</th><th>What is multiplied</th><th>Example</th><th>Solves</th><th>Does not solve</th></tr></thead>
+<tbody>
+<tr><th>X: clone</th><td>Identical copies of the whole application behind a load balancer</td><td>Ten identical API servers</td><td>Request volume on stateless code</td><td>A growing database or a growing codebase</td></tr>
+<tr><th>Y: split by function</th><td>Different services for different jobs</td><td>Separate services for users, photos and feed, each with its own data</td><td>Parts that need to scale differently. Teams blocking each other.</td><td>One function that is itself too big</td></tr>
+<tr><th>Z: split by data</th><td>The same service, each copy responsible for a subset of the data</td><td>Users A to H on one database, I to P on another</td><td>Data volume and write volume</td><td>Queries that need all the data at once</td></tr>
+</tbody>
+</table>
+<p>Stage 3 of the previous section is the X axis. Splitting a monolith into services, discussed in <x-ref to="monoliths-and-microservices"></x-ref>, is the Y axis. Partitioning is the Z axis. Large systems use all three together, and they usually reach for them in that order because that is the order of increasing difficulty.</p>
+
+<h2 id="limits">Why twice the servers is not twice the capacity</h2>
+<p>Linear scaling is the ideal, and real systems fall short of it for two reasons that can be stated exactly.</p>
+<p>The first is that some part of the work cannot be spread out. However many application servers you add, every write still goes through the one primary database. Every request still takes the same lock, or reads the same configuration, or passes through the same network link. <dfn>Amdahl’s law</dfn>, stated by Gene Amdahl in 1967, gives the consequence. If a fraction <i>p</i> of the work can be done in parallel and the rest cannot, then with <i>n</i> servers the best possible speed-up is:</p>
+<div class="formula">speed-up = 1 ÷ ( (1 − p) + p ÷ n )</div>
+
+<figure class="fig" id="fig-amdahl">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 320" role="img" aria-labelledby="f54t f54d">
+<title id="f54t">Amdahl’s law: speed-up against number of servers</title>
+<desc id="f54d">Three curves of speed-up against number of servers from 1 to 64. When 95 percent of the work is parallel the speed-up reaches 15.4 at 64 servers and can never exceed 20. At 90 percent it reaches 8.8 and can never exceed 10. At 50 percent it reaches 2 and can never exceed 2. A dashed line shows ideal linear scaling.</desc>
+<line class="axis" x1="52" x2="550" y1="274.0" y2="274.0"/>
+<text class="ts end" x="44" y="278.0">0</text>
+<line class="grid" x1="52" x2="550" y1="210.5" y2="210.5"/>
+<text class="ts end" x="44" y="214.5">5×</text>
+<line class="grid" x1="52" x2="550" y1="147.0" y2="147.0"/>
+<text class="ts end" x="44" y="151.0">10×</text>
+<line class="grid" x1="52" x2="550" y1="83.5" y2="83.5"/>
+<text class="ts end" x="44" y="87.5">15×</text>
+<line class="grid" x1="52" x2="550" y1="20.0" y2="20.0"/>
+<text class="ts end" x="44" y="24.0">20×</text>
+<text class="ts mid" x="52.0" y="292">1</text>
+<text class="ts mid" x="107.3" y="292">8</text>
+<text class="ts mid" x="170.6" y="292">16</text>
+<text class="ts mid" x="297.0" y="292">32</text>
+<text class="ts mid" x="423.5" y="292">48</text>
+<text class="ts mid" x="550.0" y="292">64</text>
+<text class="ts mid" x="301" y="312">Number of servers</text>
+<path class="e none dash" d="M52.0 261.3 L202.2 20.0"/>
+<text class="ts" x="210.2" y="32.0">ideal: every server adds a full share</text>
+<path class="line" d="M52.0 261.3 L59.9 249.8 L67.8 239.4 L75.7 229.8 L83.6 221.1 L91.5 213.0 L99.4 205.6 L107.3 198.7 L115.2 192.4 L123.1 186.4 L131.0 180.9 L139.0 175.7 L146.9 170.8 L154.8 166.2 L162.7 161.9 L170.6 157.9 L178.5 154.1 L186.4 150.4 L194.3 147.0 L202.2 143.7 L210.1 140.7 L218.0 137.7 L225.9 134.9 L233.8 132.2 L241.7 129.7 L249.6 127.2 L257.5 124.9 L265.4 122.7 L273.3 120.5 L281.2 118.5 L289.1 116.5 L297.0 114.6 L305.0 112.8 L312.9 111.1 L320.8 109.4 L328.7 107.7 L336.6 106.2 L344.5 104.7 L352.4 103.2 L360.3 101.8 L368.2 100.4 L376.1 99.1 L384.0 97.8 L391.9 96.6 L399.8 95.4 L407.7 94.2 L415.6 93.1 L423.5 92.0 L431.4 91.0 L439.3 89.9 L447.2 88.9 L455.1 88.0 L463.0 87.0 L471.0 86.1 L478.9 85.2 L486.8 84.3 L494.7 83.5 L502.6 82.7 L510.5 81.9 L518.4 81.1 L526.3 80.3 L534.2 79.6 L542.1 78.9 L550.0 78.1"></path>
+<circle class="dot" cx="550.0" cy="78.1" r="5"/>
+<text class="tb" x="562.0" y="77.1">95% parallel</text>
+<text class="ts" x="562.0" y="92.1">15.4× at 64, limit 20×</text>
+<path class="line" d="M52.0 261.3 L59.9 250.9 L67.8 242.2 L75.7 234.9 L83.6 228.6 L91.5 223.2 L99.4 218.4 L107.3 214.2 L115.2 210.5 L123.1 207.2 L131.0 204.1 L139.0 201.4 L146.9 199.0 L154.8 196.7 L162.7 194.6 L170.6 192.7 L178.5 191.0 L186.4 189.3 L194.3 187.8 L202.2 186.4 L210.1 185.1 L218.0 183.9 L225.9 182.7 L233.8 181.6 L241.7 180.6 L249.6 179.7 L257.5 178.7 L265.4 177.9 L273.3 177.1 L281.2 176.3 L289.1 175.6 L297.0 174.9 L305.0 174.2 L312.9 173.6 L320.8 173.0 L328.7 172.4 L336.6 171.8 L344.5 171.3 L352.4 170.8 L360.3 170.3 L368.2 169.9 L376.1 169.4 L384.0 169.0 L391.9 168.6 L399.8 168.2 L407.7 167.8 L415.6 167.4 L423.5 167.1 L431.4 166.7 L439.3 166.4 L447.2 166.0 L455.1 165.7 L463.0 165.4 L471.0 165.1 L478.9 164.9 L486.8 164.6 L494.7 164.3 L502.6 164.1 L510.5 163.8 L518.4 163.6 L526.3 163.3 L534.2 163.1 L542.1 162.9 L550.0 162.7"></path>
+<circle class="dot" cx="550.0" cy="162.7" r="5"/>
+<text class="tb" x="562.0" y="161.7">90% parallel</text>
+<text class="ts" x="562.0" y="176.7">8.8× at 64, limit 10×</text>
+<path class="line" d="M52.0 261.3 L59.9 257.1 L67.8 254.9 L75.7 253.7 L83.6 252.8 L91.5 252.2 L99.4 251.8 L107.3 251.4 L115.2 251.1 L123.1 250.9 L131.0 250.7 L139.0 250.6 L146.9 250.4 L154.8 250.3 L162.7 250.2 L170.6 250.1 L178.5 250.0 L186.4 249.9 L194.3 249.9 L202.2 249.8 L210.1 249.8 L218.0 249.7 L225.9 249.7 L233.8 249.6 L241.7 249.6 L249.6 249.5 L257.5 249.5 L265.4 249.5 L273.3 249.4 L281.2 249.4 L289.1 249.4 L297.0 249.4 L305.0 249.3 L312.9 249.3 L320.8 249.3 L328.7 249.3 L336.6 249.3 L344.5 249.3 L352.4 249.2 L360.3 249.2 L368.2 249.2 L376.1 249.2 L384.0 249.2 L391.9 249.2 L399.8 249.2 L407.7 249.1 L415.6 249.1 L423.5 249.1 L431.4 249.1 L439.3 249.1 L447.2 249.1 L455.1 249.1 L463.0 249.1 L471.0 249.1 L478.9 249.1 L486.8 249.0 L494.7 249.0 L502.6 249.0 L510.5 249.0 L518.4 249.0 L526.3 249.0 L534.2 249.0 L542.1 249.0 L550.0 249.0"></path>
+<circle class="dot" cx="550.0" cy="249.0" r="5"/>
+<text class="tb" x="562.0" y="248.0">50% parallel</text>
+<text class="ts" x="562.0" y="263.0">2.0× at 64, limit 2×</text>
+<rect class="hit" x="48.0" y="20" width="7.9" height="254" data-tip="1 server|95% parallel: 1.0×|90% parallel: 1.0×|50% parallel: 1.0×|ideal: 1×"/>
+<rect class="hit" x="55.9" y="20" width="7.9" height="254" data-tip="2 servers|95% parallel: 1.9×|90% parallel: 1.8×|50% parallel: 1.3×|ideal: 2×"/>
+<rect class="hit" x="63.8" y="20" width="7.9" height="254" data-tip="3 servers|95% parallel: 2.7×|90% parallel: 2.5×|50% parallel: 1.5×|ideal: 3×"/>
+<rect class="hit" x="71.8" y="20" width="7.9" height="254" data-tip="4 servers|95% parallel: 3.5×|90% parallel: 3.1×|50% parallel: 1.6×|ideal: 4×"/>
+<rect class="hit" x="79.6" y="20" width="7.9" height="254" data-tip="5 servers|95% parallel: 4.2×|90% parallel: 3.6×|50% parallel: 1.7×|ideal: 5×"/>
+<rect class="hit" x="87.5" y="20" width="7.9" height="254" data-tip="6 servers|95% parallel: 4.8×|90% parallel: 4.0×|50% parallel: 1.7×|ideal: 6×"/>
+<rect class="hit" x="95.5" y="20" width="7.9" height="254" data-tip="7 servers|95% parallel: 5.4×|90% parallel: 4.4×|50% parallel: 1.8×|ideal: 7×"/>
+<rect class="hit" x="103.3" y="20" width="7.9" height="254" data-tip="8 servers|95% parallel: 5.9×|90% parallel: 4.7×|50% parallel: 1.8×|ideal: 8×"/>
+<rect class="hit" x="111.2" y="20" width="7.9" height="254" data-tip="9 servers|95% parallel: 6.4×|90% parallel: 5.0×|50% parallel: 1.8×|ideal: 9×"/>
+<rect class="hit" x="119.1" y="20" width="7.9" height="254" data-tip="10 servers|95% parallel: 6.9×|90% parallel: 5.3×|50% parallel: 1.8×|ideal: 10×"/>
+<rect class="hit" x="127.0" y="20" width="7.9" height="254" data-tip="11 servers|95% parallel: 7.3×|90% parallel: 5.5×|50% parallel: 1.8×|ideal: 11×"/>
+<rect class="hit" x="135.1" y="20" width="7.9" height="254" data-tip="12 servers|95% parallel: 7.7×|90% parallel: 5.7×|50% parallel: 1.8×|ideal: 12×"/>
+<rect class="hit" x="143.0" y="20" width="7.9" height="254" data-tip="13 servers|95% parallel: 8.1×|90% parallel: 5.9×|50% parallel: 1.9×|ideal: 13×"/>
+<rect class="hit" x="150.9" y="20" width="7.9" height="254" data-tip="14 servers|95% parallel: 8.5×|90% parallel: 6.1×|50% parallel: 1.9×|ideal: 14×"/>
+<rect class="hit" x="158.8" y="20" width="7.9" height="254" data-tip="15 servers|95% parallel: 8.8×|90% parallel: 6.3×|50% parallel: 1.9×|ideal: 15×"/>
+<rect class="hit" x="166.7" y="20" width="7.9" height="254" data-tip="16 servers|95% parallel: 9.1×|90% parallel: 6.4×|50% parallel: 1.9×|ideal: 16×"/>
+<rect class="hit" x="174.6" y="20" width="7.9" height="254" data-tip="17 servers|95% parallel: 9.4×|90% parallel: 6.5×|50% parallel: 1.9×|ideal: 17×"/>
+<rect class="hit" x="182.5" y="20" width="7.9" height="254" data-tip="18 servers|95% parallel: 9.7×|90% parallel: 6.7×|50% parallel: 1.9×|ideal: 18×"/>
+<rect class="hit" x="190.4" y="20" width="7.9" height="254" data-tip="19 servers|95% parallel: 10.0×|90% parallel: 6.8×|50% parallel: 1.9×|ideal: 19×"/>
+<rect class="hit" x="198.2" y="20" width="7.9" height="254" data-tip="20 servers|95% parallel: 10.3×|90% parallel: 6.9×|50% parallel: 1.9×|ideal: 20×"/>
+<rect class="hit" x="206.2" y="20" width="7.9" height="254" data-tip="21 servers|95% parallel: 10.5×|90% parallel: 7.0×|50% parallel: 1.9×|ideal: 21×"/>
+<rect class="hit" x="214.1" y="20" width="7.9" height="254" data-tip="22 servers|95% parallel: 10.7×|90% parallel: 7.1×|50% parallel: 1.9×|ideal: 22×"/>
+<rect class="hit" x="222.0" y="20" width="7.9" height="254" data-tip="23 servers|95% parallel: 11.0×|90% parallel: 7.2×|50% parallel: 1.9×|ideal: 23×"/>
+<rect class="hit" x="229.9" y="20" width="7.9" height="254" data-tip="24 servers|95% parallel: 11.2×|90% parallel: 7.3×|50% parallel: 1.9×|ideal: 24×"/>
+<rect class="hit" x="237.8" y="20" width="7.9" height="254" data-tip="25 servers|95% parallel: 11.4×|90% parallel: 7.4×|50% parallel: 1.9×|ideal: 25×"/>
+<rect class="hit" x="245.7" y="20" width="7.9" height="254" data-tip="26 servers|95% parallel: 11.6×|90% parallel: 7.4×|50% parallel: 1.9×|ideal: 26×"/>
+<rect class="hit" x="253.6" y="20" width="7.9" height="254" data-tip="27 servers|95% parallel: 11.7×|90% parallel: 7.5×|50% parallel: 1.9×|ideal: 27×"/>
+<rect class="hit" x="261.4" y="20" width="7.9" height="254" data-tip="28 servers|95% parallel: 11.9×|90% parallel: 7.6×|50% parallel: 1.9×|ideal: 28×"/>
+<rect class="hit" x="269.4" y="20" width="7.9" height="254" data-tip="29 servers|95% parallel: 12.1×|90% parallel: 7.6×|50% parallel: 1.9×|ideal: 29×"/>
+<rect class="hit" x="277.2" y="20" width="7.9" height="254" data-tip="30 servers|95% parallel: 12.2×|90% parallel: 7.7×|50% parallel: 1.9×|ideal: 30×"/>
+<rect class="hit" x="285.2" y="20" width="7.9" height="254" data-tip="31 servers|95% parallel: 12.4×|90% parallel: 7.8×|50% parallel: 1.9×|ideal: 31×"/>
+<rect class="hit" x="293.1" y="20" width="7.9" height="254" data-tip="32 servers|95% parallel: 12.5×|90% parallel: 7.8×|50% parallel: 1.9×|ideal: 32×"/>
+<rect class="hit" x="301.1" y="20" width="7.9" height="254" data-tip="33 servers|95% parallel: 12.7×|90% parallel: 7.9×|50% parallel: 1.9×|ideal: 33×"/>
+<rect class="hit" x="308.9" y="20" width="7.9" height="254" data-tip="34 servers|95% parallel: 12.8×|90% parallel: 7.9×|50% parallel: 1.9×|ideal: 34×"/>
+<rect class="hit" x="316.9" y="20" width="7.9" height="254" data-tip="35 servers|95% parallel: 13.0×|90% parallel: 8.0×|50% parallel: 1.9×|ideal: 35×"/>
+<rect class="hit" x="324.8" y="20" width="7.9" height="254" data-tip="36 servers|95% parallel: 13.1×|90% parallel: 8.0×|50% parallel: 1.9×|ideal: 36×"/>
+<rect class="hit" x="332.7" y="20" width="7.9" height="254" data-tip="37 servers|95% parallel: 13.2×|90% parallel: 8.0×|50% parallel: 1.9×|ideal: 37×"/>
+<rect class="hit" x="340.6" y="20" width="7.9" height="254" data-tip="38 servers|95% parallel: 13.3×|90% parallel: 8.1×|50% parallel: 1.9×|ideal: 38×"/>
+<rect class="hit" x="348.4" y="20" width="7.9" height="254" data-tip="39 servers|95% parallel: 13.4×|90% parallel: 8.1×|50% parallel: 2.0×|ideal: 39×"/>
+<rect class="hit" x="356.4" y="20" width="7.9" height="254" data-tip="40 servers|95% parallel: 13.6×|90% parallel: 8.2×|50% parallel: 2.0×|ideal: 40×"/>
+<rect class="hit" x="364.2" y="20" width="7.9" height="254" data-tip="41 servers|95% parallel: 13.7×|90% parallel: 8.2×|50% parallel: 2.0×|ideal: 41×"/>
+<rect class="hit" x="372.2" y="20" width="7.9" height="254" data-tip="42 servers|95% parallel: 13.8×|90% parallel: 8.2×|50% parallel: 2.0×|ideal: 42×"/>
+<rect class="hit" x="380.1" y="20" width="7.9" height="254" data-tip="43 servers|95% parallel: 13.9×|90% parallel: 8.3×|50% parallel: 2.0×|ideal: 43×"/>
+<rect class="hit" x="387.9" y="20" width="7.9" height="254" data-tip="44 servers|95% parallel: 14.0×|90% parallel: 8.3×|50% parallel: 2.0×|ideal: 44×"/>
+<rect class="hit" x="395.9" y="20" width="7.9" height="254" data-tip="45 servers|95% parallel: 14.1×|90% parallel: 8.3×|50% parallel: 2.0×|ideal: 45×"/>
+<rect class="hit" x="403.8" y="20" width="7.9" height="254" data-tip="46 servers|95% parallel: 14.2×|90% parallel: 8.4×|50% parallel: 2.0×|ideal: 46×"/>
+<rect class="hit" x="411.7" y="20" width="7.9" height="254" data-tip="47 servers|95% parallel: 14.2×|90% parallel: 8.4×|50% parallel: 2.0×|ideal: 47×"/>
+<rect class="hit" x="419.6" y="20" width="7.9" height="254" data-tip="48 servers|95% parallel: 14.3×|90% parallel: 8.4×|50% parallel: 2.0×|ideal: 48×"/>
+<rect class="hit" x="427.4" y="20" width="7.9" height="254" data-tip="49 servers|95% parallel: 14.4×|90% parallel: 8.4×|50% parallel: 2.0×|ideal: 49×"/>
+<rect class="hit" x="435.4" y="20" width="7.9" height="254" data-tip="50 servers|95% parallel: 14.5×|90% parallel: 8.5×|50% parallel: 2.0×|ideal: 50×"/>
+<rect class="hit" x="443.2" y="20" width="7.9" height="254" data-tip="51 servers|95% parallel: 14.6×|90% parallel: 8.5×|50% parallel: 2.0×|ideal: 51×"/>
+<rect class="hit" x="451.2" y="20" width="7.9" height="254" data-tip="52 servers|95% parallel: 14.6×|90% parallel: 8.5×|50% parallel: 2.0×|ideal: 52×"/>
+<rect class="hit" x="459.1" y="20" width="7.9" height="254" data-tip="53 servers|95% parallel: 14.7×|90% parallel: 8.5×|50% parallel: 2.0×|ideal: 53×"/>
+<rect class="hit" x="467.1" y="20" width="7.9" height="254" data-tip="54 servers|95% parallel: 14.8×|90% parallel: 8.6×|50% parallel: 2.0×|ideal: 54×"/>
+<rect class="hit" x="474.9" y="20" width="7.9" height="254" data-tip="55 servers|95% parallel: 14.9×|90% parallel: 8.6×|50% parallel: 2.0×|ideal: 55×"/>
+<rect class="hit" x="482.9" y="20" width="7.9" height="254" data-tip="56 servers|95% parallel: 14.9×|90% parallel: 8.6×|50% parallel: 2.0×|ideal: 56×"/>
+<rect class="hit" x="490.8" y="20" width="7.9" height="254" data-tip="57 servers|95% parallel: 15.0×|90% parallel: 8.6×|50% parallel: 2.0×|ideal: 57×"/>
+<rect class="hit" x="498.7" y="20" width="7.9" height="254" data-tip="58 servers|95% parallel: 15.1×|90% parallel: 8.7×|50% parallel: 2.0×|ideal: 58×"/>
+<rect class="hit" x="506.6" y="20" width="7.9" height="254" data-tip="59 servers|95% parallel: 15.1×|90% parallel: 8.7×|50% parallel: 2.0×|ideal: 59×"/>
+<rect class="hit" x="514.4" y="20" width="7.9" height="254" data-tip="60 servers|95% parallel: 15.2×|90% parallel: 8.7×|50% parallel: 2.0×|ideal: 60×"/>
+<rect class="hit" x="522.3" y="20" width="7.9" height="254" data-tip="61 servers|95% parallel: 15.2×|90% parallel: 8.7×|50% parallel: 2.0×|ideal: 61×"/>
+<rect class="hit" x="530.2" y="20" width="7.9" height="254" data-tip="62 servers|95% parallel: 15.3×|90% parallel: 8.7×|50% parallel: 2.0×|ideal: 62×"/>
+<rect class="hit" x="538.1" y="20" width="7.9" height="254" data-tip="63 servers|95% parallel: 15.4×|90% parallel: 8.8×|50% parallel: 2.0×|ideal: 63×"/>
+<rect class="hit" x="546.0" y="20" width="7.9" height="254" data-tip="64 servers|95% parallel: 15.4×|90% parallel: 8.8×|50% parallel: 2.0×|ideal: 64×"/>
+</svg>
+</div>
+<figcaption>Amdahl’s law. The part of the work that cannot be shared sets a ceiling that no number of servers can lift. With 5% of the work serial, 64 servers give a speed-up of 15, and the limit is 20.</figcaption>
+</figure>
+
+<p>The lesson is that the serial fraction decides everything at scale. A system in which 95% of the work spreads perfectly can never run more than 20 times faster than one server, and reaches only three-quarters of that with 64 of them. Finding and shrinking the shared part, which is usually a database, a lock or a coordinator, is worth more than adding machines.</p>
+<p>The second reason is worse. Machines that share work have to talk to each other to stay consistent, and the amount of talking grows faster than the number of machines. Neil Gunther’s <dfn>Universal Scalability Law</dfn> adds this cost to Amdahl’s formula and predicts something Amdahl’s law does not: past a certain size, adding a machine makes the system <em>slower</em>, because the extra coordination costs more than the extra capacity is worth. Anyone who has watched a database cluster get slower as nodes were added has seen that curve.</p>
+<p>Both laws point to the same design goal. Capacity grows with machines only when the machines can work without consulting each other. Stateless servers manage it. Partitions that never need each other’s data manage it. Anything that requires global agreement on every operation does not, and should be kept small and off the main path.</p>
+
+<h2 id="elasticity">Elasticity and autoscaling</h2>
+<p>Load changes through the day and the week. A fleet sized for the evening peak sits mostly idle at four in the morning. <dfn>Elasticity</dfn> is the ability to add and remove capacity as load changes, and <dfn>autoscaling</dfn> is doing it automatically.</p>
+<table>
+<thead><tr><th>Kind</th><th>How it decides</th><th>Suits</th></tr></thead>
+<tbody>
+<tr><th>Reactive</th><td>A metric crosses a threshold: CPU above 60%, queue longer than 1,000 items, requests per server above a target</td><td>Gradual, unpredictable changes</td></tr>
+<tr><th>Scheduled</th><td>The clock: add servers at 08:00 on weekdays</td><td>Regular daily and weekly cycles</td></tr>
+<tr><th>Predictive</th><td>A forecast from past traffic adds capacity ahead of the expected rise</td><td>Cycles that are regular, with some variation</td></tr>
+<tr><th>Manual, ahead of an event</th><td>A person raises capacity before a launch, a sale or a broadcast</td><td>Known spikes that are too sudden for any of the above</td></tr>
+</tbody>
+</table>
+<p>Autoscaling is a control loop, and it has the weaknesses of one.</p>
+<ul>
+  <li><b>It reacts late.</b> A new server takes from tens of seconds to several minutes to start, load its code and warm its caches. A spike that arrives in ten seconds is over, or has done its damage, before help arrives. This is why the threshold sits well below saturation, as the utilization curve in <x-ref to="latency-and-throughput"></x-ref> requires.</li>
+  <li><b>It can oscillate.</b> Add servers, the metric drops, remove servers, the metric rises. Cool-down periods, and removing capacity more slowly than adding it, damp this.</li>
+  <li><b>It only helps the tier it controls.</b> Fifty new application servers each open twenty database connections. PostgreSQL’s default limit is 100 connections. Scaling one tier can knock over the next, so limits and connection pooling have to be designed with the scaling policy.</li>
+  <li><b>Scaling in is harder than scaling out.</b> Removing a server means first letting its in-flight requests finish and its long-lived connections move elsewhere. A server holding state cannot simply be switched off.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> Autoscaling protects you from gradual growth and from paying for idle machines. It does not protect you from a sudden surge, a retry storm or a dependency that has slowed down, and in the last case adding application servers makes things worse by sending more traffic at the struggling dependency. Keep a rate limit and a load-shedding policy as the backstop. Both are covered in <x-ref to="resilience-patterns"></x-ref>.</p></div>
+
+<h2 id="pitfalls">Problems that appear only at scale</h2>
+<p>Some failure modes do not exist on one server and are routine on a hundred. They recur throughout the book, and it helps to know their names early.</p>
+<ul>
+  <li><b>Hot keys and skew.</b> Dividing data evenly does not divide load evenly. One celebrity account, one viral post or one enormous customer can send most of the traffic to a single partition while the others idle. Scaling out helps the average and does nothing for the hottest item.</li>
+  <li><b>The thundering herd.</b> When a popular cache entry expires, or a service comes back after an outage, every waiting client asks for the same thing at the same moment. The burst can be many times normal load and can knock the service down again.</li>
+  <li><b>Retry amplification.</b> A struggling service fails some requests, clients retry, and the retries add load to the service that was already struggling. Across several layers that each retry three times, one user request can become dozens.</li>
+  <li><b>Fan-out.</b> One action that touches many things, such as a post that must reach ten million followers, is cheap to ask for and expensive to carry out. The work is proportional to something other than the request rate.</li>
+  <li><b>Noisy neighbors.</b> When many customers share machines, one customer’s heavy use degrades everyone else’s service unless isolation is designed in. See <x-ref to="multi-tenancy"></x-ref>.</li>
+  <li><b>Operational scale.</b> At a thousand servers, something is always broken. Deployment, configuration and monitoring have to be automated, and the system has to keep working while some of it is failing. That is the subject of the next chapter.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>Economics.</b> Scaling decisions are cost decisions. A larger machine may be cheaper than the engineering time to distribute a system, and for a while it usually is. <x-ref to="capacity-and-cost"></x-ref> works through the comparison.</li>
+  <li><b>Organization design.</b> The Y axis of the scale cube is also how teams are divided. Splitting a system by function and splitting an organization by function tend to happen together, as Conway’s law in <x-ref to="what-is-system-design">Chapter 1</x-ref> predicts.</li>
+  <li><b>Parallel computing.</b> Amdahl’s law was written about processors inside one computer. It applies to servers in a data center, and to people on a project, for the same reason.</li>
+  <li><b>Low-level design.</b> Statelessness is decided in code. A class that caches results in a static field, or a module that writes to a local temporary directory, is an architectural constraint however small it looks.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Scalability is about a specific dimension of load. Ask what grows, what you add in response, and what breaks first.</li>
+  <li>Scaling up is simple and goes further than expected. Scaling out has no ceiling and adds redundancy, at the cost of running a distributed system.</li>
+  <li>Scaling out requires stateless servers. Sessions, files, scheduled jobs, connections and counters all have to live somewhere shared.</li>
+  <li>Architectures grow in a typical order, each step triggered by a measured bottleneck and each bringing a new kind of problem.</li>
+  <li>Reads scale by adding copies. Writes and data volume scale by splitting the data. Helping one often hurts the other.</li>
+  <li>The work that cannot be shared sets the ceiling. Reduce shared state and coordination before adding machines.</li>
+  <li>Autoscaling handles gradual change and saves money. It reacts too slowly for sudden spikes.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>An application is slow even when one person uses it on an otherwise idle server. Will adding servers behind a load balancer help?</summary><p>No. That is a performance problem. Each request will be just as slow on any of the new servers. Find where the time goes within one request first: usually a missing index, a slow external call, or too much work done while the user waits.</p></details>
+<details><summary>You add a second application server and users start getting logged out at random. What happened, and what are the options?</summary><p>Sessions are stored in each server’s memory, so a request that lands on the other server finds no session. The options are sticky sessions, a shared session store, or a signed token carried by the client. The last two keep the servers interchangeable.</p></details>
+<details><summary>A system’s read traffic has grown tenfold and writes have not changed. Which stage of growth applies, and which does not?</summary><p>Caching and read replicas, stages 4 and 5. Partitioning the data is not called for, since it addresses write volume and data size and adds a great deal of complexity.</p></details>
+<details><summary>90% of a job can be parallelized. What is the largest speed-up possible, however many servers are used? How much do 8 servers give?</summary><p>The limit is 1 ÷ (1 − 0.9) = 10 times. Eight servers give 1 ÷ (0.1 + 0.9 ÷ 8), which is about 4.7 times. To do better you must shrink the 10% that is serial.</p></details>
+<details><summary>Traffic doubles within fifteen seconds when a television advertisement airs. Your autoscaler adds servers when CPU passes 70%, and a server takes three minutes to become ready. What will happen, and what would you change?</summary><p>The existing servers will be overloaded for about three minutes, which is long enough for timeouts, retries and possibly a cascade. The autoscaler is correct and too slow for this event. Since the time of the advertisement is known, raise capacity beforehand, and keep rate limiting and load shedding in place for surges that are not known in advance.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Amazon Web Services, <a href="https://aws.amazon.com/ec2/instance-types/u7i/">Amazon EC2 High Memory U7i instances</a>. Instance sizes checked October 2026.</li>
+  <li>Gene M. Amdahl, “Validity of the single processor approach to achieving large scale computing capabilities”, AFIPS Spring Joint Computer Conference, 1967.</li>
+  <li>Neil J. Gunther, <a href="http://www.perfdynamics.com/Manifesto/USLscalability.html">“How to Quantify Scalability”</a>, and <i>Guerrilla Capacity Planning</i> (Springer). The Universal Scalability Law.</li>
+  <li>Martin L. Abbott and Michael T. Fisher, <i>The Art of Scalability</i> (Addison-Wesley). The source of the scale cube.</li>
+  <li>Werner Vogels, <a href="https://www.allthingsdistributed.com/2006/03/a_word_on_scalability.html">“A Word on Scalability”</a>, 2006. A short and careful definition of the term.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/runtime-config-connection.html">Connections and Authentication</a>. The default value of <code>max_connections</code>.</li>
+  <li>Adam Wiggins, <a href="https://12factor.net/">The Twelve-Factor App</a>. Factor VI, “Processes”, is the standard statement of the stateless-process rule.</li>
+</ol>
+</section>

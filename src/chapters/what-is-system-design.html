@@ -1,0 +1,275 @@
+<!--meta
+{ "description": "What system design means, the difference between high-level and low-level design, functional and non-functional requirements, trade-offs, and a six-step method for designing any system.",
+  "lede": "Design is the set of decisions that are expensive to change later. This chapter explains which decisions those are, at two levels of zoom, and gives you a method for making them.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="more-than-code">A system is more than its code</h2>
+<p>Suppose you write a small program that lets people upload a photo and see it again later. On your laptop it is thirty lines: accept a file, write it to a folder, record its name in a database table, and serve it back when asked. It works the first time you try it.</p>
+<p>Now put the same program in front of ten million people. Nothing about the thirty lines is wrong, and yet almost everything goes wrong. One machine cannot accept that many connections. Its disk fills in days. When it restarts, the service disappears for everyone at once. A user in Dhaka waits a second for bytes stored in Virginia. Two uploads with the same file name overwrite each other. A single slow database query holds up every other request behind it.</p>
+<p>None of these problems live in the code you wrote. They live in the arrangement around it: how many machines there are, where data is kept, what happens when a part fails, and how the parts talk to each other. <dfn>System design</dfn> is the work of deciding that arrangement on purpose.</p>
+<p>A useful working definition: <b>design is the set of decisions that are expensive to change later.</b> Renaming a variable is cheap, so it is not design. Choosing how photos are identified, which database stores their metadata, and whether uploads are processed while the user waits are all expensive to reverse once real data and real traffic depend on them. Those are the decisions this book is about.</p>
+
+<h2 id="two-levels">Two levels of zoom: high-level and low-level design</h2>
+<p>The same system can be described at several distances, in the way a city can be shown on a country map, a street map, or a floor plan. Two distances matter enough to have names.</p>
+<p><dfn>High-level design</dfn> (HLD) describes the system as a set of running components and the connections between them: load balancers, application servers, databases, caches, queues. It answers questions such as “where does this data live?” and “what happens if this machine dies?” The picture it produces is the box-and-arrow architecture diagram.</p>
+<p><dfn>Low-level design</dfn> (LLD) describes the inside of one component: its classes, interfaces, data structures and the way they call one another. It answers questions such as “which object owns this rule?” and “how do I add a new payment method without editing ten files?” The pictures it produces are class and sequence diagrams, and its final form is code.</p>
+
+<figure class="fig wide" id="fig-zoom">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 296" role="img" aria-labelledby="f11t f11d">
+<title id="f11t">The same photo app at three levels of zoom</title>
+<desc id="f11d">Left: the app in its context, between the people who use it and outside providers. Middle: the high-level design, with a load balancer, API servers, a database, an object store and a queue. Right: the low-level design of the API servers, with an upload service class that depends on a repository interface and an image resizer.</desc>
+<text class="tb" x="10" y="24">Context</text>
+<text class="tb" x="250" y="24">High-level design</text>
+<text class="tb" x="490" y="24">Low-level design</text>
+<rect class="grp" x="10" y="36" width="220" height="226" rx="8"/>
+<rect class="grp" x="250" y="36" width="220" height="226" rx="8"/>
+<rect class="grp" x="490" y="36" width="220" height="226" rx="8"/>
+<!-- context -->
+<circle class="n" cx="120" cy="66" r="9"/>
+<text class="ts mid" x="120" y="94">people using the app</text>
+<rect class="n sig" x="60" y="122" width="120" height="44" rx="6"/>
+<text class="tb mid" x="120" y="149">Photo app</text>
+<rect class="n" x="38" y="206" width="164" height="36" rx="6"/>
+<text class="mid" x="120" y="229">Email and push providers</text>
+<path class="e sig" d="M120 100V122"/>
+<path class="e" d="M120 166V206"/>
+<!-- zoom lines -->
+<path class="e none dash" d="M180 126 250 36M180 162 250 262"/>
+<path class="e none dash" d="M420 112 490 36M420 144 490 262"/>
+<!-- hld -->
+<rect class="n" x="300" y="56" width="120" height="32" rx="6"/>
+<text class="mid" x="360" y="77">Load balancer</text>
+<rect class="n sig" x="300" y="112" width="120" height="32" rx="6"/>
+<text class="tb mid" x="360" y="133">API servers</text>
+<rect class="n store" x="262" y="172" width="92" height="32" rx="6"/>
+<text class="mid" x="308" y="193">Database</text>
+<rect class="n store" x="366" y="172" width="92" height="32" rx="6"/>
+<text class="mid" x="412" y="193">Object store</text>
+<rect class="n async" x="290" y="222" width="140" height="30" rx="6"/>
+<text class="mid" x="360" y="242">Queue and workers</text>
+<path class="e sig" d="M360 88V112"/>
+<path class="e store" d="M334 144 314 172"/>
+<path class="e store" d="M386 144 406 172"/>
+<path class="e async" d="M360 144V222"/>
+<!-- lld -->
+<rect class="n sig" x="540" y="54" width="120" height="48" rx="3"/>
+<text class="tb mid" x="600" y="72">UploadService</text>
+<path class="e none" d="M540 80H660"/>
+<text class="ts mid" x="600" y="95">upload(photo)</text>
+<rect class="n" x="494" y="140" width="110" height="46" rx="3"/>
+<text class="ts mid" x="549" y="157">«interface»</text>
+<text class="tb mid" x="549" y="174">PhotoRepository</text>
+<rect class="n" x="608" y="140" width="98" height="46" rx="3"/>
+<text class="tb mid" x="657" y="168">ImageResizer</text>
+<rect class="n" x="496" y="220" width="170" height="30" rx="3"/>
+<text class="mid" x="581" y="240">PostgresPhotoRepository</text>
+<path class="e" d="M574 102 552 140"/>
+<path class="e" d="M626 102 652 140"/>
+<path class="e dash" d="M549 220V186"/>
+<text class="ts mid" x="120" y="284">who uses it, what it depends on</text>
+<text class="ts mid" x="360" y="284">which components run, and where data lives</text>
+<text class="ts mid" x="600" y="284">which classes one component is made of</text>
+</svg>
+</div>
+<figcaption>One photo app at three distances. Each panel opens up a single box from the panel to its left. High-level design is the middle panel and low-level design is the right one.</figcaption>
+</figure>
+
+<aside class="sn"><b>The C4 model</b>Simon Brown’s C4 model formalizes this zooming into four levels: context, containers, components and code. “Container” there means any separately running unit, such as a web app or a database, and has nothing to do with Docker. If a team asks you for “a C4 container diagram”, they want the middle panel of <x-fig to="fig-zoom"></x-fig>.</aside>
+
+<p>The two levels differ in more than scale.</p>
+<table>
+<thead><tr><th></th><th>High-level design</th><th>Low-level design</th></tr></thead>
+<tbody>
+<tr><th>Unit of thought</th><td>Processes, machines, data stores, networks</td><td>Classes, interfaces, functions, data structures</td></tr>
+<tr><th>Main concern</th><td>Scale, availability, latency, cost, data placement</td><td>Correctness, readability, ease of change, testability</td></tr>
+<tr><th>What goes wrong</th><td>Outages, slowness under load, lost or inconsistent data</td><td>Bugs, code nobody dares to touch, features that take weeks</td></tr>
+<tr><th>Typical artifacts</th><td>Architecture diagram, API list, data model, capacity estimate</td><td>Class diagram, sequence diagram, interface definitions, code</td></tr>
+<tr><th>Typical question</th><td>“Design a chat system for 50 million users”</td><td>“Design the classes for a parking lot”</td></tr>
+<tr><th>Where in this book</th><td>Parts I to VIII and Part XI</td><td>Parts IX and X</td></tr>
+</tbody>
+</table>
+<p>They are not separate subjects. A high-level decision constrains the code: if you choose to process uploads through a queue, some class now has to deal with a message arriving twice. A low-level decision constrains the architecture: if session data is kept in a variable inside the server process, you cannot add a second server without breaking logins. Good designers move between the two levels without noticing, and this book will ask you to do the same.</p>
+
+<h2 id="requirements">Requirements: what the system must do, and how well</h2>
+<p>You cannot judge a design without knowing what it is for. The first step in any design is therefore to pin down requirements, and they come in two kinds.</p>
+<p><dfn>Functional requirements</dfn> state what the system does. They are the features, and they can usually be written as “a user can…” sentences: a user can upload a photo, a user can follow another user, a user sees a feed of photos from the people they follow.</p>
+<aside class="sn"><b>A clumsy name</b>“Non-functional” sounds like “does not work”. You will also see <i>quality attributes</i>, <i>cross-functional requirements</i>, or simply “the -ilities”. The standard ISO/IEC 25010 lists them formally. They all mean the same thing: the standards the system must meet while doing its job.</aside>
+<p><dfn>Non-functional requirements</dfn> state how well it does those things. A feed that takes forty seconds to load satisfies the functional requirement and is still a failed product. The non-functional requirements that drive most architecture decisions are these:</p>
+<table>
+<thead><tr><th>Quality</th><th>The question it asks</th><th>Example target</th><th>Chapter</th></tr></thead>
+<tbody>
+<tr><th>Scalability</th><td>Can it handle more users or data by adding resources?</td><td>10 times today’s traffic without a redesign</td><td><x-num to="scalability"></x-num></td></tr>
+<tr><th>Availability</th><td>What fraction of the time does it answer?</td><td>99.95% of requests succeed each month</td><td><x-num to="availability-and-reliability"></x-num></td></tr>
+<tr><th>Latency</th><td>How long does one request take?</td><td>99% of feed loads finish within 300 ms</td><td><x-num to="latency-and-throughput"></x-num></td></tr>
+<tr><th>Throughput</th><td>How much work is done per second?</td><td>20,000 requests per second at peak</td><td><x-num to="latency-and-throughput"></x-num></td></tr>
+<tr><th>Consistency</th><td>Do all users see the same data at the same time?</td><td>A user always sees their own upload at once</td><td><x-num to="consistency-models"></x-num></td></tr>
+<tr><th>Durability</th><td>Once saved, can data be lost?</td><td>No acknowledged upload is ever lost</td><td><x-num to="replication"></x-num></td></tr>
+<tr><th>Security</th><td>Who can do what, and can it be abused?</td><td>Private photos are visible only to approved followers</td><td><x-num to="authentication"></x-num></td></tr>
+<tr><th>Maintainability</th><td>How hard is it to change and to operate?</td><td>A new engineer ships a change in their first week</td><td><x-num to="solid-principles"></x-num></td></tr>
+<tr><th>Cost</th><td>What does it cost to run per user?</td><td>Infrastructure under 2% of revenue</td><td><x-num to="capacity-and-cost"></x-num></td></tr>
+</tbody>
+</table>
+<p>Two habits make requirements useful. First, <b>attach a number</b>. “Fast” cannot be designed for or tested; “99% of requests under 300 milliseconds” can. Second, <b>ask what is out of scope</b>. A photo app that does not need video, direct messages or advertising in its first version is a far smaller design problem, and saying so early stops you from designing three systems at once.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> The prompt is vague on purpose. “Design Instagram” describes a product with hundreds of features. Spend the first few minutes agreeing on three or four functional requirements and the two or three non-functional ones that matter most. Candidates who start drawing boxes at once are usually solving a problem the interviewer did not ask.</p></div>
+
+<h2 id="trade-offs">Constraints and trade-offs</h2>
+<p>If every quality could be maximized at once, design would be easy. It cannot, because the qualities pull against each other. Keeping three copies of data improves durability and availability, and it raises cost and makes it harder for all copies to agree. Checking every write with every copy before answering makes the copies agree, and it makes the write slower. This is why experienced engineers answer so many questions with “it depends”. What it depends on is the requirements.</p>
+<p>These are the trade-offs you will meet most often. Each gets its own treatment later in the book.</p>
+<table>
+<thead><tr><th>You can have more of…</th><th>…by giving up some…</th><th>A concrete case</th></tr></thead>
+<tbody>
+<tr><td>Consistency</td><td>Availability or latency</td><td>Wait for all replicas to confirm a bank transfer, and refuse it if one is unreachable</td></tr>
+<tr><td>Read speed</td><td>Write speed and storage</td><td>Add an index or a precomputed feed: reads get faster, every write does more work</td></tr>
+<tr><td>Throughput</td><td>Latency</td><td>Batch 500 writes into one disk flush: more per second, and each one waits for the batch</td></tr>
+<tr><td>Freshness</td><td>Speed and cost</td><td>Cache a profile for 60 seconds: fast and cheap, and up to a minute stale</td></tr>
+<tr><td>Flexibility</td><td>Simplicity</td><td>Split into services that deploy on their own schedule, and take on network calls between them</td></tr>
+<tr><td>Performance</td><td>Money</td><td>Serve from five regions instead of one</td></tr>
+<tr><td>Time to market</td><td>Control</td><td>Use a managed database today, and accept its limits and its bill</td></tr>
+</tbody>
+</table>
+<p>A design decision, then, has three parts: the option you chose, the options you rejected, and the requirement that made the difference. A design that lists only the first part is a description. One that includes all three is an argument, and an argument can be checked by someone else.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Naming a technology in place of a reason. “We’ll use Kafka” does not describe a design. “Uploads must not be lost if the resizing service is down, so they go onto a durable log first” does, and it would still be a design if you swapped Kafka for something else.</p></div>
+<aside class="sn"><b>Conway’s law</b>In 1968 Melvin Conway observed that organizations produce designs that copy their own communication structure. Four teams tend to build a four-part system. It is why “how should we split this into services?” is often a question about who works with whom, and why architecture and team structure are usually changed together.</aside>
+<p><dfn>Constraints</dfn> are the trade-offs someone has already made for you. A deadline, a budget, a law that says certain data must stay in one country, a team that knows PostgreSQL and has never run Cassandra: each removes options before you start. They belong in the requirements, since they often decide more than the technical arguments do.</p>
+
+<h2 id="method">A method you can repeat</h2>
+<p>Design looks like inspiration from the outside. In practice it is closer to a checklist that you loop through, and the same loop works for a one-hour interview, a design document at work, and a system you are building alone.</p>
+
+<figure class="fig" id="fig-loop">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 168" role="img" aria-labelledby="f12t f12d">
+<title id="f12t">The six-step design loop</title>
+<desc id="f12d">Six steps in a row: requirements, estimates, interface and data, architecture, deep dives, and stressing the design. An arrow returns from the last step to the first.</desc>
+<g>
+<g data-s="1">
+<rect class="n" x="6" y="20" width="110" height="60" rx="6"/><text class="tb mid" x="61" y="46">1 Requirements</text><text class="ts mid" x="61" y="65">what, for whom</text>
+</g>
+<g data-s="2">
+<rect class="n" x="125" y="20" width="110" height="60" rx="6"/><text class="tb mid" x="180" y="46">2 Estimates</text><text class="ts mid" x="180" y="65">how big</text>
+</g>
+<g data-s="3">
+<rect class="n" x="244" y="20" width="110" height="60" rx="6"/><text class="tb mid" x="299" y="46">3 Interface, data</text><text class="ts mid" x="299" y="65">API and model</text>
+</g>
+<g data-s="4">
+<rect class="n sig" x="363" y="20" width="110" height="60" rx="6"/><text class="tb mid" x="418" y="46">4 Architecture</text><text class="ts mid" x="418" y="65">boxes and arrows</text>
+</g>
+<g data-s="5">
+<rect class="n" x="482" y="20" width="110" height="60" rx="6"/><text class="tb mid" x="537" y="46">5 Deep dives</text><text class="ts mid" x="537" y="65">the hard parts</text>
+</g>
+<g data-s="6">
+<rect class="n fault" x="601" y="20" width="110" height="60" rx="6"/><text class="tb mid" x="656" y="46">6 Stress it</text><text class="ts mid" x="656" y="65">failure, bottlenecks</text>
+</g>
+</g>
+<path class="e" d="M116 50H125M235 50H244M354 50H363M473 50H482M592 50H601"/>
+<g data-s="7">
+<path class="e dash" d="M656 80V124H61V82"/>
+<text class="ts mid" x="358" y="146">what you learn in a later step sends you back to an earlier one</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>Start with requirements: what the system must do, for whom, and how well.</li>
+  <li>Estimate the size of the problem: requests, storage and bandwidth. The numbers decide which designs are even possible.</li>
+  <li>Define the interface and the data: the operations the system offers and the things it stores.</li>
+  <li>Draw the architecture: the components and how a request moves between them.</li>
+  <li>Go deep on the hard parts, the two or three places where the design could fail to meet its requirements.</li>
+  <li>Stress the design. Ask what happens when a part fails, and where it stops scaling.</li>
+  <li>What you learn in a later step sends you back to an earlier one. A real design goes round this loop several times.</li>
+</ol>
+<figcaption>The design loop. The steps are in order, and you will rarely pass through them only once.</figcaption>
+</figure>
+
+<ol>
+  <li><b>Requirements.</b> Agree on the few features that matter and the numbers the system must hit. Write down what is out of scope.</li>
+  <li><b>Estimates.</b> Turn “ten million users” into requests per second, bytes stored per year and bytes sent per second. The result tells you whether one database is enough or whether you have a distribution problem. <x-ref to="estimation"></x-ref> teaches this.</li>
+  <li><b>Interface and data.</b> List the operations the outside world can call, and the main things you store and how they relate. This step is short and it exposes misunderstandings early. If you cannot say what <code>POST /photos</code> returns, you are not ready to draw servers.</li>
+  <li><b>Architecture.</b> Draw the simplest set of components that satisfies the functional requirements, and trace one read and one write through it from the client to storage and back.</li>
+  <li><b>Deep dives.</b> Pick the two or three places where the numbers from step 2 break the simple picture, and design those properly: the hot table, the fan-out, the large file.</li>
+  <li><b>Stress it.</b> For each component ask what happens when it is slow, when it is down, and when traffic is ten times higher. Fix what you find, or say out loud that you are accepting the risk.</li>
+</ol>
+<p>The loop matters as much as the steps. An estimate in step 2 may show that a requirement from step 1 is unaffordable, and the right response is to go back and renegotiate it. A failure found in step 6 may change the data model from step 3. A first pass that goes through all six steps quickly, followed by a second pass that goes deeper, is better than one slow pass that perfects step 4 and never reaches step 6.</p>
+
+<h3 id="worked-example">The method on a small example</h3>
+<p>Here is a first pass for the photo app. It is deliberately quick, and every line of it is expanded somewhere later in the book.</p>
+<table>
+<thead><tr><th>Step</th><th>First-pass answer</th></tr></thead>
+<tbody>
+<tr><th>1 Requirements</th><td>Upload a photo. View one photo. See a feed of recent photos from people you follow. Feed loads in under 300 ms for 99% of requests. No acknowledged upload is lost. Out of scope: video, messages, search.</td></tr>
+<tr><th>2 Estimates</th><td>10 million daily users. About 23 uploads and 5,800 photo views per second on average, roughly three times that at peak. About 5 TB of new photo data per day. Reads outnumber writes 250 to 1. (Derived in <x-ch to="estimation"></x-ch>.)</td></tr>
+<tr><th>3 Interface, data</th><td><code>POST /photos</code>, <code>GET /photos/{id}</code>, <code>GET /feed</code>, <code>POST /follows</code>. Stored: users, photos (metadata), follows, and the image bytes themselves.</td></tr>
+<tr><th>4 Architecture</th><td>Load balancer, stateless API servers, a relational database for metadata, an object store for image bytes, a CDN in front of the images.</td></tr>
+<tr><th>5 Deep dives</th><td>Image delivery: about 9 Gbit/s on average is too much to serve from our own servers, so the CDN is essential. Feed: computing it per request means reading from hundreds of followed accounts, so precompute or cache it.</td></tr>
+<tr><th>6 Stress it</th><td>The database is a single point of failure, so add a replica and automatic failover. Resizing images during the upload request makes uploads slow and fragile, so move it to a queue and workers.</td></tr>
+</tbody>
+</table>
+<p>Notice what the estimates did. Without them, step 4 is guesswork. With them, two facts stand out: the system is overwhelmingly read-heavy, and nearly all of its bytes are images. Those two facts justify the CDN, the object store and the cached feed, and they also say what does not need attention yet. Twenty-three writes per second is a load that one ordinary database handles comfortably.</p>
+
+<h2 id="interview-vs-work">Design in an interview and design at work</h2>
+<p>The method is the same in both settings. The conditions are very different, and knowing the differences keeps you from applying interview habits where they do harm.</p>
+<table>
+<thead><tr><th></th><th>In an interview</th><th>At work</th></tr></thead>
+<tbody>
+<tr><th>Time</th><td>45 to 60 minutes</td><td>Days to months, revisited for years</td></tr>
+<tr><th>Starting point</th><td>A blank board</td><td>An existing system with users, data and history</td></tr>
+<tr><th>Scale</th><td>Usually stated as very large, to force the interesting problems</td><td>Usually modest today, uncertain tomorrow</td></tr>
+<tr><th>What is judged</th><td>Your reasoning, and whether you see the trade-offs</td><td>Whether it works, what it costs, and whether the team can run it</td></tr>
+<tr><th>Biggest risk</th><td>Running out of time before reaching the hard part</td><td>Building for a scale or a feature that never arrives</td></tr>
+<tr><th>Output</th><td>A diagram and a conversation</td><td>A written design, a migration plan, and working software</td></tr>
+</tbody>
+</table>
+<div class="note production"><p><span class="label">In production.</span> Most real design work is changing a system that already runs. The hard question is rarely “what is the ideal architecture?” It is “how do we get from here to there without downtime, while the old and new versions run side by side?” Migration is a design problem in its own right, and it comes up in <x-ref to="schema-design"></x-ref> and <x-ref to="deployment-strategies"></x-ref>.</p></div>
+
+<h2 id="mistakes">Mistakes beginners make</h2>
+<ul>
+  <li><b>Designing for a scale you do not have.</b> A system for a thousand users that copies an architecture built for a billion pays the full complexity cost and gets none of the benefit. Start with the simplest design that meets the stated requirements, and know which part you would change first when load grows.</li>
+  <li><b>Skipping the numbers.</b> “A lot of traffic” supports any design and therefore none. One rough estimate removes most of the wrong options.</li>
+  <li><b>Ignoring the data model.</b> Servers are replaceable in an afternoon. The shape of stored data lasts for years and is the hardest thing to migrate. Give it more attention than the boxes.</li>
+  <li><b>Drawing only the path where everything works.</b> Every arrow on a diagram is a network call that can be slow, fail, or succeed twice. A design that does not say what happens then is half a design.</li>
+  <li><b>Treating a product name as an answer.</b> “Add Redis” is a purchase. Say what is cached, for how long, and what happens when the cache is empty.</li>
+  <li><b>Forgetting the people.</b> Someone will be woken at night by this system. If nobody on the team can operate a component, it is a liability however elegant it looks.</li>
+</ul>
+
+<h2 id="map">How the rest of the book fits together</h2>
+<p>System design is wide, and it is easy to learn forty topics without seeing how they connect. The <a href="index.html">system map</a> on the contents page is the picture to keep in mind. A request leaves a client, crosses the network (Part II), reaches services arranged in some architecture (Part VI), which read and write data (Part III) and hand off slower work to be done later (Part V). Because all of this runs on many machines that fail independently, the rules of distributed systems (Part IV) apply everywhere, as do operations (Part VII) and security (Part VIII). Open any one service and you are in low-level design (Parts IX and X).</p>
+<p>The remaining chapters of Part I give you the vocabulary every later chapter uses: what happens during one request, how to estimate, and how to reason about speed, growth and failure.</p>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>Product management.</b> Requirements gathering is shared work. The functional list usually comes from product, and the numbers attached to it come from engineering asking “how many?” and “how fast?”</li>
+  <li><b>Software architecture.</b> The field has its own literature on quality attributes and on recording decisions. An architecture decision record is the three-part decision described above, written down.</li>
+  <li><b>Low-level design.</b> The method reappears in a shorter form for class design in <x-ref to="lld-method"></x-ref>.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Design is the set of decisions that are expensive to change later: where data lives, how components talk, what happens on failure.</li>
+  <li>High-level design arranges running components. Low-level design arranges the classes inside one component. Each constrains the other.</li>
+  <li>Functional requirements say what the system does. Non-functional requirements say how well, and they need numbers.</li>
+  <li>Qualities trade against each other. A decision is the option chosen, the options rejected, and the requirement that decided it.</li>
+  <li>The loop is requirements, estimates, interface and data, architecture, deep dives, stress. Expect to go around more than once.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A team says “the checkout page must be reliable”. Rewrite that as a requirement a design could be tested against.</summary><p>One possible answer: “99.95% of checkout requests succeed, measured monthly at the load balancer, and no order that was confirmed to the customer is ever lost.” The first half is an availability target and the second is a durability target. Both have something you can measure.</p></details>
+<details><summary>Is “store the session in the server’s memory” a high-level or a low-level decision?</summary><p>Both, which is the point. It looks like a code detail, and it decides whether a second server can be added, which is an architectural property. <x-ref to="scalability"></x-ref> returns to this exact case.</p></details>
+<details><summary>You add an index so a search query runs faster. What did you trade away?</summary><p>Write speed and storage. Every insert and update now also has to update the index, and the index occupies disk and memory.</p></details>
+<details><summary>Why estimate before drawing the architecture, when the estimate is only rough?</summary><p>Because an order of magnitude is enough to choose between kinds of design. 20 writes per second and 200,000 writes per second lead to different architectures, and the difference between 20 and 30 leads to the same one.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Simon Brown, <a href="https://c4model.com/">The C4 model for visualising software architecture</a>.</li>
+  <li>ISO/IEC 25010, <i>Systems and software Quality Requirements and Evaluation: product quality model</i>. The formal list of quality attributes.</li>
+  <li>Melvin E. Conway, <a href="https://www.melconway.com/Home/Committees_Paper.html">“How Do Committees Invent?”</a>, <i>Datamation</i>, April 1968.</li>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly). Its first chapter covers reliability, scalability and maintainability in more depth.</li>
+  <li>Michael Nygard, <a href="https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions">“Documenting Architecture Decisions”</a>, 2011. The origin of the architecture decision record.</li>
+</ol>
+</section>

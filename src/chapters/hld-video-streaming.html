@@ -1,0 +1,945 @@
+<!--meta
+{ "description": "A video platform designed with the method of chapter 76: codecs, keyframes, the bitrate ladder and adaptive streaming with HLS and DASH, requirements and estimates for 200 million daily viewers, resumable uploads with signed URLs, playlists, the data model, a processing workflow that encodes chunks in parallel, throughput-based and buffer-based players compared on 400 simulated viewers, CDN caching measured with a shield and with fills from a forecast, failures, growth and what Netflix, YouTube and the standards say.",
+  "lede": "A video platform is a pipeline that turns each upload into many versions, and a delivery system that sends those bytes to millions of screens at once over connections that change by the second. The servers you write handle little of the traffic. The design is about where the bytes go.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a video platform like YouTube. Creators upload videos from a browser or a phone. Viewers watch them on phones, laptops and televisions, on fast and slow connections, and can skip to any point. Playback should start quickly and should not freeze. The most popular videos are watched by millions of people at the same time.</p></div>
+<p>Two things make this hard, and neither is the application logic. First, the bytes: every upload becomes a dozen versions, and viewers receive hundreds of bytes for every byte creators send. Second, the network to each viewer is outside the platform’s control and changes by the second, so the player must keep choosing what to fetch. After a short account of how video is stored and played, the method of <x-ref to="hld-method"></x-ref> takes them in order.</p>
+
+<h3 id="basics">Video in four ideas</h3>
+<p>Raw video is far too large to send: 1920 × 1080 pixels of 3 bytes each, 30 times a second, is about 1.5 Gbit/s. A <dfn>codec</dfn> is the method that compresses video into a bitstream and decompresses it again for display; H.264 (2003), HEVC (2013) and AV1 (2018) are the common ones, each newer one needing fewer bits for the same quality and more computation to encode. Most frames are stored as differences from the frames around them. A <dfn>keyframe</dfn> is a frame stored whole, which can be decoded without any other frame, so playback can start only at a keyframe.</p>
+<p><dfn>Transcoding</dfn> is decoding a video and encoding it again at another resolution, bitrate or codec. A platform transcodes every upload into a set of versions, and that set, ordered from smallest to largest, is the <dfn>bitrate ladder</dfn>; each version is a rung. Apple’s guidelines for its devices give an example ladder for H.264 with nine rungs, from 416×234 at 145 kbit/s to 1920×1080 at 7,800 kbit/s, which this chapter uses throughout.</p>
+<p>Then each rung is cut into short segments, every one starting with a keyframe, at the same instants in every rung; Apple recommends 6 seconds, the length used here. <dfn>Adaptive bitrate streaming</dfn> is playing a video as a sequence of such segments, with the player choosing for each segment which rung to fetch, according to how its connection is doing. The segments are ordinary files fetched with HTTP <code>GET</code>, so any web server or CDN can deliver them (<x-ref to="cdn-and-edge"></x-ref>).</p>
+
+<figure class="fig wide" id="fig-ladder">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 352" role="img" aria-labelledby="f853t f853d">
+<title id="f853t">One video in nine renditions, cut at the same instants</title>
+<desc id="f853d">A grid. Rows are the nine rungs of Apple’s example H.264 ladder, from 1080p at 7,800 kbit/s, 5.85 MB a segment, down to 234p at 145 kbit/s, 109 KB. Columns are six 6-second segments, each starting with a keyframe. A player’s choices are highlighted: 365, then 2,000, 6,000, 6,000, 3,000 and 4,500 kbit/s, changing rung only between segments.</desc>
+<text class="tb" x="10" y="18">Each box is one file. The player may change rung only between boxes.</text>
+<text class="ts mid" x="206.0" y="32">segment 0</text>
+<text class="ts mid" x="282.0" y="32">segment 1</text>
+<text class="ts mid" x="358.0" y="32">segment 2</text>
+<text class="ts mid" x="434.0" y="32">segment 3</text>
+<text class="ts mid" x="510.0" y="32">segment 4</text>
+<text class="ts mid" x="586.0" y="32">segment 5</text>
+<text class="ts" x="638" y="32">one segment</text>
+<text class="ts" x="10" y="57">1080p, 7,800 kbit/s</text>
+<rect class="n" x="170" y="42" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="46" x2="194.0" y2="60"/>
+<line class="grid" x1="218.0" y1="46" x2="218.0" y2="60"/>
+<rect class="n" x="246" y="42" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="46" x2="270.0" y2="60"/>
+<line class="grid" x1="294.0" y1="46" x2="294.0" y2="60"/>
+<rect class="n" x="322" y="42" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="46" x2="346.0" y2="60"/>
+<line class="grid" x1="370.0" y1="46" x2="370.0" y2="60"/>
+<rect class="n" x="398" y="42" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="46" x2="422.0" y2="60"/>
+<line class="grid" x1="446.0" y1="46" x2="446.0" y2="60"/>
+<rect class="n" x="474" y="42" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="46" x2="498.0" y2="60"/>
+<line class="grid" x1="522.0" y1="46" x2="522.0" y2="60"/>
+<rect class="n" x="550" y="42" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="46" x2="574.0" y2="60"/>
+<line class="grid" x1="598.0" y1="46" x2="598.0" y2="60"/>
+<text class="ts" x="638" y="57">5.85 MB</text>
+<text class="ts" x="10" y="83">1080p, 6,000 kbit/s</text>
+<rect class="n" x="170" y="68" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="72" x2="194.0" y2="86"/>
+<line class="grid" x1="218.0" y1="72" x2="218.0" y2="86"/>
+<rect class="n" x="246" y="68" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="72" x2="270.0" y2="86"/>
+<line class="grid" x1="294.0" y1="72" x2="294.0" y2="86"/>
+<rect class="n sig" x="322" y="68" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="72" x2="346.0" y2="86"/>
+<line class="grid" x1="370.0" y1="72" x2="370.0" y2="86"/>
+<rect class="n sig" x="398" y="68" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="72" x2="422.0" y2="86"/>
+<line class="grid" x1="446.0" y1="72" x2="446.0" y2="86"/>
+<rect class="n" x="474" y="68" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="72" x2="498.0" y2="86"/>
+<line class="grid" x1="522.0" y1="72" x2="522.0" y2="86"/>
+<rect class="n" x="550" y="68" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="72" x2="574.0" y2="86"/>
+<line class="grid" x1="598.0" y1="72" x2="598.0" y2="86"/>
+<text class="ts" x="638" y="83">4.5 MB</text>
+<text class="ts" x="10" y="109">720p, 4,500 kbit/s</text>
+<rect class="n" x="170" y="94" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="98" x2="194.0" y2="112"/>
+<line class="grid" x1="218.0" y1="98" x2="218.0" y2="112"/>
+<rect class="n" x="246" y="94" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="98" x2="270.0" y2="112"/>
+<line class="grid" x1="294.0" y1="98" x2="294.0" y2="112"/>
+<rect class="n" x="322" y="94" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="98" x2="346.0" y2="112"/>
+<line class="grid" x1="370.0" y1="98" x2="370.0" y2="112"/>
+<rect class="n" x="398" y="94" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="98" x2="422.0" y2="112"/>
+<line class="grid" x1="446.0" y1="98" x2="446.0" y2="112"/>
+<rect class="n" x="474" y="94" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="98" x2="498.0" y2="112"/>
+<line class="grid" x1="522.0" y1="98" x2="522.0" y2="112"/>
+<rect class="n sig" x="550" y="94" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="98" x2="574.0" y2="112"/>
+<line class="grid" x1="598.0" y1="98" x2="598.0" y2="112"/>
+<text class="ts" x="638" y="109">3.38 MB</text>
+<text class="ts" x="10" y="135">720p, 3,000 kbit/s</text>
+<rect class="n" x="170" y="120" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="124" x2="194.0" y2="138"/>
+<line class="grid" x1="218.0" y1="124" x2="218.0" y2="138"/>
+<rect class="n" x="246" y="120" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="124" x2="270.0" y2="138"/>
+<line class="grid" x1="294.0" y1="124" x2="294.0" y2="138"/>
+<rect class="n" x="322" y="120" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="124" x2="346.0" y2="138"/>
+<line class="grid" x1="370.0" y1="124" x2="370.0" y2="138"/>
+<rect class="n" x="398" y="120" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="124" x2="422.0" y2="138"/>
+<line class="grid" x1="446.0" y1="124" x2="446.0" y2="138"/>
+<rect class="n sig" x="474" y="120" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="124" x2="498.0" y2="138"/>
+<line class="grid" x1="522.0" y1="124" x2="522.0" y2="138"/>
+<rect class="n" x="550" y="120" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="124" x2="574.0" y2="138"/>
+<line class="grid" x1="598.0" y1="124" x2="598.0" y2="138"/>
+<text class="ts" x="638" y="135">2.25 MB</text>
+<text class="ts" x="10" y="161">540p, 2,000 kbit/s</text>
+<rect class="n" x="170" y="146" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="150" x2="194.0" y2="164"/>
+<line class="grid" x1="218.0" y1="150" x2="218.0" y2="164"/>
+<rect class="n sig" x="246" y="146" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="150" x2="270.0" y2="164"/>
+<line class="grid" x1="294.0" y1="150" x2="294.0" y2="164"/>
+<rect class="n" x="322" y="146" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="150" x2="346.0" y2="164"/>
+<line class="grid" x1="370.0" y1="150" x2="370.0" y2="164"/>
+<rect class="n" x="398" y="146" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="150" x2="422.0" y2="164"/>
+<line class="grid" x1="446.0" y1="150" x2="446.0" y2="164"/>
+<rect class="n" x="474" y="146" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="150" x2="498.0" y2="164"/>
+<line class="grid" x1="522.0" y1="150" x2="522.0" y2="164"/>
+<rect class="n" x="550" y="146" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="150" x2="574.0" y2="164"/>
+<line class="grid" x1="598.0" y1="150" x2="598.0" y2="164"/>
+<text class="ts" x="638" y="161">1.5 MB</text>
+<text class="ts" x="10" y="187">432p, 1,100 kbit/s</text>
+<rect class="n" x="170" y="172" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="176" x2="194.0" y2="190"/>
+<line class="grid" x1="218.0" y1="176" x2="218.0" y2="190"/>
+<rect class="n" x="246" y="172" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="176" x2="270.0" y2="190"/>
+<line class="grid" x1="294.0" y1="176" x2="294.0" y2="190"/>
+<rect class="n" x="322" y="172" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="176" x2="346.0" y2="190"/>
+<line class="grid" x1="370.0" y1="176" x2="370.0" y2="190"/>
+<rect class="n" x="398" y="172" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="176" x2="422.0" y2="190"/>
+<line class="grid" x1="446.0" y1="176" x2="446.0" y2="190"/>
+<rect class="n" x="474" y="172" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="176" x2="498.0" y2="190"/>
+<line class="grid" x1="522.0" y1="176" x2="522.0" y2="190"/>
+<rect class="n" x="550" y="172" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="176" x2="574.0" y2="190"/>
+<line class="grid" x1="598.0" y1="176" x2="598.0" y2="190"/>
+<text class="ts" x="638" y="187">825 KB</text>
+<text class="ts" x="10" y="213">432p, 730 kbit/s</text>
+<rect class="n" x="170" y="198" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="202" x2="194.0" y2="216"/>
+<line class="grid" x1="218.0" y1="202" x2="218.0" y2="216"/>
+<rect class="n" x="246" y="198" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="202" x2="270.0" y2="216"/>
+<line class="grid" x1="294.0" y1="202" x2="294.0" y2="216"/>
+<rect class="n" x="322" y="198" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="202" x2="346.0" y2="216"/>
+<line class="grid" x1="370.0" y1="202" x2="370.0" y2="216"/>
+<rect class="n" x="398" y="198" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="202" x2="422.0" y2="216"/>
+<line class="grid" x1="446.0" y1="202" x2="446.0" y2="216"/>
+<rect class="n" x="474" y="198" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="202" x2="498.0" y2="216"/>
+<line class="grid" x1="522.0" y1="202" x2="522.0" y2="216"/>
+<rect class="n" x="550" y="198" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="202" x2="574.0" y2="216"/>
+<line class="grid" x1="598.0" y1="202" x2="598.0" y2="216"/>
+<text class="ts" x="638" y="213">548 KB</text>
+<text class="ts" x="10" y="239">360p, 365 kbit/s</text>
+<rect class="n sig" x="170" y="224" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="228" x2="194.0" y2="242"/>
+<line class="grid" x1="218.0" y1="228" x2="218.0" y2="242"/>
+<rect class="n" x="246" y="224" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="228" x2="270.0" y2="242"/>
+<line class="grid" x1="294.0" y1="228" x2="294.0" y2="242"/>
+<rect class="n" x="322" y="224" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="228" x2="346.0" y2="242"/>
+<line class="grid" x1="370.0" y1="228" x2="370.0" y2="242"/>
+<rect class="n" x="398" y="224" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="228" x2="422.0" y2="242"/>
+<line class="grid" x1="446.0" y1="228" x2="446.0" y2="242"/>
+<rect class="n" x="474" y="224" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="228" x2="498.0" y2="242"/>
+<line class="grid" x1="522.0" y1="228" x2="522.0" y2="242"/>
+<rect class="n" x="550" y="224" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="228" x2="574.0" y2="242"/>
+<line class="grid" x1="598.0" y1="228" x2="598.0" y2="242"/>
+<text class="ts" x="638" y="239">274 KB</text>
+<text class="ts" x="10" y="265">234p, 145 kbit/s</text>
+<rect class="n" x="170" y="250" width="72" height="22" rx="3"/>
+<line class="grid" x1="194.0" y1="254" x2="194.0" y2="268"/>
+<line class="grid" x1="218.0" y1="254" x2="218.0" y2="268"/>
+<rect class="n" x="246" y="250" width="72" height="22" rx="3"/>
+<line class="grid" x1="270.0" y1="254" x2="270.0" y2="268"/>
+<line class="grid" x1="294.0" y1="254" x2="294.0" y2="268"/>
+<rect class="n" x="322" y="250" width="72" height="22" rx="3"/>
+<line class="grid" x1="346.0" y1="254" x2="346.0" y2="268"/>
+<line class="grid" x1="370.0" y1="254" x2="370.0" y2="268"/>
+<rect class="n" x="398" y="250" width="72" height="22" rx="3"/>
+<line class="grid" x1="422.0" y1="254" x2="422.0" y2="268"/>
+<line class="grid" x1="446.0" y1="254" x2="446.0" y2="268"/>
+<rect class="n" x="474" y="250" width="72" height="22" rx="3"/>
+<line class="grid" x1="498.0" y1="254" x2="498.0" y2="268"/>
+<line class="grid" x1="522.0" y1="254" x2="522.0" y2="268"/>
+<rect class="n" x="550" y="250" width="72" height="22" rx="3"/>
+<line class="grid" x1="574.0" y1="254" x2="574.0" y2="268"/>
+<line class="grid" x1="598.0" y1="254" x2="598.0" y2="268"/>
+<text class="ts" x="638" y="265">109 KB</text>
+<path class="line" d="M358.0 79.0 L434.0 79.0 L586.0 105.0 L510.0 131.0 L282.0 157.0 L206.0 235.0"/>
+<circle class="dot" cx="358.0" cy="79.0" r="4"/>
+<circle class="dot" cx="434.0" cy="79.0" r="4"/>
+<circle class="dot" cx="586.0" cy="105.0" r="4"/>
+<circle class="dot" cx="510.0" cy="131.0" r="4"/>
+<circle class="dot" cx="282.0" cy="157.0" r="4"/>
+<circle class="dot" cx="206.0" cy="235.0" r="4"/>
+<line class="axis" x1="168" y1="280" x2="624" y2="280"/>
+<text class="ts mid" x="168" y="296">0 s</text>
+<text class="ts mid" x="244" y="296">6 s</text>
+<text class="ts mid" x="320" y="296">12 s</text>
+<text class="ts mid" x="396" y="296">18 s</text>
+<text class="ts mid" x="472" y="296">24 s</text>
+<text class="ts mid" x="548" y="296">30 s</text>
+<text class="ts mid" x="624" y="296">36 s</text>
+<text class="ts" x="10" y="320">Light ticks: a keyframe every 2 seconds. Every segment starts with one, in every rung, at the same instant.</text>
+</svg>
+</div>
+<figcaption>A segment of the top rung is 54 times the size of one at the bottom. Because every rung is cut at the same instants, the player can move between rungs from one segment to the next.</figcaption>
+</figure>
+
+<p>Two formats describe the segments to the player. <dfn>HTTP Live Streaming</dfn> (HLS) is Apple’s format, published as RFC 8216 in 2017: a master playlist lists the rungs, and a media playlist for each rung lists its segments. <dfn>MPEG-DASH</dfn> (Dynamic Adaptive Streaming over HTTP) is the international standard ISO/IEC 23009-1, first published in 2012, which describes the same structure in an XML manifest. Since 2018 a common segment format, CMAF, lets one set of segment files serve both, so a platform stores its segments once and writes two small manifests.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<p>The questions that change this design are how much is uploaded and watched, how long a creator may wait before the video is public, what “starts quickly” means, and whether live streaming is included. With the answers written down:</p>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>Upload videos up to 12 hours or 256 GB, from a browser or phone, surviving dropped connections</th><td>In scope</td></tr>
+<tr><th>Watch on any device at a quality that suits its connection; seek to any point; resume where you stopped</th><td>In scope</td></tr>
+<tr><th>Video pages with title and thumbnail; view counts</th><td>In scope</td></tr>
+<tr><th>Live streaming, recommendations, search, comments, advertising, paid content</th><td>Out of scope. Live and paid content are follow-up questions</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>200 million viewers a day, each watching 40 minutes at an average of 3 Mbit/s. 500,000 uploads a day, averaging 6 minutes. The busiest hour carries twice the average</td></tr>
+<tr><th>Playback</th><td>The first picture within 2 seconds for 95% of starts. Frozen time under 0.5% of watching time</td></tr>
+<tr><th>Processing</th><td>A 10-minute upload is public at low quality within a few minutes, at every quality soon after</td></tr>
+<tr><th>Availability</th><td>99.95% for playback. Uploads may pause for a few minutes during a failure and must then resume</td></tr>
+<tr><th>Durability</th><td>An upload the creator was told is complete is never lost; the original is kept, so the video can be encoded again</td></tr>
+</tbody>
+</table>
+<p>Frozen time has a name. <dfn>Rebuffering</dfn> is a pause in playback because the player has run out of downloaded video and must wait for more; viewers notice it more than a lower resolution, and it is the main quality measure of a player.</p>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">watching     200 million × 40 min = 8 billion minutes a day = 133 million hours
+streams      8 billion min ÷ 1,440 min × 2 for the peak ≈ 11.1 million at once
+delivery     11.1 million × 3 Mbit/s ≈ 33 Tbit/s at peak; 180 PB a day
+requests     11.1 million ÷ 6 s per segment ≈ 1.85 million segments a second
+uploads      500,000 × 6 min = 50,000 hours a day ≈ 35 hours every minute; 225 TB a day at 10 Mbit/s
+stored       upload + nine rungs (10 + 25.64 Mbit/s) × 1.5 overhead ≈ 1.2 PB a day, 439 PB a year
+encoding     50,000 hours × 3,600 s × 14.3 core-seconds ÷ 86,400 ≈ 30,000 cores busy all day</div>
+<p>The sizes, the 1.5 for erasure-coded redundancy (<x-ref to="object-and-file-storage#erasure-coding"></x-ref>) and the encoding cost are assumptions; 25.64 Mbit/s is the sum of the nine rungs of the ladder, and 14.3 core-seconds per second of video is the cost model of this chapter’s transcoding code. The method is that of <x-ref to="estimation#method"></x-ref>, and each line decides something.</p>
+<table>
+<thead><tr><th>The number</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><th>33 Tbit/s at peak, 800 bytes out for each byte in</th><td>Delivery is the system. Segments come from a CDN, and the origin sees only what the CDN misses: 3.3 Tbit/s even at a 90% hit ratio</td></tr>
+<tr><th>1.85 million segment requests a second</th><td>No request for a segment may touch an application server or a database. Segments are static files with stable names</td></tr>
+<tr><th>439 PB a year, mostly rungs</th><td>Object storage with cheap tiers; the original goes cold once processed; rarely watched videos may not need every rung</td></tr>
+<tr><th>30,000 cores encoding</th><td>Processing is a queue of jobs on a large, elastic pool, and the cost of a codec matters as much as its compression</td></tr>
+<tr><th>370,000 playback events a second, one per stream every 30 seconds</th><td>Counts and watch history come from a stream, not from a row written per event</td></tr>
+</tbody>
+</table>
+
+<div class="widget wide" data-widget="stream85">
+<h4>Video traffic, storage and encoding</h4>
+<p>Recomputes step 2. The drawing compares the bytes of one day on a log scale.</p>
+<div class="controls">
+  <label>Viewers a day<input type="number" name="viewers" value="200000000" min="0" max="10000000000" step="1000000"></label>
+  <label>Minutes each<input type="number" name="minutes" value="40" min="0" max="1440" step="1"></label>
+  <label>Average bitrate (Mbit/s)<input type="number" name="mbps" value="3" min="0.1" max="1000" step="0.1"></label>
+  <label>Peak factor<input type="number" name="peak" value="2" min="1" max="20" step="0.5"></label>
+  <label>Uploads a day<input type="number" name="uploads" value="500000" min="0" max="1000000000" step="10000"></label>
+  <label>Minutes per upload<input type="number" name="length" value="6" min="0.1" max="1440" step="0.5"></label>
+  <label>Upload bitrate (Mbit/s)<input type="number" name="source" value="10" min="0.1" max="1000" step="1"></label>
+  <label>All rungs together (Mbit/s)<input type="number" name="ladder" value="25.64" min="0" max="10000" step="0.01"></label>
+  <label>Storage overhead<input type="number" name="overhead" value="1.5" min="1" max="10" step="0.1"></label>
+  <label>Encoding (core-seconds per second)<input type="number" name="cost" value="14.3" min="0" max="10000" step="0.1"></label>
+  <label>CDN hit ratio by bytes (%)<input type="number" name="hit" value="90" min="0" max="100" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 170" role="img" aria-label="Bars on a log scale: bytes uploaded, stored, delivered to viewers and sent by the origin in one day."><text x="10" y="16" class="ts">Bytes in one day, on a log scale: each gridline is ten times the one before</text><line x1="160" y1="26" x2="160" y2="140" class="grid"></line><text x="160" y="156" class="ts mid">100 TB</text><line x1="245" y1="26" x2="245" y2="140" class="grid"></line><text x="245" y="156" class="ts mid">1 PB</text><line x1="330" y1="26" x2="330" y2="140" class="grid"></line><text x="330" y="156" class="ts mid">10 PB</text><line x1="415" y1="26" x2="415" y2="140" class="grid"></line><text x="415" y="156" class="ts mid">100 PB</text><line x1="500" y1="26" x2="500" y2="140" class="grid"></line><text x="500" y="156" class="ts mid">1 EB</text><text x="150" y="45" class="ts end">Uploaded</text><rect x="160" y="32" width="29.9" height="17" rx="2" class="bar mute"></rect><text x="197.9" y="45" class="ts tb">225 TB</text><text x="150" y="72" class="ts end">Stored, all rungs</text><rect x="160" y="59" width="91.8" height="17" rx="2" class="bar store"></rect><text x="259.8" y="72" class="ts tb">1.2 PB</text><text x="150" y="99" class="ts end">Delivered to viewers</text><rect x="160" y="86" width="276.7" height="17" rx="2" class="bar"></rect><text x="444.7" y="99" class="ts tb">180 PB</text><text x="150" y="126" class="ts end">Sent by the origin</text><rect x="160" y="113" width="191.7" height="17" rx="2" class="bar"></rect><text x="359.7" y="126" class="ts tb">18 PB</text></svg>
+<dl class="results">
+  <div><dt>Streams</dt><dd data-out="watching">11.1 million at peak, 133 million hours a day</dd></div>
+  <div><dt>Delivery</dt><dd data-out="delivery">33.3 Tbit/s at peak, 180 PB a day</dd></div>
+  <div><dt>From the origin</dt><dd data-out="origin">3.33 Tbit/s at peak</dd></div>
+  <div><dt>Uploads</dt><dd data-out="uploads">34.7 hours of video a minute, 225 TB a day</dd></div>
+  <div><dt>Stored</dt><dd data-out="stored">1.2 PB a day, 439 PB a year</dd></div>
+  <div><dt>Encoding</dt><dd data-out="encoders">29.8 thousand cores busy all day</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Streams at once in the busiest hour: 11.1 million, using 33.3 Tbit/s. Viewers receive 800 bytes for every byte uploaded, so delivery, not storage, is the bulk of the cost. With 90% of the bytes served by the CDN, the origin still sends 3.33 Tbit/s at peak. Encoding uploads as they arrive keeps 29.8 thousand cores busy, and storage grows by 439 PB a year.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<p>Uploading is a small API that never carries the video: it hands out signed URLs, and the client sends the file’s parts straight to object storage (<x-ref to="object-and-file-storage#multipart"></x-ref>). A dropped connection costs one part, not the file.</p>
+<pre data-lang="http" data-title="Uploading: a session, the parts, then complete">
+POST /v1/uploads                                   Idempotency-Key: 2b7c9e…
+{ "title": "Talk at the meetup", "bytes": 1207959552, "type": "video/mp4" }
+→ 201 { "videoId": "v_81", "uploadId": "up_93", "partBytes": 16777216,
+        "parts": [ { "n": 1, "url": "https://upload.example/up_93/1?exp=…&sig=…" }, … 72 parts ] }
+
+PUT https://upload.example/up_93/1?exp=…&sig=…     (16 MiB of the file)   → 200  ETag: "p1"
+POST /v1/uploads/up_93/complete  { "parts": [ [1, "p1"], [2, "p2"], … [72, "p72"] ] }
+→ 202 { "videoId": "v_81", "status": "processing" }
+
+GET /v1/uploads/up_93         → 200 { "received": [1, 2, … 40] }      after a crash: send the rest
+</pre>
+<p>Watching starts with one call to the API and continues with file requests to the CDN. The playlist URL is signed for the viewer and expires, so the CDN can refuse requests without asking the application (<x-ref to="cdn-and-edge#security"></x-ref>).</p>
+<pre data-lang="http" data-title="Watching: the video, then playlists and segments from the CDN">
+GET /v1/videos/v_81
+→ 200 { "title": "Talk at the meetup", "status": "ready", "durationSec": 600, "resumeAt": 96,
+        "playlist": "https://cdn.example/v/v_81/master.m3u8?exp=1760400000&sig=…" }
+
+GET /v/v_81/master.m3u8                    the master playlist: one entry for each rung
+#EXTM3U
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-STREAM-INF:BANDWIDTH=9400000,AVERAGE-BANDWIDTH=7900000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
+1080p_7800/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3700000,AVERAGE-BANDWIDTH=3100000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"
+720p_3000/index.m3u8
+…  seven more rungs
+
+GET /v/v_81/720p_3000/index.m3u8           a media playlist: the segments of one rung
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:6
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:6.006,
+0.m4s
+#EXTINF:6.006,
+1.m4s
+…  98 more
+#EXT-X-ENDLIST
+
+POST /v1/playback-events  [ { "videoId": "v_81", "position": 96, "rung": 6, "stalledMs": 0 }, … ]   → 204
+</pre>
+<ul>
+  <li><b>Retries are safe.</b> Creating an upload takes an idempotency key, parts are addressed by number, and <code>complete</code> names the parts it expects (<x-ref to="idempotency-and-delivery#keys"></x-ref>). Processing takes minutes, so <code>complete</code> answers 202 at once.</li>
+  <li><b>Seeking is arithmetic.</b> The playlist gives every segment’s duration, so minute 7 is segment 70. A service may instead store each rung as one file and list segments as byte ranges of it, fetched with range requests (<x-ref to="object-and-file-storage#serving"></x-ref>).</li>
+  <li><b>Segments never change.</b> A new encoding gets new names, so a finished video’s files can be cached as long as the CDN likes (<x-ref to="cdn-and-edge#freshness"></x-ref>).</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A video: owner, title, status, duration, visibility</th><td>Video id</td><td>A relational database partitioned by a hash of the id, with a cache in front</td><td>Read by id on every watch page; 500,000 new rows a day (<x-ref to="partitioning#hash"></x-ref>)</td></tr>
+<tr><th>Its renditions: codec, resolution, bitrate, playlist path</th><td>Video id, then rung</td><td>The same database</td><td>Written by the workflow as each rung is finished; the master playlist is built from them</td></tr>
+<tr><th>An upload session: parts received, expiry</th><td>Upload id</td><td>A key-value store with expiry</td><td>Lives for hours; sessions abandoned halfway are deleted with their parts</td></tr>
+<tr><th>The original upload</th><td>Video id</td><td>Object storage, moved to a cold tier once processed (<x-ref to="object-and-file-storage#tiers"></x-ref>)</td><td>Kept to encode again when a better codec arrives</td></tr>
+<tr><th>Segments and playlists</th><td>A path: <code>v/v_81/720p_3000/12.m4s</code></td><td>Object storage, the CDN’s origin</td><td>Almost all the bytes; written once, never changed</td></tr>
+<tr><th>The processing of one video</th><td>Video id</td><td>The workflow engine’s own store</td><td>A crashed worker’s job is run again and the workflow carries on (<x-ref to="scheduling-and-workflows#durable-execution"></x-ref>)</td></tr>
+<tr><th>Resume points and watch history</th><td>User, then video</td><td>A key-value store partitioned by user</td><td>Written every 30 seconds while watching, read when a video opens</td></tr>
+<tr><th>View counts</th><td>Video id</td><td>Counters updated from the event stream every few seconds</td><td>370,000 events a second are counted in windows, not written one by one (<x-ref to="batch-and-stream-processing#windows"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>The split is that of <x-ref to="hld-email"></x-ref>: small records in a database, large immutable files in object storage. Here the application never reads the files; the CDN does.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 422" role="img" aria-labelledby="f851t f851d">
+<title id="f851t">The design of the video platform</title>
+<desc id="f851d">Three paths. Uploading: the app gets part URLs from the upload API and sends the parts straight to object storage; a workflow then has encoders write segments and playlists to the origin and marks the video ready. Watching: the player gets a signed playlist URL from the video API, then fetches from a CDN edge, which asks a regional shield on a miss, which asks the origin. Counting: playback events go to a stream that updates counts and history.</desc>
+<text class="tb" x="10" y="18">Uploading</text>
+<rect class="n" x="10" y="28" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="49">Creator app</text>
+<text class="ts mid" x="60" y="66">browser, phone</text>
+<rect class="n sig" x="140" y="28" width="120" height="50" rx="6"/>
+<text class="tb mid" x="200" y="49">Upload API</text>
+<text class="ts mid" x="200" y="66">sessions, part URLs</text>
+<rect class="n store" x="290" y="28" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="49">Video metadata</text>
+<text class="ts mid" x="350" y="66">videos, renditions</text>
+<rect class="n async" x="440" y="28" width="120" height="50" rx="6"/>
+<text class="tb mid" x="500" y="49">Encoders</text>
+<text class="ts mid" x="500" y="66">chunk × rung jobs</text>
+<rect class="n store" x="590" y="28" width="120" height="50" rx="6"/>
+<text class="tb mid" x="650" y="49">Segments</text>
+<text class="ts mid" x="650" y="66">and playlists: origin</text>
+<path class="e sig" d="M110 53H140"/>
+<path class="e sig" d="M260 53H290"/>
+<rect class="n store" x="140" y="108" width="120" height="50" rx="6"/>
+<text class="tb mid" x="200" y="129">Originals</text>
+<text class="ts mid" x="200" y="146">object storage</text>
+<rect class="n async" x="290" y="108" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="129">Workflow</text>
+<text class="ts mid" x="350" y="146">split, encode, publish</text>
+<path class="e sig" d="M60 78V133H140"/>
+<text class="ts" x="66" y="100">parts, direct</text>
+<path class="e async" d="M260 133H290"/>
+<path class="e async" d="M350 108V78"/>
+<text class="ts" x="356" y="97">ready</text>
+<path class="e async" d="M410 133H500V78"/>
+<text class="ts" x="416" y="127">jobs</text>
+<path class="e async" d="M560 53H590"/>
+<text class="tb" x="10" y="190">Watching</text>
+<rect class="n" x="10" y="200" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="221">Player</text>
+<text class="ts mid" x="60" y="238">picks each rung</text>
+<rect class="n sig" x="140" y="200" width="120" height="50" rx="6"/>
+<text class="tb mid" x="200" y="221">Video API</text>
+<text class="ts mid" x="200" y="238">signs playlist URLs</text>
+<rect class="n store" x="290" y="200" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="221">Metadata cache</text>
+<text class="ts mid" x="350" y="238">watch pages</text>
+<path class="e sig" d="M110 225H140"/>
+<path class="e sig" d="M260 225H290"/>
+<rect class="n sig" x="290" y="280" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="301">CDN edge</text>
+<text class="ts mid" x="350" y="318">near the viewer</text>
+<rect class="n sig" x="440" y="280" width="120" height="50" rx="6"/>
+<text class="tb mid" x="500" y="301">Shield</text>
+<text class="ts mid" x="500" y="318">one per region</text>
+<path class="e sig" d="M60 250V305H290"/>
+<text class="ts mid" x="176" y="299">playlists, segments</text>
+<path class="e sig" d="M410 305H440"/>
+<path class="e sig" d="M560 305H650V78"/>
+<text class="ts" x="656" y="200">misses</text>
+<text class="tb" x="10" y="352">Counting</text>
+<rect class="n async" x="290" y="362" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="383">Event stream</text>
+<text class="ts mid" x="350" y="400">playback events</text>
+<rect class="n store" x="440" y="362" width="120" height="50" rx="6"/>
+<text class="tb mid" x="500" y="383">Counts, history</text>
+<text class="ts mid" x="500" y="400">views, resume points</text>
+<path class="e async" d="M36 250V387H290"/>
+<text class="ts mid" x="164" y="381">heartbeats, quality</text>
+<path class="e async" d="M410 387H440"/>
+<text class="ts" x="444" y="216">Solid: the request path.</text>
+<text class="ts" x="444" y="234">Dashed: later work.</text>
+</svg>
+</div>
+<figcaption>Creators’ bytes go straight to object storage and are processed later; viewers’ bytes come from the CDN. The application servers only sign URLs and keep the records.</figcaption>
+</figure>
+
+<p>Only small requests reach the application: creating an upload, reading a video’s record, posting events. Everything heavy goes around it. Uploads go to object storage with signed URLs, processing runs as queued work on its own pool, and playback is served by the CDN from files that never change.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 640" role="img" aria-labelledby="f852t f852d">
+<title id="f852t">Uploading and processing a video, and starting to watch it</title>
+<desc id="f852d">Two sequences. Uploading: the app gets 72 signed part URLs, sends the parts to object storage and reports completion; a workflow queues 180 encoding jobs, encoders write segments, and the video goes public at three rungs, then at nine. Watching: the player gets a signed playlist URL, fetches the master playlist and a first 360p segment from the edge, which misses through the shield to storage; playback starts and the next segment is requested at 1080p.</desc>
+<text class="tb" x="10" y="16">Uploading and processing</text>
+<g data-scene="upload">
+<text class="tb mid" x="50" y="40">Creator app</text>
+<line class="axis" x1="50" y1="48" x2="50" y2="300"/>
+<text class="tb mid" x="172" y="40">Upload API</text>
+<line class="axis" x1="172" y1="48" x2="172" y2="300"/>
+<text class="tb mid" x="300" y="40">Object storage</text>
+<line class="axis" x1="300" y1="48" x2="300" y2="300"/>
+<text class="tb mid" x="428" y="40">Workflow</text>
+<line class="axis" x1="428" y1="48" x2="428" y2="300"/>
+<text class="tb mid" x="546" y="40">Encoders</text>
+<line class="axis" x1="546" y1="48" x2="546" y2="300"/>
+<text class="tb mid" x="660" y="40">Metadata</text>
+<line class="axis" x1="660" y1="48" x2="660" y2="300"/>
+<g data-s="1">
+<path class="e sig" d="M51 72H171"/>
+<text class="ts mid" x="111.0" y="66">1. POST /uploads</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M171 99H51"/>
+<text class="ts mid" x="111.0" y="93">2. 72 part URLs</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M51 126H299"/>
+<text class="ts mid" x="175.0" y="120">3. PUT parts, four at a time</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M51 153H171"/>
+<text class="ts mid" x="111.0" y="147">4. complete</text>
+</g>
+<g data-s="5">
+<path class="e async" d="M173 180H427"/>
+<text class="ts mid" x="300.0" y="174">5. start v_81</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M429 207H545"/>
+<text class="ts mid" x="487.0" y="201">6. 180 jobs</text>
+</g>
+<g data-s="7">
+<path class="e async" d="M545 234H301"/>
+<text class="ts mid" x="423.0" y="228">7. 6-second segments</text>
+</g>
+<g data-s="8">
+<path class="e store" d="M429 261H659"/>
+<text class="ts mid" x="544.0" y="255">8. public at 3 rungs</text>
+</g>
+<g data-s="9">
+<path class="e store" d="M429 288H659"/>
+<text class="ts mid" x="544.0" y="282">9. all 9 rungs</text>
+</g>
+</g>
+<path class="e none dash" d="M10 318H710"/>
+<text class="tb" x="10" y="342">Starting to watch</text>
+<g data-scene="watch">
+<text class="tb mid" x="50" y="366">Player</text>
+<line class="axis" x1="50" y1="374" x2="50" y2="628"/>
+<text class="tb mid" x="186" y="366">Video API</text>
+<line class="axis" x1="186" y1="374" x2="186" y2="628"/>
+<text class="tb mid" x="340" y="366">CDN edge</text>
+<line class="axis" x1="340" y1="374" x2="340" y2="628"/>
+<text class="tb mid" x="486" y="366">Shield</text>
+<line class="axis" x1="486" y1="374" x2="486" y2="628"/>
+<text class="tb mid" x="630" y="366">Object storage</text>
+<line class="axis" x1="630" y1="374" x2="630" y2="628"/>
+<g data-s="1">
+<path class="e sig" d="M51 398H185"/>
+<text class="ts mid" x="118.0" y="392">1. GET /videos/v_81</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M185 425H51"/>
+<text class="ts mid" x="118.0" y="419">2. signed playlist URL</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M51 452H339"/>
+<text class="ts mid" x="195.0" y="446">3. GET master.m3u8</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M339 479H51"/>
+<text class="ts mid" x="195.0" y="473">4. nine variants</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M51 506H339"/>
+<text class="ts mid" x="195.0" y="500">5. 360p playlist, segment 0</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M341 533H485"/>
+<text class="ts mid" x="413.0" y="527">6. miss</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M487 560H629"/>
+<text class="ts mid" x="558.0" y="554">7. miss</text>
+</g>
+<g data-s="8">
+<path class="e store" d="M339 587H51"/>
+<text class="ts mid" x="195.0" y="581">8. segment 0, at 9 Mbit/s</text>
+</g>
+<g data-s="9">
+<path class="e sig" d="M51 614H339"/>
+<text class="ts mid" x="195.0" y="608">9. segment 1 at 1080p</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="upload" data-label="Upload">
+  <li data-msg="1.2 GB" data-state="Video v_81: uploading; Rungs ready: 0 of 9">The app asks to upload a 1.2 GB file. The API records a video, v_81, and an upload session.</li>
+  <li data-msg="URLs" data-state="Video v_81: uploading; Rungs ready: 0 of 9">It answers with 72 signed URLs, one per 16 MiB part.</li>
+  <li data-msg="part" data-state="Video v_81: uploading; Rungs ready: 0 of 9">The app sends the parts straight to object storage, several at once; a failed part is sent again alone.</li>
+  <li data-msg="complete" data-state="Video v_81: uploading; Rungs ready: 0 of 9">With every part stored, the app says so, and storage joins them into the original.</li>
+  <li data-msg="start" data-state="Video v_81: processing; Rungs ready: 0 of 9">The API starts a workflow for the video and answers 202. The creator can close the app now.</li>
+  <li data-msg="jobs" data-state="Video v_81: processing; Rungs ready: 0 of 9">The workflow cuts the original at keyframes into 20 chunks of 30 seconds: a job for each chunk and rung.</li>
+  <li data-msg="segments" data-state="Video v_81: processing; Rungs ready: 0 of 9">Encoders work in parallel and write 6-second segments. A failed job runs again, writing the same files.</li>
+  <li data-msg="ready" data-state="Video v_81: public; Rungs ready: 3 of 9">With the three lowest rungs complete, playlists are written and the video goes public.</li>
+  <li data-msg="ready" data-state="Video v_81: public; Rungs ready: 9 of 9">The higher rungs follow and join the master playlist. The original moves to a cold tier.</li>
+</ol>
+<ol class="steps" data-scene="watch" data-label="Watch">
+  <li data-msg="v_81" data-state="Buffered: 0 s; Playing: not yet">A viewer opens the video, and the player asks where to find it.</li>
+  <li data-msg="URL" data-state="Buffered: 0 s; Playing: not yet">The API answers from its cache with a playlist URL signed for this viewer.</li>
+  <li data-msg="master" data-state="Buffered: 0 s; Playing: not yet">The player fetches the master playlist from the edge nearest to the viewer.</li>
+  <li data-msg="9 variants" data-state="Buffered: 0 s; Playing: not yet">It lists the nine rungs, each with its bandwidth, resolution and playlist.</li>
+  <li data-msg="seg 0" data-state="Buffered: 0 s; Playing: not yet">With no measurement yet, the player starts low, so that the first picture appears within a second.</li>
+  <li data-msg="seg 0" data-state="Buffered: 0 s; Playing: not yet">This edge has never served the segment, so it asks the regional shield.</li>
+  <li data-msg="seg 0" data-state="Buffered: 0 s; Playing: not yet">The shield misses too and fetches it from the origin. Both keep a copy for the next viewer.</li>
+  <li data-msg="274 KB" data-state="Buffered: 6 s; Playing: 360p">The segment arrives quickly. Playback starts, and the player’s estimate of its bandwidth rises.</li>
+  <li data-msg="seg 1" data-state="Buffered: 6 s, filling; Playing: 360p, 1080p next">It asks for the next segment at a higher rung. All rungs start segments at the same instants, so the switch does not show.</li>
+</ol>
+<figcaption>The upload API never touches the video’s bytes, and the work that follows is queued. Playback starts from a low rung and climbs once the player has measured the connection.</figcaption>
+</figure>
+
+<p>Two details carry the requirements. The workflow publishes the video once the lowest rungs exist, meeting the “public within a few minutes” target while higher rungs are still encoding. And the player starts low because it knows nothing yet about its connection: a 360p segment is 274 KB, which arrives in a fraction of a second on almost any connection.</p>
+
+<h2 id="transcoding">Step 6a: Transcoding in parallel</h2>
+<p>Processing an upload means decoding the original, encoding it nine times, cutting each rung into segments and writing the playlists. The chapter’s code models the cost: each rung costs core-seconds in proportion to its pixels, 3.2 for each second of 1080p, plus 0.3 for decoding, varying with the complexity of each scene. The ladder costs 14.3 core-seconds per second of video, the figure in step 2, so a 10-minute upload is 2.3 core-hours of work.</p>
+<p>Giving each rung its own worker stops helping at nine workers, because the 1080p rungs alone take over half an hour. The better plan cuts the original at keyframes into chunks, encodes each chunk of each rung as a separate job, and joins the results: a map step and a reduce step (<x-ref to="batch-and-stream-processing#batch"></x-ref>). Each job pays a fixed 4 seconds in the model to start, fetch its piece and write its output. The simulation schedules the jobs on a pool of workers, largest first.</p>
+<table>
+<thead><tr><th>A 10-minute upload</th><th>1 worker</th><th>8</th><th>32</th><th>128</th><th>512</th><th>Work done</th></tr></thead>
+<tbody>
+<tr><th>One job per rung, whole file</th><td>138 min</td><td>34 min</td><td>34 min</td><td>34 min</td><td>34 min</td><td>2.30 core-hours</td></tr>
+<tr><th>60-second chunks</th><td>144 min</td><td>18 min</td><td>5.0 min</td><td>4.2 min</td><td>4.2 min</td><td>2.40 core-hours</td></tr>
+<tr><th>30-second chunks</th><td>150 min</td><td>19 min</td><td>5.1 min</td><td>2.5 min</td><td>2.5 min</td><td>2.50 core-hours</td></tr>
+<tr><th>6-second chunks</th><td>198 min</td><td>25 min</td><td>6.5 min</td><td>1.9 min</td><td>1.0 min</td><td>3.30 core-hours</td></tr>
+</tbody>
+</table>
+<p>Each plan has a floor: the longest single job. Smaller chunks lower the floor, a minute for 6-second chunks against 34 for whole files, but every job pays its overhead again, so 6-second chunks do 43% more work than whole files. Chunks of 30 to 60 seconds get the time under five minutes for 4 to 9% more work. Short chunks have a second cost that the model leaves out: an encoder that sees only a few seconds plans its bits with less to go on.</p>
+<p>The order of the queue decides when the video can go public. With 30-second chunks on 32 workers, largest first finishes everything in 5.1 minutes but completes no rung until near the end. Lowest rungs first has three rungs ready after 1.2 minutes, so the video goes public then, and finishes in 6.1.</p>
+<p>The steps run as a durable workflow: split, encode, assemble, publish (<x-ref to="scheduling-and-workflows#workflows"></x-ref>). A worker that dies makes its job reappear in the queue (<x-ref to="message-queues#ack"></x-ref>), and every output’s name is fixed by video, rung and chunk, so a job that runs twice writes the same files. The pool of step 2, 30,000 cores, depends more on the codec and the hardware than on any scheduling. Nor must every video get the same ladder. <dfn>Per-title encoding</dfn> is choosing the rungs of each video from an analysis of that video, since a cartoon needs far fewer bits than a football match for the same quality.</p>
+
+<h2 id="abr">Step 6b: Choosing a bitrate, segment by segment</h2>
+<p>The player holds a buffer of downloaded video, up to 60 seconds in the model, and chooses a rung before fetching each segment. Too high, and the segment takes longer to arrive than the buffer lasts, so the picture freezes. Too low, and the picture is worse than the connection allows. Players use two signals.</p>
+<ul>
+  <li><b>Throughput-based.</b> Estimate the bandwidth from how fast recent segments arrived, and pick the highest rung under a fraction of it. The browser player hls.js documents its version: the smaller of two moving averages with half-lives of 3 and 9 seconds, and a rung must fit in 95% of it, or 70% to switch up.</li>
+  <li><b>Buffer-based.</b> Let the buffer decide, as in the code below, which moves one rung at a time unless the line has passed several. Huang and colleagues at Stanford and Netflix proposed this in 2014, finding that estimates of a varying connection are either wrong or too cautious, while the buffer already holds the answer: it grows when the rung is below the bandwidth and shrinks when above.</li>
+</ul>
+<pre data-lang="ts" data-title="Buffer-based: below the reservoir the lowest rung, above the cushion the highest, a line between">
+export class BufferBased implements Abr {
+  readonly name: string;
+  private readonly reservoir: number;
+  private readonly cushion: number;
+  constructor(reservoir = 24, cushion = 30) {
+    this.reservoir = reservoir;
+    this.cushion = cushion;
+    this.name = `buffer-based, reservoir ${reservoir} s`;
+  }
+  choose(view: View): number {
+    const top = LADDER.length - 1, b = view.buffer;
+    if (b <= this.reservoir) return 0;
+    if (b >= this.reservoir + this.cushion) return top;
+    const lo = (LADDER[0] as Rung).kbps, hi = (LADDER[top] as Rung).kbps;
+    const f = lo + (hi - lo) * (b - this.reservoir) / this.cushion;
+    const prev = Math.max(view.last, 0);
+    const up = Math.min(prev + 1, top), down = Math.max(prev - 1, 0);
+    if (f >= (LADDER[up] as Rung).kbps) return Math.max(highestBelow(f), prev);
+    if (f <= (LADDER[down] as Rung).kbps) {
+      for (let i = 0; i <= top; i++) if ((LADDER[i] as Rung).kbps > f) return Math.min(i, prev);
+    }
+    return prev;
+  }
+}
+</pre>
+<p>The simulation plays 10 minutes of video for 400 generated viewers. Half are on fixed lines, typically 8 Mbit/s; half on mobile, typically 4 Mbit/s, shifting every 20 seconds or so and dropping to 5 to 20% for 4 to 20 seconds about once a minute (fixed lines every five minutes). Segment sizes vary by about 25% with the scene, and each request waits 80 ms for its first byte. Every player runs on the same traces.</p>
+
+<figure class="fig wide" id="fig-abr">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 400" role="img" aria-labelledby="f854t f854d">
+<title id="f854t">One mobile viewer, two players</title>
+<desc id="f854d">Two charts over the first ten minutes of one mobile viewer’s session from the experiment. Top: the bandwidth available each second, which averages 2.7 Mbit/s and dips twice to under 1 Mbit/s, and the bitrate each player requested. The throughput-based player averaged 1,119 kbit/s and changed rung 24 times; the buffer-based player averaged 2,563 kbit/s and changed rung 37 times. Bottom: seconds of video buffered. The throughput-based player’s buffer ran dry at 18 seconds and the video froze for 4.6 seconds; after the first minute its buffer stayed near 54 seconds. The buffer-based player kept between 16 and 48 seconds after the first minute and never froze.</desc>
+<text class="tb" x="10" y="18">Bandwidth available, and the bitrate each player asked for, kbit/s</text>
+<line class="grid" x1="70" y1="200.0" x2="650" y2="200.0"/>
+<text class="ts end" x="62" y="204.0">0</text>
+<line class="grid" x1="70" y1="161.0" x2="650" y2="161.0"/>
+<text class="ts end" x="62" y="165.0">2,000</text>
+<line class="grid" x1="70" y1="122.0" x2="650" y2="122.0"/>
+<text class="ts end" x="62" y="126.0">4,000</text>
+<line class="grid" x1="70" y1="83.0" x2="650" y2="83.0"/>
+<text class="ts end" x="62" y="87.0">6,000</text>
+<line class="grid" x1="70" y1="44.0" x2="650" y2="44.0"/>
+<text class="ts end" x="62" y="48.0">8,000</text>
+<path class="line" style="stroke:var(--ink-3);stroke-width:1" d="M70.5 112.1 L71.5 138.3 L72.4 132.0 L73.4 135.7 L74.3 123.0 L75.3 113.5 L76.3 118.8 L77.2 187.4 L78.2 189.3 L79.2 194.2 L80.2 193.0 L81.1 195.2 L82.1 194.0 L83.0 187.0 L84.0 189.8 L85.0 187.6 L86.0 184.9 L86.9 195.9 L87.9 194.6 L88.8 195.2 L89.8 185.4 L90.8 194.8 L91.8 112.9 L92.7 106.2 L93.7 132.6 L94.7 131.2 L95.6 187.4 L96.6 195.4 L97.5 185.2 L98.5 182.3 L99.5 185.0 L100.5 187.1 L101.4 194.8 L102.4 195.4 L103.3 189.0 L104.3 189.6 L105.3 194.4 L106.2 196.8 L107.2 196.4 L108.2 190.5 L109.2 192.4 L110.1 188.1 L111.1 189.3 L112.0 192.2 L113.0 196.9 L114.0 136.2 L115.0 136.4 L115.9 129.5 L116.9 108.4 L117.8 143.6 L118.8 102.1 L119.8 141.8 L120.8 129.1 L121.7 143.9 L122.7 137.0 L123.7 147.2 L124.6 144.3 L125.6 137.0 L126.5 145.5 L127.5 141.2 L128.5 122.1 L129.4 124.7 L130.4 111.1 L131.4 84.1 L132.3 112.7 L133.3 151.3 L134.3 156.0 L135.2 149.9 L136.2 152.9 L137.2 151.2 L138.2 156.7 L139.1 151.9 L140.1 156.9 L141.1 142.9 L142.0 44.0 L143.0 44.0 L143.9 53.7 L144.9 44.0 L145.9 44.0 L146.8 56.9 L147.8 44.6 L148.8 44.0 L149.8 183.5 L150.7 184.6 L151.7 184.1 L152.7 177.6 L153.6 185.1 L154.6 196.9 L155.6 196.8 L156.5 195.8 L157.5 197.9 L158.4 196.9 L159.4 198.1 L160.4 198.1 L161.3 196.8 L162.3 195.8 L163.3 195.2 L164.2 196.7 L165.2 198.1 L166.2 178.8 L167.2 182.6 L168.1 179.1 L169.1 180.7 L170.1 178.7 L171.0 173.8 L172.0 181.0 L172.9 87.3 L173.9 102.1 L174.9 117.2 L175.8 93.2 L176.8 121.8 L177.8 98.9 L178.8 170.1 L179.7 168.9 L180.7 167.2 L181.7 171.5 L182.6 173.3 L183.6 174.4 L184.6 168.2 L185.5 180.7 L186.5 167.4 L187.4 167.7 L188.4 163.2 L189.4 173.2 L190.3 173.0 L191.3 172.1 L192.3 173.9 L193.2 172.2 L194.2 169.7 L195.2 174.3 L196.2 96.8 L197.1 96.6 L198.1 93.7 L199.1 56.8 L200.0 96.6 L201.0 71.4 L201.9 105.4 L202.9 84.9 L203.9 115.9 L204.8 70.3 L205.8 99.6 L206.8 125.0 L207.8 151.6 L208.7 142.3 L209.7 155.0 L210.7 136.8 L211.6 138.5 L212.6 135.0 L213.6 129.0 L214.5 140.6 L215.5 119.3 L216.4 136.9 L217.4 139.8 L218.4 155.8 L219.3 156.7 L220.3 158.7 L221.3 151.1 L222.2 156.6 L223.2 155.5 L224.2 145.3 L225.2 147.2 L226.1 140.7 L227.1 142.0 L228.1 146.9 L229.0 157.5 L230.0 150.5 L230.9 162.6 L231.9 154.6 L232.9 180.3 L233.8 173.8 L234.8 173.4 L235.8 181.0 L236.8 180.8 L237.7 175.3 L238.7 178.7 L239.7 177.6 L240.6 182.6 L241.6 172.1 L242.6 178.8 L243.5 181.6 L244.5 177.7 L245.4 182.2 L246.4 176.4 L247.4 177.2 L248.3 177.8 L249.3 179.7 L250.3 177.6 L251.2 180.1 L252.2 178.1 L253.2 171.0 L254.2 194.5 L255.1 196.3 L256.1 198.3 L257.1 199.0 L258.0 196.8 L259.0 198.8 L259.9 196.0 L260.9 193.4 L261.9 195.9 L262.9 197.2 L263.8 198.5 L264.8 197.0 L265.8 174.3 L266.7 177.6 L267.7 177.3 L268.6 181.4 L269.6 171.7 L270.6 174.0 L271.6 183.7 L272.5 181.2 L273.5 179.9 L274.4 174.2 L275.4 172.6 L276.4 175.7 L277.4 125.3 L278.3 144.2 L279.3 131.2 L280.2 125.0 L281.2 142.6 L282.2 127.4 L283.1 138.3 L284.1 139.2 L285.1 142.6 L286.1 144.2 L287.0 137.8 L288.0 118.7 L288.9 127.4 L289.9 137.9 L290.9 135.7 L291.9 140.2 L292.8 144.5 L293.8 126.0 L294.8 147.7 L295.7 129.8 L296.7 139.3 L297.6 141.0 L298.6 139.0 L299.6 120.1 L300.6 137.5 L301.5 147.5 L302.5 138.0 L303.4 138.4 L304.4 127.5 L305.4 131.2 L306.4 139.3 L307.3 124.5 L308.3 124.3 L309.2 152.4 L310.2 145.5 L311.2 133.5 L312.1 130.1 L313.1 136.4 L314.1 127.9 L315.1 136.0 L316.0 122.8 L317.0 137.1 L317.9 126.8 L318.9 125.1 L319.9 130.1 L320.9 141.3 L321.8 143.7 L322.8 132.9 L323.8 135.0 L324.7 143.8 L325.7 139.0 L326.6 151.9 L327.6 143.6 L328.6 126.8 L329.6 155.7 L330.5 130.3 L331.5 149.2 L332.4 142.4 L333.4 147.5 L334.4 152.8 L335.4 152.9 L336.3 149.4 L337.3 133.3 L338.2 149.7 L339.2 159.9 L340.2 149.4 L341.1 143.2 L342.1 119.4 L343.1 111.8 L344.1 120.4 L345.0 107.2 L346.0 114.9 L346.9 112.1 L347.9 100.6 L348.9 87.5 L349.9 110.3 L350.8 137.0 L351.8 87.8 L352.8 58.3 L353.7 104.6 L354.7 94.1 L355.6 158.2 L356.6 145.2 L357.6 155.5 L358.6 155.4 L359.5 154.8 L360.5 158.8 L361.4 157.0 L362.4 144.1 L363.4 152.4 L364.4 149.4 L365.3 149.1 L366.3 147.6 L367.2 146.5 L368.2 155.2 L369.2 143.7 L370.1 147.0 L371.1 149.4 L372.1 143.1 L373.1 150.2 L374.0 159.2 L375.0 145.8 L375.9 157.3 L376.9 155.6 L377.9 154.4 L378.9 154.1 L379.8 154.9 L380.8 139.7 L381.8 149.7 L382.7 144.7 L383.7 152.8 L384.6 139.3 L385.6 129.0 L386.6 152.5 L387.6 156.8 L388.5 152.5 L389.5 129.5 L390.4 141.4 L391.4 152.0 L392.4 157.8 L393.4 145.3 L394.3 148.7 L395.3 150.7 L396.2 140.4 L397.2 155.5 L398.2 153.6 L399.1 160.3 L400.1 143.7 L401.1 148.7 L402.1 151.0 L403.0 148.6 L404.0 138.0 L404.9 163.6 L405.9 155.5 L406.9 148.8 L407.9 151.2 L408.8 144.9 L409.8 140.3 L410.8 160.1 L411.7 149.4 L412.7 147.9 L413.6 151.4 L414.6 147.0 L415.6 135.4 L416.6 137.3 L417.5 140.9 L418.5 141.3 L419.4 154.7 L420.4 155.6 L421.4 145.4 L422.4 148.1 L423.3 151.5 L424.3 147.2 L425.2 151.3 L426.2 150.2 L427.2 153.2 L428.1 149.4 L429.1 197.1 L430.1 196.7 L431.1 195.6 L432.0 191.0 L433.0 193.9 L433.9 194.7 L434.9 193.3 L435.9 197.3 L436.9 155.9 L437.8 146.2 L438.8 66.3 L439.8 44.0 L440.7 57.4 L441.7 52.2 L442.6 68.4 L443.6 86.1 L444.6 100.3 L445.6 96.7 L446.5 126.9 L447.5 108.1 L448.4 106.3 L449.4 123.8 L450.4 110.9 L451.4 125.2 L452.3 80.1 L453.3 102.3 L454.2 118.9 L455.2 139.9 L456.2 123.5 L457.1 115.9 L458.1 112.9 L459.1 125.6 L460.1 112.5 L461.0 115.1 L462.0 132.0 L462.9 187.3 L463.9 193.9 L464.9 193.7 L465.9 193.4 L466.8 194.9 L467.8 195.2 L468.8 197.4 L469.7 195.7 L470.7 193.5 L471.6 193.9 L472.6 197.6 L473.6 197.5 L474.6 191.6 L475.5 177.8 L476.5 184.7 L477.4 183.1 L478.4 179.6 L479.4 172.9 L480.4 176.3 L481.3 173.0 L482.3 178.9 L483.2 175.7 L484.2 168.6 L485.2 182.3 L486.1 168.0 L487.1 178.4 L488.1 181.8 L489.1 116.2 L490.0 99.9 L491.0 112.9 L491.9 128.4 L492.9 87.9 L493.9 118.0 L494.9 109.1 L495.8 105.3 L496.8 119.3 L497.8 96.2 L498.7 115.2 L499.7 127.9 L500.6 90.2 L501.6 103.0 L502.6 129.4 L503.6 103.1 L504.5 109.1 L505.5 115.7 L506.4 113.0 L507.4 122.8 L508.4 169.0 L509.4 165.1 L510.3 160.4 L511.3 161.3 L512.2 161.2 L513.2 159.9 L514.2 167.1 L515.1 165.3 L516.1 166.1 L517.1 166.7 L518.0 167.3 L519.0 164.5 L520.0 101.1 L521.0 101.2 L521.9 81.7 L522.9 64.4 L523.9 115.0 L524.8 109.7 L525.8 95.7 L526.8 88.6 L527.7 96.5 L528.7 102.5 L529.6 97.7 L530.6 86.3 L531.6 103.8 L532.5 107.3 L533.5 95.3 L534.5 153.5 L535.5 172.9 L536.4 170.7 L537.4 171.3 L538.4 168.8 L539.3 163.4 L540.3 159.7 L541.2 162.2 L542.2 169.4 L543.2 168.3 L544.1 87.0 L545.1 105.6 L546.1 101.4 L547.0 76.0 L548.0 74.1 L549.0 84.4 L550.0 92.6 L550.9 112.8 L551.9 102.3 L552.9 80.4 L553.8 104.3 L554.8 105.3 L555.8 79.3 L556.7 85.6 L557.7 97.6 L558.6 58.1 L559.6 103.3 L560.6 63.1 L561.5 98.1 L562.5 84.5 L563.5 73.6 L564.5 116.6 L565.4 88.1 L566.4 114.3 L567.4 86.0 L568.3 106.3 L569.3 81.8 L570.2 110.6 L571.2 68.6 L572.2 81.9 L573.1 99.1 L574.1 111.0 L575.1 189.4 L576.0 193.9 L577.0 194.0 L578.0 194.3 L579.0 191.1 L579.9 144.7 L580.9 151.1 L581.9 135.7 L582.8 146.4 L583.8 138.2 L584.8 147.6 L585.7 139.5 L586.7 146.0 L587.6 143.7 L588.6 136.5 L589.6 145.6 L590.5 132.7 L591.5 144.5 L592.5 194.6 L593.5 193.0 L594.4 186.0 L595.4 194.6 L596.4 195.1 L597.3 196.4 L598.3 185.7 L599.2 130.2 L600.2 148.1 L601.2 129.3 L602.1 139.9 L603.1 190.9 L604.1 192.8 L605.0 196.8 L606.0 185.9 L607.0 193.4 L608.0 196.2 L608.9 195.7 L609.9 189.9 L610.9 188.1 L611.8 194.4 L612.8 193.1 L613.8 188.5 L614.7 194.1 L615.7 188.5 L616.6 191.3 L617.6 195.4 L618.6 194.2 L619.5 188.0 L620.5 133.7 L621.5 139.0 L622.5 150.8 L623.4 129.8 L624.4 141.0 L625.4 142.9 L626.3 134.4 L627.3 137.1 L628.2 135.1 L629.2 133.6 L630.2 124.0 L631.1 147.1 L632.1 128.9 L633.1 136.4 L634.0 140.9 L635.0 119.7 L636.0 193.5 L637.0 191.1 L637.9 193.4 L638.9 197.5 L639.9 193.3 L640.8 195.8 L641.8 193.4 L642.8 196.5 L643.7 194.5 L644.7 160.0 L645.6 132.5 L646.6 135.2 L647.6 130.9 L648.5 133.4 L649.5 114.4"/>
+<path class="line" style="stroke:var(--sig)" d="M70.0 197.2 L70.3 197.2 L70.3 161.0 L74.0 161.0 L74.0 161.0 L76.0 161.0 L76.0 161.0 L92.1 161.0 L92.1 185.8 L92.9 185.8 L92.9 185.8 L94.2 185.8 L94.2 178.6 L104.0 178.6 L104.0 185.8 L113.7 185.8 L113.7 192.9 L114.4 192.9 L114.4 192.9 L115.1 192.9 L115.1 192.9 L115.5 192.9 L115.5 185.8 L116.7 185.8 L116.7 185.8 L117.9 185.8 L117.9 185.8 L120.0 185.8 L120.0 178.6 L121.6 178.6 L121.6 178.6 L123.3 178.6 L123.3 178.6 L125.0 178.6 L125.0 178.6 L127.1 178.6 L127.1 178.6 L132.7 178.6 L132.7 178.6 L138.5 178.6 L138.5 178.6 L144.3 178.6 L144.3 178.6 L150.1 178.6 L150.1 178.6 L168.8 178.6 L168.8 192.9 L170.1 192.9 L170.1 192.9 L171.9 192.9 L171.9 192.9 L173.3 192.9 L173.3 185.8 L179.1 185.8 L179.1 185.8 L184.9 185.8 L184.9 185.8 L190.7 185.8 L190.7 185.8 L196.5 185.8 L196.5 185.8 L202.3 185.8 L202.3 178.6 L208.1 178.6 L208.1 178.6 L213.9 178.6 L213.9 178.6 L219.7 178.6 L219.7 178.6 L225.5 178.6 L225.5 178.6 L231.3 178.6 L231.3 178.6 L237.1 178.6 L237.1 178.6 L242.9 178.6 L242.9 178.6 L248.7 178.6 L248.7 178.6 L254.5 178.6 L254.5 185.8 L269.3 185.8 L269.3 192.9 L272.4 192.9 L272.4 192.9 L274.7 192.9 L274.7 192.9 L277.7 192.9 L277.7 192.9 L283.5 192.9 L283.5 192.9 L289.3 192.9 L289.3 185.8 L295.1 185.8 L295.1 185.8 L300.9 185.8 L300.9 178.6 L306.7 178.6 L306.7 178.6 L312.5 178.6 L312.5 178.6 L318.3 178.6 L318.3 178.6 L324.1 178.6 L324.1 178.6 L329.9 178.6 L329.9 178.6 L335.7 178.6 L335.7 178.6 L341.5 178.6 L341.5 178.6 L347.3 178.6 L347.3 178.6 L353.1 178.6 L353.1 161.0 L358.9 161.0 L358.9 161.0 L364.9 161.0 L364.9 161.0 L370.5 161.0 L370.5 161.0 L376.3 161.0 L376.3 161.0 L382.1 161.0 L382.1 161.0 L387.9 161.0 L387.9 161.0 L393.7 161.0 L393.7 161.0 L399.5 161.0 L399.5 161.0 L405.3 161.0 L405.3 161.0 L411.1 161.0 L411.1 161.0 L416.9 161.0 L416.9 161.0 L422.7 161.0 L422.7 161.0 L428.5 161.0 L428.5 161.0 L438.7 161.0 L438.7 185.8 L440.1 185.8 L440.1 178.6 L445.9 178.6 L445.9 178.6 L451.7 178.6 L451.7 178.6 L457.5 178.6 L457.5 178.6 L463.3 178.6 L463.3 161.0 L483.9 161.0 L483.9 192.9 L486.4 192.9 L486.4 192.9 L488.1 192.9 L488.1 192.9 L488.9 192.9 L488.9 185.8 L492.3 185.8 L492.3 185.8 L498.1 185.8 L498.1 178.6 L503.9 178.6 L503.9 178.6 L509.7 178.6 L509.7 178.6 L515.5 178.6 L515.5 178.6 L521.3 178.6 L521.3 178.6 L527.1 178.6 L527.1 178.6 L532.9 178.6 L532.9 178.6 L538.7 178.6 L538.7 178.6 L544.5 178.6 L544.5 178.6 L550.3 178.6 L550.3 178.6 L556.1 178.6 L556.1 161.0 L561.9 161.0 L561.9 161.0 L567.7 161.0 L567.7 161.0 L573.5 161.0 L573.5 161.0 L581.4 161.0 L581.4 178.6 L585.1 178.6 L585.1 178.6 L590.9 178.6 L590.9 178.6 L598.6 178.6 L598.6 185.8 L600.1 185.8"/>
+<path class="line" style="stroke:var(--store)" d="M70.0 197.2 L70.3 197.2 L70.3 197.2 L70.6 197.2 L70.6 197.2 L70.8 197.2 L70.8 197.2 L71.2 197.2 L71.2 197.2 L71.5 197.2 L71.5 178.6 L73.6 178.6 L73.6 161.0 L80.2 161.0 L80.2 161.0 L92.6 161.0 L92.6 185.8 L93.8 185.8 L93.8 178.6 L97.9 178.6 L97.9 161.0 L110.3 161.0 L110.3 192.9 L113.8 192.9 L113.8 185.8 L115.2 185.8 L115.2 161.0 L120.9 161.0 L120.9 161.0 L124.3 161.0 L124.3 161.0 L127.2 161.0 L127.2 141.5 L130.7 141.5 L130.7 141.5 L135.2 141.5 L135.2 141.5 L141.6 141.5 L141.6 141.5 L143.4 141.5 L143.4 112.2 L146.1 112.2 L146.1 83.0 L151.2 83.0 L151.2 83.0 L181.7 83.0 L181.7 197.2 L182.2 197.2 L182.2 178.6 L186.7 178.6 L186.7 178.6 L191.6 178.6 L191.6 178.6 L196.0 178.6 L196.0 161.0 L198.3 161.0 L198.3 141.5 L201.5 141.5 L201.5 141.5 L204.9 141.5 L204.9 141.5 L209.6 141.5 L209.6 112.2 L214.4 112.2 L214.4 112.2 L225.2 112.2 L225.2 112.2 L243.0 112.2 L243.0 185.8 L247.1 185.8 L247.1 185.8 L252.4 185.8 L252.4 185.8 L264.0 185.8 L264.0 197.2 L265.7 197.2 L265.7 192.9 L267.4 192.9 L267.4 178.6 L272.0 178.6 L272.0 161.0 L280.2 161.0 L280.2 161.0 L286.3 161.0 L286.3 161.0 L290.1 161.0 L290.1 161.0 L293.9 161.0 L293.9 161.0 L297.2 161.0 L297.2 141.5 L302.9 141.5 L302.9 141.5 L308.2 141.5 L308.2 141.5 L315.5 141.5 L315.5 141.5 L322.1 141.5 L322.1 141.5 L327.2 141.5 L327.2 141.5 L332.5 141.5 L332.5 141.5 L341.2 141.5 L341.2 141.5 L345.4 141.5 L345.4 141.5 L349.2 141.5 L349.2 141.5 L352.9 141.5 L352.9 141.5 L357.8 141.5 L357.8 141.5 L366.5 141.5 L366.5 141.5 L371.7 141.5 L371.7 141.5 L380.6 141.5 L380.6 141.5 L386.1 141.5 L386.1 141.5 L393.1 141.5 L393.1 141.5 L398.2 141.5 L398.2 141.5 L402.5 141.5 L402.5 141.5 L409.6 141.5 L409.6 141.5 L415.4 141.5 L415.4 141.5 L420.9 141.5 L420.9 141.5 L427.9 141.5 L427.9 141.5 L439.6 141.5 L439.6 185.8 L440.1 185.8 L440.1 161.0 L441.9 161.0 L441.9 141.5 L444.3 141.5 L444.3 141.5 L448.6 141.5 L448.6 141.5 L452.5 141.5 L452.5 112.2 L457.9 112.2 L457.9 112.2 L477.6 112.2 L477.6 161.0 L488.7 161.0 L488.7 197.2 L489.0 197.2 L489.0 178.6 L491.2 178.6 L491.2 161.0 L493.3 161.0 L493.3 141.5 L495.9 141.5 L495.9 141.5 L499.5 141.5 L499.5 112.2 L504.9 112.2 L504.9 112.2 L511.3 112.2 L511.3 112.2 L520.8 112.2 L520.8 112.2 L525.5 112.2 L525.5 112.2 L529.2 112.2 L529.2 112.2 L532.3 112.2 L532.3 112.2 L539.6 112.2 L539.6 112.2 L546.8 112.2 L546.8 112.2 L550.8 112.2 L550.8 112.2 L557.9 112.2 L557.9 112.2 L561.9 112.2 L561.9 112.2 L567.4 112.2 L567.4 112.2 L572.0 112.2 L572.0 112.2 L590.2 112.2 L590.2 141.5 L601.6 141.5 L601.6 178.6 L611.1 178.6 L611.1 197.2 L613.7 197.2 L613.7 192.9 L617.9 192.9 L617.9 185.8 L621.1 185.8"/>
+<text class="tb" x="10" y="238">Seconds of video buffered</text>
+<line class="grid" x1="70" y1="356.0" x2="650" y2="356.0"/>
+<text class="ts end" x="62" y="360.0">0 s</text>
+<line class="grid" x1="70" y1="324.7" x2="650" y2="324.7"/>
+<text class="ts end" x="62" y="328.7">20 s</text>
+<line class="grid" x1="70" y1="293.3" x2="650" y2="293.3"/>
+<text class="ts end" x="62" y="297.3">40 s</text>
+<line class="grid" x1="70" y1="262.0" x2="650" y2="262.0"/>
+<text class="ts end" x="62" y="266.0">60 s</text>
+<line class="axis" x1="70" y1="356" x2="650" y2="356"/>
+<text class="ts mid" x="70.0" y="374">0 min</text>
+<text class="ts mid" x="128.0" y="374">1 min</text>
+<text class="ts mid" x="186.0" y="374">2 min</text>
+<text class="ts mid" x="244.0" y="374">3 min</text>
+<text class="ts mid" x="302.0" y="374">4 min</text>
+<text class="ts mid" x="360.0" y="374">5 min</text>
+<text class="ts mid" x="418.0" y="374">6 min</text>
+<text class="ts mid" x="476.0" y="374">7 min</text>
+<text class="ts mid" x="534.0" y="374">8 min</text>
+<text class="ts mid" x="592.0" y="374">9 min</text>
+<text class="ts mid" x="650.0" y="374">10 min</text>
+<rect class="n fault" x="87.7" y="256" width="4.4" height="100" style="opacity:.35"/>
+<text class="ts end" x="650" y="238">Shaded: the throughput-based player froze for 4.6 s</text>
+<path class="line" style="stroke:var(--sig)" d="M70.0 356.0 L70.3 356.0 L70.3 346.6 L74.0 352.6 L74.0 343.2 L76.0 346.3 L76.0 336.9 L87.7 356.0 L92.1 356.0 L92.1 346.6 L92.9 347.9 L92.9 338.5 L94.2 340.5 L94.2 331.1 L104.0 347.1 L104.0 337.7 L113.7 353.3 L113.7 343.9 L114.4 345.2 L114.4 335.8 L115.1 336.9 L115.1 327.5 L115.5 328.1 L115.5 318.7 L116.7 320.6 L116.7 311.2 L117.9 313.2 L117.9 303.8 L120.0 307.1 L120.0 297.7 L121.6 300.4 L121.6 291.0 L123.3 293.6 L123.3 284.2 L125.0 287.1 L125.0 277.7 L127.1 281.1 L127.1 271.7 L128.9 274.5 L128.9 265.1 L132.7 271.4 L135.3 275.6 L135.3 266.2 L138.5 271.4 L141.0 275.3 L141.0 265.9 L144.3 271.4 L144.9 272.3 L144.9 262.9 L150.1 271.4 L168.8 301.6 L168.8 292.2 L170.1 294.4 L170.1 285.0 L171.9 287.9 L171.9 278.4 L172.9 280.0 L172.9 270.6 L173.3 271.4 L174.4 273.1 L174.4 263.7 L179.1 271.4 L181.8 275.8 L181.8 266.4 L184.9 271.4 L188.2 276.9 L188.2 267.5 L190.7 271.4 L193.9 276.6 L193.9 267.2 L196.5 271.4 L197.4 272.8 L197.4 263.4 L202.3 271.4 L203.0 272.5 L203.0 263.1 L208.1 271.4 L210.7 275.6 L210.7 266.2 L213.9 271.4 L216.1 274.8 L216.1 265.4 L219.7 271.4 L222.6 276.1 L222.6 266.7 L225.5 271.4 L228.6 276.4 L228.6 267.0 L231.3 271.4 L234.7 276.9 L234.7 267.5 L237.1 271.4 L241.5 278.4 L241.5 269.1 L242.9 271.4 L248.5 280.5 L248.5 271.1 L248.7 271.4 L253.4 278.9 L253.4 269.5 L254.5 271.4 L269.3 295.4 L269.3 286.0 L272.4 291.0 L272.4 281.6 L274.7 285.3 L274.7 275.9 L276.4 278.6 L276.4 269.2 L277.7 271.4 L278.4 272.7 L278.4 263.3 L283.5 271.4 L284.3 272.7 L284.3 263.3 L289.3 271.4 L290.8 273.8 L290.8 264.4 L295.1 271.4 L296.9 274.4 L296.9 265.0 L300.9 271.4 L303.7 275.9 L303.7 266.5 L306.7 271.4 L308.3 273.9 L308.3 264.5 L312.5 271.4 L314.3 274.2 L314.3 264.8 L318.3 271.4 L320.8 275.3 L320.8 265.9 L324.1 271.4 L326.3 275.0 L326.3 265.6 L329.9 271.4 L332.2 275.0 L332.2 265.6 L335.7 271.4 L338.2 275.5 L338.2 266.1 L341.5 271.4 L343.1 274.1 L343.1 264.7 L347.3 271.4 L348.9 273.9 L348.9 264.5 L353.1 271.4 L355.0 274.4 L355.0 265.0 L358.9 271.4 L364.9 281.1 L364.9 271.7 L369.0 278.3 L369.0 268.9 L370.5 271.4 L375.3 279.1 L375.3 269.7 L376.3 271.4 L380.2 277.7 L380.2 268.3 L382.1 271.4 L384.7 275.8 L384.7 266.4 L387.9 271.4 L392.3 278.4 L392.3 269.1 L393.7 271.4 L397.6 277.7 L397.6 268.3 L399.5 271.4 L403.4 277.7 L403.4 268.3 L405.3 271.4 L409.9 278.9 L409.9 269.5 L411.1 271.4 L415.7 278.8 L415.7 269.4 L416.9 271.4 L421.1 278.1 L421.1 268.7 L422.7 271.4 L427.9 279.7 L427.9 270.3 L428.5 271.4 L438.7 287.9 L438.7 278.4 L439.5 279.7 L439.5 270.3 L440.1 271.4 L441.0 273.0 L441.0 263.6 L445.9 271.4 L447.4 273.8 L447.4 264.4 L451.7 271.4 L452.8 273.1 L452.8 263.7 L457.5 271.4 L459.5 274.5 L459.5 265.1 L463.3 271.4 L483.9 304.8 L483.9 295.4 L486.4 299.4 L486.4 290.0 L488.1 292.9 L488.1 283.5 L488.9 284.6 L488.9 275.2 L489.7 276.6 L489.7 267.2 L492.3 271.4 L493.1 272.7 L493.1 263.3 L498.1 271.4 L499.2 273.3 L499.2 263.9 L503.9 271.4 L505.1 273.3 L505.1 263.9 L509.7 271.4 L512.9 276.6 L512.9 267.2 L515.5 271.4 L518.3 275.9 L518.3 266.5 L521.3 271.4 L522.0 272.7 L522.0 263.3 L527.1 271.4 L528.0 272.8 L528.0 263.4 L532.9 271.4 L534.2 273.4 L534.2 264.0 L538.7 271.4 L541.7 276.3 L541.7 266.9 L544.5 271.4 L546.5 274.5 L546.5 265.1 L550.3 271.4 L551.7 273.6 L551.7 264.2 L556.1 271.4 L558.5 275.2 L558.5 265.8 L561.9 271.4 L563.8 274.4 L563.8 265.0 L567.7 271.4 L571.6 277.7 L571.6 268.3 L573.5 271.4 L581.4 284.1 L581.4 274.7 L583.6 278.3 L583.6 268.9 L585.1 271.4 L587.6 275.3 L587.6 265.9 L590.9 271.4 L598.6 283.8 L598.6 274.4 L600.1 276.9 L600.1 267.5 L650.0 356.0"/>
+<path class="line" style="stroke:var(--store)" d="M70.0 356.0 L70.3 356.0 L70.3 346.6 L70.6 347.1 L70.6 337.7 L70.8 338.0 L70.8 328.6 L71.2 329.2 L71.2 319.8 L71.5 320.3 L71.5 310.9 L73.6 314.2 L73.6 304.8 L80.2 315.4 L80.2 306.0 L92.6 326.4 L92.6 317.0 L93.8 318.9 L93.8 309.5 L97.9 316.1 L97.9 306.6 L110.3 326.9 L110.3 317.5 L113.8 323.1 L113.8 313.7 L115.2 315.9 L115.2 306.5 L120.9 315.9 L120.9 306.5 L124.3 311.8 L124.3 302.4 L127.2 307.3 L127.2 297.9 L130.7 303.4 L130.7 294.0 L135.2 301.3 L135.2 291.9 L141.6 302.3 L141.6 292.9 L143.4 295.8 L143.4 286.4 L146.1 290.8 L146.1 281.4 L151.2 289.6 L151.2 280.2 L181.7 329.8 L181.7 320.4 L182.2 321.2 L182.2 311.8 L186.7 318.9 L186.7 309.5 L191.6 317.6 L191.6 308.2 L196.0 315.3 L196.0 305.9 L198.3 309.5 L198.3 300.1 L201.5 305.4 L201.5 296.0 L204.9 301.5 L204.9 292.1 L209.6 299.8 L209.6 290.4 L214.4 298.2 L214.4 288.8 L225.2 306.3 L225.2 296.9 L243.0 325.8 L243.0 316.4 L247.1 322.9 L247.1 313.5 L252.4 322.2 L252.4 312.8 L264.0 331.6 L264.0 322.2 L265.7 324.7 L265.7 315.3 L267.4 318.1 L267.4 308.7 L272.0 316.2 L272.0 306.8 L280.2 320.3 L280.2 310.9 L286.3 320.8 L286.3 311.4 L290.1 317.5 L290.1 308.1 L293.9 314.2 L293.9 304.8 L297.2 310.1 L297.2 300.7 L302.9 309.8 L302.9 300.4 L308.2 309.0 L308.2 299.6 L315.5 311.7 L315.5 302.3 L322.1 312.9 L322.1 303.5 L327.2 311.8 L327.2 302.4 L332.5 311.0 L332.5 301.6 L341.2 315.7 L341.2 306.3 L345.4 312.9 L345.4 303.5 L349.2 309.6 L349.2 300.2 L352.9 306.5 L352.9 297.1 L357.8 304.9 L357.8 295.5 L366.5 309.6 L366.5 300.2 L371.7 308.7 L371.7 299.3 L380.6 313.7 L380.6 304.3 L386.1 313.1 L386.1 303.7 L393.1 315.1 L393.1 305.7 L398.2 314.0 L398.2 304.6 L402.5 311.5 L402.5 302.1 L409.6 313.7 L409.6 304.3 L415.4 313.7 L415.4 304.3 L420.9 313.1 L420.9 303.7 L427.9 315.0 L427.9 305.6 L439.6 324.7 L439.6 315.3 L440.1 316.1 L440.1 306.6 L441.9 309.6 L441.9 300.2 L444.3 304.0 L444.3 294.6 L448.6 301.6 L448.6 292.2 L452.5 298.5 L452.5 289.1 L457.9 298.0 L457.9 288.6 L477.6 320.4 L477.6 311.0 L488.7 329.1 L488.7 319.7 L489.0 320.1 L489.0 310.7 L491.2 314.3 L491.2 304.9 L493.3 308.4 L493.3 299.0 L495.9 303.2 L495.9 293.8 L499.5 299.6 L499.5 290.2 L504.9 299.0 L504.9 289.6 L511.3 299.8 L511.3 290.4 L520.8 305.9 L520.8 296.5 L525.5 304.1 L525.5 294.7 L529.2 300.7 L529.2 291.3 L532.3 296.3 L532.3 286.9 L539.6 298.7 L539.6 289.3 L546.8 301.0 L546.8 291.6 L550.8 298.2 L550.8 288.8 L557.9 300.2 L557.9 290.8 L561.9 297.4 L561.9 288.0 L567.4 296.9 L567.4 287.5 L572.0 294.7 L572.0 285.3 L590.2 315.0 L590.2 305.6 L601.6 324.0 L601.6 314.6 L611.1 330.1 L611.1 320.8 L613.7 324.8 L613.7 315.4 L617.9 322.3 L617.9 312.9 L621.1 318.1 L621.1 308.7 L650.0 356.0"/>
+<text class="ts" style="paint-order:stroke;stroke:var(--raised);stroke-width:5px;stroke-linejoin:round" x="73.9" y="65.4">bandwidth</text>
+<text class="ts" style="paint-order:stroke;stroke:var(--raised);stroke-width:5px;stroke-linejoin:round;fill:var(--store)" x="360.0" y="135.5">buffer-based</text>
+<text class="ts" style="paint-order:stroke;stroke:var(--raised);stroke-width:5px;stroke-linejoin:round;fill:var(--sig)" x="360.0" y="156.0">throughput-based</text>
+<rect class="hit" x="70" y="40" width="9.66667" height="316" data-tip="0 min 00 s|bandwidth 4,508 kbit/s|throughput-based: 145 kbit/s, 0 s buffered|buffer-based: 145 kbit/s, 0 s buffered"/>
+<rect class="hit" x="79.6667" y="40" width="9.66667" height="316" data-tip="0 min 10 s|bandwidth 357 kbit/s|throughput-based: 2,000 kbit/s, 8 s buffered|buffer-based: 2,000 kbit/s, 26 s buffered"/>
+<rect class="hit" x="89.3333" y="40" width="9.66667" height="316" data-tip="0 min 20 s|bandwidth 749 kbit/s|throughput-based: 2,000 kbit/s, 0 s buffered|buffer-based: 2,000 kbit/s, 22 s buffered"/>
+<rect class="hit" x="99" y="40" width="9.66667" height="316" data-tip="0 min 30 s|bandwidth 769 kbit/s|throughput-based: 1,100 kbit/s, 11 s buffered|buffer-based: 2,000 kbit/s, 30 s buffered"/>
+<rect class="hit" x="108.667" y="40" width="9.66667" height="316" data-tip="0 min 40 s|bandwidth 391 kbit/s|throughput-based: 730 kbit/s, 7 s buffered|buffer-based: 2,000 kbit/s, 20 s buffered"/>
+<rect class="hit" x="118.333" y="40" width="9.66667" height="316" data-tip="0 min 50 s|bandwidth 5,023 kbit/s|throughput-based: 730 kbit/s, 33 s buffered|buffer-based: 2,000 kbit/s, 28 s buffered"/>
+<rect class="hit" x="128" y="40" width="9.66667" height="316" data-tip="1 min 00 s|bandwidth 3,994 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 3,000 kbit/s, 36 s buffered"/>
+<rect class="hit" x="137.667" y="40" width="9.66667" height="316" data-tip="1 min 10 s|bandwidth 2,220 kbit/s|throughput-based: 1,100 kbit/s, 55 s buffered|buffer-based: 3,000 kbit/s, 38 s buffered"/>
+<rect class="hit" x="147.333" y="40" width="9.66667" height="316" data-tip="1 min 20 s|bandwidth 7,970 kbit/s|throughput-based: 1,100 kbit/s, 57 s buffered|buffer-based: 6,000 kbit/s, 46 s buffered"/>
+<rect class="hit" x="157" y="40" width="9.66667" height="316" data-tip="1 min 30 s|bandwidth 107 kbit/s|throughput-based: 1,100 kbit/s, 47 s buffered|buffer-based: 6,000 kbit/s, 42 s buffered"/>
+<rect class="hit" x="166.667" y="40" width="9.66667" height="316" data-tip="1 min 40 s|bandwidth 891 kbit/s|throughput-based: 1,100 kbit/s, 37 s buffered|buffer-based: 6,000 kbit/s, 32 s buffered"/>
+<rect class="hit" x="176.333" y="40" width="9.66667" height="316" data-tip="1 min 50 s|bandwidth 4,010 kbit/s|throughput-based: 730 kbit/s, 57 s buffered|buffer-based: 6,000 kbit/s, 22 s buffered"/>
+<rect class="hit" x="186" y="40" width="9.66667" height="316" data-tip="2 min 00 s|bandwidth 1,672 kbit/s|throughput-based: 730 kbit/s, 53 s buffered|buffer-based: 1,100 kbit/s, 24 s buffered"/>
+<rect class="hit" x="195.667" y="40" width="9.66667" height="316" data-tip="2 min 10 s|bandwidth 5,294 kbit/s|throughput-based: 730 kbit/s, 55 s buffered|buffer-based: 1,100 kbit/s, 26 s buffered"/>
+<rect class="hit" x="205.333" y="40" width="9.66667" height="316" data-tip="2 min 20 s|bandwidth 5,149 kbit/s|throughput-based: 1,100 kbit/s, 57 s buffered|buffer-based: 3,000 kbit/s, 40 s buffered"/>
+<rect class="hit" x="215" y="40" width="9.66667" height="316" data-tip="2 min 30 s|bandwidth 4,141 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 4,500 kbit/s, 42 s buffered"/>
+<rect class="hit" x="224.667" y="40" width="9.66667" height="316" data-tip="2 min 40 s|bandwidth 2,708 kbit/s|throughput-based: 1,100 kbit/s, 55 s buffered|buffer-based: 4,500 kbit/s, 32 s buffered"/>
+<rect class="hit" x="234.333" y="40" width="9.66667" height="316" data-tip="2 min 50 s|bandwidth 1,365 kbit/s|throughput-based: 1,100 kbit/s, 51 s buffered|buffer-based: 4,500 kbit/s, 28 s buffered"/>
+<rect class="hit" x="244" y="40" width="9.66667" height="316" data-tip="3 min 00 s|bandwidth 1,145 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 730 kbit/s, 24 s buffered"/>
+<rect class="hit" x="253.667" y="40" width="9.66667" height="316" data-tip="3 min 10 s|bandwidth 280 kbit/s|throughput-based: 1,100 kbit/s, 55 s buffered|buffer-based: 730 kbit/s, 26 s buffered"/>
+<rect class="hit" x="263.333" y="40" width="9.66667" height="316" data-tip="3 min 20 s|bandwidth 79 kbit/s|throughput-based: 730 kbit/s, 45 s buffered|buffer-based: 730 kbit/s, 16 s buffered"/>
+<rect class="hit" x="273" y="40" width="9.66667" height="316" data-tip="3 min 30 s|bandwidth 1,033 kbit/s|throughput-based: 365 kbit/s, 47 s buffered|buffer-based: 2,000 kbit/s, 30 s buffered"/>
+<rect class="hit" x="282.667" y="40" width="9.66667" height="316" data-tip="3 min 40 s|bandwidth 3,162 kbit/s|throughput-based: 365 kbit/s, 55 s buffered|buffer-based: 2,000 kbit/s, 26 s buffered"/>
+<rect class="hit" x="292.333" y="40" width="9.66667" height="316" data-tip="3 min 50 s|bandwidth 2,848 kbit/s|throughput-based: 730 kbit/s, 57 s buffered|buffer-based: 2,000 kbit/s, 28 s buffered"/>
+<rect class="hit" x="302" y="40" width="9.66667" height="316" data-tip="4 min 00 s|bandwidth 3,181 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 3,000 kbit/s, 30 s buffered"/>
+<rect class="hit" x="311.667" y="40" width="9.66667" height="316" data-tip="4 min 10 s|bandwidth 3,587 kbit/s|throughput-based: 1,100 kbit/s, 55 s buffered|buffer-based: 3,000 kbit/s, 32 s buffered"/>
+<rect class="hit" x="321.333" y="40" width="9.66667" height="316" data-tip="4 min 20 s|bandwidth 2,885 kbit/s|throughput-based: 1,100 kbit/s, 57 s buffered|buffer-based: 3,000 kbit/s, 28 s buffered"/>
+<rect class="hit" x="331" y="40" width="9.66667" height="316" data-tip="4 min 30 s|bandwidth 2,603 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 3,000 kbit/s, 30 s buffered"/>
+<rect class="hit" x="340.667" y="40" width="9.66667" height="316" data-tip="4 min 40 s|bandwidth 2,915 kbit/s|throughput-based: 1,100 kbit/s, 55 s buffered|buffer-based: 3,000 kbit/s, 26 s buffered"/>
+<rect class="hit" x="350.333" y="40" width="9.66667" height="316" data-tip="4 min 50 s|bandwidth 3,231 kbit/s|throughput-based: 1,100 kbit/s, 57 s buffered|buffer-based: 3,000 kbit/s, 34 s buffered"/>
+<rect class="hit" x="360" y="40" width="9.66667" height="316" data-tip="5 min 00 s|bandwidth 2,114 kbit/s|throughput-based: 2,000 kbit/s, 53 s buffered|buffer-based: 3,000 kbit/s, 36 s buffered"/>
+<rect class="hit" x="369.667" y="40" width="9.66667" height="316" data-tip="5 min 10 s|bandwidth 2,718 kbit/s|throughput-based: 2,000 kbit/s, 55 s buffered|buffer-based: 3,000 kbit/s, 32 s buffered"/>
+<rect class="hit" x="379.333" y="40" width="9.66667" height="316" data-tip="5 min 20 s|bandwidth 2,315 kbit/s|throughput-based: 2,000 kbit/s, 51 s buffered|buffer-based: 3,000 kbit/s, 28 s buffered"/>
+<rect class="hit" x="389" y="40" width="9.66667" height="316" data-tip="5 min 30 s|bandwidth 3,614 kbit/s|throughput-based: 2,000 kbit/s, 53 s buffered|buffer-based: 3,000 kbit/s, 30 s buffered"/>
+<rect class="hit" x="398.667" y="40" width="9.66667" height="316" data-tip="5 min 40 s|bandwidth 2,034 kbit/s|throughput-based: 2,000 kbit/s, 55 s buffered|buffer-based: 3,000 kbit/s, 32 s buffered"/>
+<rect class="hit" x="408.333" y="40" width="9.66667" height="316" data-tip="5 min 50 s|bandwidth 2,824 kbit/s|throughput-based: 2,000 kbit/s, 51 s buffered|buffer-based: 3,000 kbit/s, 28 s buffered"/>
+<rect class="hit" x="418" y="40" width="9.66667" height="316" data-tip="6 min 00 s|bandwidth 3,012 kbit/s|throughput-based: 2,000 kbit/s, 53 s buffered|buffer-based: 3,000 kbit/s, 30 s buffered"/>
+<rect class="hit" x="427.667" y="40" width="9.66667" height="316" data-tip="6 min 10 s|bandwidth 2,593 kbit/s|throughput-based: 2,000 kbit/s, 49 s buffered|buffer-based: 3,000 kbit/s, 26 s buffered"/>
+<rect class="hit" x="437.333" y="40" width="9.66667" height="316" data-tip="6 min 20 s|bandwidth 2,760 kbit/s|throughput-based: 2,000 kbit/s, 45 s buffered|buffer-based: 3,000 kbit/s, 22 s buffered"/>
+<rect class="hit" x="447" y="40" width="9.66667" height="316" data-tip="6 min 30 s|bandwidth 4,712 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 3,000 kbit/s, 36 s buffered"/>
+<rect class="hit" x="456.667" y="40" width="9.66667" height="316" data-tip="6 min 40 s|bandwidth 4,313 kbit/s|throughput-based: 1,100 kbit/s, 55 s buffered|buffer-based: 4,500 kbit/s, 38 s buffered"/>
+<rect class="hit" x="466.333" y="40" width="9.66667" height="316" data-tip="6 min 50 s|bandwidth 260 kbit/s|throughput-based: 2,000 kbit/s, 51 s buffered|buffer-based: 4,500 kbit/s, 34 s buffered"/>
+<rect class="hit" x="476" y="40" width="9.66667" height="316" data-tip="7 min 00 s|bandwidth 786 kbit/s|throughput-based: 2,000 kbit/s, 41 s buffered|buffer-based: 4,500 kbit/s, 24 s buffered"/>
+<rect class="hit" x="485.667" y="40" width="9.66667" height="316" data-tip="7 min 10 s|bandwidth 1,640 kbit/s|throughput-based: 365 kbit/s, 37 s buffered|buffer-based: 2,000 kbit/s, 20 s buffered"/>
+<rect class="hit" x="495.333" y="40" width="9.66667" height="316" data-tip="7 min 20 s|bandwidth 4,858 kbit/s|throughput-based: 730 kbit/s, 57 s buffered|buffer-based: 3,000 kbit/s, 34 s buffered"/>
+<rect class="hit" x="505" y="40" width="9.66667" height="316" data-tip="7 min 30 s|bandwidth 4,324 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 4,500 kbit/s, 42 s buffered"/>
+<rect class="hit" x="514.667" y="40" width="9.66667" height="316" data-tip="7 min 40 s|bandwidth 1,778 kbit/s|throughput-based: 1,100 kbit/s, 55 s buffered|buffer-based: 4,500 kbit/s, 38 s buffered"/>
+<rect class="hit" x="524.333" y="40" width="9.66667" height="316" data-tip="7 min 50 s|bandwidth 4,633 kbit/s|throughput-based: 1,100 kbit/s, 57 s buffered|buffer-based: 4,500 kbit/s, 34 s buffered"/>
+<rect class="hit" x="534" y="40" width="9.66667" height="316" data-tip="8 min 00 s|bandwidth 2,386 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 4,500 kbit/s, 42 s buffered"/>
+<rect class="hit" x="543.667" y="40" width="9.66667" height="316" data-tip="8 min 10 s|bandwidth 5,795 kbit/s|throughput-based: 1,100 kbit/s, 55 s buffered|buffer-based: 4,500 kbit/s, 38 s buffered"/>
+<rect class="hit" x="553.333" y="40" width="9.66667" height="316" data-tip="8 min 20 s|bandwidth 4,910 kbit/s|throughput-based: 1,100 kbit/s, 57 s buffered|buffer-based: 4,500 kbit/s, 40 s buffered"/>
+<rect class="hit" x="563" y="40" width="9.66667" height="316" data-tip="8 min 30 s|bandwidth 6,483 kbit/s|throughput-based: 2,000 kbit/s, 53 s buffered|buffer-based: 4,500 kbit/s, 42 s buffered"/>
+<rect class="hit" x="572.667" y="40" width="9.66667" height="316" data-tip="8 min 40 s|bandwidth 5,174 kbit/s|throughput-based: 2,000 kbit/s, 55 s buffered|buffer-based: 4,500 kbit/s, 44 s buffered"/>
+<rect class="hit" x="582.333" y="40" width="9.66667" height="316" data-tip="8 min 50 s|bandwidth 2,751 kbit/s|throughput-based: 1,100 kbit/s, 51 s buffered|buffer-based: 4,500 kbit/s, 34 s buffered"/>
+<rect class="hit" x="592" y="40" width="9.66667" height="316" data-tip="9 min 00 s|bandwidth 275 kbit/s|throughput-based: 1,100 kbit/s, 53 s buffered|buffer-based: 3,000 kbit/s, 30 s buffered"/>
+<rect class="hit" x="601.667" y="40" width="9.66667" height="316" data-tip="9 min 10 s|bandwidth 3,083 kbit/s|throughput-based: 730 kbit/s, 55 s buffered|buffer-based: 1,100 kbit/s, 26 s buffered"/>
+<rect class="hit" x="611.333" y="40" width="9.66667" height="316" data-tip="9 min 20 s|bandwidth 287 kbit/s|throughput-based: 730 kbit/s, 45 s buffered|buffer-based: 145 kbit/s, 22 s buffered"/>
+<rect class="hit" x="621" y="40" width="9.66667" height="316" data-tip="9 min 30 s|bandwidth 3,128 kbit/s|throughput-based: 730 kbit/s, 35 s buffered|buffer-based: 730 kbit/s, 24 s buffered"/>
+<rect class="hit" x="630.667" y="40" width="9.66667" height="316" data-tip="9 min 40 s|bandwidth 2,715 kbit/s|throughput-based: 730 kbit/s, 25 s buffered|buffer-based: 730 kbit/s, 20 s buffered"/>
+<rect class="hit" x="640.333" y="40" width="9.66667" height="316" data-tip="9 min 50 s|bandwidth 216 kbit/s|throughput-based: 730 kbit/s, 15 s buffered|buffer-based: 730 kbit/s, 10 s buffered"/>
+</svg>
+</div>
+<figcaption>The throughput-based player trusts a cautious estimate and froze early with a short buffer. The buffer-based player let the buffer decide, asked for more and never ran dry.</figcaption>
+</figure>
+
+<p>Here the throughput-based player climbed at once, met a dip with 12 seconds buffered and froze. Afterward its cautious estimate kept it near 1 Mbit/s, less than half the bandwidth, with its buffer full and unused. Some viewers go the other way, so the table over all 400 is what counts.</p>
+<table>
+<thead><tr><th>Player</th><th>Frozen time</th><th>Sessions that froze</th><th>Average bitrate</th><th>First minute</th><th>Rung changes</th></tr></thead>
+<tbody>
+<tr><th>One bitrate, 3,000 kbit/s</th><td>18.1%</td><td>37.5%</td><td>3,000 kbit/s</td><td>3,000 kbit/s</td><td>0</td></tr>
+<tr><th>Throughput-based, 60% of the estimate</th><td>0.02%</td><td>2.8%</td><td>2,153 kbit/s</td><td>2,218 kbit/s</td><td>12</td></tr>
+<tr><th>Throughput-based, 80%</th><td>0.07%</td><td>7.0%</td><td>2,929 kbit/s</td><td>2,818 kbit/s</td><td>15</td></tr>
+<tr><th>Throughput-based, 95%, as hls.js</th><td>0.11%</td><td>12.3%</td><td>3,404 kbit/s</td><td>3,174 kbit/s</td><td>16</td></tr>
+<tr><th>Throughput-based, 120%</th><td>0.43%</td><td>32.0%</td><td>4,256 kbit/s</td><td>3,921 kbit/s</td><td>17</td></tr>
+<tr><th>Buffer-based, reservoir 12 s</th><td>0.65%</td><td>22.0%</td><td>4,727 kbit/s</td><td>1,802 kbit/s</td><td>21</td></tr>
+<tr><th>Buffer-based, reservoir 24 s</th><td>0.20%</td><td>11.0%</td><td>4,650 kbit/s</td><td>1,339 kbit/s</td><td>25</td></tr>
+<tr><th>Buffer-based, reservoir 36 s</th><td>0.07%</td><td>4.3%</td><td>4,570 kbit/s</td><td>939 kbit/s</td><td>31</td></tr>
+<tr><th>Buffer-based, 24 s, fast start</th><td>0.23%</td><td>16.0%</td><td>4,763 kbit/s</td><td>3,049 kbit/s</td><td>24</td></tr>
+</tbody>
+</table>
+<p>A single bitrate froze for 18% of all watching time, 30% on mobile: that is the case for a ladder. Each throughput setting buys bitrate with frozen time along one curve, and the buffer-based players sit above it: at the same frozen time, interpolated, the 24-second reservoir delivered 1.28 times the bitrate and the 36-second one 1.56 times. A throughput player with a full buffer and a cautious estimate pays twice for the same safety.</p>
+<p>The buffer-based player has two costs. It changes rung more often, 25 times a session against 16, which viewers can see. And it starts at the bottom: its first minute averaged 1,339 kbit/s. The paper’s later versions sped up the start with how fast the first segments arrived; the last row follows the throughput estimate until the buffer map catches up, for a first minute at 3,049 kbit/s and a little more freezing. dash.js, the DASH Industry Forum’s player, switches by buffer level between a throughput rule and a buffer rule called BOLA (Spiteri, Urgaonkar and Sitaraman, 2016).</p>
+<p>Most remaining stalls came from a drop while a large segment was on its way. Real players abandon such a download and fetch the segment from a lower rung, as a dash.js rule does; the model does not, so its stalls are an upper bound.</p>
+
+<h2 id="delivery">Step 6c: Delivery from the edge</h2>
+<p>At 33 Tbit/s, delivery is a cache problem with three facts working against it. Popularity has a long tail: a few videos get most views, and millions get a handful each. Viewers leave early, so a video’s first segments are requested far more than its last. And an edge can serve only what it has fetched before, so each segment’s first request at each location is a miss (<x-ref to="cdn-and-edge#hit-ratio"></x-ref>).</p>
+<p>The simulation sends 100,000 views of 5,000 videos, chosen with Zipf’s law (exponent 0.9), to 4 edges. Viewers use three rungs, 6,000, 3,000 and 1,100 kbit/s, and leave after 30 segments on average. Each edge’s cache is sized as a share of the 3.2 TB catalog, in three arrangements: caching on demand, evicting the least recently used segment (<x-ref to="lld-lru-cache#policy"></x-ref>); the same with a shield four times as large behind (<x-ref to="cdn-and-edge#shield"></x-ref>); and filled in advance with the segments a forecast expects most, the forecast of each video’s popularity being off by a random factor of typically two.</p>
+
+<figure class="fig wide" id="fig-cdn">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 310" role="img" aria-labelledby="f855t f855d">
+<title id="f855t">How much of the delivery the caches absorb</title>
+<desc id="f855d">A line chart of the share of bytes served without the origin against each edge’s capacity, 0.5% to 20% of the 3.2 TB catalog, log scale. At 0.5%: edge only 21%, with the shield 37%, from a forecast 31%. At 5%: edge only 51%, with the shield 75%, from a forecast 56%. At 20%: edge only 69%, with the shield 86%, from a forecast 78%.</desc>
+<text class="tb" x="10" y="18">Share of bytes served without the origin, by the size of each edge cache</text>
+<line class="grid" x1="80" y1="250.0" x2="540" y2="250.0"/>
+<text class="ts end" x="72" y="254.0">0%</text>
+<line class="grid" x1="80" y1="197.5" x2="540" y2="197.5"/>
+<text class="ts end" x="72" y="201.5">25%</text>
+<line class="grid" x1="80" y1="145.0" x2="540" y2="145.0"/>
+<text class="ts end" x="72" y="149.0">50%</text>
+<line class="grid" x1="80" y1="92.5" x2="540" y2="92.5"/>
+<text class="ts end" x="72" y="96.5">75%</text>
+<line class="grid" x1="80" y1="40.0" x2="540" y2="40.0"/>
+<text class="ts end" x="72" y="44.0">100%</text>
+<line class="axis" x1="80" y1="250" x2="540" y2="250"/>
+<text class="ts mid" x="80.0" y="268">0.5%</text>
+<text class="ts mid" x="166.4" y="268">1%</text>
+<text class="ts mid" x="252.9" y="268">2%</text>
+<text class="ts mid" x="367.1" y="268">5%</text>
+<text class="ts mid" x="453.6" y="268">10%</text>
+<text class="ts mid" x="540.0" y="268">20%</text>
+<text class="ts" x="80" y="290">5,000 videos, Zipf 0.9; 100,000 views, 4 edges; the shield holds four times an edge. code/85-hld-video-streaming.</text>
+<path class="line" style="stroke:var(--store)" d="M80.0 173.1 L166.4 151.9 L252.9 128.3 L367.1 91.6 L453.6 69.7 L540.0 69.6"/>
+<circle class="dot" style="fill:var(--store)" cx="80.0" cy="173.1" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="166.4" cy="151.9" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="252.9" cy="128.3" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="367.1" cy="91.6" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="453.6" cy="69.7" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="540.0" cy="69.6" r="3.5"/>
+<text class="ts" x="550" y="73.6">edge and shield, 86%</text>
+<path class="line" style="stroke:var(--async);stroke-dasharray:6 4" d="M80.0 185.6 L166.4 171.0 L252.9 155.8 L367.1 132.4 L453.6 111.1 L540.0 86.5"/>
+<circle class="dot" style="fill:var(--async)" cx="80.0" cy="185.6" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="166.4" cy="171.0" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="252.9" cy="155.8" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="367.1" cy="132.4" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="453.6" cy="111.1" r="3.5"/>
+<circle class="dot" style="fill:var(--async)" cx="540.0" cy="86.5" r="3.5"/>
+<text class="ts" x="550" y="90.5">filled from a forecast, 78%</text>
+<path class="line" style="stroke:var(--sig)" d="M80.0 205.2 L166.4 188.7 L252.9 170.2 L367.1 142.3 L453.6 118.4 L540.0 105.9"/>
+<circle class="dot" style="fill:var(--sig)" cx="80.0" cy="205.2" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="166.4" cy="188.7" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="252.9" cy="170.2" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="367.1" cy="142.3" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="453.6" cy="118.4" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="540.0" cy="105.9" r="3.5"/>
+<text class="ts" x="550" y="109.9">edge only, on demand, 69%</text>
+<rect class="hit" x="70" y="40" width="53.2174" height="210" data-tip="each edge holds 0.5% of the catalog|edge only: 21.3%|edge and shield: 36.6%|filled from a forecast: 30.7%|the origin sends 63.4% of the bytes"/>
+<rect class="hit" x="123.217" y="40" width="86.4348" height="210" data-tip="each edge holds 1% of the catalog|edge only: 29.2%|edge and shield: 46.7%|filled from a forecast: 37.6%|the origin sends 53.3% of the bytes"/>
+<rect class="hit" x="209.652" y="40" width="100.348" height="210" data-tip="each edge holds 2% of the catalog|edge only: 38.0%|edge and shield: 58.0%|filled from a forecast: 44.8%|the origin sends 42.0% of the bytes"/>
+<rect class="hit" x="310" y="40" width="100.348" height="210" data-tip="each edge holds 5% of the catalog|edge only: 51.3%|edge and shield: 75.4%|filled from a forecast: 56.0%|the origin sends 24.6% of the bytes"/>
+<rect class="hit" x="410.348" y="40" width="86.4348" height="210" data-tip="each edge holds 10% of the catalog|edge only: 62.6%|edge and shield: 85.8%|filled from a forecast: 66.1%|the origin sends 14.2% of the bytes"/>
+<rect class="hit" x="496.783" y="40" width="53.2174" height="210" data-tip="each edge holds 20% of the catalog|edge only: 68.6%|edge and shield: 85.9%|filled from a forecast: 77.9%|the origin sends 14.1% of the bytes"/>
+</svg>
+</div>
+<figcaption>Edges that cache on demand miss on every first request, so a shared shield behind them halves what the origin sends. A cache filled in advance from a forecast avoids those first misses.</figcaption>
+</figure>
+
+<p>With edges holding 5% of the catalog, they served 51% of the bytes alone and 75% with the shield, so the shield cut what the origin sends from 49% to 25%. Edges caching on demand gain slowly beyond that, reaching 69% at the largest size, because most of what they miss are first requests. A shield is shared, so the same segment’s first request at each of the four edges reaches the origin once. The forecast fill avoids first requests altogether and beat on-demand caching at every size, 78% against 69% at the largest, even with a forecast that is often wrong by a factor of two. Its weakness is not in the model, whose popularity does not change during the day: a video that becomes popular at noon is not in a cache filled at night. So a fill is combined with caching on demand.</p>
+<p>Data leaving a cloud is priced by the gigabyte (<x-ref to="capacity-and-cost#data-transfer"></x-ref>), so at this scale each point of hit ratio is worth more than any server in the design. That is why the largest platforms run their own CDNs, with servers inside their viewers’ ISPs.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Letting the signature of a signed URL into the cache key. Every viewer’s URL is different, so every request becomes a different object and the hit ratio falls to almost nothing. The edge checks the signature and then caches by the path alone (<x-ref to="cdn-and-edge#cache-key"></x-ref>).</p></div>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>An encoder dies during a job</th><td>Nothing; the video is ready a little later</td><td>The job reappears in the queue and runs again, writing the same files</td></tr>
+<tr><th>An upload is corrupt or in a format the encoders cannot read</th><td>The creator sees that processing failed, and why</td><td>The workflow inspects the original before queuing jobs. A job that keeps failing goes to a dead-letter queue (<x-ref to="message-queues#failures"></x-ref>)</td></tr>
+<tr><th>The creator’s connection drops during an upload</th><td>A pause, then the upload continues</td><td>Stored parts are kept; the session lists them and the app sends the rest</td></tr>
+<tr><th>An edge location fails or is overloaded</th><td>A short stall while the player retries a segment</td><td>Requests are routed to another location (<x-ref to="cdn-and-edge#routing"></x-ref>); the buffer covers the gap</td></tr>
+<tr><th>The metadata database is down</th><td>New plays may not start; plays in progress continue</td><td>Video records come from the cache; playlist URLs already given out stay valid until they expire</td></tr>
+<tr><th>The origin is slow</th><td>Rarely watched videos start slowly or fail</td><td>The shield absorbs most misses; popular segments are already at the edges</td></tr>
+<tr><th>A premiere sends millions to one new video at once</th><td>Nothing, if prepared</td><td>The edges are filled before it starts, and request collapsing at the shield turns a burst of misses into one (<x-ref to="cdn-and-edge#shield"></x-ref>)</td></tr>
+<tr><th>A new encoder version has a defect</th><td>Broken picture in new videos</td><td>Gradual rollout (<x-ref to="deployment-strategies"></x-ref>); affected videos are encoded again from their originals</td></tr>
+</tbody>
+</table>
+<p>Then growth. The test recomputes step 2 with ten and a hundred times the viewers and uploads.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Today</th><th>× 10</th><th>× 100</th></tr></thead>
+<tbody>
+<tr><th>Streams at peak</th><td>11.1 million</td><td>111 million</td><td>1.1 billion</td></tr>
+<tr><th>Delivery at peak</th><td>33.3 Tbit/s</td><td>333 Tbit/s</td><td>3.33 Pbit/s</td></tr>
+<tr><th>Segment requests a second</th><td>1.85 million</td><td>18.5 million</td><td>185 million</td></tr>
+<tr><th>Stored each year</th><td>439 PB</td><td>4.39 EB</td><td>43.9 EB</td></tr>
+<tr><th>Cores encoding</th><td>29,792</td><td>297,917</td><td>2,979,167</td></tr>
+</tbody>
+</table>
+<p>Nothing in the request path changes at ten times: the application tier adds servers and the CDN adds capacity in more places. What changes is cost. Storage passes four exabytes a year, so rungs of videos nobody watches are deleted or never made, and at three hundred thousand cores a custom encoding chip like Google’s, below, becomes worth its cost. At a hundred times, the delivery network must be built with the ISPs: servers inside their networks, filled at night, so that most bytes never cross the internet’s backbone.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>The formats.</b> HLS is RFC 8216 (August 2017), an informational RFC. Its second edition, draft-pantos-hls-rfc8216bis, was at revision 22 in May 2026 and had been sent to the RFC Editor but not published when checked in October 2026. MPEG-DASH is ISO/IEC 23009-1, first published in April 2012; its sixth edition appeared in July 2026. RFC 8216 requires that matching content in every variant have matching timestamps, so that clients can switch, and that a live client start at least three target durations from the end of the playlist.</li>
+  <li><b>Apple’s rules for its devices</b> (checked October 2026): video in H.264, HEVC, Dolby Vision or AV1; a keyframe every 2 seconds and at the start of every segment; 6-second segments. This chapter’s ladder is its example for H.264.</li>
+  <li><b>Netflix.</b> In March 2016 it reported over 125 million hours of viewing a day, peaks of tens of terabits a second, and Open Connect servers in close to 1,000 locations, many inside ISPs, which its overview says are filled off-peak from predictions of what members will watch. Per-title encoding (2015) gave one title’s top 1080p stream 4,640 kbit/s instead of the fixed ladder’s 5,800. In December 2025 AV1 carried about 30% of its viewing, with a third less bandwidth than H.264 and HEVC and 45% fewer buffering interruptions. Its encoding service (2024) splits, encodes chunks in parallel and assembles.</li>
+  <li><b>YouTube</b> says more than 20 million videos are uploaded on an average day (press page, checked October 2026), forty times this chapter’s assumption. In 2021 Google described its video coding unit, a custom chip for transcoding deployed in its data centers, with 20 to 33 times the efficiency of its earlier, well-tuned software encoding.</li>
+  <li><b>Players.</b> In A/B tests in 2013 with over half a million Netflix users each, the buffer-based approach reduced the rebuffer rate by 10 to 20% against the default algorithm of the time, at a similar average rate.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“Add live streaming”</th><td>Segments are encoded as the event happens and the playlist grows; players reload it. With 6-second segments and a start three segments from the end, viewers are 18 seconds or more behind. Low-latency HLS adds partial segments of about a second. Under a second needs WebRTC (<x-ref to="realtime-communication#webrtc"></x-ref>)</td><td>The ladder, the CDN, adaptive players</td></tr>
+<tr><th>“Paid films that must not be copied”</th><td>Segments are encrypted once; a license service gives each authorized player the key, which is digital rights management (DRM); playlist URLs expire within minutes</td><td>Encrypted segments are still cached by the CDN, since every viewer receives the same bytes</td></tr>
+<tr><th>“Most uploads are never watched”</th><td>Encode three low rungs first; add higher rungs and AV1 when views pass a threshold; delete rungs of videos nobody has watched in a year</td><td>The playlists, which list whatever rungs exist</td></tr>
+<tr><th>“Show unique viewers per video”</th><td>A HyperLogLog sketch per video, merged across windows (<x-ref to="probabilistic-structures#hll"></x-ref>)</td><td>The event stream</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Spend 5 minutes on requirements, including whether live is in scope, and 3 on estimates, ending with the 800-to-1 ratio of bytes out to bytes in. Explain codecs, the ladder, segments and playlists in 3 minutes before drawing, because every later choice depends on them. Draw the two paths, upload through signed URLs into a workflow and playback from the CDN, in 10. Give the deep dives to chunked transcoding, the player’s choice of rung and the cache hierarchy, and keep 5 minutes for failures.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Sending video through the application servers</th><td>Every byte crosses your servers; they become the bottleneck and the bill</td><td>Signed URLs to object storage for uploads, the CDN for playback</td></tr>
+<tr><th>One file per video at one bitrate</th><td>Freezes on slow connections, 18% of watching time in the simulation, and wasted bandwidth on fast ones</td><td>A ladder of rungs and an adaptive player</td></tr>
+<tr><th>Cutting rungs at different instants</th><td>The player cannot switch rung or start at a seek point cleanly</td><td>Keyframes at the same instants in every rung, and segments that start with one</td></tr>
+<tr><th>Encoding each rung of a long video as one job</th><td>A 10-minute video takes 34 minutes however many workers there are</td><td>Chunks encoded in parallel, the lowest rungs first</td></tr>
+<tr><th>A player that trusts only its throughput estimate, cautiously</th><td>A full buffer that is never used and a lower picture quality</td><td>Let the buffer level drive the choice, with throughput for the start</td></tr>
+<tr><th>Writing a database row for every playback event</th><td>370,000 writes a second at peak</td><td>An event stream, counted in windows</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="hld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="object-and-file-storage"></x-ref>: signed URLs, multipart uploads, range requests and storage tiers.</li>
+  <li><x-ref to="cdn-and-edge"></x-ref>: hit ratio, shields, request collapsing and signed URLs at the edge.</li>
+  <li><x-ref to="scheduling-and-workflows"></x-ref>: the durable workflow that runs processing.</li>
+  <li><x-ref to="lld-lru-cache"></x-ref>: the eviction policy of the edge caches, and skewed popularity.</li>
+  <li><x-ref to="capacity-and-cost"></x-ref>: why bytes leaving a cloud dominate the bill.</li>
+  <li><x-ref to="realtime-communication"></x-ref>: WebRTC, for video that must arrive in under a second.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Video is many versions of every upload: a ladder of rungs, each cut into short segments that start with keyframes at the same instants.</li>
+  <li>Viewers receive hundreds of bytes for every byte uploaded, so delivery from a CDN is the design, and the application servers only sign URLs and keep records.</li>
+  <li>Uploads go straight to object storage in parts; processing is a durable workflow of jobs that can run twice safely.</li>
+  <li>Encode chunks in parallel, not whole files: time falls from 34 minutes to a few, for a few percent more work, and the lowest rungs first make the video public early.</li>
+  <li>The player chooses a rung for every segment. Letting the buffer level decide gave 1.3 to 1.6 times the bitrate of a throughput-based player at the same frozen time in the simulation.</li>
+  <li>Edges caching on demand miss every first request; a shared shield halves what reaches the origin, and a fill from a forecast avoids the first misses.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why must every rung be cut into segments at the same instants, each starting with a keyframe?</summary><p>A player changes rung between segments. If segment 12 starts at the same instant in every rung and needs no earlier frame, the player can take segment 11 from one rung and 12 from another, or start at 12 after a seek, without a glitch.</p></details>
+<details><summary>Why does the upload API hand out signed URLs instead of receiving the file?</summary><p>So that the gigabytes go straight to object storage. The API only authorizes and records the upload, no application server is tied up carrying bytes, and a dropped connection costs one part.</p></details>
+<details><summary>A 10-minute video takes 34 minutes to encode with one worker per rung, even with 500 workers. Why, and what fixes it?</summary><p>There are only nine jobs, and the 1080p rung alone takes 34 minutes. Chunks cut at keyframes make hundreds of smaller jobs: 2.5 minutes on 128 workers with 30-second chunks in the simulation.</p></details>
+<details><summary>Why not cut chunks as small as possible?</summary><p>Every job pays a fixed overhead to start, fetch its piece and write its output: in the model, 6-second chunks did 43% more work than whole files.</p></details>
+<details><summary>A throughput-based player keeps its buffer full yet delivers a lower bitrate than a buffer-based one with the same frozen time. Why?</summary><p>It pays twice for safety: a cautious estimate, and a full buffer it never draws on. A buffer-based player uses the buffer itself as the margin.</p></details>
+<details><summary>Why does a shield behind the edges cut origin traffic so much?</summary><p>Each edge misses the first request it gets for a segment, so without a shield the origin sends it once per edge. The shared shield fetches it once and answers the other edges’ misses; in the simulation it halved what the origin sent.</p></details>
+<details><summary>What goes wrong if the signature of a signed URL is part of the CDN’s cache key?</summary><p>Every viewer’s URL differs, so every request is a different object and almost nothing is a hit. The edge should check the signature and cache by the path alone.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>R. Pantos and W. May, <a href="https://www.rfc-editor.org/rfc/rfc8216">RFC 8216: HTTP Live Streaming</a>, IETF, August 2017; and <a href="https://datatracker.ietf.org/doc/draft-pantos-hls-rfc8216bis/">draft-pantos-hls-rfc8216bis</a>, the second edition, revision 22, May 2026, status checked October 2026.</li>
+  <li>ISO/IEC, <a href="https://www.iso.org/standard/23009-1">ISO/IEC 23009-1: Dynamic adaptive streaming over HTTP (DASH), Part 1</a>, sixth edition, July 2026; the first edition was published in April 2012.</li>
+  <li>Apple, <a href="https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices">HLS authoring specification for Apple devices</a>, checked October 2026. The example ladder, keyframe and segment rules.</li>
+  <li>T.-Y. Huang, R. Johari, N. McKeown, M. Trunnell and M. Watson, <a href="https://web.stanford.edu/class/cs244/papers/sigcomm2014-video.pdf">“A Buffer-Based Approach to Rate Adaptation: Evidence from a Large Video Streaming Service”</a>, SIGCOMM, 2014.</li>
+  <li><a href="https://github.com/video-dev/hls.js/blob/master/docs/API.md">hls.js API documentation</a> (the ABR settings) and <a href="https://dashif.org/dash.js/pages/usage/abr/settings.html">dash.js ABR settings</a>, checked October 2026.</li>
+  <li>A. Aaron, Z. Li, M. Manohara, J. De Cock and D. Ronca, <a href="https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2">“Per-Title Encode Optimization”</a>, Netflix Technology Blog, December 2015.</li>
+  <li>L. Guo, Z. Li, S. Radford and J. Watts, <a href="https://netflixtechblog.com/av1-now-powering-30-of-netflix-streaming-02f592242d80">“AV1: Now Powering 30% of Netflix Streaming”</a>, Netflix Technology Blog, December 2025.</li>
+  <li>Netflix, <a href="https://about.netflix.com/en/news/how-netflix-works-with-isps-around-the-globe-to-deliver-a-great-viewing-experience">“How Netflix works with ISPs around the globe”</a>, March 2016; and the <a href="https://openconnect.netflix.com/Open-Connect-Overview.pdf">Open Connect overview</a>, checked October 2026, on filling servers off-peak.</li>
+  <li>L. Guo, V. Carvalho, A. Moorthy, A. Mavlankar and L. Zhu, <a href="https://netflixtechblog.com/the-making-of-ves-the-cosmos-microservice-for-netflix-video-encoding-946b9b3cd300">“The Making of VES: the Cosmos Microservice for Netflix Video Encoding”</a>, Netflix Technology Blog, April 2024. Splitting, encoding and assembling chunks.</li>
+  <li>P. Ranganathan and others, <a href="https://research.google/pubs/warehouse-scale-video-acceleration-co-design-and-deployment-in-the-wild/">“Warehouse-Scale Video Acceleration: Co-design and Deployment in the Wild”</a>, ASPLOS, 2021.</li>
+  <li>YouTube, <a href="https://blog.youtube/press/">press page</a>, checked October 2026.</li>
+</ol>
+</section>

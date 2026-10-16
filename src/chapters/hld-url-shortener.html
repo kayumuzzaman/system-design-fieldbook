@@ -1,0 +1,776 @@
+<!--meta
+{ "description": "A URL shortener designed with the method of chapter 76: requirements and estimates for 100 million new links and 10 billion redirects a day, the API, a partitioned link store, short codes from random draws, hashes or counter ranges measured by simulation, which redirects browsers cache, how large the link cache must be, counting clicks off the redirect path, failures, growth and what real shorteners do.",
+  "lede": "A URL shortener has two operations and fits on a napkin, which is why it is the most common first system design question. The difficulty is hidden in three places: making billions of short codes that never collide and cannot be counted through, answering a hundred thousand redirects a second faster than anyone notices, and counting every click without slowing a single one.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a URL shortener. A user submits a long URL and gets back a short link. Anyone who opens the short link is sent to the long URL. The owner can see how many times the link was clicked.</p></div>
+<p>Each part is easy alone. What makes the whole hard is that the parts pull against each other. Codes must be as short as possible, but there must be enough of them for decades of links, and no two may ever be equal. Redirects must be fast, which argues for caching them everywhere, but every cached redirect is a click the analytics never sees and a deleted link that keeps working. And the system is read a hundred times for every write, so the read path must not share anything slow with the write path. The method of <x-ref to="hld-method"></x-ref> takes these in order.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<p>The questions that change this design are about volume, link lifetime, whether a link can change, and how exact the click counts must be. With the answers written down:</p>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>Create a short link for a long URL, with an optional expiry</th><td>In scope</td></tr>
+<tr><th>Redirect from the short link to the long URL</th><td>In scope</td></tr>
+<tr><th>Delete a link (its owner), or disable it as abuse (the operator)</th><td>In scope</td></tr>
+<tr><th>Click counts per link and day, for the owner</th><td>In scope</td></tr>
+<tr><th>Custom codes chosen by the user, changing where a link points, breakdowns by country or device, QR codes, accounts and billing</th><td>Out of scope. The first two are follow-up questions at the end</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>100 million new links a day. Each is clicked 100 times on average, so 10 billion redirects a day. The busiest hour runs at twice the average</td></tr>
+<tr><th>Latency</th><td>99% of redirects answered within 20 ms, measured at the server</td></tr>
+<tr><th>Availability</th><td>99.99% for redirects, about 4 minutes a month, because a broken short link breaks every page and message that contains it. 99.9% for creating links</td></tr>
+<tr><th>Durability</th><td>A link works until it expires or is deleted. Plan for 10 years of links</td></tr>
+<tr><th>Consistency</th><td>A new link works as soon as the create call returns. A deleted or disabled link stops redirecting within a minute</td></tr>
+<tr><th>Codes</th><td>At most 7 characters, and impossible to list by counting from a known one</td></tr>
+<tr><th>Analytics</th><td>Counts may lag by a minute and may miss a small share of clicks. Counting must never slow a redirect</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">creates     100,000,000 a day ÷ 86,400 ≈ 1,160 a second          peak × 2 ≈ 2,300
+redirects   100 × 100 million = 10 billion a day ≈ 116,000 a second   peak ≈ 230,000
+links       100 million a day × 3,650 days = 365 billion after 10 years
+storage     365 billion × 500 bytes ≈ 183 TB          in three copies ≈ 550 TB
+code space  62⁷ ≈ 3.5 trillion codes of 7 characters, of which 365 billion is 10%
+out         116,000 × 500 bytes ≈ 58 MB/s ≈ 460 Mbit/s
+cache       one day of new links: 100 million × 500 bytes = 50 GB</div>
+<p>The 500 bytes for a link, with its URL, owner, dates and its share of the index, and the 500 bytes of a redirect, which is headers only, are assumptions. The arithmetic is that of <x-ref to="estimation#method"></x-ref>, and each line decides something.</p>
+<table>
+<thead><tr><th>The number</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><th>550 TB of links</th><td>No single machine holds them. The link store is partitioned from the start (<x-ref to="partitioning"></x-ref>)</td></tr>
+<tr><th>230,000 redirects a second at peak</th><td>Many stateless redirect servers, and caches in front of the store</td></tr>
+<tr><th>2,300 creates a second at peak</th><td>Modest. Whatever makes codes must not need a shared step for each one</td></tr>
+<tr><th>10% of the code space after 10 years</th><td>Seven characters last for decades at this rate</td></tr>
+<tr><th>50 GB for a day of new links</th><td>The links people are clicking now fit in the memory of a small cache cluster</td></tr>
+</tbody>
+</table>
+
+<div class="widget wide" data-widget="keyspace77">
+<h4>Links, redirects and the code space</h4>
+<p>Recomputes step 2, and shows how fast codes of each length run out.</p>
+<div class="controls">
+  <label>New links a day<input type="number" name="links" value="100000000" min="1" max="1000000000000" step="1000000"></label>
+  <label>Clicks per link<input type="number" name="clicks" value="100" min="0" max="1000000" step="1"></label>
+  <label>Years of links kept<input type="number" name="years" value="10" min="0.1" max="100" step="0.1"></label>
+  <label>Characters in a code<input type="number" name="length" value="7" min="4" max="10" step="1"></label>
+  <label>Bytes per link<input type="number" name="bytes" value="500" min="10" max="100000" step="10"></label>
+  <label>Peak factor<input type="number" name="peak" value="2" min="1" max="20" step="0.5"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 200" role="img" aria-label="Lines of the share of the code space in use against years of operation, for codes one character shorter than chosen, as chosen, and one character longer. A dot marks the chosen length at the chosen number of years."><line x1="58" y1="156" x2="480" y2="156" class="grid"></line><text x="50" y="160" class="ts end">0%</text><line x1="58" y1="124.5" x2="480" y2="124.5" class="grid"></line><text x="50" y="128.5" class="ts end">25%</text><line x1="58" y1="93" x2="480" y2="93" class="grid"></line><text x="50" y="97" class="ts end">50%</text><line x1="58" y1="61.5" x2="480" y2="61.5" class="grid"></line><text x="50" y="65.5" class="ts end">75%</text><line x1="58" y1="30" x2="480" y2="30" class="grid"></line><text x="50" y="34" class="ts end">100%</text><text x="58" y="176" class="ts mid">0</text><text x="269" y="176" class="ts mid">5</text><text x="480" y="176" class="ts mid">10 years</text><text x="10" y="14" class="ts">Share of the code space in use, by years of operation</text><path d="M58 156 L65 142.5 L72.1 129 L79.1 115.5 L86.1 102 L93.2 88.5 L100.2 75 L107.2 61.5 L114.3 48 L121.3 34.5 L128.3 30" class="line" style="stroke:var(--ink-3);stroke-width:1.5"></path><text x="136.3" y="40" class="ts">6 characters, full after 568 days</text><path d="M58 156 L65 155.8 L72.1 155.6 L79.1 155.3 L86.1 155.1 L93.2 154.9 L100.2 154.7 L107.2 154.5 L114.3 154.3 L121.3 154 L128.3 153.8 L135.4 153.6 L142.4 153.4 L149.4 153.2 L156.5 153 L163.5 152.7 L170.5 152.5 L177.6 152.3 L184.6 152.1 L191.6 151.9 L198.7 151.6 L205.7 151.4 L212.7 151.2 L219.8 151 L226.8 150.8 L233.8 150.6 L240.9 150.3 L247.9 150.1 L254.9 149.9 L262 149.7 L269 149.5 L276 149.3 L283.1 149 L290.1 148.8 L297.1 148.6 L304.2 148.4 L311.2 148.2 L318.2 147.9 L325.3 147.7 L332.3 147.5 L339.3 147.3 L346.4 147.1 L353.4 146.9 L360.4 146.6 L367.5 146.4 L374.5 146.2 L381.5 146 L388.6 145.8 L395.6 145.6 L402.6 145.3 L409.7 145.1 L416.7 144.9 L423.7 144.7 L430.8 144.5 L437.8 144.2 L444.8 144 L451.9 143.8 L458.9 143.6 L465.9 143.4 L473 143.2 L480 142.9" class="line" style=""></path><path d="M58 156 L65 156 L72.1 156 L79.1 156 L86.1 156 L93.2 156 L100.2 156 L107.2 156 L114.3 156 L121.3 156 L128.3 156 L135.4 156 L142.4 156 L149.4 156 L156.5 156 L163.5 155.9 L170.5 155.9 L177.6 155.9 L184.6 155.9 L191.6 155.9 L198.7 155.9 L205.7 155.9 L212.7 155.9 L219.8 155.9 L226.8 155.9 L233.8 155.9 L240.9 155.9 L247.9 155.9 L254.9 155.9 L262 155.9 L269 155.9 L276 155.9 L283.1 155.9 L290.1 155.9 L297.1 155.9 L304.2 155.9 L311.2 155.9 L318.2 155.9 L325.3 155.9 L332.3 155.9 L339.3 155.9 L346.4 155.9 L353.4 155.9 L360.4 155.8 L367.5 155.8 L374.5 155.8 L381.5 155.8 L388.6 155.8 L395.6 155.8 L402.6 155.8 L409.7 155.8 L416.7 155.8 L423.7 155.8 L430.8 155.8 L437.8 155.8 L444.8 155.8 L451.9 155.8 L458.9 155.8 L465.9 155.8 L473 155.8 L480 155.8" class="line" style="stroke:var(--ink-3);stroke-width:1.5"></path><text x="488" y="146.9" class="ts tb">7 characters, 10% used</text><text x="488" y="160.9" class="ts">8 characters, 0.17% used</text><circle cx="480" cy="142.9" r="5" class="dot"></circle><text x="10" y="196" class="ts">Lines for one character fewer and one more. A full space has no code left for a new link.</text></svg>
+<dl class="results">
+  <div><dt>Creates</dt><dd data-out="creates">1,157 /s, peak 2,315 /s</dd></div>
+  <div><dt>Redirects</dt><dd data-out="redirects">116 thousand /s, peak 231 thousand /s</dd></div>
+  <div><dt>Links stored</dt><dd data-out="stored">365 billion links</dd></div>
+  <div><dt>Storage</dt><dd data-out="storage">183 TB, 548 TB in 3 copies</dd></div>
+  <div><dt>Traffic out</dt><dd data-out="egress">463 Mbit/s, peak 926 Mbit/s</dd></div>
+  <div><dt>Code space used</dt><dd data-out="space">10.4% of 3.52 trillion</dd></div>
+  <div><dt>Attempts for a random code, at the end</dt><dd data-out="attempts">1.12</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">After 10 years, 365 billion links use 10.4% of the 3.52 trillion codes of 7 characters, so a random code takes 1.12 attempts on average. Random codes are as likely as not to repeat once 2.21 million have been drawn, 31.8 min of creates, so every insert must check that its code is free.</p>
+</div>
+<p>Six characters would be full in 568 days at this rate. Seven last 96 years, which is why seven is the usual answer. Try ten times the links, and seven characters run out within the ten years.</p>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Create a link">
+POST /api/links
+Authorization: Bearer …
+Idempotency-Key: 9b2e6f4a-1c7d-4e8b-a3f5-6d0c8e1b2a74
+Content-Type: application/json
+
+{ "longUrl": "https://example.com/reports/2026/q3?utm_source=mail", "expiresAt": null }
+
+HTTP/1.1 201 Created
+Location: https://sho.rt/aZ3kQ9x
+
+{ "code": "aZ3kQ9x", "shortUrl": "https://sho.rt/aZ3kQ9x", "expiresAt": null }
+</pre>
+<pre data-lang="http" data-title="Follow, delete, count">
+GET /aZ3kQ9x               → 301 Moved Permanently
+                             Location: https://example.com/reports/2026/q3?utm_source=mail
+                             Cache-Control: private, max-age=60
+GET /zzzzzzz               → 404 Not Found
+GET /Qx81bTe               → 410 Gone (expired, deleted or disabled)
+
+DELETE /api/links/aZ3kQ9x  → 204 No Content
+GET /api/links/aZ3kQ9x/clicks?from=2026-10-01&to=2026-10-12
+                           → 200 OK  { "days": [ { "day": "2026-10-01", "clicks": 1874 }, … ] }
+</pre>
+<ul>
+  <li><b>Retries.</b> The idempotency key makes a retried create return the first link instead of a second one (<x-ref to="api-styles#idempotency-keys"></x-ref>).</li>
+  <li><b>The redirect.</b> Its status code and <code>Cache-Control</code> header decide whether the browser asks again next time. Step 6b measures what they do.</li>
+  <li><b>Errors.</b> 400 for a URL that does not parse, 422 for one on a list of known unsafe sites, 429 for a caller over its limit (<x-ref to="hld-rate-limiter"></x-ref>). The clicks endpoint returns at most a year of days, so it needs no pagination.</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A link: long URL, owner, created, expires, disabled</th><td>The code</td><td>A key-value store partitioned by a hash of the code, three copies</td><td>Every read is by code and nothing joins. 550 TB must be spread over many machines. “Insert if absent” is one atomic operation (<x-ref to="data-models#key-value"></x-ref>)</td></tr>
+<tr><th>The next counter range</th><td>One row</td><td>A small strongly consistent store</td><td>Read and moved on about once a second, by every API server (step 6a)</td></tr>
+<tr><th>A click: code, time, referrer</th><td>The code</td><td>An event log, partitioned by code, kept 7 days</td><td>Written in batches, read once by the aggregators (<x-ref to="event-streaming"></x-ref>)</td></tr>
+<tr><th>Clicks per link and day</th><td>Code and day</td><td>A wide-column table</td><td>The stats API reads one link’s days in one partition (<x-ref to="data-models#wide-column"></x-ref>)</td></tr>
+<tr><th>A cached link</th><td>The code</td><td>A cache cluster, and a small cache in each redirect server</td><td>The links being clicked now, about 50 GB</td></tr>
+</tbody>
+</table>
+<p>A relational database partitioned by code would also work. The key-value store wins on fit, not on capability: the only query is a lookup by key, and the stores built for that partition, replicate and rebalance themselves (<x-ref to="hld-key-value-store"></x-ref>).</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 352" role="img" aria-labelledby="f771t f771d">
+<title id="f771t">The design of the URL shortener</title>
+<desc id="f771d">Three bands. In the middle, the redirect path: a browser asks the load balancer, which passes the request to a redirect server with a small cache inside; on a miss the server asks the shared link cache, and on a miss there, the link store, which is partitioned by code and kept in three copies. At the bottom, the create path: an app calls the API servers through the same load balancer; the API servers take counter ranges from a range coordinator and insert new links into the link store, and send each new link to safety checks that run later and can disable it. At the top, work done later: redirect servers send click events to a click event log, aggregators count them per link and minute, and the counts are stored for the stats API.</desc>
+<text class="ts" x="10" y="18">Later, off the redirect path</text>
+<rect class="n async" x="256" y="28" width="150" height="46" rx="6"/>
+<text class="tb mid" x="331" y="47">Click event log</text>
+<text class="ts mid" x="331" y="64">partitioned by code</text>
+<rect class="n async" x="436" y="28" width="120" height="46" rx="6"/>
+<text class="tb mid" x="496" y="47">Aggregators</text>
+<text class="ts mid" x="496" y="64">count per minute</text>
+<rect class="n store" x="590" y="28" width="120" height="46" rx="6"/>
+<text class="tb mid" x="650" y="47">Click counts</text>
+<text class="ts mid" x="650" y="64">read by the stats API</text>
+<path class="e async" d="M406 51H436"/>
+<path class="e async" d="M556 51H590"/>
+<rect class="n" x="10" y="114" width="96" height="46" rx="6"/>
+<text class="tb mid" x="58" y="133">Browser</text>
+<text class="ts mid" x="58" y="150">clicks a link</text>
+<rect class="n" x="130" y="114" width="96" height="144" rx="6"/>
+<text class="tb mid" x="178" y="182">Load</text>
+<text class="ts mid" x="178" y="199">balancer</text>
+<rect class="n sig" x="256" y="114" width="150" height="46" rx="6"/>
+<text class="tb mid" x="331" y="133">Redirect servers</text>
+<text class="ts mid" x="331" y="150">a small cache inside</text>
+<rect class="n sig" x="436" y="114" width="120" height="46" rx="6"/>
+<text class="tb mid" x="496" y="133">Link cache</text>
+<text class="ts mid" x="496" y="150">the hot links</text>
+<rect class="n store" x="590" y="114" width="120" height="144" rx="6"/>
+<text class="tb mid" x="650" y="173.5">Link store</text>
+<text class="ts mid" x="650" y="190.5">partitioned by code,</text>
+<text class="ts mid" x="650" y="207.5">three copies</text>
+<path class="e sig" d="M106 137H130"/>
+<path class="e sig" d="M226 137H256"/>
+<path class="e sig" d="M406 137H436"/>
+<path class="e sig" d="M556 137H590"/>
+<text class="ts mid" x="421" y="106">miss</text>
+<text class="ts mid" x="573" y="106">miss</text>
+<path class="e async" d="M331 114V74"/>
+<text class="ts end" x="325" y="98">clicks, in batches</text>
+<rect class="n" x="10" y="212" width="96" height="46" rx="6"/>
+<text class="tb mid" x="58" y="231">App or site</text>
+<text class="ts mid" x="58" y="248">creates links</text>
+<rect class="n sig" x="256" y="212" width="150" height="46" rx="6"/>
+<text class="tb mid" x="331" y="231">API servers</text>
+<text class="ts mid" x="331" y="248">create, delete, stats</text>
+<path class="e sig" d="M106 235H130"/>
+<path class="e sig" d="M226 235H256"/>
+<path class="e sig" d="M406 235H590"/>
+<text class="ts mid" x="498" y="228">insert if absent</text>
+<rect class="n" x="256" y="290" width="120" height="46" rx="6"/>
+<text class="tb mid" x="316" y="309">Range coordinator</text>
+<text class="ts mid" x="316" y="326">counter ranges</text>
+<path class="e sig" d="M316 258V290"/>
+<rect class="n async" x="436" y="290" width="120" height="46" rx="6"/>
+<text class="tb mid" x="496" y="309">Safety checks</text>
+<text class="ts mid" x="496" y="326">scan new links</text>
+<path class="e async" d="M392 258V313H436"/>
+<path class="e async" d="M556 313H650V258"/>
+<text class="ts" x="658" y="290">disable</text>
+<text class="ts" x="658" y="304">if unsafe</text>
+</svg>
+</div>
+<figcaption>Redirects take the middle path and never wait for anything in the top band. New links take the bottom path. Purple dashed lines are work done later; green boxes hold data at rest.</figcaption>
+</figure>
+
+<p>The redirect servers and the API servers are separate fleets behind the same load balancer. They scale for different loads, a hundred to one, and a surge of creates cannot slow the redirects. The safety checks that scan new URLs for malware and phishing run after the create returns, and disable a link if they find something. A synchronous scan would put a third-party service on the create path.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 520" role="img" aria-labelledby="f772t f772d">
+<title id="f772t">Creating a link, and following one</title>
+<desc id="f772d">Two sequences. Creating: the app posts a long URL with an idempotency key; the API server checks the URL, takes the next code from the range it holds without any network call, inserts the link into the store if the code is absent, writes it into the link cache because the first clicks come soon, and answers 201 Created. Following: a browser asks a redirect server for the code; the server misses its own small cache and the shared link cache, reads the link store, fills the cache, answers 301 with a Location header and a cache lifetime of 60 seconds for the browser only, and later sends the click event in a batch.</desc>
+<text class="tb" x="10" y="16">Creating a link</text>
+<g data-scene="create">
+<text class="tb mid" x="60" y="40">App</text>
+<line class="axis" x1="60" y1="48" x2="60" y2="240"/>
+<text class="tb mid" x="240" y="40">API server</text>
+<line class="axis" x1="240" y1="48" x2="240" y2="240"/>
+<text class="tb mid" x="440" y="40">Link cache</text>
+<line class="axis" x1="440" y1="48" x2="440" y2="240"/>
+<text class="tb mid" x="640" y="40">Link store</text>
+<line class="axis" x1="640" y1="48" x2="640" y2="240"/>
+<g data-s="1">
+<path class="e sig" d="M61 72H239"/>
+<text class="ts mid" x="150.0" y="66">1. POST /api/links</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n " x="248" y="84" width="213.2" height="22" rx="4"/>
+<text class="ts mid" x="354.6" y="99">2. URL valid, not on a blocklist</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n " x="248" y="110" width="237.6" height="22" rx="4"/>
+<text class="ts mid" x="366.8" y="125">3. next code from its range: aZ3kQ9x</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M241 150H639"/>
+<text class="ts mid" x="440.0" y="144">4. insert aZ3kQ9x if absent</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M639 176H241"/>
+<text class="ts mid" x="440.0" y="170">5. ok</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M241 202H439"/>
+<text class="ts mid" x="340.0" y="196">6. put aZ3kQ9x</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M239 228H61"/>
+<text class="ts mid" x="150.0" y="222">7. 201 Created, Location: …/aZ3kQ9x</text>
+</g>
+</g>
+<path class="e none dash" d="M10 256H710"/>
+<text class="tb" x="10" y="278">Following a link</text>
+<g data-scene="redirect">
+<text class="tb mid" x="60" y="302">Browser</text>
+<line class="axis" x1="60" y1="310" x2="60" y2="516"/>
+<text class="tb mid" x="220" y="302">Redirect server</text>
+<line class="axis" x1="220" y1="310" x2="220" y2="516"/>
+<text class="tb mid" x="390" y="302">Link cache</text>
+<line class="axis" x1="390" y1="310" x2="390" y2="516"/>
+<text class="tb mid" x="530" y="302">Link store</text>
+<line class="axis" x1="530" y1="310" x2="530" y2="516"/>
+<text class="tb mid" x="660" y="302">Click log</text>
+<line class="axis" x1="660" y1="310" x2="660" y2="516"/>
+<g data-s="1">
+<path class="e sig" d="M61 334H219"/>
+<text class="ts mid" x="140.0" y="328">1. GET /aZ3kQ9x</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M221 358H389"/>
+<text class="ts mid" x="305.0" y="352">2. get aZ3kQ9x</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M389 382H221"/>
+<text class="ts mid" x="305.0" y="376">3. miss</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M221 406H529"/>
+<text class="ts mid" x="375.0" y="400">4. get aZ3kQ9x</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M529 430H221"/>
+<text class="ts mid" x="375.0" y="424">5. the long URL</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M221 454H389"/>
+<text class="ts mid" x="305.0" y="448">6. put aZ3kQ9x</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M219 478H61"/>
+<text class="ts mid" x="140.0" y="472">7. 301, Location, max-age=60</text>
+</g>
+<g data-s="8">
+<path class="e async" d="M221 502H659"/>
+<text class="ts mid" x="440.0" y="496">8. a batch of clicks, later</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="create" data-label="Create">
+  <li data-msg="POST" data-state="Store: 0 links; cache: empty">The app sends the long URL, with an idempotency key so that a retry cannot create a second link.</li>
+  <li data-msg="none" data-state="Store: 0 links; cache: empty">The server checks that the URL is well formed and not on a list of known unsafe sites. A deeper scan comes later.</li>
+  <li data-msg="none" data-state="Store: 0 links; cache: empty">It takes the next code from the counter range it holds. No other machine is asked.</li>
+  <li data-msg="insert" data-state="Store: aZ3kQ9x; cache: empty">It inserts the link. A unique key on the code makes a duplicate impossible, whatever went wrong before.</li>
+  <li data-msg="ok" data-state="Store: aZ3kQ9x; cache: empty">The store confirms the write, on a majority of its copies.</li>
+  <li data-msg="put" data-state="Store: aZ3kQ9x; cache: aZ3kQ9x">It also writes the new link into the cache, because most of a link’s clicks come in its first hours.</li>
+  <li data-msg="201" data-state="Store: aZ3kQ9x; cache: aZ3kQ9x">The app gets the short link.</li>
+</ol>
+<ol class="steps" data-scene="redirect" data-label="Redirect">
+  <li data-msg="GET" data-state="Server’s own cache: empty; link cache: empty">A browser follows the short link. The load balancer sends it to any redirect server.</li>
+  <li data-msg="get" data-state="Server’s own cache: empty; link cache: empty">The server’s own small cache does not have the code, so it asks the shared link cache.</li>
+  <li data-msg="miss" data-state="Server’s own cache: empty; link cache: empty">This link has gone cold, so the shared cache does not have it either.</li>
+  <li data-msg="get" data-state="Server’s own cache: empty; link cache: empty">The server reads the link from the store, from one copy, by its key.</li>
+  <li data-msg="URL" data-state="Server’s own cache: empty; link cache: empty">The store returns the long URL, its expiry and whether it is disabled.</li>
+  <li data-msg="put" data-state="Server’s own cache: aZ3kQ9x; link cache: aZ3kQ9x">The server fills both caches, so the next request for this code stops earlier.</li>
+  <li data-msg="301" data-state="Server’s own cache: aZ3kQ9x; link cache: aZ3kQ9x; clicks waiting: 1">It answers at once: 301 with the long URL, which the browser alone may reuse for 60 seconds.</li>
+  <li data-msg="batch" data-state="Server’s own cache: aZ3kQ9x; link cache: aZ3kQ9x; clicks waiting: 0">About a second later the click leaves in a batch with others. The browser has already moved on.</li>
+</ol>
+<figcaption>The create path asks one other machine and the store. The redirect path answers as soon as it knows the URL; counting the click happens after the browser has gone.</figcaption>
+</figure>
+
+<p>Two choices in the flows are deliberate. The new link goes into the shared cache at creation, because most of a link’s clicks come in its first hours (step 6b). And the click is sent after the redirect has been answered, in a batch, so that analytics can be slow or down without a redirect noticing (step 6c).</p>
+
+<h2 id="keys">Step 6a: Generating short keys</h2>
+<p>The <dfn>short code</dfn> is the part of a short link after the domain, such as <code>aZ3kQ9x</code>, that identifies the link. Seven characters from the 62 digits and letters give 62<sup>7</sup>, about 3.5 trillion, codes (<x-ref to="unique-ids#sequences"></x-ref>). There are three ways to choose one: draw it at random, hash the long URL, or count.</p>
+<p>Random codes need no coordination, but they repeat sooner than intuition suggests. The <dfn>birthday bound</dfn> is the number of values drawn at random from N possibilities at which a repeat becomes as likely as not: about 1.18 times the square root of N. For 7 characters that is 2.2 million codes, 32 minutes of creates at this system’s rate.</p>
+
+<figure class="fig wide" id="fig-birthday">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f773t f773d">
+<title id="f773t">How soon random codes repeat</title>
+<desc id="f773d">A chart of the chance that random 4-character codes include at least one repeat, against the number of codes drawn, from 0 to 13,000. The formula gives a smooth S-shaped curve that passes 50% at about 4,526 codes. Dots measured over 2,000 trials sit on the curve: 2,000 codes 12.7%, 4,000 codes 40.1%, 6,000 codes 68.8%, 8,000 codes 88.2%, 10,000 codes 96.9%, 12,000 codes 99.4%. A second row of labels gives the number of 7-character codes with the same chance, 488 times as many: 50% at about 2.2 million.</desc>
+<line class="grid" x1="70" y1="230.0" x2="690" y2="230.0"/>
+<text class="ts end" x="62" y="234.0">0%</text>
+<line class="grid" x1="70" y1="182.5" x2="690" y2="182.5"/>
+<text class="ts end" x="62" y="186.5">25%</text>
+<line class="grid" x1="70" y1="135.0" x2="690" y2="135.0"/>
+<text class="ts end" x="62" y="139.0">50%</text>
+<line class="grid" x1="70" y1="87.5" x2="690" y2="87.5"/>
+<text class="ts end" x="62" y="91.5">75%</text>
+<line class="grid" x1="70" y1="40.0" x2="690" y2="40.0"/>
+<text class="ts end" x="62" y="44.0">100%</text>
+<line class="axis" x1="70" y1="230" x2="690" y2="230"/>
+<line class="axis" x1="70.0" y1="230" x2="70.0" y2="235"/>
+<text class="ts mid" x="70.0" y="248">0</text>
+<text class="ts mid" x="70.0" y="264">0</text>
+<line class="axis" x1="165.4" y1="230" x2="165.4" y2="235"/>
+<text class="ts mid" x="165.4" y="248">2,000</text>
+<text class="ts mid" x="165.4" y="264">0.98M</text>
+<line class="axis" x1="260.8" y1="230" x2="260.8" y2="235"/>
+<text class="ts mid" x="260.8" y="248">4,000</text>
+<text class="ts mid" x="260.8" y="264">1.95M</text>
+<line class="axis" x1="356.2" y1="230" x2="356.2" y2="235"/>
+<text class="ts mid" x="356.2" y="248">6,000</text>
+<text class="ts mid" x="356.2" y="264">2.93M</text>
+<line class="axis" x1="451.5" y1="230" x2="451.5" y2="235"/>
+<text class="ts mid" x="451.5" y="248">8,000</text>
+<text class="ts mid" x="451.5" y="264">3.91M</text>
+<line class="axis" x1="546.9" y1="230" x2="546.9" y2="235"/>
+<text class="ts mid" x="546.9" y="248">10,000</text>
+<text class="ts mid" x="546.9" y="264">4.88M</text>
+<line class="axis" x1="642.3" y1="230" x2="642.3" y2="235"/>
+<text class="ts mid" x="642.3" y="248">12,000</text>
+<text class="ts mid" x="642.3" y="264">5.86M</text>
+<text class="ts end" x="62" y="248">4 chars</text>
+<text class="ts end" x="62" y="264">7 chars</text>
+<text class="ts" x="70" y="286">Codes drawn. The second row gives the number of 7-character codes with the same chance: 488 times as many.</text>
+<path class="line" d="M70.0 230.0 L74.8 229.9 L79.5 229.7 L84.3 229.4 L89.1 229.0 L93.8 228.4 L98.6 227.7 L103.4 226.9 L108.2 225.9 L112.9 224.9 L117.7 223.7 L122.5 222.4 L127.2 221.0 L132.0 219.4 L136.8 217.8 L141.5 216.1 L146.3 214.2 L151.1 212.3 L155.8 210.3 L160.6 208.2 L165.4 206.0 L170.2 203.7 L174.9 201.3 L179.7 198.9 L184.5 196.4 L189.2 193.8 L194.0 191.2 L198.8 188.5 L203.5 185.7 L208.3 183.0 L213.1 180.1 L217.8 177.3 L222.6 174.4 L227.4 171.5 L232.2 168.5 L236.9 165.5 L241.7 162.6 L246.5 159.6 L251.2 156.6 L256.0 153.6 L260.8 150.6 L265.5 147.6 L270.3 144.6 L275.1 141.6 L279.8 138.7 L284.6 135.8 L289.4 132.9 L294.2 130.0 L298.9 127.1 L303.7 124.3 L308.5 121.6 L313.2 118.8 L318.0 116.1 L322.8 113.5 L327.5 110.8 L332.3 108.3 L337.1 105.8 L341.8 103.3 L346.6 100.9 L351.4 98.5 L356.2 96.2 L360.9 94.0 L365.7 91.8 L370.5 89.6 L375.2 87.5 L380.0 85.5 L384.8 83.5 L389.5 81.6 L394.3 79.7 L399.1 77.9 L403.8 76.2 L408.6 74.5 L413.4 72.9 L418.2 71.3 L422.9 69.8 L427.7 68.3 L432.5 66.9 L437.2 65.6 L442.0 64.3 L446.8 63.0 L451.5 61.8 L456.3 60.6 L461.1 59.5 L465.8 58.5 L470.6 57.5 L475.4 56.5 L480.2 55.6 L484.9 54.7 L489.7 53.8 L494.5 53.0 L499.2 52.3 L504.0 51.5 L508.8 50.8 L513.5 50.2 L518.3 49.6 L523.1 49.0 L527.8 48.4 L532.6 47.9 L537.4 47.4 L542.2 46.9 L546.9 46.4 L551.7 46.0 L556.5 45.6 L561.2 45.2 L566.0 44.9 L570.8 44.6 L575.5 44.2 L580.3 43.9 L585.1 43.7 L589.8 43.4 L594.6 43.2 L599.4 42.9 L604.2 42.7 L608.9 42.5 L613.7 42.3 L618.5 42.2 L623.2 42.0 L628.0 41.9 L632.8 41.7 L637.5 41.6 L642.3 41.5 L647.1 41.3 L651.8 41.2 L656.6 41.1 L661.4 41.0 L666.2 41.0 L670.9 40.9 L675.7 40.8 L680.5 40.7 L685.2 40.7 L690.0 40.6"/>
+<circle class="dot" style="fill:var(--store)" cx="117.7" cy="223.3" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="165.4" cy="205.9" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="213.1" cy="179.3" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="260.8" cy="153.8" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="308.5" cy="126.4" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="356.2" cy="99.3" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="403.8" cy="77.6" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="451.5" cy="62.4" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="499.2" cy="52.8" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="546.9" cy="46.0" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="594.6" cy="43.5" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="642.3" cy="41.1" r="4"/>
+<circle class="dot" style="fill:var(--store)" cx="690.0" cy="40.5" r="4"/>
+<path class="e none dash" d="M285.9 135.0V230"/>
+<text class="ts" x="293.9" y="165.0">50% at 4,526 codes</text>
+<text class="ts" x="293.9" y="179.0">(2.21 million for 7 characters)</text>
+<text class="ts" x="509.2" y="78.0">line: the formula</text>
+<text class="ts" x="509.2" y="92.0">dots: 2,000 trials</text>
+<rect class="hit" x="93.8462" y="30" width="47.6923" height="200" data-tip="1,000 codes of 4 characters|a repeat in 3.5% of trials|formula 3.3%|same chance at 0.49 million 7-character codes"/>
+<rect class="hit" x="141.538" y="30" width="47.6923" height="200" data-tip="2,000 codes of 4 characters|a repeat in 12.7% of trials|formula 12.7%|same chance at 0.98 million 7-character codes"/>
+<rect class="hit" x="189.231" y="30" width="47.6923" height="200" data-tip="3,000 codes of 4 characters|a repeat in 26.7% of trials|formula 26.2%|same chance at 1.46 million 7-character codes"/>
+<rect class="hit" x="236.923" y="30" width="47.6923" height="200" data-tip="4,000 codes of 4 characters|a repeat in 40.1% of trials|formula 41.8%|same chance at 1.95 million 7-character codes"/>
+<rect class="hit" x="284.615" y="30" width="47.6923" height="200" data-tip="5,000 codes of 4 characters|a repeat in 54.5% of trials|formula 57.1%|same chance at 2.44 million 7-character codes"/>
+<rect class="hit" x="332.308" y="30" width="47.6923" height="200" data-tip="6,000 codes of 4 characters|a repeat in 68.8% of trials|formula 70.4%|same chance at 2.93 million 7-character codes"/>
+<rect class="hit" x="380" y="30" width="47.6923" height="200" data-tip="7,000 codes of 4 characters|a repeat in 80.2% of trials|formula 80.9%|same chance at 3.42 million 7-character codes"/>
+<rect class="hit" x="427.692" y="30" width="47.6923" height="200" data-tip="8,000 codes of 4 characters|a repeat in 88.2% of trials|formula 88.5%|same chance at 3.91 million 7-character codes"/>
+<rect class="hit" x="475.385" y="30" width="47.6923" height="200" data-tip="9,000 codes of 4 characters|a repeat in 93.2% of trials|formula 93.5%|same chance at 4.39 million 7-character codes"/>
+<rect class="hit" x="523.077" y="30" width="47.6923" height="200" data-tip="10,000 codes of 4 characters|a repeat in 96.9% of trials|formula 96.6%|same chance at 4.88 million 7-character codes"/>
+<rect class="hit" x="570.769" y="30" width="47.6923" height="200" data-tip="11,000 codes of 4 characters|a repeat in 98.2% of trials|formula 98.3%|same chance at 5.37 million 7-character codes"/>
+<rect class="hit" x="618.462" y="30" width="47.6923" height="200" data-tip="12,000 codes of 4 characters|a repeat in 99.4% of trials|formula 99.2%|same chance at 5.86 million 7-character codes"/>
+<rect class="hit" x="666.154" y="30" width="47.6923" height="200" data-tip="13,000 codes of 4 characters|a repeat in 99.8% of trials|formula 99.7%|same chance at 6.35 million 7-character codes"/>
+</svg>
+</div>
+<figcaption>The chance of a repeat grows with the square of the number of codes. Measured over 2,000 trials, it follows the formula. For 7 characters the even-odds point comes after 2.2 million links.</figcaption>
+</figure>
+
+<p>So a repeat is certain within the first day, and every scheme needs the store to refuse a code that is taken: an insert that succeeds only if the key is absent, and a new draw when it fails. The cost of the retry depends on how full the space is. The simulation filled a small space with random codes and counted the attempts each insert needed.</p>
+<table>
+<thead><tr><th>Space in use</th><th>Attempts per insert, measured</th><th>Formula, 1 ÷ (1 − fill)</th><th>Most for one insert</th></tr></thead>
+<tbody>
+<tr><th>10%</th><td>1.113</td><td>1.111</td><td>5</td></tr>
+<tr><th>50%</th><td>1.986</td><td>2.000</td><td>16</td></tr>
+<tr><th>90%</th><td>10.217</td><td>10.000</td><td>89</td></tr>
+</tbody>
+</table>
+<p>At the 10% this system reaches after ten years, one insert in ten needs a second try. Random codes are a sound design here, as long as the space stays mostly empty.</p>
+<p>Hashing the URL makes the same URL always give the same code, which deduplicates links. It does not avoid collisions: two different URLs whose hashes agree in the first 7 characters collide exactly as often as random draws do. Over 200 sets of 1,000 links in a space of 238,328 codes, the simulation found 2.03 equal pairs per set for hashed codes, 1.89 for random ones, and the formula predicts 2.10. Deduplication is also a product decision with costs: two owners would share one link’s counts, and one owner’s delete would break the other’s link.</p>
+<p>Counting gives codes that never repeat, but a single counter incremented for every link is a shared step on every create, and a single point of failure. The fix is a <dfn>counter range</dfn>: a block of consecutive numbers that one server takes from the shared counter in one atomic step and then hands out alone.</p>
+
+<figure class="fig wide" id="fig-ranges">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 268" role="img" aria-labelledby="f774t f774d">
+<title id="f774t">Counter ranges, and what a crash costs</title>
+<desc id="f774d">A sequence between server A, the range coordinator and server B. A leases the range 1,000 to 1,999 and B leases 2,000 to 2,999. A issues 400 codes from its range with no network calls, then crashes. When it restarts it leases 3,000 to 3,999. The values 1,400 to 1,999 are never issued: wasted, but never duplicated.</desc>
+<text class="tb mid" x="90" y="20">Server A</text>
+<line class="axis" x1="90" y1="28" x2="90" y2="262"/>
+<text class="tb mid" x="360" y="20">Range coordinator</text>
+<line class="axis" x1="360" y1="28" x2="360" y2="262"/>
+<text class="tb mid" x="630" y="20">Server B</text>
+<line class="axis" x1="630" y1="28" x2="630" y2="262"/>
+<g data-s="1">
+<path class="e sig" d="M91 54H359"/>
+<text class="ts mid" x="225.0" y="48">1. give me a range</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M359 80H91"/>
+<text class="ts mid" x="225.0" y="74">2. 1,000 to 1,999</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M629 106H361"/>
+<text class="ts mid" x="495.0" y="100">3. give me a range</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M361 132H629"/>
+<text class="ts mid" x="495.0" y="126">4. 2,000 to 2,999</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n sig" x="98" y="144" width="164.4" height="22" rx="4"/>
+<text class="ts mid" x="180.2" y="159">5. issues 1,000 to 1,399</text>
+</g>
+<g data-s="6" data-packet="none">
+<rect class="n fault" x="98" y="170" width="79" height="22" rx="4"/>
+<text class="ts mid" x="137.5" y="185">6. crashes</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M91 210H359"/>
+<text class="ts mid" x="225.0" y="204">7. give me a range</text>
+</g>
+<g data-s="8">
+<path class="e store" d="M359 236H91"/>
+<text class="ts mid" x="225.0" y="230">8. 3,000 to 3,999</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="lease" data-state="Coordinator’s next value: 1,000; A holds: nothing; B holds: nothing">Server A starts with nothing, and asks for a range of 1,000 counter values.</li>
+  <li data-msg="1,000" data-state="Coordinator’s next value: 2,000; A holds: 1,000 to 1,999; B holds: nothing">The coordinator moves its next value on by 1,000 in one atomic step and hands A the range.</li>
+  <li data-msg="lease" data-state="Coordinator’s next value: 2,000; A holds: 1,000 to 1,999; B holds: nothing">Server B, starting at the same moment, asks for a range too.</li>
+  <li data-msg="2,000" data-state="Coordinator’s next value: 3,000; A holds: 1,000 to 1,999; B holds: 2,000 to 2,999">B gets the next range. The two can never overlap, because only the coordinator moves the next value.</li>
+  <li data-msg="none" data-state="Coordinator’s next value: 3,000; A holds: 1,400 to 1,999; B holds: 2,000 to 2,999">A creates 400 links from its range, asking nobody.</li>
+  <li data-msg="none" data-state="Coordinator’s next value: 3,000; A holds: nothing (1,400 to 1,999 lost); B holds: 2,000 to 2,999">A crashes. What was left of its range lived only in its memory.</li>
+  <li data-msg="lease" data-state="Coordinator’s next value: 3,000; A holds: nothing; B holds: 2,000 to 2,999">After the restart, A asks for a new range.</li>
+  <li data-msg="3,000" data-state="Coordinator’s next value: 4,000; A holds: 3,000 to 3,999; B holds: 2,000 to 2,999">It gets a fresh one. The 600 lost values are skipped forever: a gap, never a duplicate.</li>
+</ol>
+<figcaption>The coordinator is asked once for every thousand links. A crash wastes the rest of a range, which costs a little of the code space and never correctness.</figcaption>
+</figure>
+
+<p>The range size trades coordination against waste. The simulation ran 20 servers issuing 10 million codes at this system’s rate, with 40 restarts at random moments.</p>
+<table>
+<thead><tr><th>Range size</th><th>Requests to the coordinator</th><th>Values wasted by 40 restarts</th><th>Duplicates</th></tr></thead>
+<tbody>
+<tr><th>100</th><td>11.6 a second</td><td>0.02%</td><td>0</td></tr>
+<tr><th>1,000</th><td>1.2 a second</td><td>0.21%</td><td>0</td></tr>
+<tr><th>10,000</th><td>0.12 a second</td><td>1.96%</td><td>0</td></tr>
+<tr><th>100,000</th><td>0.016 a second</td><td>23.8%</td><td>0</td></tr>
+</tbody>
+</table>
+<p>A counter written in base 62 has one flaw: neighbors are neighbors. Anyone holding <code>aZ3kQ9x</code> can try <code>aZ3kQ9y</code> and read other people’s links. The answer, promised in <x-ref to="unique-ids#security"></x-ref>, is to scramble each counter value with a keyed shuffle of the whole space before encoding it. The chapter uses a <dfn>Feistel network</dfn>: the bits of a number are split into two halves, and in each of several rounds one half is mixed into the other through a function of a secret key. Each round can be undone, so the result is a permutation, and two counter values never give the same code. The test confirmed it on every one of the 14,776,336 values of a 4-character space. Counter values 0 to 4 become <code>s1rruso</code>, <code>12bjS6f</code>, <code>IrbSgvz</code>, <code>GWJnvs8</code> and <code>F7YzKBq</code>. With a million links issued, the 1,000 codes after a known one were all real links with a plain counter, and none with the scrambled one.</p>
+<pre data-lang="ts" data-title="A server that hands out codes from leased ranges">
+export class CodeServer {
+  private readonly coordinator: RangeCoordinator;
+  private readonly scrambler: Scrambler | null;
+  private nextValue = 0;
+  private end = 0; // exclusive: the server starts with an empty range
+
+  constructor(coordinator: RangeCoordinator, scrambler: Scrambler | null = null) {
+    this.coordinator = coordinator;
+    this.scrambler = scrambler;
+  }
+
+  // The next counter value. Nothing shared is touched until the range runs out.
+  nextNumber(): number {
+    if (this.nextValue === this.end) {
+      const range = this.coordinator.lease();
+      this.nextValue = range.start;
+      this.end = range.end;
+    }
+    return this.nextValue++;
+  }
+
+  nextCode(length = 7): string {
+    const n = this.nextNumber();
+    return encode(this.scrambler ? this.scrambler.permute(n) : n, length);
+  }
+
+  // A restart loses what was left of the range. Those values are never issued, which wastes them
+  // but can never cause a duplicate.
+  restart(): number {
+    const lost = this.end - this.nextValue;
+    this.nextValue = 0;
+    this.end = 0;
+    return lost;
+  }
+}
+</pre>
+<p>The mixing function here is a fast hash, not a cipher. It stops anyone counting through the links, but a patient analyst with many codes might work out the key. Links that must stay secret need long random codes instead. The design uses counter ranges of 1,000, scrambled, with insert-if-absent kept as a guard against a bug or a misconfigured range. Random codes with a retry would be an equally defensible answer.</p>
+
+<h2 id="redirects">Step 6b: Redirects and caching</h2>
+<p>The fastest redirect is one that never reaches the servers. Whether a browser reuses a redirect is decided by its status code and its <code>Cache-Control</code> header (<x-ref to="http-and-tls#caching"></x-ref>). HTTP’s specification, RFC 9110, lets a cache store a 301 or 308 response with no explicit lifetime, and does not let it for a 302 or 307. The chapter measured what that means in practice: a local server answered a short link in each of seven ways, and a fresh browser clicked each one three times.</p>
+
+<figure class="fig wide" id="fig-browser">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 248" role="img" aria-labelledby="f775t f775d">
+<title id="f775t">How many of three clicks reached the shortener</title>
+<desc id="f775d">Bars for seven kinds of redirect, measured in Chromium 141.0.7390.37 with a fresh cache, clicking the same short link three times: 301, no Cache-Control: 1 of 3; 302, no Cache-Control: 3 of 3; 307, no Cache-Control: 3 of 3; 308, no Cache-Control: 1 of 3; 301, private, max-age=60: 1 of 3; 302, private, max-age=60: 1 of 3; 301, no-store: 3 of 3.</desc>
+<text class="tb" x="10" y="18">Clicks that reached the server, of three, in Chromium 141.0.7390.37</text>
+<text class="ts end" x="230" y="49">301, no Cache-Control</text>
+<rect class="bar store" x="240" y="36" width="100" height="17" rx="3"/>
+<text class="ts" x="348" y="49">1 of 3, the browser reused it</text>
+<rect class="hit" x="10" y="33" width="700" height="23" data-tip="301, no Cache-Control|1 of 3 clicks reached the shortener|the browser served the other clicks from its cache"/>
+<text class="ts end" x="230" y="75">302, no Cache-Control</text>
+<rect class="bar " x="240" y="62" width="300" height="17" rx="3"/>
+<text class="ts" x="548" y="75">3 of 3, every click arrived</text>
+<rect class="hit" x="10" y="59" width="700" height="23" data-tip="302, no Cache-Control|3 of 3 clicks reached the shortener|the browser asked every time"/>
+<text class="ts end" x="230" y="101">307, no Cache-Control</text>
+<rect class="bar " x="240" y="88" width="300" height="17" rx="3"/>
+<text class="ts" x="548" y="101">3 of 3, every click arrived</text>
+<rect class="hit" x="10" y="85" width="700" height="23" data-tip="307, no Cache-Control|3 of 3 clicks reached the shortener|the browser asked every time"/>
+<text class="ts end" x="230" y="127">308, no Cache-Control</text>
+<rect class="bar store" x="240" y="114" width="100" height="17" rx="3"/>
+<text class="ts" x="348" y="127">1 of 3, the browser reused it</text>
+<rect class="hit" x="10" y="111" width="700" height="23" data-tip="308, no Cache-Control|1 of 3 clicks reached the shortener|the browser served the other clicks from its cache"/>
+<text class="ts end" x="230" y="153">301, private, max-age=60</text>
+<rect class="bar store" x="240" y="140" width="100" height="17" rx="3"/>
+<text class="ts" x="348" y="153">1 of 3, the browser reused it</text>
+<rect class="hit" x="10" y="137" width="700" height="23" data-tip="301, private, max-age=60|1 of 3 clicks reached the shortener|the browser served the other clicks from its cache"/>
+<text class="ts end" x="230" y="179">302, private, max-age=60</text>
+<rect class="bar store" x="240" y="166" width="100" height="17" rx="3"/>
+<text class="ts" x="348" y="179">1 of 3, the browser reused it</text>
+<rect class="hit" x="10" y="163" width="700" height="23" data-tip="302, private, max-age=60|1 of 3 clicks reached the shortener|the browser served the other clicks from its cache"/>
+<text class="ts end" x="230" y="205">301, no-store</text>
+<rect class="bar " x="240" y="192" width="300" height="17" rx="3"/>
+<text class="ts" x="548" y="205">3 of 3, every click arrived</text>
+<rect class="hit" x="10" y="189" width="700" height="23" data-tip="301, no-store|3 of 3 clicks reached the shortener|the browser asked every time"/>
+<line class="axis" x1="240" y1="30" x2="240" y2="214"/>
+<text class="ts" x="10" y="236">Measured with a local server, a page holding the link, and three clicks in a fresh browser. One run.</text>
+</svg>
+</div>
+<figcaption>Without instructions, the browser kept the permanent redirects and asked again for the temporary ones. With an explicit lifetime, the status code made no difference.</figcaption>
+</figure>
+
+<p>A bare 301 is the worst of both: the browser keeps it for as long as it likes, so the owner sees one click where there were three, and a deleted link keeps working in that browser. A 302 or a <code>no-store</code> brings every click back, which costs a request each time. The design answers 301 with <code>Cache-Control: private, max-age=60</code>. A browser reuses the redirect for a minute, shared caches such as CDNs never store it, and a deleted link stops within the minute that step 1 allowed. A repeat click from the same browser within that minute is not counted, which is acceptable for counts that are allowed to miss a little. The 301 also tells search engines that the short link stands for the long one.</p>
+<p>Behind the browser, two server-side caches hold links. Their size follows from how clicks arrive. A link’s <dfn>half-life</dfn> is the time after its peak in which it receives half of all the clicks it will ever get. Bitly measured 2.8 hours for links shared on Twitter and 3.2 for Facebook in 2011. That is why the design writes a new link into the shared cache at creation, as the pastebin of <x-ref to="hld-method#dive-cache"></x-ref> did: the first clicks come within minutes. The older links follow a skewed popularity, which the simulation models with a Zipf distribution over a million links.</p>
+
+<figure class="fig wide" id="fig-hit-ratio">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f776t f776d">
+<title id="f776t">Hit ratio of a cache of links, by size</title>
+<desc id="f776d">A chart of hit ratio against cache size, from 0.1% to 20% of one million links, on a log scale. Skew 1, LRU measured: 0.1% 40%, 0.2% 46%, 0.5% 53%, 1.0% 59%, 2.0% 64%, 5.0% 72%, 10.0% 78%, 20.0% 84%. Skew 1, best possible: 0.1% 52%, 0.2% 57%, 0.5% 63%, 1.0% 68%, 2.0% 73%, 5.0% 79%, 10.0% 84%, 20.0% 89%. Skew 0.8, LRU measured: 0.1% 10%, 0.2% 13%, 0.5% 18%, 1.0% 23%, 2.0% 29%, 5.0% 39%, 10.0% 49%, 20.0% 61%. Skew 0.8, best possible: 0.1% 21%, 0.2% 25%, 0.5% 31%, 1.0% 36%, 2.0% 43%, 5.0% 52%, 10.0% 61%, 20.0% 71%.</desc>
+<line class="grid" x1="70" y1="240.0" x2="545" y2="240.0"/>
+<text class="ts end" x="62" y="244.0">0%</text>
+<line class="grid" x1="70" y1="198.0" x2="545" y2="198.0"/>
+<text class="ts end" x="62" y="202.0">20%</text>
+<line class="grid" x1="70" y1="156.0" x2="545" y2="156.0"/>
+<text class="ts end" x="62" y="160.0">40%</text>
+<line class="grid" x1="70" y1="114.0" x2="545" y2="114.0"/>
+<text class="ts end" x="62" y="118.0">60%</text>
+<line class="grid" x1="70" y1="72.0" x2="545" y2="72.0"/>
+<text class="ts end" x="62" y="76.0">80%</text>
+<line class="grid" x1="70" y1="30.0" x2="545" y2="30.0"/>
+<text class="ts end" x="62" y="34.0">100%</text>
+<line class="axis" x1="70" y1="240" x2="545" y2="240"/>
+<line class="axis" x1="70.0" y1="240" x2="70.0" y2="245"/>
+<text class="ts mid" x="70.0" y="258">0.1%</text>
+<line class="axis" x1="132.1" y1="240" x2="132.1" y2="245"/>
+<text class="ts mid" x="132.1" y="258">0.2%</text>
+<line class="axis" x1="214.3" y1="240" x2="214.3" y2="245"/>
+<text class="ts mid" x="214.3" y="258">0.5%</text>
+<line class="axis" x1="276.4" y1="240" x2="276.4" y2="245"/>
+<text class="ts mid" x="276.4" y="258">1%</text>
+<line class="axis" x1="338.6" y1="240" x2="338.6" y2="245"/>
+<text class="ts mid" x="338.6" y="258">2%</text>
+<line class="axis" x1="420.7" y1="240" x2="420.7" y2="245"/>
+<text class="ts mid" x="420.7" y="258">5%</text>
+<line class="axis" x1="482.9" y1="240" x2="482.9" y2="245"/>
+<text class="ts mid" x="482.9" y="258">10%</text>
+<line class="axis" x1="545.0" y1="240" x2="545.0" y2="245"/>
+<text class="ts mid" x="545.0" y="258">20%</text>
+<text class="ts" x="70" y="280">Cache size, as a share of one million links (log scale). Ten million clicks, LRU, code/77-hld-url-shortener.</text>
+<path class="line" style="stroke:var(--sig);" d="M70.0 155.4 L132.1 144.0 L214.3 128.8 L276.4 117.1 L338.6 105.2 L420.7 89.0 L482.9 76.3 L545.0 63.1"/>
+<circle class="dot" style="fill:var(--sig)" cx="70.0" cy="155.4" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="132.1" cy="144.0" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="214.3" cy="128.8" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="276.4" cy="117.1" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="338.6" cy="105.2" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="420.7" cy="89.0" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="482.9" cy="76.3" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="545.0" cy="63.1" r="3.5"/>
+<path class="line" style="stroke:var(--sig);stroke-dasharray:5 4;" d="M70.0 130.8 L132.1 120.7 L214.3 107.3 L276.4 97.2 L338.6 87.1 L420.7 73.7 L482.9 63.6 L545.0 53.5"/>
+<path class="line" style="stroke:var(--store);" d="M70.0 219.0 L132.1 212.4 L214.3 201.6 L276.4 191.3 L338.6 178.8 L420.7 157.9 L482.9 137.7 L545.0 112.6"/>
+<circle class="dot" style="fill:var(--store)" cx="70.0" cy="219.0" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="132.1" cy="212.4" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="214.3" cy="201.6" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="276.4" cy="191.3" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="338.6" cy="178.8" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="420.7" cy="157.9" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="482.9" cy="137.7" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="545.0" cy="112.6" r="3.5"/>
+<path class="line" style="stroke:var(--store);stroke-dasharray:5 4;" d="M70.0 196.6 L132.1 188.3 L214.3 175.4 L276.4 163.9 L338.6 150.7 L420.7 130.3 L482.9 112.1 L545.0 91.2"/>
+<text class="ts" x="553" y="57.5">best possible, skew 1</text>
+<text class="ts" x="553" y="71.5">LRU, skew 1</text>
+<text class="ts" x="553" y="95.2">best possible, skew 0.8</text>
+<text class="ts" x="553" y="116.6">LRU, skew 0.8</text>
+<text class="tb" x="10" y="18">Share of clicks answered by a cache of links</text>
+<rect class="hit" x="70" y="30" width="31.0707" height="210" data-tip="cache of 0.1%, 1,000 links|skew 1: LRU 40.3%, best 52.0%|skew 0.8: LRU 10.0%, best 20.7%|store reads at 115,741/s: 69,093 (skew 1), 104,170 (skew 0.8)"/>
+<rect class="hit" x="101.071" y="30" width="72.1439" height="210" data-tip="cache of 0.2%, 2,000 links|skew 1: LRU 45.7%, best 56.8%|skew 0.8: LRU 13.1%, best 24.6%|store reads at 115,741/s: 62,836 (skew 1), 100,552 (skew 0.8)"/>
+<rect class="hit" x="173.215" y="30" width="72.1439" height="210" data-tip="cache of 0.5%, 5,000 links|skew 1: LRU 53.0%, best 63.2%|skew 0.8: LRU 18.3%, best 30.8%|store reads at 115,741/s: 54,449 (skew 1), 94,562 (skew 0.8)"/>
+<rect class="hit" x="245.359" y="30" width="62.1414" height="210" data-tip="cache of 1%, 10,000 links|skew 1: LRU 58.5%, best 68.0%|skew 0.8: LRU 23.2%, best 36.2%|store reads at 115,741/s: 48,020 (skew 1), 88,913 (skew 0.8)"/>
+<rect class="hit" x="307.5" y="30" width="72.1439" height="210" data-tip="cache of 2%, 20,000 links|skew 1: LRU 64.2%, best 72.8%|skew 0.8: LRU 29.1%, best 42.5%|store reads at 115,741/s: 41,458 (skew 1), 82,024 (skew 0.8)"/>
+<rect class="hit" x="379.644" y="30" width="72.1439" height="210" data-tip="cache of 5%, 50,000 links|skew 1: LRU 71.9%, best 79.2%|skew 0.8: LRU 39.1%, best 52.3%|store reads at 115,741/s: 32,529 (skew 1), 70,487 (skew 0.8)"/>
+<rect class="hit" x="451.788" y="30" width="62.1414" height="210" data-tip="cache of 10%, 100,000 links|skew 1: LRU 77.9%, best 84.0%|skew 0.8: LRU 48.7%, best 60.9%|store reads at 115,741/s: 25,527 (skew 1), 59,372 (skew 0.8)"/>
+<rect class="hit" x="513.929" y="30" width="31.0707" height="210" data-tip="cache of 20%, 200,000 links|skew 1: LRU 84.3%, best 88.8%|skew 0.8: LRU 60.7%, best 70.8%|store reads at 115,741/s: 18,221 (skew 1), 45,540 (skew 0.8)"/>
+</svg>
+</div>
+<figcaption>A cache of 1% of the links answers more than half the redirects if popularity is steep, and a quarter if it is gentler. LRU trails the best possible cache by five to thirteen points.</figcaption>
+</figure>
+
+<p>With steep skew, a cache of 1% of the links answers 58% of the clicks, and 20% answers 84%. With gentler skew the same sizes answer 23% and 61%. The gap to the best possible cache, which always holds the most popular links, is the price of not knowing the future. About 6% of clicks were the first click on their link in the run, so a cache filled only on a miss can never answer them. Two smaller rules complete the read path. Each redirect server keeps a small in-process cache for the hottest links, so one viral link does not land on one node of the shared cache. And an unknown code is remembered for 5 seconds, so that a scanner trying random codes reads the store once per code, not once per try (<x-ref to="dns#caching"></x-ref>).</p>
+
+<h2 id="analytics">Step 6c: Counting clicks</h2>
+<p>A redirect must not wait for analytics, so the click is recorded after the reply. Each redirect server adds the click to a buffer in memory, and about once a second the buffer leaves as one batch for the click log. Aggregators read the log, count clicks per link per minute, and write the counts. The test checks the property that matters: a call to the analytics side that hangs never delays a redirect.</p>
+<pre data-lang="ts" data-title="Clicks wait in a bounded buffer and leave in batches">
+export class ClickBuffer {
+  dropped = 0;
+  private pending: Click[] = [];
+  private readonly send: (batch: Click[]) => Promise<void>;
+  private readonly maxPending: number;
+
+  constructor(send: (batch: Click[]) => Promise<void>, maxPending = 100_000) {
+    this.send = send;
+    this.maxPending = maxPending;
+  }
+
+  add(click: Click): void {
+    this.pending.push(click);
+    if (this.pending.length > this.maxPending) {
+      this.pending.shift();
+      this.dropped++;
+    }
+  }
+
+  // Called on a timer, about once a second.
+  async flush(): Promise<number> {
+    const batch = this.pending;
+    this.pending = [];
+    if (batch.length === 0) return 0;
+    try {
+      await this.send(batch);
+      return batch.length;
+    } catch {
+      this.pending = batch.concat(this.pending); // try again at the next flush
+      return 0;
+    }
+  }
+
+  get waiting(): number {
+    return this.pending.length;
+  }
+}
+</pre>
+<p>Counting first is what makes the writes affordable. At 115,741 clicks a second over a million links with steep skew, the simulation found the most popular link clicked 8,046 times a second: one counter written that often is a hot key on one partition. Counting per minute in the aggregators turned the 115,741 writes a second into 11,047, ten times fewer, and the hottest counter is written once a minute. The buffer is bounded: when the log is down for long, the oldest clicks are dropped. Counts may then miss clicks, as step 1 allowed, and redirects carry on. If counts had to be exact, the aggregators would record the log offset with each count in one write, so that a restart neither loses nor repeats a batch (<x-ref to="idempotency-and-delivery#consumers"></x-ref>). Unique visitors would add a HyperLogLog sketch per link and day (<x-ref to="probabilistic-structures#hll"></x-ref>).</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A redirect server crashes</th><td>A click in flight fails. Clicking again works</td><td>The load balancer stops sending it requests. Its buffered clicks are lost, at most a second’s worth</td></tr>
+<tr><th>A node of the link cache is lost</th><td>Slightly slower redirects for its links</td><td>Its share of keys falls through to the store, and consistent hashing moves only that share (<x-ref to="partitioning#consistent-hashing"></x-ref>)</td></tr>
+<tr><th>One copy of a store partition fails</th><td>Nothing</td><td>Reads and writes use the other two copies (<x-ref to="replication#leaderless"></x-ref>)</td></tr>
+<tr><th>The range coordinator is down</th><td>Nothing at first</td><td>Servers use the ranges they hold. With 20 API servers at 58 creates a second each, a range of 1,000 lasts 17 seconds. Beyond that, creates fall back to random codes with insert-if-absent</td></tr>
+<tr><th>The click log is down</th><td>Counts stop rising for a while</td><td>Buffers hold clicks to their bound, then drop the oldest. Redirects are unaffected</td></tr>
+<tr><th>A link turns out to be phishing</th><td>A warning or 410 within a minute</td><td>The operator disables it; an event tells every server to forget it, and browser copies expire within 60 seconds</td></tr>
+<tr><th>Someone scans random codes</th><td>Nothing</td><td>404s come from the negative cache, and a rate limit stops the scanner</td></tr>
+</tbody>
+</table>
+<p>At ten times the links, a billion a day, seven characters run out in 9.6 years: switch new links to eight characters, which last for centuries, and keep old codes working. Redirects reach 1.2 million a second, which means more redirect servers and a larger cache, but no new component. At a hundred times, the store holds 55 PB in three copies and the partitioning becomes the main operational work: rebalancing, repair and backups across thousands of nodes. The redirect logic, the API and the key scheme do not change.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>X’s t.co.</b> Every link shared on X, including in direct messages, is rewritten to a t.co link. X says the service checks links against a list of potentially dangerous sites, warns before following a flagged one, and measures clicks as a signal for ranking (X Help Center, checked October 2026).</li>
+  <li><b>Google’s goo.gl.</b> Google stopped creating goo.gl links after announcing the shutdown in 2018, and later said existing links would stop working after 25 August 2025. On 1 August 2025 it changed course: links that were still in use would keep working, and only those with no activity in late 2024 would be turned off. A short link is a promise that can outlive its product.</li>
+  <li><b>How long links are clicked.</b> A 2011 Bitly study of 1,000 popular links measured a mean half-life of 2.8 hours on Twitter, 3.2 hours on Facebook and 7.4 hours on YouTube, as reported by Search Engine Land.</li>
+  <li><b>The rules for caching redirects.</b> RFC 9110, the HTTP semantics standard of June 2022, makes 301 and 308 responses cacheable by default and 302 and 307 responses not, which is what the browser in step 6b did.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“Users can choose their own code”</th><td>A custom code is an insert-if-absent of the chosen string, with reserved words refused. Make custom codes longer than 7 characters, or give them their own prefix, so they never take a value the counter will issue</td><td>The store, the redirect path</td></tr>
+<tr><th>“Owners can change where a link points”</th><td>A cached redirect may now be wrong: shorten <code>max-age</code>, and send a forget event on every change</td><td>Keys, analytics</td></tr>
+<tr><th>“Show unique visitors by country”</th><td>The redirect server adds the country from the address to each click. Aggregators keep a HyperLogLog sketch per link, day and country</td><td>The redirect path’s latency</td></tr>
+<tr><th>“Serve users on every continent”</th><td>Redirect servers, caches and read copies of the store in each region. Creates write to the store’s home region, or each region leases its own counter ranges, which never overlap</td><td>The API</td></tr>
+<tr><th>“Some links must be private”</th><td>Long random codes, 12 characters or more, because a scrambled counter is not a secret</td><td>Everything else</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Spend 5 minutes on requirements and say the read-to-write ratio aloud, 3 on the estimates, 5 on the API and the data model together, and 10 on the drawing and the two flows. Use the deep dives for keys first, with the birthday bound and why every scheme needs insert-if-absent, then redirect caching with the 301 and 302 trade-off. Keep the last 5 minutes for failures, and mention analytics off the redirect path even if there is no time to design it.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Cutting a hash of the URL to 7 characters, with no check</th><td>Within the first day, two URLs get the same code and one overwrites the other</td><td>Insert if absent, and draw again on a conflict</td></tr>
+<tr><th>One shared counter, incremented for every link</th><td>A network call on every create, and a single point of failure</td><td>Counter ranges, leased in blocks</td></tr>
+<tr><th>A plain counter in base 62</th><td>Anyone can list other people’s links</td><td>Scramble the counter, or use random codes</td></tr>
+<tr><th>A 301 with no <code>Cache-Control</code></th><td>Browsers keep it indefinitely: clicks go uncounted and deletes do not reach them</td><td>A 301 with <code>private, max-age=60</code>, or a 302 if every click must arrive</td></tr>
+<tr><th>Writing the click before answering the redirect</th><td>Redirect latency and availability tied to analytics</td><td>Answer first, then batch the click</td></tr>
+<tr><th>One database write per click</th><td>The most popular link’s counter becomes a hot key</td><td>Count per minute in the aggregators</td></tr>
+<tr><th>Filling the cache only on a miss</th><td>The first, busiest minutes of every link go to the store</td><td>Write new links into the cache at creation</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="hld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="unique-ids"></x-ref>: the identifier schemes behind step 6a.</li>
+  <li><x-ref to="http-and-tls"></x-ref>: status codes and caching headers.</li>
+  <li><x-ref to="caching"></x-ref>: hit ratios, eviction and filling a cache.</li>
+  <li><x-ref to="partitioning"></x-ref> and <x-ref to="hld-key-value-store"></x-ref>: the link store.</li>
+  <li><x-ref to="event-streaming"></x-ref>: the click log.</li>
+  <li><x-ref to="hld-rate-limiter"></x-ref>: limiting creates and scanners.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Reads outnumber writes a hundred to one, so redirects and creates run on separate fleets and share only the store.</li>
+  <li>Seven base-62 characters give 3.5 trillion codes, enough for decades at 100 million links a day.</li>
+  <li>Random codes repeat after about 2.2 million draws, so every scheme needs an insert that fails when the code is taken.</li>
+  <li>Hashing the URL deduplicates links but collides as often as random codes.</li>
+  <li>Counter ranges remove the shared step from each create, waste a little on restarts, and never duplicate. Scramble the counter so codes cannot be counted through.</li>
+  <li>A bare 301 is cached by browsers indefinitely; a 301 with <code>private, max-age=60</code> bounds both lost clicks and stale deletes.</li>
+  <li>Write new links into the cache at creation, because most clicks come in a link’s first hours.</li>
+  <li>Record clicks after the redirect, in batches, and count per minute before writing.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>With random 7-character codes and 100 million new links a day, how long until two links are as likely as not to have drawn the same code?</summary><p>About 2.2 million codes, the birthday bound for 3.5 trillion possibilities, which is 32 minutes of creates. So the store must refuse a code that is taken from the first day.</p></details>
+<details><summary>Why does hashing the long URL not solve collisions?</summary><p>Different URLs can have hashes that agree in the characters kept. Cut to 7 characters, the hash behaves like a random draw, and the simulation found as many equal pairs for hashed codes as for random ones. Hashing only makes the same URL give the same code.</p></details>
+<details><summary>A server holding the range 5,000 to 5,999 crashes after issuing 5,000 to 5,320. What happens to 5,321 to 5,999?</summary><p>They are never issued. After the restart the server leases a fresh range from the coordinator, which has already moved past 5,999. The values are wasted, about 0.2% of all values with ranges of 1,000 in the simulation, but no code is ever given twice.</p></details>
+<details><summary>Why scramble the counter value before writing it in base 62?</summary><p>A plain counter makes consecutive links consecutive codes, so anyone can find other people’s links by counting from their own. A keyed permutation keeps every code unique while placing neighbors far apart.</p></details>
+<details><summary>What does a 301 with no <code>Cache-Control</code> header do to the owner’s click counts?</summary><p>The browser keeps the redirect and follows it without asking again, so repeat clicks from that browser never reach the shortener and are not counted. In the measurement, one of three clicks arrived.</p></details>
+<details><summary>Analytics is down for ten minutes. What do users and owners see?</summary><p>Users see nothing: redirects are answered before the click is sent. Owners see counts stop rising, then catch up from the buffers, minus any clicks dropped once a buffer reached its bound.</p></details>
+<details><summary>Why write a new link into the cache when it is created?</summary><p>Most of a link’s clicks come in its first hours, so its busiest minutes are its first. A cache filled only on a miss would send each new link’s first clicks to the store.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>R. Fielding, M. Nottingham and J. Reschke, <a href="https://www.rfc-editor.org/rfc/rfc9110">RFC 9110: HTTP Semantics</a>, IETF, June 2022. Section 15.4 on redirects and which are cacheable by default.</li>
+  <li>X Help Center, <a href="https://help.x.com/en/using-x/url-shortener">“How to use the t.co URL shortener”</a>, checked October 2026.</li>
+  <li>Google for Developers Blog, <a href="https://developers.googleblog.com/2018/03/transitioning-google-url-shortener.html">“Google URL Shortener links will no longer be available”</a>, 2018, updated 1 August 2025.</li>
+  <li>Search Engine Land, <a href="https://searchengineland.com/why-second-chance-tweets-matter-after-3-hours-few-care-about-socially-shared-links-92125">“Why second chance tweets matter: after 3 hours, few care about socially shared links”</a>, September 2011. Reports Bitly’s half-life study; Bitly’s original post is no longer online.</li>
+  <li>Michael Luby and Charles Rackoff, “How to construct pseudorandom permutations from pseudorandom functions”, <cite>SIAM Journal on Computing</cite> 17, 1988, pages 373 to 386. Why a Feistel network with good round functions gives a permutation that is hard to tell from random.</li>
+</ol>
+</section>

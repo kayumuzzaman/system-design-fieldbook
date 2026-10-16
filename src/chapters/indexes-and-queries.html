@@ -1,0 +1,437 @@
+<!--meta
+{ "description": "How database indexes work and how queries are executed: B-trees, clustered and secondary indexes, composite and covering indexes, the query planner and EXPLAIN, join algorithms, the N+1 problem, keyset pagination and connection pooling.",
+  "lede": "Most performance problems in ordinary applications come down to a database reading far more data than the answer contains. An index is how a database avoids that, and the query planner is what decides whether to use it. This chapter explains both well enough to predict what a query will cost before you run it.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="problem">Finding rows without reading everything</h2>
+<p>A table is stored on disk as a sequence of fixed-size blocks called <dfn>pages</dfn>, 8 KB each in PostgreSQL and 16 KB in MySQL’s default engine. Rows are placed in pages roughly in the order they were inserted. To answer <code>SELECT * FROM photos WHERE owner_id = 42</code> with no other help, the database has one option: read every page of the table and check every row. This is a <dfn>sequential scan</dfn>, or full table scan.</p>
+<p>For a table of a thousand rows that is fine. For a photos table of 100 million rows at about 100 rows per page, it is a million pages, or 8 GB, to find perhaps thirty rows. Even from a fast SSD that takes seconds, and it competes with every other query for memory and disk while it runs.</p>
+<p>An <dfn>index</dfn> is a separate structure, maintained by the database alongside the table, that is organized for finding rows by the value of one or more columns. It is the same idea as the index at the back of a textbook: a sorted list of terms, each with the page numbers where it appears. You read a small sorted structure to learn where to look, then go straight there.</p>
+
+<h2 id="btree">The B-tree</h2>
+<p>The default index in nearly every relational database is the <dfn>B-tree</dfn>. It keeps keys in sorted order in a tree of pages that is very wide and very shallow.</p>
+
+<figure class="fig wide" id="fig-btree">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f161t f161d">
+<title id="f161t">A B-tree index and the table rows it points to</title>
+<desc id="f161d">A root page holds the separator keys 40 and 80, with pointers to three leaf pages: keys below 40, keys 40 to 79, and keys 80 and above. The leaf pages hold every key in sorted order and are linked to their neighbors. Each leaf entry points to a row in the table pages, where rows are in no particular order. Finding key 59 reads the root, then the middle leaf, then the table page that holds row 59.</desc>
+<text class="ts" x="10" y="36">root page</text>
+<rect class="n sig" x="314" y="16" width="46" height="30" rx="0"/><text class="mid" x="337" y="35.5">40</text><rect class="n sig" x="360" y="16" width="46" height="30" rx="0"/><text class="mid" x="383" y="35.5">80</text>
+<rect class="n" x="24" y="104" width="46" height="30" rx="0"/><text class="mid" x="47" y="123.5">5</text>
+<rect class="n" x="70" y="104" width="46" height="30" rx="0"/><text class="mid" x="93" y="123.5">12</text>
+<rect class="n" x="116" y="104" width="46" height="30" rx="0"/><text class="mid" x="139" y="123.5">27</text>
+<rect class="n" x="162" y="104" width="46" height="30" rx="0"/><text class="mid" x="185" y="123.5">33</text>
+<rect class="n" x="268" y="104" width="46" height="30" rx="0"/><text class="mid" x="291" y="123.5">40</text>
+<rect class="n" x="314" y="104" width="46" height="30" rx="0"/><text class="mid" x="337" y="123.5">48</text>
+<rect class="n sig" x="360" y="104" width="46" height="30" rx="0"/><text class="mid" x="383" y="123.5">59</text>
+<rect class="n" x="406" y="104" width="46" height="30" rx="0"/><text class="mid" x="429" y="123.5">71</text>
+<rect class="n" x="512" y="104" width="46" height="30" rx="0"/><text class="mid" x="535" y="123.5">80</text>
+<rect class="n" x="558" y="104" width="46" height="30" rx="0"/><text class="mid" x="581" y="123.5">86</text>
+<rect class="n" x="604" y="104" width="46" height="30" rx="0"/><text class="mid" x="627" y="123.5">92</text>
+<rect class="n" x="650" y="104" width="46" height="30" rx="0"/><text class="mid" x="673" y="123.5">97</text>
+<path class="e" d="M314 46 116 104"/>
+<path class="e sig" d="M360 46V104"/>
+<path class="e" d="M406 46 604 104"/>
+<text class="ts end" x="200" y="70">keys below 40</text>
+<text class="ts" x="368" y="82">40 to 79</text>
+<text class="ts" x="520" y="70">80 and above</text>
+<path class="e dash both" d="M208 119H268"/>
+<path class="e dash both" d="M452 119H512"/>
+<text class="ts" x="10" y="156">leaf pages: every key, in order</text>
+<text class="ts" x="10" y="206">table pages</text>
+<rect class="n sunk" x="100" y="186" width="92" height="32" rx="4"/>
+<text class="ts mid" x="146" y="206.5">row 12</text>
+<rect class="n sunk" x="202" y="186" width="92" height="32" rx="4"/>
+<text class="ts mid" x="248" y="206.5">row 97</text>
+<rect class="n sig" x="304" y="186" width="92" height="32" rx="4"/>
+<text class="ts mid" x="350" y="206.5">row 59</text>
+<rect class="n sunk" x="406" y="186" width="92" height="32" rx="4"/>
+<text class="ts mid" x="452" y="206.5">row 5</text>
+<rect class="n sunk" x="508" y="186" width="92" height="32" rx="4"/>
+<text class="ts mid" x="554" y="206.5">row 71</text>
+<rect class="n sunk" x="610" y="186" width="92" height="32" rx="4"/>
+<text class="ts mid" x="656" y="206.5">row 40</text>
+<path class="e sig" d="M383 134 C383 160 350 160 350 186"/>
+<text class="ts" x="10" y="246">Each leaf entry holds the location of its row. Finding key 59: read the root, follow the middle pointer, read one</text>
+<text class="ts" x="10" y="263">leaf, then fetch the row. Three page reads here, and four or five in a real index with hundreds of keys per page.</text>
+
+</svg>
+</div>
+<figcaption>A small B-tree. The highlighted path finds key 59. The table itself is unordered, and the index supplies the order.</figcaption>
+</figure>
+
+<p>Three properties make this structure so useful.</p>
+<ul>
+  <li><b>It is shallow.</b> Each page holds hundreds of keys, so each level multiplies the number of rows the tree can address by hundreds. A lookup reads one page per level.</li>
+  <li><b>It is sorted.</b> The leaf pages hold all keys in order and are linked to their neighbors. Once the database has found the first matching key it can walk along the leaves, which makes range conditions (<code>BETWEEN</code>, <code>&gt;</code>, <code>&lt;</code>), prefix matches (<code>LIKE 'abc%'</code>) and <code>ORDER BY</code> efficient as well as equality.</li>
+  <li><b>It stays balanced.</b> When a page fills up it splits in two, and the tree grows a new level only when the root itself splits. Every leaf is always the same distance from the root, so lookups have predictable cost.</li>
+</ul>
+
+<div class="widget" data-widget="btree">
+<h4>How deep is the index?</h4>
+<p>Compare the pages read by an index lookup with the pages read by a scan of the whole table.</p>
+<div class="controls">
+  <label>Rows in the table<input type="number" name="rows" value="100000000" min="1" step="1000000"></label>
+  <label>Keys per index page<input type="number" name="fanout" value="300" min="2" step="10"></label>
+  <label>Rows per table page<input type="number" name="perpage" value="100" min="1" step="10"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 194" role="img" aria-label="The levels of the index drawn as rows that widen toward the leaves, then the table. One page is marked on each row: the pages a single lookup reads."><text x="10" y="16" class="ts">A lookup reads one page on every row, marked in blue. A full scan reads every page of the table.</text><text x="10" y="45" class="ts">Index level 1, the root</text><rect x="325" y="28" width="30" height="24" rx="4" class="n"></rect><rect x="331" y="31" width="18" height="18" rx="3" class="bar"></rect><text x="363" y="45" class="ts">1 page</text><text x="10" y="77" class="ts">Index level 2</text><rect x="310.5" y="60" width="59.1" height="24" rx="4" class="n"></rect><rect x="331" y="63" width="18" height="18" rx="3" class="bar"></rect><text x="377.5" y="77" class="ts">4 pages</text><text x="10" y="109" class="ts">Index level 3</text><rect x="251.4" y="92" width="177.2" height="24" rx="4" class="n"></rect><rect x="331" y="95" width="18" height="18" rx="3" class="bar"></rect><text x="436.6" y="109" class="ts">1,112 pages</text><text x="10" y="141" class="ts">Index level 4, the leaves</text><rect x="191.5" y="124" width="296.9" height="24" rx="4" class="n"></rect><rect x="331" y="127" width="18" height="18" rx="3" class="bar"></rect><text x="496.5" y="141" class="ts">333 thousand pages</text><text x="10" y="173" class="ts">Table</text><rect x="180" y="156" width="320" height="24" rx="4" class="n store"></rect><rect x="331" y="159" width="18" height="18" rx="3" class="bar"></rect><text x="508" y="173" class="ts">1 million pages</text></svg>
+<dl class="results">
+  <div><dt>Levels in the index</dt><dd data-out="levels">4</dd></div>
+  <div><dt>Pages read to find one row</dt><dd data-out="lookup">5 pages</dd></div>
+  <div><dt>Pages read by a full scan</dt><dd data-out="scan">1 million pages</dd></div>
+  <div><dt>Difference</dt><dd data-out="ratio">200 thousand×</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">A tree 4 levels deep with 300 keys per page can index up to 8.1 billion rows, so this table could grow 81 times before the index gains another level. Depth grows with the logarithm of the table size, which is why indexed lookups stay fast as data grows.</p>
+</div>
+
+<p>The upper levels of an index are small and are read constantly, so they stay in memory. In practice a lookup by an indexed key costs one or two reads from disk at most, and often none.</p>
+
+<h2 id="cost">What an index costs</h2>
+<p>If indexes make reads fast, why not index every column? Because each one is paid for on every write.</p>
+<ul>
+  <li><b>Writes do more work.</b> Inserting a row means inserting an entry into every index on the table. A table with six indexes turns one insert into seven writes. Updating an indexed column means removing one entry and adding another.</li>
+  <li><b>Space.</b> Indexes are often as large as the table, and sometimes larger in total.</li>
+  <li><b>Memory.</b> The database keeps frequently used pages in memory. Every index competes for that space, and indexes that do not fit in memory are far slower.</li>
+</ul>
+<p>The working rule is to create indexes for the queries the application actually runs, and to remove indexes nothing uses. Databases keep usage statistics for each index, so unused ones can be found with a query.</p>
+
+<h2 id="clustered">Where the rows live: heaps and clustered indexes</h2>
+<p>Databases differ in what the leaf of an index contains, and the difference has practical consequences.</p>
+<p>In PostgreSQL the table is a <dfn>heap</dfn>: rows sit in no particular order, and every index, including the primary key, holds pointers to row locations. In MySQL’s InnoDB engine the table <em>is</em> the primary key’s B-tree, with the full rows stored in its leaves. This is called a <dfn>clustered index</dfn>. Every other index, called a <dfn>secondary index</dfn>, stores the primary key value as its pointer.</p>
+<table>
+<thead><tr><th></th><th>Heap table (PostgreSQL)</th><th>Clustered table (MySQL InnoDB, SQL Server by default)</th></tr></thead>
+<tbody>
+<tr><th>Lookup by primary key</th><td>Index, then one more read for the row</td><td>The row is in the index leaf. No extra read.</td></tr>
+<tr><th>Range scan by primary key</th><td>Rows may be scattered across pages</td><td>Rows are physically adjacent. Very fast.</td></tr>
+<tr><th>Lookup by secondary index</th><td>Index, then the row</td><td>Secondary index, then the primary key’s tree, then the row. Two tree descents.</td></tr>
+<tr><th>Size of secondary indexes</th><td>Independent of the primary key</td><td>Each entry includes the primary key, so a wide key makes every index larger</td></tr>
+</tbody>
+</table>
+<p>One consequence deserves attention because it surprises people. In a clustered table, rows are stored in primary key order. If keys arrive in increasing order, every insert goes to the end of the tree, onto a page that is already in memory. If keys are random, as version 4 UUIDs are, every insert lands on a random page somewhere in the tree. Pages must be fetched from disk and split, and the table becomes fragmented. On large tables this slows inserts considerably. The remedy is a key that increases with time: an auto-incrementing number, or a time-ordered identifier such as UUID version 7, which PostgreSQL 18 can generate with a built-in <code>uuidv7()</code> function. <x-ref to="unique-ids"></x-ref> covers the options.</p>
+
+<h2 id="composite">Indexes on several columns</h2>
+<p>An index can cover more than one column. A <dfn>composite index</dfn> on <code>(owner_id, created_at)</code> sorts its entries by owner first and, among entries with the same owner, by creation time. A telephone directory sorted by surname and then first name is the same structure.</p>
+<pre data-lang="sql">
+CREATE INDEX photos_owner_created_idx ON photos (owner_id, created_at);
+</pre>
+
+<figure class="fig wide" id="fig-composite">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-labelledby="f162t f162d">
+<title id="f162t">Which queries a composite index on owner and creation time can serve</title>
+<desc id="f162d">The index entries are sorted by owner_id and then by created_at. A query for owner 42 ordered by creation time matches one contiguous run of three entries. A query for all photos created in October matches entries scattered through the index, because the index is sorted by owner first.</desc>
+<text class="tb" x="10" y="18">WHERE owner_id = 42 ORDER BY created_at</text>
+<rect class="n sunk" x="10" y="30" width="90" height="22" rx="0"/>
+<text class="ts tb" x="17" y="45">owner_id</text>
+<rect class="n sunk" x="100" y="30" width="100" height="22" rx="0"/>
+<text class="ts tb" x="107" y="45">created_at</text>
+<rect class="n" x="10" y="52" width="90" height="22" rx="0"/>
+<text class="ts" x="17" y="67">41</text>
+<rect class="n" x="100" y="52" width="100" height="22" rx="0"/>
+<text class="ts" x="107" y="67">Oct 1</text>
+<rect class="n" x="10" y="74" width="90" height="22" rx="0"/>
+<text class="ts" x="17" y="89">41</text>
+<rect class="n" x="100" y="74" width="100" height="22" rx="0"/>
+<text class="ts" x="107" y="89">Oct 9</text>
+<rect class="n sig" x="10" y="96" width="90" height="22" rx="0"/>
+<text class="ts" x="17" y="111">42</text>
+<rect class="n sig" x="100" y="96" width="100" height="22" rx="0"/>
+<text class="ts" x="107" y="111">Sep 3</text>
+<rect class="n sig" x="10" y="118" width="90" height="22" rx="0"/>
+<text class="ts" x="17" y="133">42</text>
+<rect class="n sig" x="100" y="118" width="100" height="22" rx="0"/>
+<text class="ts" x="107" y="133">Sep 30</text>
+<rect class="n sig" x="10" y="140" width="90" height="22" rx="0"/>
+<text class="ts" x="17" y="155">42</text>
+<rect class="n sig" x="100" y="140" width="100" height="22" rx="0"/>
+<text class="ts" x="107" y="155">Oct 8</text>
+<rect class="n" x="10" y="162" width="90" height="22" rx="0"/>
+<text class="ts" x="17" y="177">43</text>
+<rect class="n" x="100" y="162" width="100" height="22" rx="0"/>
+<text class="ts" x="107" y="177">Aug 2</text>
+<rect class="n" x="10" y="184" width="90" height="22" rx="0"/>
+<text class="ts" x="17" y="199">43</text>
+<rect class="n" x="100" y="184" width="100" height="22" rx="0"/>
+<text class="ts" x="107" y="199">Oct 5</text>
+<text class="ts" x="216" y="82">One contiguous run,</text>
+<text class="ts" x="216" y="99">already in order.</text>
+<text class="ts" x="216" y="116">The database jumps</text>
+<text class="ts" x="216" y="133">to the first entry</text>
+<text class="ts" x="216" y="150">and reads forward.</text>
+<path class="e none dash" d="M360 8V214"/>
+<text class="tb" x="380" y="18">WHERE created_at &gt;= 'Oct 1'</text>
+<rect class="n sunk" x="380" y="30" width="90" height="22" rx="0"/>
+<text class="ts tb" x="387" y="45">owner_id</text>
+<rect class="n sunk" x="470" y="30" width="100" height="22" rx="0"/>
+<text class="ts tb" x="477" y="45">created_at</text>
+<rect class="n fault" x="380" y="52" width="90" height="22" rx="0"/>
+<text class="ts" x="387" y="67">41</text>
+<rect class="n fault" x="470" y="52" width="100" height="22" rx="0"/>
+<text class="ts" x="477" y="67">Oct 1</text>
+<rect class="n fault" x="380" y="74" width="90" height="22" rx="0"/>
+<text class="ts" x="387" y="89">41</text>
+<rect class="n fault" x="470" y="74" width="100" height="22" rx="0"/>
+<text class="ts" x="477" y="89">Oct 9</text>
+<rect class="n" x="380" y="96" width="90" height="22" rx="0"/>
+<text class="ts" x="387" y="111">42</text>
+<rect class="n" x="470" y="96" width="100" height="22" rx="0"/>
+<text class="ts" x="477" y="111">Sep 3</text>
+<rect class="n" x="380" y="118" width="90" height="22" rx="0"/>
+<text class="ts" x="387" y="133">42</text>
+<rect class="n" x="470" y="118" width="100" height="22" rx="0"/>
+<text class="ts" x="477" y="133">Sep 30</text>
+<rect class="n fault" x="380" y="140" width="90" height="22" rx="0"/>
+<text class="ts" x="387" y="155">42</text>
+<rect class="n fault" x="470" y="140" width="100" height="22" rx="0"/>
+<text class="ts" x="477" y="155">Oct 8</text>
+<rect class="n" x="380" y="162" width="90" height="22" rx="0"/>
+<text class="ts" x="387" y="177">43</text>
+<rect class="n" x="470" y="162" width="100" height="22" rx="0"/>
+<text class="ts" x="477" y="177">Aug 2</text>
+<rect class="n fault" x="380" y="184" width="90" height="22" rx="0"/>
+<text class="ts" x="387" y="199">43</text>
+<rect class="n fault" x="470" y="184" width="100" height="22" rx="0"/>
+<text class="ts" x="477" y="199">Oct 5</text>
+<text class="ts" x="586" y="82">The matches are</text>
+<text class="ts" x="586" y="99">scattered. The index</text>
+<text class="ts" x="586" y="116">is sorted by owner</text>
+<text class="ts" x="586" y="133">first, so it cannot</text>
+<text class="ts" x="586" y="150">jump to them.</text>
+
+</svg>
+</div>
+<figcaption>The same index, two queries. Column order decides which questions the index answers.</figcaption>
+</figure>
+
+<p>The order of columns is the whole design. The index is useful for a query that constrains a leading part of it:</p>
+<ul>
+  <li><code>WHERE owner_id = 42</code>: yes.</li>
+  <li><code>WHERE owner_id = 42 AND created_at &gt; '2026-10-01'</code>: yes, and efficiently.</li>
+  <li><code>WHERE owner_id = 42 ORDER BY created_at DESC LIMIT 20</code>: yes, and with no sorting step, because the entries are already in order. The database reads twenty entries and stops.</li>
+  <li><code>WHERE created_at &gt; '2026-10-01'</code>: not in the ordinary way, because the matching entries are spread through every owner’s section.</li>
+</ul>
+<aside class="sn"><b>Skip scan</b>Some databases can use a composite index without a condition on its first column, by treating it as many small indexes, one per distinct leading value, and searching each. PostgreSQL added this in version 18. It helps when the leading column has few distinct values and is no substitute for the right index.</aside>
+<p>Two rules cover most cases. Put the columns compared with <code>=</code> first and the column used for a range or for sorting last. And let one composite index do the work of several: an index on <code>(owner_id, created_at)</code> also serves every query that an index on <code>(owner_id)</code> alone would, so the single-column one is redundant.</p>
+
+<h2 id="covering">Covering, partial and expression indexes</h2>
+<p>Three refinements are worth knowing, because each turns a slow query into a fast one without touching application code.</p>
+<p>A <dfn>covering index</dfn> contains every column a query needs, so the database can answer from the index without visiting the table at all. This is called an index-only scan. Extra columns can be attached to an index purely for this purpose:</p>
+<pre data-lang="sql">
+CREATE INDEX photos_owner_created_idx ON photos (owner_id, created_at) INCLUDE (caption);
+</pre>
+<p>A <dfn>partial index</dfn> covers only the rows that match a condition. If a jobs table has ten million rows of which a few hundred are pending, an index on only the pending ones is tiny and stays in memory:</p>
+<pre data-lang="sql">
+CREATE INDEX jobs_pending_idx ON jobs (run_at) WHERE status = 'pending';
+</pre>
+<p>An <dfn>expression index</dfn> indexes the result of a function instead of a raw column. This matters because a condition that wraps a column in a function cannot use an ordinary index on that column. <code>WHERE lower(email) = 'ana@example.com'</code> needs an index on <code>lower(email)</code>.</p>
+<p>A <dfn>unique index</dfn> does double duty: it speeds up lookups and it enforces that no two rows share a value. It is the only reliable way to guarantee uniqueness. Checking in application code and then inserting leaves a gap in which two requests can both pass the check (<x-ref to="transactions"></x-ref>).</p>
+
+<h2 id="other-types">Other kinds of index</h2>
+<table>
+<thead><tr><th>Index</th><th>Good for</th><th>Not for</th></tr></thead>
+<tbody>
+<tr><th>B-tree</th><td>Equality, ranges, sorting, prefixes. The default.</td><td>Searching inside text or inside arrays and JSON</td></tr>
+<tr><th>Hash</th><td>Equality only</td><td>Ranges and sorting. Rarely better than a B-tree in practice.</td></tr>
+<tr><th>Inverted (GIN in PostgreSQL)</th><td>“Contains” queries: words in text, elements in arrays, keys in JSON</td><td>Tables with very frequent updates, since it is slow to maintain</td></tr>
+<tr><th>Spatial (GiST, R-tree)</th><td>Points near a location, shapes that overlap</td><td>Ordinary scalar lookups</td></tr>
+<tr><th>Block range (BRIN)</th><td>Enormous tables where a column follows insertion order, such as timestamps in a log. Tiny.</td><td>Columns whose values are scattered</td></tr>
+<tr><th>Vector (HNSW, IVF)</th><td>Finding the nearest neighbors of an embedding</td><td>Exact matching</td></tr>
+</tbody>
+</table>
+<p><x-ref to="search-systems"></x-ref> explains inverted indexes, and <x-ref to="specialized-databases"></x-ref> covers spatial and vector indexes.</p>
+
+<h2 id="planner">The query planner</h2>
+<p>SQL says what you want and leaves the method to the database. The component that chooses the method is the <dfn>query planner</dfn>, or optimizer. For each query it considers different ways to produce the result, such as which index to use, in which order to join tables and by which algorithm, estimates the cost of each, and runs the cheapest.</p>
+<p>Its estimates come from <dfn>statistics</dfn> the database keeps about each column: how many rows the table has, how many distinct values a column holds, which values are most common. From these it predicts how many rows each condition will match. When the statistics are out of date or the prediction is wrong, the planner chooses badly, and a query that ran in a millisecond yesterday takes ten seconds today with no change to the code.</p>
+<p>You can ask the database to show its plan. In PostgreSQL, <code>EXPLAIN</code> shows the plan it would use, and <code>EXPLAIN ANALYZE</code> runs the query and reports what happened. Reading this output is the most valuable database skill an application developer can have.</p>
+<pre data-lang="text" data-title="The same query before and after adding the composite index (output abridged)">
+EXPLAIN ANALYZE
+SELECT id, caption FROM photos WHERE owner_id = 42 ORDER BY created_at DESC LIMIT 20;
+
+-- Before
+Limit  (actual time=8421.5..8421.6 rows=20)
+  ->  Sort  (actual time=8421.5..8421.5 rows=20)
+        Sort Key: created_at DESC
+        ->  Seq Scan on photos  (actual time=0.9..8420.3 rows=1288)
+              Filter: (owner_id = 42)
+              Rows Removed by Filter: 99998712
+Execution Time: 8421.7 ms
+
+-- After
+Limit  (actual time=0.03..0.06 rows=20)
+  ->  Index Scan Backward using photos_owner_created_idx on photos
+        (actual time=0.03..0.05 rows=20)
+        Index Cond: (owner_id = 42)
+Execution Time: 0.08 ms
+</pre>
+<p>Read a plan from the innermost line outward. In the first plan the database read all 100 million rows, discarded all but 1,288, sorted those, and returned 20. The line to notice is <code>Rows Removed by Filter</code>: a large number there means the database examined rows it did not need. In the second plan it walked the index backward from Ana’s newest photo, took 20 entries and stopped. There is no sort and nothing was discarded. The timings are illustrative, and the shape of the two plans is what real output looks like.</p>
+
+<h3 id="when-ignored">Why the database is not using your index</h3>
+<p>Sometimes an index exists and the planner still scans the table. Usually it is right to. Fetching rows through an index means jumping around the table, one row at a time, and that is slower per row than reading pages in order.</p>
+
+<figure class="fig wide" id="fig-selectivity">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f163t f163d">
+<title id="f163t">The cost of an index scan and of a full scan as more rows match</title>
+<desc id="f163d">A chart with the share of rows that match a condition on the horizontal axis and query cost on the vertical axis. The cost of a full table scan is a flat line. The cost of using the index starts near zero and rises steadily. The two cross, and beyond that point reading the whole table is cheaper.</desc>
+<line class="axis" x1="70" y1="200" x2="670" y2="200"/>
+<line class="axis" x1="70" y1="200" x2="70" y2="30"/>
+<path class="line" style="stroke:var(--ink-2)" d="M70 130H670"/>
+<path class="line" d="M70 196L670 36"/>
+<line class="grid" x1="318" y1="200" x2="318" y2="30" stroke-dasharray="4 4"/>
+<text class="ts end" x="666" y="122">read the whole table</text>
+<text class="ts end" x="560" y="54">use the index</text>
+<text class="ts end" x="309.5" y="44">index is cheaper</text>
+<text class="ts" x="325.5" y="44">full scan is cheaper</text>
+<text class="ts" x="70" y="218">few rows match</text>
+<text class="ts end" x="670" y="218">most rows match</text>
+<text class="ts mid" transform="translate(28 115.0) rotate(-90)">cost of the query</text>
+
+</svg>
+</div>
+<figcaption>An index wins when a condition matches a small fraction of the table. Where the lines cross depends on row size, storage speed and how the table is laid out, so the planner estimates it for each query.</figcaption>
+</figure>
+
+<p>An index on a column with few distinct values, such as a status that is <code>'active'</code> for 95% of rows, is useless for finding active rows and excellent for finding the other 5%. This property is called <dfn>selectivity</dfn>. The other common reasons an index is passed over are mistakes in the query:</p>
+<ul>
+  <li><b>A function or calculation on the column</b>: <code>WHERE date(created_at) = '2026-10-10'</code>. Rewrite it as a range on the bare column, or create an expression index.</li>
+  <li><b>A type mismatch</b>: comparing a text column with a number makes the database convert every row before comparing.</li>
+  <li><b>A leading wildcard</b>: <code>LIKE '%sunset%'</code> cannot use a B-tree, because the sorted order is only helpful when the start of the value is known.</li>
+  <li><b>The wrong column order</b> in a composite index, as in the figure above.</li>
+  <li><b>Out-of-date statistics</b>, typically after a bulk load. Running <code>ANALYZE</code> fixes this.</li>
+</ul>
+
+<h2 id="joins">How joins are executed</h2>
+<p>A join can be carried out in three ways, and the planner picks one from its row estimates.</p>
+<table>
+<thead><tr><th>Algorithm</th><th>How it works</th><th>Chosen when</th></tr></thead>
+<tbody>
+<tr><th>Nested loop</th><td>For each row on one side, look up the matching rows on the other, ideally through an index</td><td>One side is small and the other has an index on the join column. The usual plan for application queries.</td></tr>
+<tr><th>Hash join</th><td>Build an in-memory hash table from the smaller side, then scan the larger side and probe it</td><td>Both sides are large and there is no useful index. Typical of reports.</td></tr>
+<tr><th>Merge join</th><td>Walk two inputs that are already sorted on the join column, side by side</td><td>Both sides arrive sorted, for example from indexes</td></tr>
+</tbody>
+</table>
+<p>The practical lesson is that foreign key columns should nearly always be indexed. PostgreSQL indexes primary keys automatically and does not index the column that refers to them. Without an index on <code>comments.photo_id</code>, loading the comments for one photo scans every comment in the system, and deleting a photo does the same while it checks for references.</p>
+
+<h2 id="n-plus-one">The N+1 problem</h2>
+<p>The most common query problem in application code involves no slow query at all. It is too many fast ones.</p>
+<pre data-lang="ts" data-title="Loading 20 photos and their owners">
+// N+1: one query for the list, then one more for each item. 21 round trips.
+const photos = await db.query("SELECT * FROM photos ORDER BY created_at DESC LIMIT 20");
+for (const photo of photos) {
+  photo.owner = await db.queryOne("SELECT * FROM users WHERE id = $1", [photo.owner_id]);
+}
+
+// Fix 1: let the database join. One round trip.
+const rows = await db.query(`
+  SELECT p.id, p.caption, u.username
+  FROM photos p JOIN users u ON u.id = p.owner_id
+  ORDER BY p.created_at DESC LIMIT 20`);
+
+// Fix 2: fetch the related rows in one batch. Two round trips.
+const ownerIds = [...new Set(photos.map((p) => p.owner_id))];
+const owners = await db.query("SELECT * FROM users WHERE id = ANY($1)", [ownerIds]);
+</pre>
+<p>Each query in the first version takes a fraction of a millisecond to execute. The cost is the round trip between the application and the database, around half a millisecond each inside a data center. Twenty-one of them is some 10 ms where one would do, and a page that lists 200 items with three relations each makes 601 queries. The pattern usually hides inside an object-relational mapper, where reading <code>photo.owner</code> quietly runs a query. It also hides from slow-query logs, since no individual query is slow. Count the queries per request during development, and use your mapper’s option for loading relations in advance.</p>
+<p>The same problem appears in GraphQL servers, where each field resolver fetches its own data (<x-ref to="api-styles#graphql"></x-ref>), and the same fix applies: collect the keys and fetch them in one batch.</p>
+
+<h2 id="pagination">Pagination, seen from the database</h2>
+<p><x-ref to="api-styles#pagination"></x-ref> compared offset and cursor pagination from the client’s side. The database’s side explains the performance difference. <code>OFFSET 100000 LIMIT 20</code> does not jump to row 100,000. The database produces the first 100,020 rows in order and throws the first 100,000 away. Every page is slower than the one before it.</p>
+<pre data-lang="sql" data-title="Keyset pagination: continue from the last row seen">
+SELECT id, caption, created_at
+FROM photos
+WHERE owner_id = 42
+  AND (created_at, id) < ('2026-10-01 18:04:00', 871)   -- values from the last row of the previous page
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+</pre>
+<p>With an index on <code>(owner_id, created_at, id)</code>, this goes directly to the right place in the index and reads 20 entries, however deep into the list the user has scrolled. The <code>id</code> is included as a tiebreaker so that two photos with the same timestamp have a definite order.</p>
+
+<h2 id="connections">Connections are a limited resource</h2>
+<p>Queries run over connections, and database connections are expensive in a way that HTTP connections are not. PostgreSQL starts a separate operating system process for each one, and each uses several megabytes of memory. The default limit is 100 connections. Opening one involves a network handshake, authentication and process creation, which can take tens of milliseconds.</p>
+<p>Applications therefore keep a <dfn>connection pool</dfn>: a small set of open connections that requests borrow and return. Two things go wrong at scale.</p>
+<ul>
+  <li><b>The pools add up.</b> Fifty application instances with a pool of 20 each want 1,000 connections. Autoscaling makes it worse, since adding application servers during a traffic spike adds database connections at the moment the database is busiest.</li>
+  <li><b>More connections do not mean more throughput.</b> A database server has a fixed number of CPU cores and disks. Beyond a few connections per core, extra concurrent queries only contend with each other, and total throughput falls.</li>
+</ul>
+<p>The standard answer is a <dfn>connection pooler</dfn> between the application and the database, such as PgBouncer. Thousands of application connections share a few dozen real ones, each borrowed only for the duration of a transaction. Serverless functions make a pooler essential, because each function instance would otherwise open its own connection. <x-ref to="serverless"></x-ref> returns to that.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> When requests start timing out waiting for a database connection, the instinct is to raise the pool size. If the database is already saturated, that makes each query slower and the queue longer. Find out first whether connections are being held too long, for example by a transaction left open while the code calls another service, or whether the queries themselves need attention.</p></div>
+
+<h2 id="workflow">Working on a slow query</h2>
+<ol>
+  <li><b>Find out which queries matter.</b> Look at total time, which is the number of calls multiplied by the average duration. Databases can report this, in PostgreSQL through the <code>pg_stat_statements</code> extension. A 2 ms query that runs a million times an hour matters more than a 5-second report that runs twice a day.</li>
+  <li><b>Read the plan</b> with <code>EXPLAIN ANALYZE</code>, using realistic data. A plan from a development database with a hundred rows tells you nothing.</li>
+  <li><b>Compare estimated rows with actual rows.</b> A large gap means the planner was misinformed.</li>
+  <li><b>Look for rows read and thrown away</b>, and for sorts that an index could have avoided.</li>
+  <li><b>Fix the cheapest thing first</b>: rewrite the condition so it can use an existing index, then add or change an index, then restructure the query, and only then consider caching or changing the schema.</li>
+  <li><b>Measure again</b>, and check that writes to the table have not become noticeably slower.</li>
+</ol>
+<div class="note production"><p><span class="label">In production.</span> Creating an index on a large table takes time and, done the default way in PostgreSQL, blocks writes to the table for the duration. Use <code>CREATE INDEX CONCURRENTLY</code>, which builds the index without blocking writes at the price of taking longer. <x-ref to="schema-design#migrations"></x-ref> covers this kind of change.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> When you write down a table, write down its indexes too, and derive them from the queries: “the feed query filters by owner and sorts by time, so a composite index on owner and creation time”. Then mention the cost: “this table is write-heavy, so I would keep it to two indexes”. That link from access pattern to index to write cost is what interviewers are listening for.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>No index on foreign key columns.</b> Joins and deletes scan whole tables.</li>
+  <li><b>One index per column instead of composite indexes</b> matched to real queries.</li>
+  <li><b>Indexes nobody uses</b>, slowing every write.</li>
+  <li><b>Wrapping an indexed column in a function</b> in the <code>WHERE</code> clause.</li>
+  <li><b>Queries in a loop.</b> The N+1 pattern, usually inside an object-relational mapper.</li>
+  <li><b><code>SELECT *</code> in hot paths</b>, which fetches columns nobody reads and prevents index-only scans.</li>
+  <li><b>Deep <code>OFFSET</code> pagination.</b></li>
+  <li><b>Random primary keys on a large clustered table.</b></li>
+  <li><b>Testing with a hundred rows</b> and discovering the plan with a hundred million.</li>
+  <li><b>Raising the connection limit</b> instead of pooling.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="storage-engines"></x-ref>: how B-trees are kept on disk, and the alternative used by write-heavy databases.</li>
+  <li><x-ref to="transactions"></x-ref>: indexes also determine which rows a query locks.</li>
+  <li><x-ref to="schema-design"></x-ref>: choosing keys, and adding indexes to live tables.</li>
+  <li><x-ref to="caching"></x-ref>: what to do when the right index is still not fast enough.</li>
+  <li><x-ref to="partitioning"></x-ref>: when one table is too large for any index to save it.</li>
+  <li><x-ref to="observability"></x-ref>: finding the queries that need this treatment.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Without an index a database reads the whole table. With a B-tree it reads one page per level, and four or five levels are enough for billions of rows.</li>
+  <li>Every index speeds up some reads and slows down every write. Create them for real queries and remove the unused ones.</li>
+  <li>In a composite index, column order decides which queries it serves: equality columns first, the range or sort column last.</li>
+  <li>Covering, partial and expression indexes solve specific problems cheaply.</li>
+  <li>The planner chooses a plan from statistics. <code>EXPLAIN ANALYZE</code> shows what it did, and rows read and discarded are the thing to look for.</li>
+  <li>An index is used only when a condition is selective and the column appears bare in the query.</li>
+  <li>Many fast queries in a loop are as harmful as one slow query. Batch them or join.</li>
+  <li>Paginate by key, not by offset, and put a pooler in front of the database.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>You have an index on <code>(country, city)</code>. Which of these can use it efficiently: a filter on country, a filter on city, a filter on both?</summary><p>A filter on country and a filter on both. The entries are sorted by country and then by city, so all rows for one country are adjacent, and within them all rows for one city. A filter on city alone matches entries scattered through every country’s section.</p></details>
+<details><summary>A query has <code>WHERE lower(email) = 'ana@example.com'</code> and there is an index on <code>email</code>. Why is it slow, and what are two fixes?</summary><p>The index is sorted by the original value, and the query compares a transformed value, so the index order is no help and every row is checked. Either create an expression index on <code>lower(email)</code>, or store emails in lower case and compare the bare column.</p></details>
+<details><summary>Why might the planner ignore an index on a <code>status</code> column when you query for <code>status = 'active'</code>?</summary><p>If most rows are active, the condition is not selective. Using the index would mean fetching most of the table one row at a time in index order, which is slower than reading the pages in sequence. The planner is making the right choice.</p></details>
+<details><summary>A page loads in 400 ms. The slow-query log is empty. The page shows 100 orders, each with its customer and its items. What do you suspect?</summary><p>The N+1 pattern: one query for the orders and then one or two more per order, around 200 fast queries whose round trips add up. No single query is slow, so nothing is logged. Count the queries made by the request, then load the customers and items in batches or with joins.</p></details>
+<details><summary>Why does page 5,000 of an offset-paginated list take far longer than page 1?</summary><p>The database cannot jump to an offset. It generates all the preceding rows in order and discards them, so the work grows with the page number. Keyset pagination avoids this by using the last row’s sort values as a starting point that an index can seek to directly.</p></details>
+<details><summary>Your service runs 40 instances, each with a pool of 25 connections, against one PostgreSQL server. What is wrong, and what would you change?</summary><p>That is up to 1,000 connections to a server that can usefully run a few dozen queries at once, and whose default limit is 100. Each connection also costs memory. Put a connection pooler in front of the database so the instances share a small number of real connections, and reduce each instance’s pool.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Markus Winand, <a href="https://use-the-index-luke.com/">Use The Index, Luke</a>. A free book on indexing for developers, and the best single resource on the subject.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/indexes.html">Indexes</a> and <a href="https://www.postgresql.org/docs/current/using-explain.html">Using EXPLAIN</a>.</li>
+  <li>PostgreSQL Global Development Group, <a href="https://www.postgresql.org/about/news/postgresql-18-released-3142/">PostgreSQL 18 Released</a>, September 2025. Skip scan and <code>uuidv7()</code>.</li>
+  <li>MySQL documentation, <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html">Clustered and Secondary Indexes</a>.</li>
+  <li>Douglas Comer, <a href="https://dl.acm.org/doi/10.1145/356770.356776">The Ubiquitous B-Tree</a>, ACM Computing Surveys, 1979.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/pgstatstatements.html">pg_stat_statements</a>.</li>
+  <li><a href="https://www.pgbouncer.org/">PgBouncer</a>, a connection pooler for PostgreSQL.</li>
+  <li>Brett Wooldridge, <a href="https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing">About Pool Sizing</a>, HikariCP wiki. Why smaller pools give higher throughput.</li>
+</ol>
+</section>

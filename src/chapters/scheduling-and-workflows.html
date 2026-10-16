@@ -1,0 +1,603 @@
+<!--meta
+{ "description": "Job scheduling and workflow engines for system design: cron and its failure modes, time zones and daylight saving, distributed cron with leader election and idempotent runs, background job queues and job states, storing millions of timers with SQL and timing wheels, DAG orchestrators, durable execution with replay, and when a state machine is enough.",
+  "lede": "Not all work starts with a request. Reports run every night. A reminder is due in three days. An order moves through payment, packing and shipping over a week. Each of these needs something to remember that work is owed, start it at the right time, notice when it fails and make sure it happens once. This chapter covers the tools, from cron on one machine to engines that keep a program’s place for months.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="need">Work that nobody is waiting for</h2>
+<p>The systems so far have reacted to requests and to messages. Three further kinds of work have no such trigger.</p>
+<table>
+<thead><tr><th>Kind</th><th>Examples in the photo app</th><th>What it needs</th></tr></thead>
+<tbody>
+<tr><th>Recurring</th><td>Nightly usage report. Hourly cleanup of abandoned uploads. Monthly invoices.</td><td>A schedule, and exactly one run for each scheduled time</td></tr>
+<tr><th>Delayed</th><td>“Your trial ends in three days.” Delete an account 30 days after the request.</td><td>A durable timer for each item, possibly millions of them</td></tr>
+<tr><th>Multi-step</th><td>Printing a photo book: render, charge, send to the printer, wait for shipping, email the customer.</td><td>Memory of how far the process has got, across failures and long waits</td></tr>
+</tbody>
+</table>
+<p>All three share a requirement that request handling does not have. The work is promised for the future, so the promise has to survive restarts, deployments and machine failures between now and then.</p>
+
+<h2 id="cron">Cron</h2>
+<p>The oldest scheduler is <dfn>cron</dfn>, a Unix program from the 1970s that runs commands at times described by five fields: minute, hour, day of month, month and day of week.</p>
+<pre data-lang="text" data-title="Cron expressions">
+┌───────── minute (0–59)
+│ ┌─────── hour (0–23)
+│ │ ┌───── day of month (1–31)
+│ │ │ ┌─── month (1–12)
+│ │ │ │ ┌─ day of week (0–6, Sunday is 0)
+│ │ │ │ │
+0 2 * * *        every day at 02:00
+*/15 * * * *     every 15 minutes
+0 9 * * 1-5      at 09:00, Monday to Friday
+0 0 1 * *        at midnight on the first of each month
+30 3 * * 0       at 03:30 every Sunday
+</pre>
+<p>The syntax has outlived the program. Kubernetes CronJobs, cloud schedulers and most job libraries accept it, so it is worth being able to read.</p>
+
+<h3 id="cron-problems">What goes wrong on one machine</h3>
+<p>Cron on a single server works until something happens that it has no answer for.</p>
+<ul>
+  <li><b>The machine is down at the scheduled time.</b> The run is skipped and nothing records that it was.</li>
+  <li><b>The job fails.</b> Cron does not retry and, by default, tells nobody.</li>
+  <li><b>The job overruns.</b> A job scheduled every five minutes that takes seven starts a second copy on top of the first, and then a third.</li>
+  <li><b>There is no history.</b> Did last Tuesday’s run happen? How long did it take? Cron cannot say.</li>
+  <li><b>Everyone picks the top of the hour.</b> If a thousand jobs across a company run at <code>0 * * * *</code>, shared databases see a spike at minute zero of every hour. Spread schedules out, and add a random delay of a few seconds or minutes to anything that does not need precision.</li>
+</ul>
+
+<h3 id="time-zones">Time zones and daylight saving</h3>
+<p>A schedule is a statement about clock time, and local clock time is not continuous.</p>
+
+<figure class="fig wide" id="fig-dst">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f391t f391d">
+<title id="f391t">A 02:30 job on the two daylight saving changeover days in Berlin in 2026</title>
+<desc id="f391d">On Sunday 29 March 2026 in Berlin, clocks jump from 02:00 to 03:00, so the hour from 02:00 to 02:59 does not exist and a job scheduled for 02:30 never runs. On Sunday 25 October 2026, clocks go back from 03:00 to 02:00, so the hour from 02:00 to 02:59 happens twice and a job scheduled for 02:30 runs twice.</desc>
+<text class="tb" x="10" y="20">Sunday 29 March 2026 in Berlin: clocks jump from 02:00 to 03:00</text>
+<rect class="n" x="10" y="32" width="130" height="30" rx="3"/>
+<text class="ts mid" x="75" y="52">01:00 to 01:59</text>
+<rect class="n ghost" x="144" y="32" width="210" height="30" rx="3"/>
+<text class="ts mid" x="249" y="52">02:00 to 02:59 does not exist</text>
+<rect class="n" x="358" y="32" width="130" height="30" rx="3"/>
+<text class="ts mid" x="423" y="52">03:00 to 03:59</text>
+<text class="ts" x="500" y="52">a 02:30 job never runs</text>
+<text class="tb" x="10" y="108">Sunday 25 October 2026 in Berlin: clocks go back from 03:00 to 02:00</text>
+<rect class="n" x="10" y="120" width="110" height="30" rx="3"/>
+<text class="ts mid" x="65" y="140">01:00 to 01:59</text>
+<rect class="n fault" x="124" y="120" width="110" height="30" rx="3"/>
+<text class="ts mid" x="179" y="140">02:00 to 02:59</text>
+<rect class="n fault" x="238" y="120" width="140" height="30" rx="3"/>
+<text class="ts mid" x="308" y="140">02:00 to 02:59 again</text>
+<rect class="n" x="382" y="120" width="110" height="30" rx="3"/>
+<text class="ts mid" x="437" y="140">03:00 to 03:59</text>
+<text class="ts" x="504" y="140">a 02:30 job runs twice</text>
+<text class="ts" x="10" y="192">A schedule written in local time has two days a year on which it does not mean what its author intended.</text>
+<text class="ts" x="10" y="208">Schedule in UTC, which has no such days, unless the job is truly tied to local time, and then decide these cases on purpose.</text>
+
+</svg>
+</div>
+<figcaption>Two days a year, a local-time schedule in the early morning either skips or repeats. Early morning is exactly when maintenance jobs are usually placed.</figcaption>
+</figure>
+
+<p>Schedule in UTC by default. Where a job is tied to local time, such as “send the daily summary at 8 in the morning in each user’s own time zone”, store the time zone’s name, compute the next run with a proper time zone library, and decide deliberately what should happen on the two unusual days.</p>
+
+<h2 id="distributed-cron">Cron across many machines</h2>
+<p>The fix for “the machine was down” is to stop depending on one machine. That immediately creates the opposite problem. If three servers each run the scheduler, the nightly invoice job runs three times. The requirement is now precise: for each scheduled time, the job should run <b>exactly once</b>, on <b>some</b> machine.</p>
+<p>Exactly once is not available, as <x-ref to="idempotency-and-delivery#guarantees"></x-ref> established. What can be built is at-least-once triggering with duplicates made harmless. The design has three parts.</p>
+
+<figure class="fig wide" id="fig-dcron">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f392t f392d">
+<title id="f392t">A distributed scheduler: a leader inserts a unique run record, a queue carries it, and one worker executes it</title>
+<desc id="f392d">Three scheduler instances exist, one of which is the leader. At 02:00 the leader inserts a row into a job runs table, keyed uniquely by job and due time. The run goes onto a queue, and one of three workers executes it. If the leader dies just before 02:00, a standby takes over and inserts the run a few seconds late. If two leaders both try, the unique key lets only one insert succeed.</desc>
+<rect class="n sig" x="10" y="20" width="130" height="40" rx="6"/>
+<text class="ts tb mid" x="75" y="36">Scheduler 1</text>
+<text class="ts mid" x="75" y="53">leader</text>
+<rect class="n ghost" x="10" y="72" width="130" height="40" rx="6"/>
+<text class="ts tb mid" x="75" y="88">Scheduler 2</text>
+<text class="ts mid" x="75" y="105">standby</text>
+<rect class="n ghost" x="10" y="124" width="130" height="40" rx="6"/>
+<text class="ts tb mid" x="75" y="140">Scheduler 3</text>
+<text class="ts mid" x="75" y="157">standby</text>
+<rect class="n store" x="210" y="60" width="170" height="64" rx="6"/>
+<text class="ts tb mid" x="295" y="79.5">Job runs table</text>
+<text class="ts mid" x="295" y="96.5">one row per (job, due time)</text>
+<text class="ts mid" x="295" y="113.5">unique, so inserted once</text>
+<g data-s="1">
+<path class="e sig" d="M140 40C180 40 170 92 210 92"/>
+<text class="ts" x="214" y="30">1. at 02:00, the leader</text>
+<text class="ts" x="214" y="45">inserts the run</text>
+</g>
+<rect class="n async" x="440" y="70" width="80" height="44" rx="6"/>
+<text class="tb mid" x="480" y="96.5">Queue</text>
+<g data-s="2">
+<path class="e async" d="M380 92H440"/>
+<text class="ts mid" x="410" y="84">2.</text>
+</g>
+<rect class="n" x="590" y="20" width="120" height="40" rx="6"/>
+<text class="ts tb mid" x="650" y="44.5">Worker 1</text>
+<g data-s="3">
+<path class="e async" d="M520 92C556 92 554 40 590 40"/>
+</g>
+<rect class="n" x="590" y="72" width="120" height="40" rx="6"/>
+<text class="ts tb mid" x="650" y="96.5">Worker 2</text>
+<g data-s="3">
+<path class="e async" d="M520 92C556 92 554 92 590 92"/>
+</g>
+<rect class="n" x="590" y="124" width="120" height="40" rx="6"/>
+<text class="ts tb mid" x="650" y="148.5">Worker 3</text>
+<g data-s="3">
+<path class="e async" d="M520 92C556 92 554 144 590 144"/>
+<text class="ts mid" x="650" y="184">3. one worker runs it</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="212">If the leader dies at 01:59:59, a standby takes over and inserts the 02:00 run a few seconds late. If both the old and new</text>
+<text class="ts" x="10" y="228">leader try, the unique key lets only one insert succeed. The job may still execute twice if a worker crashes, so it must be idempotent.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="insert run">At 02:00 the leader decides that a run is due, and inserts a row for this job and this due time. That pair is unique, so the row can be inserted only once.</li>
+  <li data-msg="run 02:00">The run is placed on a queue.</li>
+  <li data-msg="">One worker takes it from the queue and runs the job.</li>
+  <li>If the leader dies at 01:59:59, a standby takes over and inserts the 02:00 run a few seconds late. If two schedulers both try, the unique key lets only one of them succeed.</li>
+</ol>
+<figcaption>Deciding that a run is due is separated from doing it. The unique key on job and due time is what stops a double trigger.</figcaption>
+</figure>
+
+<ol>
+  <li><b>One scheduler decides.</b> Several instances run, and one holds a lease as leader (<x-ref to="membership-and-coordination#election"></x-ref>). Only the leader turns schedules into runs.</li>
+  <li><b>Each run has an identity.</b> When 02:00 arrives, the leader records a run whose key is the job’s name plus the scheduled time, such as <code>daily-report/2026-10-10T02:00Z</code>, under a unique constraint. If an old leader and a new one both try, the second insert is rejected. The key identifies the <em>intended</em> run, whatever time it really starts.</li>
+  <li><b>Workers execute, idempotently.</b> The run is placed on a queue and a worker picks it up. A worker can crash halfway, in which case the run is retried, so the job itself must be safe to repeat. The scheduled time is passed to the job, so that a report for 10 October computes the same thing whether it starts at 02:00 or, after a retry, at 02:40.</li>
+</ol>
+<p>Passing the scheduled time in, instead of letting the job read the clock, is the single most useful habit in scheduled work. It makes runs repeatable, makes late runs correct, and makes it possible to run a job for a date in the past.</p>
+
+<h3 id="policies">Two policies to choose</h3>
+<p><b>Missed runs.</b> If the scheduler was down from 01:00 to 05:00, should the 02:00 job run when it comes back? For a daily report, yes: run it late. For “send a reminder five minutes before the meeting”, a run four hours late is worse than none. And if an hourly job missed four runs, should it run four times or once? Each job needs a declared answer: catch up, run once, or skip.</p>
+<p><b>Overlap.</b> If the previous run is still going when the next is due, the choices are to allow both, to skip the new one, or to cancel the old one. Skipping is the safe default for most jobs.</p>
+<p>Kubernetes CronJobs expose both as settings, <code>startingDeadlineSeconds</code> and <code>concurrencyPolicy</code>. Its documentation is also candid about the limits of the guarantee: under some conditions a CronJob may create two jobs for one scheduled time, or none, so the jobs should be idempotent. That is true of every scheduler, and few say so as plainly.</p>
+<div class="note production"><p><span class="label">In production.</span> The failure that hurts most is the job that silently stops running. Nothing errors, because nothing runs. Alert on absence: for each important job, record the time of its last successful completion and raise an alarm when that is older than it should be. This is sometimes called a dead man’s switch. An alert on failures alone will never fire for a job that never starts.</p></div>
+
+<h2 id="job-queues">Background jobs</h2>
+<p>Scheduled runs are one source of background work. The other is the application itself: “send this email”, “resize this photo”, “export this user’s data”. These are jobs placed on a queue by request handlers and executed by workers, which is the queue pattern of <x-ref to="message-queues"></x-ref> with more bookkeeping around each item.</p>
+<p>A job system adds what a bare queue lacks.</p>
+<ul>
+  <li><b>State for each job</b> that can be inspected: pending, running, done, failed, and how many attempts so far.</li>
+  <li><b>Retries with backoff</b>, a limit on attempts, and a place for jobs that exhaust it.</li>
+  <li><b>Timeouts and heartbeats</b>, so that a job whose worker died is noticed and given to another.</li>
+  <li><b>Scheduling</b>: run this at a given time, or after a delay.</li>
+  <li><b>Uniqueness</b>: do not enqueue a second “rebuild index for user 42” while one is waiting.</li>
+  <li><b>Limits</b>: at most 50 jobs at once against the payment provider, at most 5 for any one customer.</li>
+</ul>
+
+<figure class="fig wide" id="fig-job-states">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f393t f393d">
+<title id="f393t">The states of a background job</title>
+<desc id="f393d">A job is scheduled until its run time arrives and then pending. A worker claims it and it is running. Success moves it to done. A failure or an expired lock sends it back to pending to be retried later with backoff. After too many failures it is dead and needs attention. Every transition is one guarded update, so two workers cannot both claim the same job.</desc>
+<rect class="n ghost" x="10" y="60" width="100" height="44" rx="6"/>
+<text class="ts tb mid" x="60" y="78">Scheduled</text>
+<text class="ts mid" x="60" y="95">run_at in future</text>
+<rect class="n async" x="160" y="60" width="100" height="44" rx="6"/>
+<text class="ts tb mid" x="210" y="78">Pending</text>
+<text class="ts mid" x="210" y="95">due, waiting</text>
+<rect class="n sig" x="310" y="60" width="110" height="44" rx="6"/>
+<text class="ts tb mid" x="365" y="78">Running</text>
+<text class="ts mid" x="365" y="95">locked by a worker</text>
+<rect class="n store" x="480" y="60" width="100" height="44" rx="6"/>
+<text class="ts tb mid" x="530" y="86.5">Done</text>
+<rect class="n fault" x="480" y="150" width="100" height="44" rx="6"/>
+<text class="ts tb mid" x="530" y="168">Dead</text>
+<text class="ts mid" x="530" y="185">needs attention</text>
+<g data-s="1">
+<path class="e" d="M110 82H160"/>
+<text class="ts mid" x="135" y="74">due</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M260 72H310"/>
+<text class="ts mid" x="285" y="64">claim</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M420 82H480"/>
+<text class="ts mid" x="450" y="74">success</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M330 104C330 150 240 150 215 106"/>
+<text class="ts" x="140" y="146">failed, or the lock expired:</text>
+<text class="ts" x="140" y="161">retry later, with backoff</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M400 104C400 150 440 172 480 172"/>
+<text class="ts" x="374" y="196">failed too many times</text>
+</g>
+<g data-s="6">
+<text class="ts" x="598" y="60">Each transition is</text>
+<text class="ts" x="598" y="75">one guarded update,</text>
+<text class="ts" x="598" y="90">so two workers</text>
+<text class="ts" x="598" y="105">cannot both claim</text>
+<text class="ts" x="598" y="120">the same job.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>A job is created to run at a later time. When that time comes, it becomes pending.</li>
+  <li>A worker claims it. The job is now running, and locked so that no other worker takes it.</li>
+  <li>If the work succeeds, the job is done.</li>
+  <li data-msg="failure">If it fails, or the worker dies and the lock expires, the job goes back to pending and is retried later, after a delay that grows each time.</li>
+  <li>After too many failures it is marked dead, and waits for a person.</li>
+  <li>Every transition is a single guarded update in the database, which is why two workers can never both claim the same job.</li>
+</ol>
+<figcaption>A job’s life. The same shape appears in every job library, whatever the states are called.</figcaption>
+</figure>
+
+<p>A relational database makes a sound job queue for a great many systems, as <x-ref to="message-queues#landscape"></x-ref> argued. The decisive advantage is that a job can be enqueued in the same transaction as the data change that calls for it, so the two cannot disagree.</p>
+<pre data-lang="sql" data-title="A jobs table that handles scheduling, claiming, crashes and duplicates">
+CREATE TABLE jobs (
+  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind         text        NOT NULL,
+  payload      jsonb       NOT NULL DEFAULT '{}',
+  run_at       timestamptz NOT NULL,
+  status       text        NOT NULL DEFAULT 'pending',   -- pending, running, done, dead
+  attempts     int         NOT NULL DEFAULT 0,
+  locked_until timestamptz,
+  dedupe_key   text UNIQUE                               -- for example 'daily-report/2026-10-10'
+);
+CREATE INDEX jobs_due ON jobs (run_at) WHERE status = 'pending';
+
+-- The scheduler records a run. A second scheduler doing the same changes nothing.
+INSERT INTO jobs (kind, run_at, dedupe_key)
+VALUES ('daily-report', '2026-10-10 02:00+00', 'daily-report/2026-10-10')
+ON CONFLICT (dedupe_key) DO NOTHING;
+
+-- A worker claims up to ten due jobs. Rows locked by another worker are skipped, not waited for.
+UPDATE jobs
+   SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+ WHERE id IN (
+   SELECT id FROM jobs
+    WHERE status = 'pending' AND run_at <= now()
+    ORDER BY run_at
+    LIMIT 10
+    FOR UPDATE SKIP LOCKED)
+RETURNING id, kind, payload, attempts;
+
+-- A sweeper returns jobs whose worker went silent.
+UPDATE jobs SET status = 'pending'
+ WHERE status = 'running' AND locked_until < now();
+</pre>
+<p>The <code>locked_until</code> column is a lease, with the property leases always have (<x-ref to="membership-and-coordination#locks"></x-ref>): a slow worker can still be running when its lease expires and another worker takes the job. The job runs twice. Long jobs should extend their lease as they go, and every job should be idempotent regardless.</p>
+
+<h2 id="timers">Millions of timers</h2>
+<p>“Remind me in three days” is easy to state and surprisingly easy to get wrong. An in-memory timer, such as <code>setTimeout</code>, is lost when the process restarts, which in a system deployed daily means nearly every three-day timer is lost.</p>
+<p>The durable form is the table above. A timer is a row with a <code>run_at</code> in the future. The partial index on <code>run_at</code> keeps finding due rows cheap however many rows are waiting, because the index is ordered by time and the poller only reads its front. Ten million pending reminders cost storage and nothing else until they fall due.</p>
+<p>Polling introduces a small delay, at most one polling interval. For most uses a second or two is immaterial. Where it is not, the two approaches are combined: the database holds everything, and each scheduler loads the timers due in the next minute into memory and fires them precisely.</p>
+
+<h3 id="wheel">Timing wheels</h3>
+<p>Inside one process, the efficient structure for a large number of timers is the <dfn>timing wheel</dfn>. Keeping timers in sorted order makes each insertion cost more as the number grows. A wheel avoids sorting altogether.</p>
+
+<figure class="fig wide" id="fig-wheel">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f394t f394d">
+<title id="f394t">A timing wheel with twelve one-second slots</title>
+<desc id="f394d">Twelve slots numbered 0 to 11 are arranged in a ring, shown unrolled, with a pointer at slot 3 marking now. The pointer moves one slot each second and fires whatever is in the slot. Timer A, due in 2 seconds, is in slot 5. Timer B, due in 9 seconds, is in slot 0, after the wrap-around. Timer C, due in 14 seconds, is also in slot 5 with one lap remaining. Adding a timer is one calculation: the slot is now plus delay, modulo 12.</desc>
+<text class="tb" x="10" y="18">A timing wheel with 12 one-second slots. The pointer moves one slot each second and fires whatever is in it.</text>
+<rect class="n" x="40" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="66" y="85">0</text>
+<rect class="n" x="92" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="118" y="85">1</text>
+<rect class="n" x="144" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="170" y="85">2</text>
+<rect class="n sig" x="196" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="222" y="85">3</text>
+<rect class="n" x="248" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="274" y="85">4</text>
+<rect class="n" x="300" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="326" y="85">5</text>
+<rect class="n" x="352" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="378" y="85">6</text>
+<rect class="n" x="404" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="430" y="85">7</text>
+<rect class="n" x="456" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="482" y="85">8</text>
+<rect class="n" x="508" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="534" y="85">9</text>
+<rect class="n" x="560" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="586" y="85">10</text>
+<rect class="n" x="612" y="64" width="52" height="32" rx="0"/>
+<text class="ts mid" x="638" y="85">11</text>
+<path class="e sig" d="M222 36V64"/>
+<text class="ts" x="230.0" y="46">now</text>
+<path class="e dash" d="M664 80h24v-52H66.0v36"/>
+<path class="e none" d="M326 96V116"/>
+<rect class="n store" x="268.0" y="116" width="116" height="34" rx="6"/>
+<text class="ts mid" x="326" y="137.5">A: due in 2 s</text>
+<path class="e none" d="M66 96V116"/>
+<rect class="n store" x="8.0" y="116" width="116" height="34" rx="6"/>
+<text class="ts mid" x="66" y="137.5">B: due in 9 s</text>
+<path class="e none" d="M326 150V160"/>
+<rect class="n async" x="268.0" y="160" width="116" height="34" rx="6"/>
+<text class="ts mid" x="326" y="181.5">C: in 14 s, 1 lap</text>
+<text class="ts" x="10" y="222">Adding a timer is one calculation: slot = (now + delay) mod 12. Nothing is sorted, and each tick looks at only one slot.</text>
+<text class="ts" x="10" y="238">C is further away than one lap of the wheel, so it stays in its slot for one full turn before it fires.</text>
+</svg>
+</div>
+<figcaption>A timing wheel, unrolled. Insertion and expiry both cost the same small amount whether there are a hundred timers or ten million.</figcaption>
+</figure>
+
+<p>For long delays, wheels are stacked like the hands of a clock: one for seconds, one for minutes, one for hours. A timer due in two hours waits in the hours wheel and moves down as its time approaches. Network stacks, the Linux kernel and message brokers use this structure for connection timeouts and delayed messages.</p>
+
+<h2 id="workflows">Processes with many steps</h2>
+<p>Ana orders a printed book of her album. Fulfilling the order takes several steps across several systems.</p>
+<ol>
+  <li>Collect the album’s photos.</li>
+  <li>Render a print-ready file, which takes a few minutes.</li>
+  <li>Charge her card.</li>
+  <li>Send the file to the printing company.</li>
+  <li>Wait, up to ten days, for the printer to report that it has shipped.</li>
+  <li>Email her the tracking number. If the printer never confirms, refund her and apologize.</li>
+</ol>
+<p>Any step can fail. The process outlives any single server and any deployment. The ten-day wait must not hold a thread or a connection. And if step 4 fails after step 3 succeeded, a card has been charged for nothing unless something knows to try again or to refund.</p>
+<p>The usual first implementation is a status column on the order, a queue message for each step, and a scheduled job that sweeps for orders stuck in one status too long. This works, and what has been built is a workflow engine, spread across a table, several queue consumers and a cron job, with its logic visible in no one place. As steps and exceptions accumulate, nobody can say with confidence what happens to an order that fails at step 4 on its third retry during a deployment.</p>
+<p>Two kinds of tool exist to make such processes explicit.</p>
+
+<h2 id="dags">DAG orchestrators for data pipelines</h2>
+<p>In data engineering the steps are batch jobs with dependencies: load two tables, then join them, then build three reports from the result. The structure is a <dfn>directed acyclic graph</dfn>, or DAG: tasks as nodes, and “must finish before” as arrows, with no cycles.</p>
+
+<figure class="fig wide" id="fig-dag">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f395t f395d">
+<title id="f395t">A nightly data pipeline as a graph of dependent tasks</title>
+<desc id="f395d">Two extraction tasks, for users and for photos, have succeeded. A cleaning and joining task that depends on both has succeeded. Two tasks that depend on it, daily aggregates and a search export, are running in parallel. A final task that publishes the dashboard depends on the aggregates and is waiting. The run is for data date 9 October 2026. A failed task is retried alone, and the run can be repeated for any past date.</desc>
+<rect class="n store" x="10" y="30" width="140" height="40" rx="6"/>
+<text class="ts tb mid" x="80" y="46">extract_users</text>
+<text class="ts mid" x="80" y="63">succeeded</text>
+<rect class="n store" x="10" y="110" width="140" height="40" rx="6"/>
+<text class="ts tb mid" x="80" y="126">extract_photos</text>
+<text class="ts mid" x="80" y="143">succeeded</text>
+<rect class="n store" x="190" y="70" width="140" height="40" rx="6"/>
+<text class="ts tb mid" x="260" y="86">clean_and_join</text>
+<text class="ts mid" x="260" y="103">succeeded</text>
+<rect class="n sig" x="370" y="30" width="140" height="40" rx="6"/>
+<text class="ts tb mid" x="440" y="46">daily_aggregates</text>
+<text class="ts mid" x="440" y="63">running</text>
+<rect class="n sig" x="370" y="110" width="140" height="40" rx="6"/>
+<text class="ts tb mid" x="440" y="126">search_export</text>
+<text class="ts mid" x="440" y="143">running</text>
+<rect class="n ghost" x="570" y="30" width="140" height="40" rx="6"/>
+<text class="ts tb mid" x="640" y="46">publish_dashboard</text>
+<text class="ts mid" x="640" y="63">waiting</text>
+<path class="e" d="M150 50C170 50 170 82 190 82"/>
+<path class="e" d="M150 130C170 130 170 98 190 98"/>
+<path class="e" d="M330 82C350 82 350 50 370 50"/>
+<path class="e" d="M330 98C350 98 350 130 370 130"/>
+<path class="e dash" d="M510 50H570"/>
+<text class="ts" x="10" y="186">Run for data date 2026-10-09. A task starts when everything it depends on has succeeded. Independent tasks run in parallel.</text>
+<text class="ts" x="10" y="202">A failed task is retried alone, and the whole run can be repeated for any past date.</text>
+</svg>
+</div>
+<figcaption>One night’s run of a pipeline. The orchestrator works out what can run now, what must wait and what to retry.</figcaption>
+</figure>
+
+<p>An orchestrator such as Apache Airflow, Dagster or Prefect takes the graph and a schedule, and provides the rest: starting each task when its dependencies have succeeded, running independent tasks in parallel, retrying failures, alerting, and a record of every run. Airflow, the most widely used, is at version 3 as of October 2026.</p>
+<p>The idea to carry away is the <dfn>data interval</dfn>. Each run is for a specific period of data, such as 9 October, and every task receives that period as a parameter. A task written this way can be rerun for any date and produce the same output, which makes two operations routine: retrying last night’s failed task this morning, and <dfn>backfilling</dfn>, which is running the pipeline for the past 90 days after its logic has changed. It is the scheduled-time principle from earlier in the chapter, applied to data.</p>
+
+<h2 id="durable-execution">Durable execution</h2>
+<p>For business processes like the photo book, with waits, branches and compensation, a second kind of engine has become standard: <dfn>durable execution</dfn>. Temporal, AWS Step Functions and Azure Durable Functions are examples. <x-ref to="distributed-transactions#workflows"></x-ref> introduced them as the practical way to run a saga.</p>
+<p>The promise sounds impossible: write the process as an ordinary function, with ordinary variables, loops and <code>await</code>, and the engine will keep it running across crashes and restarts, for days or months, as if the machine never failed. The mechanism behind it is simple once seen.</p>
+<p>Every interaction with the outside world, called a <dfn>step</dfn> or activity, goes through the engine. When a step finishes, the engine saves its result to a durable <dfn>history</dfn> before the function continues. If the worker crashes, another worker starts the function again from the first line, with the history in hand. Each step that already has a recorded result returns it immediately without doing anything. The function races through everything it did before, arriving at the same point with the same variables, and continues for real from there. This is <dfn>replay</dfn>.</p>
+
+<figure class="fig wide" id="fig-replay">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f396t f396d">
+<title id="f396t">A workflow that crashes at its fourth step and resumes on another worker by replaying its history</title>
+<desc id="f396d">On the first attempt, the steps list photos, render book and charge card each finish and have their results saved to the history, and the worker crashes during send to printer. On the second attempt, on another worker, the code runs again from the top. The first three steps are not run and their recorded results are read back, so the card is not charged again. The fourth step runs now.</desc>
+<g data-s="1">
+<text class="tb" x="10" y="18">First attempt: each finished step is written to the history before the next begins</text>
+<rect class="n store" x="10" y="30" width="164" height="48" rx="6"/>
+<text class="ts tb mid" x="92" y="50">list photos</text>
+<text class="ts mid" x="92" y="67">saved: [871, 872, 873]</text>
+</g>
+<g data-s="2">
+<path class="e" d="M174 54H188"/>
+<rect class="n store" x="188" y="30" width="164" height="48" rx="6"/>
+<text class="ts tb mid" x="270" y="50">render book</text>
+<text class="ts mid" x="270" y="67">saved: books/3-pages.pdf</text>
+</g>
+<g data-s="3">
+<path class="e" d="M352 54H366"/>
+<rect class="n store" x="366" y="30" width="164" height="48" rx="6"/>
+<text class="ts tb mid" x="448" y="50">charge card</text>
+<text class="ts mid" x="448" y="67">saved: receipt-7-2500</text>
+</g>
+<g data-s="4">
+<path class="e" d="M530 54H544"/>
+<rect class="n fault" x="544" y="30" width="164" height="48" rx="6"/>
+<text class="ts tb mid" x="626" y="50">send to printer</text>
+<text class="ts mid" x="626" y="67">worker crashes</text>
+<path class="x" d="M687 33l14 14M701 33l-14 14"/>
+</g>
+<g data-s="5">
+<text class="tb" x="10" y="120">Second attempt, on another worker: the code runs again from the top</text>
+<rect class="n ghost" x="10" y="132" width="164" height="48" rx="6"/>
+<text class="ts tb mid" x="92" y="152">list photos</text>
+<text class="ts mid" x="92" y="169">not run: result read back</text>
+<path class="e" d="M174 156H188"/>
+<rect class="n ghost" x="188" y="132" width="164" height="48" rx="6"/>
+<text class="ts tb mid" x="270" y="152">render book</text>
+<text class="ts mid" x="270" y="169">not run: result read back</text>
+<path class="e" d="M352 156H366"/>
+<rect class="n ghost" x="366" y="132" width="164" height="48" rx="6"/>
+<text class="ts tb mid" x="448" y="152">charge card</text>
+<text class="ts mid" x="448" y="169">not run: result read back</text>
+</g>
+<g data-s="6">
+<path class="e" d="M530 156H544"/>
+<rect class="n sig" x="544" y="132" width="164" height="48" rx="6"/>
+<text class="ts tb mid" x="626" y="152">send to printer</text>
+<text class="ts mid" x="626" y="169">runs now</text>
+<text class="ts" x="10" y="212">The workflow function is called again with the saved history. For the first three steps it receives the recorded results at once,</text>
+<text class="ts" x="10" y="228">so the card is not charged a second time. Execution continues for real from the first step that has no result.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Results in the history: 1; Card charged: no">The workflow starts. Its first step lists the photos, and the result is saved to the history before anything else happens.</li>
+  <li data-state="Results in the history: 2; Card charged: no">It renders the book, and saves where the file is.</li>
+  <li data-state="Results in the history: 3; Card charged: once">It charges the card, and saves the receipt.</li>
+  <li>While it is sending the job to the printer, the worker crashes.</li>
+  <li>Another worker picks the workflow up and runs the code again from the top. For the first three steps it does not repeat the work. It reads each result back from the history, so the card is not charged twice.</li>
+  <li data-state="Results in the history: 4; Card charged: once">At the fourth step there is no saved result, so execution continues for real, and the book is sent to the printer.</li>
+</ol>
+<figcaption>Replay. The function is run again, and the past is answered from the record.</figcaption>
+</figure>
+
+<p>A working miniature is short.</p>
+<pre data-lang="ts" data-title="Durable execution in miniature: record each step, replay on restart">
+type History = { step: string; result: unknown }[];
+
+class Workflow {
+  private cursor = 0;
+
+  constructor(private history: History, private save: (history: History) => void) {}
+
+  // Run a step once. On a replay, return its recorded result instead of running it again.
+  async step<T>(name: string, run: () => Promise<T>): Promise<T> {
+    const recorded = this.history[this.cursor];
+    if (recorded) {
+      if (recorded.step !== name) {
+        throw new Error(`history has "${recorded.step}" here, but the code ran "${name}"`);
+      }
+      this.cursor += 1;
+      return recorded.result as T;
+    }
+    const result = await run();
+    this.history.push({ step: name, result });
+    this.save(this.history);                       // made durable before the workflow moves on
+    this.cursor += 1;
+    return result;
+  }
+}
+
+// The workflow is ordinary code. It may be run from the top any number of times.
+async function printPhotoBook(wf: Workflow, albumId: number): Promise<string> {
+  const photos  = await wf.step("list photos", () => listPhotos(albumId));
+  const pdfKey  = await wf.step("render book", () => renderBook(photos));
+  const receipt = await wf.step("charge card", () => chargeCard(albumId, 2500));
+  return wf.step("send to printer", () => sendToPrinter(pdfKey, receipt));
+}
+</pre>
+<p>In a test of this code, the first run failed at the printer after charging the card. The second run, started with the saved history, completed. The charge function had been called once in total, and the printer function twice. A third run with the full history called nothing at all.</p>
+<p>Real engines add what makes this production-grade: timers that last for months without holding any resource, signals so that the outside world can wake a waiting workflow, such as the printer’s shipping confirmation, retries with backoff for each step, timeouts, and a console showing every running workflow and exactly where it is.</p>
+
+<h3 id="determinism">The rules that replay imposes</h3>
+<p>Replay works only if the function takes the same path every time it is run with the same history. That places requirements on the code which are easy to state and easy to break.</p>
+<ul>
+  <li><b>Workflow code must be deterministic.</b> It must not read the clock, generate random numbers, or call a database or API directly. All of those go through a step, so that their results are recorded. Reading the time directly would give one answer on the first run and another on replay, and the function could take a different branch.</li>
+  <li><b>Steps run at least once.</b> If a worker crashes after a step’s effect and before its result is saved, the step runs again on replay. In the miniature above, that is the gap between <code>run()</code> returning and <code>save</code> completing. Every step that has an outside effect needs an idempotency key (<x-ref to="idempotency-and-delivery#keys"></x-ref>).</li>
+  <li><b>Changing code under running workflows needs care.</b> A workflow started last week has a history recorded by last week’s code. If today’s code performs steps in a different order, replay fails, as the check in <code>step</code> shows. Engines provide versioning mechanisms, and ignoring them is the most common way teams are hurt.</li>
+  <li><b>Histories are finite.</b> Each step adds to the history, and replay reads all of it. Engines cap the size. AWS Step Functions, for example, limits a standard workflow to one year and 25,000 history events. A process that loops indefinitely must periodically restart itself with a fresh history.</li>
+</ul>
+
+<h2 id="state-machines">When a state machine is enough</h2>
+<p>A workflow engine is one more critical system to run or pay for, with its own model to learn. For a process with a handful of states and no long waits, an explicit state machine in your own database is often the better choice.</p>
+<ul>
+  <li>A status column with a fixed set of values.</li>
+  <li>A table, in code, of the allowed transitions between them.</li>
+  <li>Each transition as one guarded update, <code>UPDATE … SET status = 'paid' WHERE id = … AND status = 'pending'</code>, so that two concurrent attempts cannot both succeed (<x-ref to="transactions#atomic-ops"></x-ref>).</li>
+  <li>A job enqueued in the same transaction for whatever the new state requires.</li>
+  <li>A scheduled sweep for anything that has been in a non-final state too long.</li>
+</ul>
+<p>The difference from the accidental workflow engine described earlier is that it is deliberate: the states and transitions are written down in one place and enforced. Move to an engine when the process gains long waits, many branches, compensation logic, or when people regularly ask “where is this order stuck, and why?” and the answer takes an engineer an hour.</p>
+
+<h2 id="operating">Operating scheduled work</h2>
+<ul>
+  <li><b>Recovery creates a surge.</b> After an outage, every missed job and every expired timer becomes due at once. Limit how fast the backlog is released, or the recovery will cause the next outage (<x-ref to="message-queues#backpressure"></x-ref>).</li>
+  <li><b>One tenant can starve the rest.</b> A customer who enqueues a million export jobs will occupy every worker if jobs are taken strictly in order. Limit concurrency for each tenant, or take jobs from tenants in rotation (<x-ref to="multi-tenancy"></x-ref>).</li>
+  <li><b>Deployments interrupt running jobs.</b> Workers should stop taking new jobs when asked to shut down, and finish or cleanly release the ones in hand. Jobs longer than the shutdown grace period should save progress and resume.</li>
+  <li><b>Poison jobs exist here too.</b> Cap attempts, park failures where they can be inspected, and alert on them.</li>
+  <li><b>Keep jobs small.</b> A job that processes a million rows in one go loses everything on a failure at row 900,000. Break it into batches that each commit and record progress.</li>
+</ul>
+
+<h2 id="choosing">Choosing a tool</h2>
+<table>
+<thead><tr><th>Need</th><th>Reasonable choice</th></tr></thead>
+<tbody>
+<tr><th>A few recurring jobs for one service</th><td>The platform’s scheduler, such as a Kubernetes CronJob or a cloud scheduler, with idempotent jobs and an alert on missed runs</td></tr>
+<tr><th>Background work triggered by requests</th><td>A job queue: a table in your database, or a library backed by a broker</td></tr>
+<tr><th>Reminders and delayed actions, at any volume</th><td>Rows with a due time, polled through an index</td></tr>
+<tr><th>Batch data pipelines with dependencies</th><td>A DAG orchestrator</td></tr>
+<tr><th>A short business process with a few states</th><td>An explicit state machine in the database</td></tr>
+<tr><th>A long-running process with waits, branches and compensation</th><td>A durable execution engine</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> When a design includes “a cron job that…”, expect to be asked what happens if it runs twice, or not at all. Have the answer built in: “the scheduler runs with leader election, each run is keyed by job and scheduled time so that a duplicate trigger is rejected, the job takes the scheduled time as input and is idempotent, and we alert if the last success is older than expected”. For multi-step flows, say where the state lives and who notices a stuck one.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Cron on one server for something that matters</th><td>Runs are silently skipped when that server is down</td><td>A scheduler with redundancy and a record of every run</td></tr>
+<tr><th>The same cron job on every instance of a service</th><td>It runs once for each instance</td><td>One leader triggers, and each run has a unique key</td></tr>
+<tr><th>Jobs that read the current time to decide what to process</th><td>A late or retried run processes the wrong period</td><td>Pass the scheduled time in as a parameter</td></tr>
+<tr><th>Schedules in local time</th><td>Skipped or doubled runs when clocks change</td><td>UTC, with deliberate handling where local time is required</td></tr>
+<tr><th>Alerting only on failure</th><td>A job that stops running raises no alarm</td><td>Alert when the last success is too old</td></tr>
+<tr><th>In-memory timers for long delays</th><td>Lost on every restart and deployment</td><td>Durable rows with a due time</td></tr>
+<tr><th>Jobs that are not idempotent</th><td>Duplicate emails, charges and records after any retry</td><td>Idempotency keys and guarded state transitions</td></tr>
+<tr><th>A multi-step process held together by status flags and sweeps</th><td>Stuck and half-finished cases that nobody can explain</td><td>An explicit state machine, or a workflow engine</td></tr>
+<tr><th>Reading the clock or calling services directly in workflow code</th><td>Replay takes a different path and fails</td><td>All outside interaction goes through recorded steps</td></tr>
+<tr><th>Deploying new workflow code without versioning</th><td>Workflows already in flight break on replay</td><td>Use the engine’s versioning for every change in step order</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="message-queues"></x-ref>: the queue underneath background jobs, and backlog arithmetic.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: why every job and every step must be safe to repeat.</li>
+  <li><x-ref to="distributed-transactions"></x-ref>: sagas, the main use of workflow engines.</li>
+  <li><x-ref to="membership-and-coordination"></x-ref>: leader election and leases for schedulers and workers.</li>
+  <li><x-ref to="transactions"></x-ref>: row locks and guarded updates for claiming jobs and changing state.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: clocks, and why time is a poor thing to depend on.</li>
+  <li><x-ref to="change-data-capture"></x-ref> and <x-ref to="batch-and-stream-processing"></x-ref>: the pipelines that orchestrators run.</li>
+  <li><x-ref to="lld-infrastructure"></x-ref>: a task scheduler designed as code.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Scheduled, delayed and multi-step work is a promise about the future, so it has to be stored durably and survive restarts.</li>
+  <li>Cron’s syntax is everywhere. Cron on one machine skips runs, does not retry, allows overlaps and keeps no history.</li>
+  <li>Across machines, one leader decides that a run is due, each run is keyed by job and scheduled time, and workers execute idempotently.</li>
+  <li>Pass the scheduled time into the job. Never have the job read the clock to decide what to do.</li>
+  <li>Schedule in UTC, and alert on the absence of success as well as on failure.</li>
+  <li>A timer is a row with a due time behind an index. Timing wheels handle large numbers of timers in memory.</li>
+  <li>DAG orchestrators run dependent batch tasks for a given data interval, which makes retries and backfills routine.</li>
+  <li>Durable execution records each step’s result and replays the function after a crash. Workflow code must be deterministic, and steps must be idempotent.</li>
+  <li>For a small process, an explicit state machine in the database is enough.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A service runs on six instances, and each has the same nightly cron entry. What happens, and what are the two parts of the fix?</summary><p>The job runs six times each night. First, only one instance should trigger it, through leader election or a single external scheduler. Second, because leadership can change at the wrong moment, each run is recorded under a unique key of job name and scheduled time, so that a second trigger for the same time is rejected, and the job itself is idempotent.</p></details>
+<details><summary>A daily report job computes “yesterday” from the current time. It fails at 23:50 and is retried at 00:10. What goes wrong, and how should the job be written?</summary><p>The retry runs after midnight, so “yesterday” is now a different day. One day’s report is produced twice and another is never produced. The job should receive its scheduled time or data date as a parameter and compute from that, so that a late or repeated run does the same work as the original would have.</p></details>
+<details><summary>Why is a job scheduled for 02:30 local time a poor idea in a region that observes daylight saving?</summary><p>On the day clocks move forward, the hour from 02:00 to 03:00 does not exist, so the job is skipped. On the day they move back, that hour occurs twice, so the job runs twice. Scheduling in UTC avoids both.</p></details>
+<details><summary>Ten workers poll the same jobs table. How does FOR UPDATE SKIP LOCKED prevent two of them from taking the same job without making them wait for each other?</summary><p>The claiming query locks the rows it selects. Another worker running the same query at the same moment does not block on those locked rows. It skips them and takes the next available ones. Each worker therefore gets a different set, immediately.</p></details>
+<details><summary>A worker claims a job with a five-minute lock and then takes eight minutes. What happens, and what two measures limit the damage?</summary><p>After five minutes the sweeper returns the job to pending and a second worker starts it while the first is still running. The job runs twice, concurrently. Long jobs should extend their lock periodically while they make progress, and the job must be idempotent so that a duplicate run does no harm.</p></details>
+<details><summary>In a durable execution engine, a workflow has completed three steps when its worker crashes. Describe what happens when another worker picks it up.</summary><p>The new worker runs the workflow function from the beginning, supplied with the saved history. For each of the first three steps the engine returns the recorded result without executing the step. The function reaches the fourth step with the same variable values as before, and executes from there normally.</p></details>
+<details><summary>Why must workflow code not call Date.now() or Math.random() directly?</summary><p>On replay the function must take exactly the path it took originally. A direct call returns a different value each time, so a condition could go the other way and the code would attempt steps that do not match the recorded history. The time and random values must be obtained through the engine, which records them the first time and returns the same values on replay.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Štěpán Davidovič, edited by Kavita Guliani, <a href="https://sre.google/sre-book/distributed-periodic-scheduling/">Distributed Periodic Scheduling with Cron</a>, chapter 24 of <cite>Site Reliability Engineering</cite>, Google, 2016. Designing a cron service that survives machine failure.</li>
+  <li>Kubernetes, <a href="https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/">CronJob</a>. Concurrency policy, starting deadlines, time zones and the note on idempotency.</li>
+  <li>Linux man-pages, <a href="https://man7.org/linux/man-pages/man5/crontab.5.html">crontab(5)</a>. The schedule format.</li>
+  <li>PostgreSQL Global Development Group, <a href="https://www.postgresql.org/docs/current/sql-select.html">SELECT: The Locking Clause</a>. <code>FOR UPDATE</code> and <code>SKIP LOCKED</code>.</li>
+  <li>George Varghese and Tony Lauck, “Hashed and Hierarchical Timing Wheels: Data Structures for the Efficient Implementation of a Timer Facility”, SOSP 1987.</li>
+  <li>Apache Airflow, <a href="https://airflow.apache.org/docs/apache-airflow/stable/">Documentation</a>. DAGs, data intervals and backfills.</li>
+  <li>Temporal, <a href="https://docs.temporal.io/workflows">Workflows</a>. Durable execution, replay and the determinism requirement.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/step-functions/latest/dg/limits.html">Step Functions service quotas</a>. Execution time and history limits, as read in October 2026.</li>
+  <li>Microsoft, <a href="https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-code-constraints">Orchestrator function code constraints</a>, Azure Durable Functions. A clear list of what deterministic workflow code may not do.</li>
+</ol>
+</section>

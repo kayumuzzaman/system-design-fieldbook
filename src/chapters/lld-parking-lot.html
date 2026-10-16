@@ -1,0 +1,762 @@
+<!--meta
+{ "description": "A complete low-level design of a parking lot in TypeScript, tested: clarifying the problem, spots, vehicles and tickets, the invariants and which class owns each, a class diagram, pricing as composable strategies with a grace period and a daily cap, finding the nearest free spot with a heap, the race between two entry gates and how to remove it in one process and in a database, and the usual follow-up questions.",
+  "lede": "The parking lot is the most frequently set low-level design problem, and it earns its place. It is small enough to finish and has a real invariant at its center: a space can hold one vehicle. Everything interesting follows from protecting that rule while several gates admit cars at the same moment. This chapter works the problem from the first clarifying question to tested code, in the seven steps of the method.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the software for a multi-level parking garage. Vehicles of different sizes come in through several entry gates, are given a ticket and a space, and pay when they leave according to how long they stayed.</p></div>
+<p>In the terms of <x-ref to="lld-method#shapes"></x-ref>, this is a problem of handing out a limited resource. The same shape returns as seats in a cinema, rooms in a hotel and tables in a restaurant, so the reasoning here is worth more than the parking.</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>What kinds of vehicle, and what sizes of space?</th><td>Motorcycles, cars and vans. Small, medium and large spaces</td></tr>
+<tr><th>May a vehicle use a larger space than it needs?</th><td>Yes, when nothing of its own size is free</td></tr>
+<tr><th>Who chooses the space?</th><td>The system, at the gate: the nearest suitable one, lower floors first</td></tr>
+<tr><th>How is the fee worked out?</th><td>For each started hour, by kind of vehicle. The first 15 minutes are free, and there is a maximum for each day</td></tr>
+<tr><th>How many gates?</th><td>Several entries and exits, in use at the same time</td></tr>
+<tr><th>What is out of scope?</th><td>Taking the payment, reservations, electric charging, monthly passes, the barrier hardware</td></tr>
+</tbody>
+</table>
+<p>That gives three use cases: a vehicle enters and is given a ticket for a space, a vehicle leaves and is charged, and the sign at the entrance shows how many spaces of each size are free.</p>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+<p>The nouns are vehicle, space, floor, gate, ticket and fee. Sorting them as in <x-ref to="lld-method#model"></x-ref>:</p>
+<table>
+<thead><tr><th>Concept</th><th>Kind</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Spot</th><td>Entity</td><td>Each one is tracked individually and changes between free and taken</td></tr>
+<tr><th>Ticket</th><td>Entity, written as an immutable record</td><td>One vehicle’s claim on one spot from a moment in time. It is the relationship between vehicle and spot, promoted to a type</td></tr>
+<tr><th>Vehicle</th><td>Value</td><td>A plate and a kind. The lot has no interest in the vehicle beyond those</td></tr>
+<tr><th>Floor</th><td>A field of the spot</td><td>Nothing in scope happens to a floor as a whole. A class for it would have no behavior</td></tr>
+<tr><th>Gate</th><td>A caller, outside the model</td><td>Gates invoke the lot. Their hardware is out of scope</td></tr>
+<tr><th>Fee</th><td>A number of cents, produced by a pricing function</td><td>The rule varies, so it is a strategy</td></tr>
+</tbody>
+</table>
+<p>Two of these decisions are worth defending in an interview. Leaving out a <code>Floor</code> class and a <code>Gate</code> class is deliberate: a noun becomes a class when it has data and rules of its own, and here neither does. If the interviewer adds “close a floor for cleaning”, a floor gains state and earns a class at that moment.</p>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th></tr></thead>
+<tbody>
+<tr><th>A spot holds at most one vehicle</th><td><code>Spot</code>, which knows its holder and refuses a second</td></tr>
+<tr><th>A vehicle is given only a spot it fits</th><td><code>ParkingLot</code>, when it claims a spot</td></tr>
+<tr><th>A vehicle has at most one open ticket</th><td><code>ParkingLot</code>, which keeps the plates inside</td></tr>
+<tr><th>A ticket is charged once, from its own entry time</th><td><code>ParkingLot</code>, which removes the ticket when it is paid</td></tr>
+</tbody>
+</table>
+
+<h2 id="classes">Step 4: The classes</h2>
+
+<figure class="fig wide" id="fig-classes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f671t f671d">
+<title id="f671t">The classes of the parking lot</title>
+<desc id="f671d">A class diagram. ParkingLot has private heaps of free spots for each size, the open tickets and the plates inside, and the operations park, leave and freeCounts. It owns one or more Spots. A Spot has a floor, a number, a size and a private holder, with the operations occupy and vacate. ParkingLot holds any number of open Tickets. A Ticket is a record of an identifier, a vehicle, a spot and an entry time, and refers to exactly one Spot. A Vehicle is a value with a plate and a kind. ParkingLot also holds a Pricing function, which takes a kind of vehicle and a number of minutes and returns a fee in cents.</desc>
+<rect class="n sig" x="10" y="24" width="220" height="144" rx="4"/>
+<text class="tb mid" x="120" y="43">ParkingLot</text>
+<line class="sep sig" x1="10" y1="52" x2="230" y2="52"/>
+<text class="ts" x="18" y="68">− freeSpots: a heap for each size</text>
+<text class="ts" x="18" y="84">− open: tickets by id</text>
+<text class="ts" x="18" y="100">− inside: plates</text>
+<line class="sep sig" x1="10" y1="110" x2="230" y2="110"/>
+<text class="ts" x="18" y="126">+ park(vehicle, now): Ticket</text>
+<text class="ts" x="18" y="142">+ leave(ticketId, now): Receipt</text>
+<text class="ts" x="18" y="158">+ freeCounts</text>
+<rect class="n sig" x="310" y="24" width="170" height="112" rx="4"/>
+<text class="tb mid" x="395" y="43">Spot</text>
+<line class="sep sig" x1="310" y1="52" x2="480" y2="52"/>
+<text class="ts" x="318" y="68">floor, number, size</text>
+<text class="ts" x="318" y="84">− heldBy: TicketId or none</text>
+<line class="sep sig" x1="310" y1="94" x2="480" y2="94"/>
+<text class="ts" x="318" y="110">+ occupy(ticket)</text>
+<text class="ts" x="318" y="126">+ vacate(ticket)</text>
+<rect class="n" x="310" y="190" width="170" height="84" rx="4"/>
+<text class="ts mid" x="395" y="206">«record»</text>
+<text class="tb mid" x="395" y="223">Ticket</text>
+<line class="sep" x1="310" y1="232" x2="480" y2="232"/>
+<text class="ts" x="318" y="248">id</text>
+<text class="ts" x="318" y="264">enteredAt</text>
+<rect class="n" x="550" y="190" width="160" height="84" rx="4"/>
+<text class="ts mid" x="630" y="206">«value»</text>
+<text class="tb mid" x="630" y="223">Vehicle</text>
+<line class="sep" x1="550" y1="232" x2="710" y2="232"/>
+<text class="ts" x="558" y="248">plate</text>
+<text class="ts" x="558" y="264">kind: motorcycle, car, van</text>
+<rect class="n store" x="10" y="206" width="220" height="68" rx="4"/>
+<text class="ts mid" x="120" y="222">«function»</text>
+<text class="tb mid" x="120" y="239">Pricing</text>
+<line class="sep store" x1="10" y1="248" x2="230" y2="248"/>
+<text class="ts" x="18" y="264">(kind, minutes) → cents</text>
+<path class="e owns" d="M230 67.2 L310 71.04"/>
+<text class="ts mid" x="270" y="62.12">1..*</text>
+<path class="e has" d="M230 146.4 L310 215.2"/>
+<text class="ts" x="238" y="228">open,</text>
+<text class="ts" x="238" y="244">0..*</text>
+<path class="e assoc" d="M395 190 L395 136"/>
+<text class="ts mid" x="407" y="167">1</text>
+<path class="e owns" d="M480 232 L550 232"/>
+<path class="e has" d="M120 168 L120 206"/>
+<text class="ts" x="550" y="40">Spot owns: at most one</text>
+<text class="ts" x="550" y="56">vehicle in a spot.</text>
+<text class="ts" x="550" y="84">ParkingLot owns: one open</text>
+<text class="ts" x="550" y="100">ticket for a vehicle, and</text>
+<text class="ts" x="550" y="116">a spot that fits it.</text>
+<text class="ts" x="10" y="290">Pricing is built from small functions: hourly, withGrace and withDailyCap. The lot calls it and knows nothing of rates.</text>
+</svg>
+</div>
+<figcaption>Five types carry the design. The ticket is the overloaded noun split off: the spot is the resource, and the ticket is one vehicle’s claim on it for a period of time.</figcaption>
+</figure>
+
+<figure class="fig wide" id="fig-fit">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f672t f672d">
+<title id="f672t">Which vehicle may use which size of spot, and in what order of preference</title>
+<desc id="f672d">A grid with three rows for motorcycle, car and van, and three columns for small, medium and large spots. A motorcycle takes a small spot first, then a medium, then a large. A car does not fit a small spot, takes a medium first and then a large. A van fits only a large spot.</desc>
+<text class="tb mid" x="230" y="24">Small spot</text>
+<text class="tb mid" x="390" y="24">Medium spot</text>
+<text class="tb mid" x="550" y="24">Large spot</text>
+<text class="tb end" x="130" y="61">Motorcycle</text>
+<rect class="n store" x="150" y="36" width="160" height="40" rx="0"/>
+<text class="ts mid tb" x="230" y="61">1st choice</text>
+<rect class="n " x="310" y="36" width="160" height="40" rx="0"/>
+<text class="ts mid" x="390" y="61">2nd choice</text>
+<rect class="n " x="470" y="36" width="160" height="40" rx="0"/>
+<text class="ts mid" x="550" y="61">3rd choice</text>
+<text class="tb end" x="130" y="107">Car</text>
+<rect class="n sunk" x="150" y="82" width="160" height="40" rx="0"/>
+<text class="ts mid" x="230" y="107">does not fit</text>
+<rect class="n store" x="310" y="82" width="160" height="40" rx="0"/>
+<text class="ts mid tb" x="390" y="107">1st choice</text>
+<rect class="n " x="470" y="82" width="160" height="40" rx="0"/>
+<text class="ts mid" x="550" y="107">2nd choice</text>
+<text class="tb end" x="130" y="153">Van</text>
+<rect class="n sunk" x="150" y="128" width="160" height="40" rx="0"/>
+<text class="ts mid" x="230" y="153">does not fit</text>
+<rect class="n sunk" x="310" y="128" width="160" height="40" rx="0"/>
+<text class="ts mid" x="390" y="153">does not fit</text>
+<rect class="n store" x="470" y="128" width="160" height="40" rx="0"/>
+<text class="ts mid tb" x="550" y="153">1st choice</text>
+<text class="ts" x="10" y="192">Letting a vehicle use a larger spot keeps the lot fuller. The cost: in the test, a car took the last large</text>
+<text class="ts" x="10" y="208">spot and the next van was turned away.</text>
+</svg>
+</div>
+<figcaption>The table is data, and the allocation code reads it. A lot that reserves large spots for vans changes one row and no logic.</figcaption>
+</figure>
+
+<p>The fitting rule is a table of data, and that is the point of drawing it. An <code>if</code> for every pairing of vehicle and spot would work for three kinds and become unmanageable at five. A table that the code reads can be changed by editing one row.</p>
+
+<h2 id="pricing">Step 5: What varies</h2>
+<p>Pricing is the part of a parking lot that changes most often and differs most between lots: weekend rates, event days, a free first quarter of an hour. It is a strategy in the sense of <x-ref to="behavioral-patterns#strategy"></x-ref>, and because each rule modifies another, the strategies wrap each other.</p>
+<pre data-lang="ts" data-title="Pricing built from three small functions">
+export type VehicleKind = "motorcycle" | "car" | "van";
+
+// The pricing strategy: from what was parked and for how many minutes, to a fee in cents.
+export type Pricing = (kind: VehicleKind, minutes: number) => number;
+
+// Every started hour is charged in full.
+export const hourly = (centsPerHour: Record<VehicleKind, number>): Pricing => (kind, minutes) =>
+  Math.ceil(minutes / 60) * centsPerHour[kind];
+
+// A short stay costs nothing. Past the grace period the whole stay is charged.
+export const withGrace = (freeMinutes: number, inner: Pricing): Pricing => (kind, minutes) =>
+  minutes <= freeMinutes ? 0 : inner(kind, minutes);
+
+// No single day costs more than the cap. Each full day costs exactly the cap.
+export const withDailyCap = (capCents: Record<VehicleKind, number>, inner: Pricing): Pricing => (kind, minutes) => {
+  const days = Math.floor(minutes / 1440);
+  const rest = minutes - days * 1440;
+  return days * capCents[kind] + Math.min(capCents[kind], inner(kind, rest));
+};
+
+// The policy used in this chapter, assembled from the three parts.
+export const standardPricing: Pricing = withGrace(
+  15,
+  withDailyCap({ motorcycle: 800, car: 2400, van: 4000 }, hourly({ motorcycle: 100, car: 300, van: 500 })),
+);
+</pre>
+<table>
+<thead><tr><th>A car stays</th><th>Fee</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>15 minutes</th><td>0.00</td><td>Inside the grace period</td></tr>
+<tr><th>16 minutes</th><td>3.00</td><td>Past it, and the whole first hour is charged</td></tr>
+<tr><th>61 minutes</th><td>6.00</td><td>A second hour has started</td></tr>
+<tr><th>9 hours</th><td>24.00</td><td>The cap. Without it, 27.00</td></tr>
+<tr><th>25 hours</th><td>27.00</td><td>One capped day, and one hour of the next</td></tr>
+<tr><th>3 days</th><td>72.00</td><td>Three capped days</td></tr>
+</tbody>
+</table>
+
+<figure class="fig wide" id="fig-fee">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 276" role="img" aria-labelledby="f675t f675d">
+<title id="f675t">The fee for a car by length of stay, with and without the daily cap</title>
+<desc id="f675d">A bar chart of the fee for a car against the length of stay, for stays of 0 to 30 whole hours, computed by the chapter’s pricing code. The fee rises by 3.00 for each hour up to 24.00 at eight hours, then stays at 24.00 for the rest of the first day. On the second day it rises again from 27.00 at 25 hours to 42.00 at 30 hours. A dashed line shows the fee with no cap, which rises steadily to 90.00 at 30 hours.</desc>
+<text class="tb" x="10" y="16">Fee for a car, by hours parked</text>
+<line class="grid" x1="58" y1="232.0" x2="709" y2="232.0"/>
+<text class="ts end" x="50" y="236.0">0.00</text>
+<line class="grid" x1="58" y1="178.7" x2="709" y2="178.7"/>
+<text class="ts end" x="50" y="182.7">24.00</text>
+<line class="grid" x1="58" y1="125.3" x2="709" y2="125.3"/>
+<text class="ts end" x="50" y="129.3">48.00</text>
+<line class="grid" x1="58" y1="72.0" x2="709" y2="72.0"/>
+<text class="ts end" x="50" y="76.0">72.00</text>
+<line class="grid" x1="58" y1="32.0" x2="709" y2="32.0"/>
+<text class="ts end" x="50" y="36.0">90.00</text>
+<rect class="bar" x="82" y="225.3" width="15" height="6.7" rx="2"/>
+<rect class="bar" x="103" y="218.7" width="15" height="13.3" rx="2"/>
+<rect class="bar" x="124" y="212.0" width="15" height="20.0" rx="2"/>
+<rect class="bar" x="145" y="205.3" width="15" height="26.7" rx="2"/>
+<rect class="bar" x="166" y="198.7" width="15" height="33.3" rx="2"/>
+<rect class="bar" x="187" y="192.0" width="15" height="40.0" rx="2"/>
+<rect class="bar" x="208" y="185.3" width="15" height="46.7" rx="2"/>
+<rect class="bar" x="229" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="250" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="271" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="292" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="313" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="334" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="355" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="376" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="397" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="418" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="439" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="460" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="481" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="502" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="523" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="544" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="565" y="178.7" width="15" height="53.3" rx="2"/>
+<rect class="bar" x="586" y="172.0" width="15" height="60.0" rx="2"/>
+<rect class="bar" x="607" y="165.3" width="15" height="66.7" rx="2"/>
+<rect class="bar" x="628" y="158.7" width="15" height="73.3" rx="2"/>
+<rect class="bar" x="649" y="152.0" width="15" height="80.0" rx="2"/>
+<rect class="bar" x="670" y="145.3" width="15" height="86.7" rx="2"/>
+<rect class="bar" x="691" y="138.7" width="15" height="93.3" rx="2"/>
+<path class="line" style="stroke:var(--ink-3,var(--ink-2));stroke-dasharray:5 4" d="M68.5 232.0 L89.5 225.3 L110.5 218.7 L131.5 212.0 L152.5 205.3 L173.5 198.7 L194.5 192.0 L215.5 185.3 L236.5 178.7 L257.5 172.0 L278.5 165.3 L299.5 158.7 L320.5 152.0 L341.5 145.3 L362.5 138.7 L383.5 132.0 L404.5 125.3 L425.5 118.7 L446.5 112.0 L467.5 105.3 L488.5 98.7 L509.5 92.0 L530.5 85.3 L551.5 78.7 L572.5 72.0 L593.5 65.3 L614.5 58.7 L635.5 52.0 L656.5 45.3 L677.5 38.7 L698.5 32.0"/>
+<line class="axis" x1="58" y1="232" x2="709" y2="232"/>
+<text class="ts mid" x="68.5" y="248">0</text>
+<text class="ts mid" x="152.5" y="248">4</text>
+<text class="ts mid" x="236.5" y="248">8</text>
+<text class="ts mid" x="320.5" y="248">12</text>
+<text class="ts mid" x="404.5" y="248">16</text>
+<text class="ts mid" x="488.5" y="248">20</text>
+<text class="ts mid" x="572.5" y="248">24</text>
+<text class="ts mid" x="656.5" y="248">28</text>
+<text class="ts mid" x="383.5" y="266">hours parked</text>
+<text class="ts" x="250" y="60">without a cap</text>
+<text class="ts" x="400" y="170">capped at 24.00 a day</text>
+<rect class="hit" x="58" y="20" width="21" height="212" data-tip="0 hours|fee 0.00|without the cap 0.00"/>
+<rect class="hit" x="79" y="20" width="21" height="212" data-tip="1 hours|fee 3.00|without the cap 3.00"/>
+<rect class="hit" x="100" y="20" width="21" height="212" data-tip="2 hours|fee 6.00|without the cap 6.00"/>
+<rect class="hit" x="121" y="20" width="21" height="212" data-tip="3 hours|fee 9.00|without the cap 9.00"/>
+<rect class="hit" x="142" y="20" width="21" height="212" data-tip="4 hours|fee 12.00|without the cap 12.00"/>
+<rect class="hit" x="163" y="20" width="21" height="212" data-tip="5 hours|fee 15.00|without the cap 15.00"/>
+<rect class="hit" x="184" y="20" width="21" height="212" data-tip="6 hours|fee 18.00|without the cap 18.00"/>
+<rect class="hit" x="205" y="20" width="21" height="212" data-tip="7 hours|fee 21.00|without the cap 21.00"/>
+<rect class="hit" x="226" y="20" width="21" height="212" data-tip="8 hours|fee 24.00|without the cap 24.00"/>
+<rect class="hit" x="247" y="20" width="21" height="212" data-tip="9 hours|fee 24.00|without the cap 27.00|the cap saves 3.00"/>
+<rect class="hit" x="268" y="20" width="21" height="212" data-tip="10 hours|fee 24.00|without the cap 30.00|the cap saves 6.00"/>
+<rect class="hit" x="289" y="20" width="21" height="212" data-tip="11 hours|fee 24.00|without the cap 33.00|the cap saves 9.00"/>
+<rect class="hit" x="310" y="20" width="21" height="212" data-tip="12 hours|fee 24.00|without the cap 36.00|the cap saves 12.00"/>
+<rect class="hit" x="331" y="20" width="21" height="212" data-tip="13 hours|fee 24.00|without the cap 39.00|the cap saves 15.00"/>
+<rect class="hit" x="352" y="20" width="21" height="212" data-tip="14 hours|fee 24.00|without the cap 42.00|the cap saves 18.00"/>
+<rect class="hit" x="373" y="20" width="21" height="212" data-tip="15 hours|fee 24.00|without the cap 45.00|the cap saves 21.00"/>
+<rect class="hit" x="394" y="20" width="21" height="212" data-tip="16 hours|fee 24.00|without the cap 48.00|the cap saves 24.00"/>
+<rect class="hit" x="415" y="20" width="21" height="212" data-tip="17 hours|fee 24.00|without the cap 51.00|the cap saves 27.00"/>
+<rect class="hit" x="436" y="20" width="21" height="212" data-tip="18 hours|fee 24.00|without the cap 54.00|the cap saves 30.00"/>
+<rect class="hit" x="457" y="20" width="21" height="212" data-tip="19 hours|fee 24.00|without the cap 57.00|the cap saves 33.00"/>
+<rect class="hit" x="478" y="20" width="21" height="212" data-tip="20 hours|fee 24.00|without the cap 60.00|the cap saves 36.00"/>
+<rect class="hit" x="499" y="20" width="21" height="212" data-tip="21 hours|fee 24.00|without the cap 63.00|the cap saves 39.00"/>
+<rect class="hit" x="520" y="20" width="21" height="212" data-tip="22 hours|fee 24.00|without the cap 66.00|the cap saves 42.00"/>
+<rect class="hit" x="541" y="20" width="21" height="212" data-tip="23 hours|fee 24.00|without the cap 69.00|the cap saves 45.00"/>
+<rect class="hit" x="562" y="20" width="21" height="212" data-tip="24 hours|fee 24.00|without the cap 72.00|the cap saves 48.00"/>
+<rect class="hit" x="583" y="20" width="21" height="212" data-tip="25 hours|fee 27.00|without the cap 75.00|the cap saves 48.00"/>
+<rect class="hit" x="604" y="20" width="21" height="212" data-tip="26 hours|fee 30.00|without the cap 78.00|the cap saves 48.00"/>
+<rect class="hit" x="625" y="20" width="21" height="212" data-tip="27 hours|fee 33.00|without the cap 81.00|the cap saves 48.00"/>
+<rect class="hit" x="646" y="20" width="21" height="212" data-tip="28 hours|fee 36.00|without the cap 84.00|the cap saves 48.00"/>
+<rect class="hit" x="667" y="20" width="21" height="212" data-tip="29 hours|fee 39.00|without the cap 87.00|the cap saves 48.00"/>
+<rect class="hit" x="688" y="20" width="21" height="212" data-tip="30 hours|fee 42.00|without the cap 90.00|the cap saves 48.00"/>
+</svg>
+</div>
+<figcaption>Every value in this chart was produced by the pricing function in the chapter’s code. The flat stretch from 8 to 24 hours is the daily cap at work.</figcaption>
+</figure>
+
+<div class="widget" data-widget="parkfee">
+<h4>The fee for one stay</h4>
+<p>The same three rules as the code: every started hour is charged, a short stay is free, and no day costs more than the cap.</p>
+<div class="controls">
+  <label>Length of stay, minutes<input type="number" name="minutes" value="150" min="0" max="100000" step="1"></label>
+  <label>Rate for each started hour<input type="number" name="rate" value="3" min="0" max="1000" step="0.01"></label>
+  <label>Free for the first, minutes<input type="number" name="grace" value="15" min="0" max="1440" step="1"></label>
+  <label>Most for one day<input type="number" name="cap" value="24" min="0" max="100000" step="0.01"></label>
+</div>
+<dl class="results">
+  <div><dt>Fee</dt><dd data-out="fee">9.00</dd></div>
+  <div><dt>Hours charged</dt><dd data-out="hours">3</dd></div>
+  <div><dt>Without the cap</dt><dd data-out="uncapped">9.00</dd></div>
+  <div><dt>Paid for each hour parked</dt><dd data-out="per">3.60</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">A stay of 150 minutes is 3 started hours. At 3.00 an hour that is 9.00. That is under the daily cap of 24.00, so the fee is 9.00.</p>
+</div>
+<p>Two smaller things also vary and need less machinery. Which spot a vehicle is offered is decided by the table of acceptable sizes and by the ordering used for “nearest”. A lot that wants to fill from the top floor, or keep large spots for vans, changes that table or that comparison function.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> A class hierarchy for vehicles: <code>Car extends Vehicle</code>, <code>Motorcycle extends Vehicle</code>, each with a method returning its size. The kinds of vehicle differ in one value and in no behavior, so subclasses add nothing a string does not. Inheritance is for different behavior (<x-ref to="oop-in-typescript#inheritance"></x-ref>).</p></div>
+
+<h2 id="code">Step 6: The code</h2>
+<pre data-lang="ts" data-title="The parking lot">
+export type SpotSize = "small" | "medium" | "large";
+export type TicketId = string & { readonly __brand: "TicketId" };
+
+// Which sizes each kind of vehicle may use, best choice first.
+const acceptable: Record<VehicleKind, readonly SpotSize[]> = {
+  motorcycle: ["small", "medium", "large"],
+  car: ["medium", "large"],
+  van: ["large"],
+};
+
+export interface Vehicle {
+  readonly plate: string;
+  readonly kind: VehicleKind;
+}
+
+export class LotError extends Error {}
+
+// Owns the rule "one spot, at most one vehicle".
+export class Spot {
+  readonly id: string;
+  readonly floor: number;
+  readonly number: number;
+  readonly size: SpotSize;
+  private heldBy: TicketId | null = null;
+
+  constructor(floor: number, number: number, size: SpotSize) {
+    this.floor = floor;
+    this.number = number;
+    this.size = size;
+    this.id = `F${floor}-${size[0]?.toUpperCase()}${number}`;
+  }
+  get free(): boolean {
+    return this.heldBy === null;
+  }
+  occupy(ticket: TicketId): void {
+    if (this.heldBy) throw new LotError(`spot ${this.id} is taken`);
+    this.heldBy = ticket;
+  }
+  vacate(ticket: TicketId): void {
+    if (this.heldBy !== ticket) throw new LotError(`spot ${this.id} is not held by ticket ${ticket}`);
+    this.heldBy = null;
+  }
+}
+
+export interface Ticket {
+  readonly id: TicketId;
+  readonly vehicle: Vehicle;
+  readonly spot: Spot;
+  readonly enteredAt: Date;
+}
+export interface Receipt {
+  readonly ticket: TicketId;
+  readonly plate: string;
+  readonly minutes: number;
+  readonly feeCents: number;
+}
+
+// Nearest first: lower floors before higher ones, lower numbers before higher ones.
+const nearer = (a: Spot, b: Spot): boolean => a.floor < b.floor || (a.floor === b.floor && a.number < b.number);
+
+export class ParkingLot {
+  private readonly pricing: Pricing;
+  private readonly freeSpots: Record<SpotSize, MinHeap<Spot>> = { small: new MinHeap(nearer), medium: new MinHeap(nearer), large: new MinHeap(nearer) };
+  private readonly open = new Map<TicketId, Ticket>();
+  private readonly inside = new Set<string>(); // plates of vehicles currently parked
+  private issued = 0;
+
+  constructor(spots: Spot[], pricing: Pricing) {
+    this.pricing = pricing;
+    for (const spot of spots) this.freeSpots[spot.size].push(spot);
+  }
+
+  // Entry: claim the nearest spot of the smallest size that fits, and issue a ticket for it.
+  park(vehicle: Vehicle, now: Date): Ticket {
+    if (this.inside.has(vehicle.plate)) throw new LotError(`${vehicle.plate} is already parked here`);
+    const spot = this.claim(vehicle.kind);
+    if (!spot) throw new LotError(`no space for a ${vehicle.kind}`);
+    const ticket: Ticket = { id: `T${(this.issued += 1)}` as TicketId, vehicle, spot, enteredAt: now };
+    spot.occupy(ticket.id);
+    this.open.set(ticket.id, ticket);
+    this.inside.add(vehicle.plate);
+    return ticket;
+  }
+
+  // Exit: work out the fee from the ticket's own times, and put the spot back.
+  leave(ticketId: string, now: Date): Receipt {
+    const ticket = this.open.get(ticketId as TicketId);
+    if (!ticket) throw new LotError(`no open ticket ${ticketId}`);
+    const minutes = Math.ceil((now.getTime() - ticket.enteredAt.getTime()) / 60_000);
+    if (minutes < 0) throw new LotError("a vehicle cannot leave before it arrived");
+    const feeCents = this.pricing(ticket.vehicle.kind, minutes);
+    ticket.spot.vacate(ticket.id);
+    this.freeSpots[ticket.spot.size].push(ticket.spot);
+    this.open.delete(ticket.id);
+    this.inside.delete(ticket.vehicle.plate);
+    return { ticket: ticket.id, plate: ticket.vehicle.plate, minutes, feeCents };
+  }
+
+  // What the sign at the entrance shows.
+  get freeCounts(): Record<SpotSize, number> {
+    return { small: this.freeSpots.small.size, medium: this.freeSpots.medium.size, large: this.freeSpots.large.size };
+  }
+
+  private claim(kind: VehicleKind): Spot | undefined {
+    for (const size of acceptable[kind]) {
+      const spot = this.freeSpots[size].pop();
+      if (spot) return spot;
+    }
+    return undefined;
+  }
+}
+</pre>
+<p>The free spots are kept in three <dfn>heaps</dfn>, one for each size. A heap is a structure that always hands back its smallest item, here the nearest spot, and takes a number of steps proportional to the logarithm of its size to add or remove one. The choice is worth a sentence when asked how the nearest free spot is found.</p>
+<table>
+<thead><tr><th>How free spots are kept</th><th>Find and take the nearest</th><th>Give one back</th><th>Reasonable when</th></tr></thead>
+<tbody>
+<tr><th>Scan all spots for the first free one</th><td>Proportional to the number of spots</td><td>Constant</td><td>A few hundred spots. Say so, and move on</td></tr>
+<tr><th>A heap of free spots for each size</th><td>Logarithmic</td><td>Logarithmic</td><td>Any size. Forty lines of code, in this chapter’s folder</td></tr>
+<tr><th>An index in a database, ordered by floor and number</th><td>Logarithmic</td><td>Logarithmic</td><td>Several servers, as shown below</td></tr>
+</tbody>
+</table>
+<p>Because a spot is removed from its heap at the moment it is offered, the first invariant is protected twice: a spot that is taken is not in any heap to be found, and <code>Spot.occupy</code> would refuse it even if it were.</p>
+<p>The scenario test used two floors, each with two small, three medium and one large spot.</p>
+<table>
+<thead><tr><th>Event</th><th>Result</th></tr></thead>
+<tbody>
+<tr><th>The first car arrives</th><td>Spot F1-M3, the nearest medium, on ticket T1</td></tr>
+<tr><th>A motorcycle and a van arrive</th><td>F1-S1 and F1-L6</td></tr>
+<tr><th>The same plate tries to enter again</th><td>Refused: “CAR-1 is already parked here”</td></tr>
+<tr><th>Five more cars</th><td>F1-M4, F1-M5, then floor two: F2-M3, F2-M4, F2-M5</td></tr>
+<tr><th>A seventh car, with no medium spot left</th><td>F2-L6, a large spot</td></tr>
+<tr><th>A second van</th><td>Refused. The car has the last large spot</td></tr>
+<tr><th>The first car leaves after 2 hours 30 minutes</th><td>150 minutes, 9.00. Its ticket cannot be used again</td></tr>
+<tr><th>The next car to arrive</th><td>F1-M3, which is the nearest free spot once more</td></tr>
+</tbody>
+</table>
+<p>The row with the second van is the design’s one questionable behavior, and it is better to raise it than to have it found. Letting cars overflow into large spots fills the lot and can turn vans away. Whether that is right is a business decision, and it is one line of the fitting table.</p>
+<p>A second test ran 20,000 random arrivals and departures against a three-floor lot. After every event it checked that the number of occupied spots equaled the number of open tickets and that free and occupied spots together equaled the total. Both held throughout, with 9,066 vehicles parked and 1,905 turned away at a full lot.</p>
+
+<h2 id="walk">Step 7: Walk it</h2>
+
+<figure class="fig wide" id="fig-park">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 430" role="img" aria-labelledby="f673t f673d">
+<title id="f673t">A car entering at 09:00 and leaving at 11:30</title>
+<desc id="f673d">Two sequences between a gate, the ParkingLot, its heap of free medium spots, a Spot and the Pricing function. On entry, the gate calls park. The lot checks that the plate is not already inside, pops the nearest free medium spot F1-M3 from the heap, tells the spot it is occupied by ticket T1 and returns the ticket. On exit, the gate calls leave with the ticket. The lot works out 150 minutes, asks the pricing function and gets 900 cents, tells the spot it is vacant, pushes it back on the heap and returns a receipt.</desc>
+<text class="tb mono" x="10" y="16">park({ plate: "CAR-1", kind: "car" }, 09:00)</text>
+<g data-scene="enter">
+<text class="tb mid" x="46" y="36">Gate</text>
+<line class="axis" x1="46" y1="44" x2="46" y2="176"/>
+<text class="tb mid" x="190" y="36">ParkingLot</text>
+<line class="axis" x1="190" y1="44" x2="190" y2="176"/>
+<text class="tb mid" x="350" y="36">Free medium spots</text>
+<line class="axis" x1="350" y1="44" x2="350" y2="176"/>
+<text class="tb mid" x="510" y="36">Spot F1-M3</text>
+<line class="axis" x1="510" y1="44" x2="510" y2="176"/>
+<text class="tb mid" x="650" y="36">Pricing</text>
+<line class="axis" x1="650" y1="44" x2="650" y2="176"/>
+<g data-s="1">
+<path class="e sig" d="M47 70H189"/>
+<text class="ts mid" x="118.0" y="64">1. park(vehicle, 09:00)</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M191 95H349"/>
+<text class="ts mid" x="270.0" y="89">2. pop()  F1-M3</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M191 120H509"/>
+<text class="ts mid" x="350.0" y="114">3. occupy(T1)</text>
+</g>
+<g data-s="4">
+<path class="e uses" d="M189 145H47"/>
+<text class="ts mid" x="118.0" y="139">4. ticket T1, spot F1-M3</text>
+</g>
+</g>
+<path class="e none dash" d="M10 192H710"/>
+<text class="tb mono" x="10" y="212">leave("T1", 11:30)</text>
+<g data-scene="leave">
+<text class="tb mid" x="46" y="232">Gate</text>
+<line class="axis" x1="46" y1="240" x2="46" y2="400"/>
+<text class="tb mid" x="190" y="232">ParkingLot</text>
+<line class="axis" x1="190" y1="240" x2="190" y2="400"/>
+<text class="tb mid" x="350" y="232">Free medium spots</text>
+<line class="axis" x1="350" y1="240" x2="350" y2="400"/>
+<text class="tb mid" x="510" y="232">Spot F1-M3</text>
+<line class="axis" x1="510" y1="240" x2="510" y2="400"/>
+<text class="tb mid" x="650" y="232">Pricing</text>
+<line class="axis" x1="650" y1="240" x2="650" y2="400"/>
+<g data-s="1">
+<path class="e sig" d="M47 266H189"/>
+<text class="ts mid" x="118.0" y="260">1. leave("T1", 11:30)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M191 291H649"/>
+<text class="ts mid" x="420.0" y="285">2. ("car", 150)  900</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M191 316H509"/>
+<text class="ts mid" x="350.0" y="310">3. vacate(T1)</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M191 341H349"/>
+<text class="ts mid" x="270.0" y="335">4. push(F1-M3)</text>
+</g>
+<g data-s="5">
+<path class="e uses" d="M189 366H47"/>
+<text class="ts mid" x="118.0" y="360">5. receipt: 900 cents</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="enter" data-label="Entering">
+  <li data-msg="park" data-state="Free medium spots: 6; F1-M3: free">A car reaches the barrier. The gate passes the vehicle and the time to the lot, which first checks that this plate is not already inside.</li>
+  <li data-msg="pop" data-state="Free medium spots: 5; F1-M3: claimed">The lot asks for the nearest free spot of the smallest size a car fits. Popping removes it from the heap, so nothing else can be given it.</li>
+  <li data-msg="occupy" data-state="Free medium spots: 5; F1-M3: held by T1">The spot records which ticket holds it. Had it been taken already, it would have refused.</li>
+  <li data-msg="ticket">The ticket goes back to the gate to be printed. It carries the entry time, which is all the exit will need.</li>
+</ol>
+<ol class="steps" data-scene="leave" data-label="Leaving">
+  <li data-msg="leave" data-state="Free medium spots: 5; F1-M3: held by T1">The driver presents the ticket at the exit. The lot finds it among the open tickets and works out the stay: 150 minutes.</li>
+  <li data-msg="price?">The lot asks the pricing function. Three started hours at 3.00, past the 15 free minutes and under the daily cap: 9.00.</li>
+  <li data-msg="vacate" data-state="Free medium spots: 5; F1-M3: free">The spot lets go, but only for the ticket that holds it.</li>
+  <li data-msg="push" data-state="Free medium spots: 6; F1-M3: free">The spot goes back on the heap, where it is again the nearest free medium spot.</li>
+  <li data-msg="receipt">The ticket is closed and removed, so it cannot be used a second time. The gate takes payment and opens.</li>
+</ol>
+<figcaption>Entry is a claim and exit is a release. A spot is either in a free heap or held by exactly one open ticket, never both and never neither.</figcaption>
+</figure>
+
+<h2 id="gates">Several gates at once</h2>
+<p>The interviewer’s next question is certain: two cars arrive at two gates at the same instant, and one spot is left. The answer depends on where the lot’s state lives, and it is worth giving in two parts.</p>
+<p><b>In one process.</b> <code>ParkingLot.park</code> contains no <code>await</code>. On a single-threaded runtime it runs from its first line to its last without interruption, so the second gate’s call cannot start until the first has taken the spot (<x-ref to="concurrency-in-code#loop"></x-ref>). The danger appears as soon as entering involves waiting, for a ticket printer or a database, and the wait is put in the wrong place.</p>
+<pre data-lang="ts" data-title="An entry gate that waits for a printer, written wrongly and rightly">
+// Two ways to write an entry gate when issuing the ticket involves waiting, for a printer or a database.
+export class Gates {
+  private readonly free: Spot[]; // nearest first
+  private readonly printTicket: () => Promise<void>;
+
+  constructor(free: Spot[], printTicket: () => Promise<void>) {
+    this.free = [...free];
+    this.printTicket = printTicket;
+  }
+
+  // Broken: looks at the nearest free spot, waits, and only then takes it.
+  async enterRacy(): Promise<Spot | null> {
+    const spot = this.free[0];
+    if (!spot) return null;
+    await this.printTicket(); // the other gate runs here and sees the same spot
+    this.free.shift();
+    return spot;
+  }
+
+  // Fixed: takes the spot out of the free list first, and gives it back if printing fails.
+  async enterClaimFirst(): Promise<Spot | null> {
+    const spot = this.free.shift();
+    if (!spot) return null;
+    try {
+      await this.printTicket();
+      return spot;
+    } catch (error) {
+      this.free.unshift(spot);
+      throw error;
+    }
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-gates">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 400" role="img" aria-labelledby="f674t f674d">
+<title id="f674t">Two entry gates and one free spot</title>
+<desc id="f674d">Two sequences between gate A, gate B, the list of free spots, which holds only F1-M7, and a ticket printer. In the first, gate A reads the nearest free spot, F1-M7, and starts printing a ticket. While it waits, gate B reads the list, which still shows F1-M7, and starts printing too. Both gates then remove a spot from the list, and two cars hold tickets for F1-M7. In the second, gate A removes F1-M7 from the list before printing. Gate B finds the list empty and shows that the lot is full.</desc>
+<text class="tb" x="10" y="16">Look, wait, then take</text>
+<g data-scene="racy">
+<text class="tb mid" x="70" y="36">Gate A</text>
+<line class="axis" x1="70" y1="44" x2="70" y2="200"/>
+<text class="tb mid" x="220" y="36">Gate B</text>
+<line class="axis" x1="220" y1="44" x2="220" y2="200"/>
+<text class="tb mid" x="430" y="36">Free spots</text>
+<line class="axis" x1="430" y1="44" x2="430" y2="200"/>
+<text class="tb mid" x="630" y="36">Ticket printer</text>
+<line class="axis" x1="630" y1="44" x2="630" y2="200"/>
+<g data-s="1">
+<path class="e sig" d="M71 70H429"/>
+<text class="ts mid" x="250.0" y="64">1. nearest free?  F1-M7</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M71 95H629"/>
+<text class="ts mid" x="350.0" y="89">2. print, and wait</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M221 120H429"/>
+<text class="ts mid" x="325.0" y="114">3. nearest free?  F1-M7</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M221 145H629"/>
+<text class="ts mid" x="425.0" y="139">4. print, and wait</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M629 170H71"/>
+<text class="ts mid" x="350.0" y="164">5. both printed</text>
+</g>
+</g>
+<path class="e none dash" d="M10 216H710"/>
+<text class="tb" x="10" y="236">Take, then wait</text>
+<g data-scene="claim">
+<text class="tb mid" x="70" y="256">Gate A</text>
+<line class="axis" x1="70" y1="264" x2="70" y2="402"/>
+<text class="tb mid" x="220" y="256">Gate B</text>
+<line class="axis" x1="220" y1="264" x2="220" y2="402"/>
+<text class="tb mid" x="430" y="256">Free spots</text>
+<line class="axis" x1="430" y1="264" x2="430" y2="402"/>
+<text class="tb mid" x="630" y="256">Ticket printer</text>
+<line class="axis" x1="630" y1="264" x2="630" y2="402"/>
+<g data-s="1">
+<path class="e store" d="M71 290H429"/>
+<text class="ts mid" x="250.0" y="284">1. take the nearest  F1-M7</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M71 315H629"/>
+<text class="ts mid" x="350.0" y="309">2. print, and wait</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M221 340H429"/>
+<text class="ts mid" x="325.0" y="334">3. take the nearest  none</text>
+</g>
+<g data-s="4">
+<path class="e uses" d="M429 365H221"/>
+<text class="ts mid" x="325.0" y="359">4. full</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M629 390H71"/>
+<text class="ts mid" x="350.0" y="384">5. printed</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="racy" data-label="Look, wait, take">
+  <li data-msg="nearest?" data-state="Free list: F1-M7; tickets issued for F1-M7: 0">A car arrives at gate A. The gate looks at the front of the free list and sees the last spot.</li>
+  <li data-msg="print">Gate A starts printing a ticket for F1-M7 and waits. The spot is still in the list.</li>
+  <li data-msg="nearest?" data-state="Free list: F1-M7; tickets issued for F1-M7: 0">A car arrives at gate B during that wait. It sees the same list and the same spot.</li>
+  <li data-msg="print">Gate B prints a ticket for F1-M7 as well.</li>
+  <li data-msg="printed" data-state="Free list: empty; tickets issued for F1-M7: 2">Both prints finish, and each gate removes a spot from the list. Two drivers now hold tickets for one space.</li>
+</ol>
+<ol class="steps" data-scene="claim" data-label="Take, then wait">
+  <li data-msg="take" data-state="Free list: empty; tickets issued for F1-M7: 0">Gate A removes the spot from the list as it reads it. From this instant no one else can be offered it.</li>
+  <li data-msg="print">Now gate A waits for the printer. If printing fails, it puts the spot back.</li>
+  <li data-msg="take" data-state="Free list: empty; tickets issued for F1-M7: 0">Gate B looks during the wait and finds nothing to take.</li>
+  <li>Gate B shows “full” and keeps its barrier down.</li>
+  <li data-msg="printed" data-state="Free list: empty; tickets issued for F1-M7: 1">Gate A’s ticket is ready. One spot, one ticket.</li>
+</ol>
+<figcaption>The check “is there a free spot?” and the change “it is now taken” must be one step. Inside one process, that means no waiting in between. Across several machines, it means one database statement.</figcaption>
+</figure>
+
+<p>With one spot left and two gates entering together, the first version gave F1-M7 to both. The second gave it to one and nothing to the other, and when the printer was made to fail, the spot was back in the list for the next car. In a threaded language the same method would hold a lock around the check and the claim, and release it before printing.</p>
+<p><b>With several servers.</b> A real garage has a controller at each gate, or a service running as several copies. No lock in one process protects another, so the claim must be made by the shared database, as a single statement.</p>
+<pre data-lang="ts" data-title="Claiming a spot atomically in SQL">
+// With several servers, or several gate controllers, the claim has to be made by the database.
+export function createTables(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE spots (id TEXT PRIMARY KEY, floor INTEGER NOT NULL, number INTEGER NOT NULL, size TEXT NOT NULL, plate TEXT);
+    CREATE UNIQUE INDEX one_spot_for_each_vehicle ON spots (plate) WHERE plate IS NOT NULL;`);
+}
+
+// One statement finds the nearest free spot of an acceptable size and takes it. No other session can get in between.
+export function claimSpot(db: DatabaseSync, plate: string, sizes: string[]): string | null {
+  const marks = sizes.map(() => "?").join(", ");
+  const row = db.prepare(`
+    UPDATE spots SET plate = ?
+    WHERE id = (SELECT id FROM spots WHERE plate IS NULL AND size IN (${marks}) ORDER BY floor, number LIMIT 1)
+      AND plate IS NULL
+    RETURNING id`).get(plate, ...sizes);
+  return row ? String(row["id"]) : null;
+}
+
+export function releaseSpot(db: DatabaseSync, plate: string): boolean {
+  return db.prepare("UPDATE spots SET plate = NULL WHERE plate = ?").run(plate).changes === 1;
+}
+</pre>
+<p>Run against SQLite with two medium spots and one large, four cars claimed F1-M2, F1-M3 and F1-L4, and the fourth was told there was nothing. A second claim for a car already inside was refused by the unique index, which enforces “one spot for each vehicle” whatever the application code does. The statement works because the database applies an <code>UPDATE</code> as one indivisible change: the row is free when the statement begins or it is not updated (<x-ref to="transactions#atomic-ops"></x-ref>). In PostgreSQL the same idea is usually written by selecting the candidate row <code>FOR UPDATE SKIP LOCKED</code>, so that gates working at the same moment each take a different spot without waiting for each other.</p>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Electric cars need a charging spot</th><td>A spot gains a set of features. The fitting rule becomes “size fits, and the spot has every feature the vehicle requires”</td><td><code>Ticket</code>, pricing</td></tr>
+<tr><th>Rates differ at weekends and on event days</th><td>One more pricing function that chooses a rate table from the entry time, wrapped like the others</td><td><code>ParkingLot</code></td></tr>
+<tr><th>Monthly pass holders do not pay</th><td>A pricing wrapper that returns zero for plates on a list</td><td><code>ParkingLot</code>, <code>Spot</code></td></tr>
+<tr><th>Signs on each floor show free counts live</th><td>The lot announces “spot taken” and “spot freed” events, and signs subscribe (<x-ref to="behavioral-patterns#observer"></x-ref>)</td><td>The allocation logic</td></tr>
+<tr><th>Drivers pay at a machine before returning to the car</th><td>A ticket gains states: open, paid, closed, with a time limit to reach the exit after paying. That is a small state machine (<x-ref to="behavioral-patterns#state"></x-ref>)</td><td><code>Spot</code>, pricing</td></tr>
+<tr><th>A lost ticket</th><td>Look the open ticket up by plate, which the lot already tracks, and apply a pricing rule for lost tickets</td><td>Everything else</td></tr>
+<tr><th>A floor is closed for cleaning</th><td>Now <code>Floor</code> has state, so it becomes a class, and its spots leave the heaps while it is closed</td><td>Tickets, pricing</td></tr>
+<tr><th>A company runs fifty garages</th><td>A lot identifier on every row, and the questions move to the scale of <x-ref to="multi-tenancy"></x-ref></td><td>The model of one lot</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> A workable use of 45 minutes for this problem: five on the questions in the first table. Five on the model, saying aloud that the ticket is the claim and the spot is the resource, and naming the four invariants. Seven on the class diagram and the fitting table. Twelve writing <code>Spot</code>, <code>park</code> and <code>leave</code>, with pricing as one function type. The rest on the two-gate question, where naming the check and the claim as one step is the answer being listened for, and on one extension of the interviewer’s choosing.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Subclasses for every vehicle and every spot size</th><td>Six or nine classes with no behavior, and a rule spread across them</td><td>Kinds as values, and one table of what fits what</td></tr>
+<tr><th>The fee calculation inside <code>ParkingLot</code> or <code>Ticket</code></th><td>Every change of rates edits the core class</td><td>A pricing function passed in</td></tr>
+<tr><th>No ticket: the spot stores the plate and the entry time</th><td>Nothing represents a stay, so history, lost tickets and paying before exit have nowhere to go</td><td>A ticket as the claim, separate from the resource</td></tr>
+<tr><th>A stored count of free spots, changed by hand</th><td>The count drifts from the truth after the first missed update</td><td>Derive it from the structure that holds the free spots</td></tr>
+<tr><th>Reading the clock inside <code>park</code> and <code>leave</code></th><td>A fee for “two and a half hours” cannot be tested without waiting</td><td>Pass the time in</td></tr>
+<tr><th>Finding a free spot, then waiting, then marking it taken</th><td>Two vehicles assigned the same spot</td><td>Claim first. One statement when the state is in a database</td></tr>
+<tr><th>Answering the concurrency question with “add a lock” and nothing more</th><td>No sign of knowing what is being protected, or that a second server ignores the lock</td><td>Name the invariant, the check and the claim, and where they become one step</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="lld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="behavioral-patterns"></x-ref>: strategy, used for pricing, and observer, for the signs.</li>
+  <li><x-ref to="concurrency-in-code"></x-ref>: check-then-act races and why claiming first removes them.</li>
+  <li><x-ref to="transactions"></x-ref>: atomic updates and row locks, the database’s version of the claim.</li>
+  <li><x-ref to="lld-booking"></x-ref>: the same shape with seats, holds that expire and payment in the middle.</li>
+  <li><x-ref to="hld-ticket-booking"></x-ref>: the same invariant at the scale of a whole reservation system.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>The parking lot is a problem of handing out a limited resource. Its central invariant is one vehicle for each spot.</li>
+  <li>Separate the resource from the claim on it: the spot, and the ticket.</li>
+  <li>Kinds of vehicle and sizes of spot are values, and what fits what is a table of data.</li>
+  <li>Pricing is a strategy. Small rules such as a grace period and a daily cap wrap each other as functions.</li>
+  <li>Keep free spots in a structure that hands back the nearest one, and remove a spot from it at the moment it is offered.</li>
+  <li>Pass the time in, so that fees can be tested without a clock.</li>
+  <li>With several gates, checking for a free spot and taking it must be one step: no waiting in between in one process, and one statement in a shared database.</li>
+  <li>Most extensions change one table or add one function. Say which, and say what stays the same.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why is there a <code>Ticket</code> type, when a spot could simply record the plate of the vehicle in it and when it arrived?</summary><p>The ticket represents a stay: one vehicle’s claim on one spot from a moment in time. That is a different thing from the spot, which outlives thousands of stays. With a ticket, the fee is computed from the ticket’s own data, a ticket can be charged exactly once, and later needs such as paying before exit, lost tickets and a history of stays have an object to attach to.</p></details>
+<details><summary>With the pricing in this chapter, what does a car pay for 15 minutes, 16 minutes, 8 hours and 26 hours?</summary><p>Nothing for 15 minutes, which is inside the grace period. 3.00 for 16 minutes: past the grace period, and the first started hour is charged in full. 24.00 for 8 hours, which is eight hours at 3.00 and exactly the daily cap. 30.00 for 26 hours: one full day at the cap, and two hours of the next day.</p></details>
+<details><summary>An interviewer says: “Vans should never be turned away while a car is sitting in a large spot.” What are two ways to change the design?</summary><p>The simplest is to change the fitting table so that cars accept only medium spots. Then large spots are kept for vans, at the cost of turning cars away while large spots stand empty. A middle path is to let cars overflow only while more than some number of large spots remain free. Both are changes to the allocation rule, and neither touches <code>Spot</code>, <code>Ticket</code> or pricing.</p></details>
+<details><summary>Explain exactly how two gates could assign the same spot, and what removes the possibility in a single process.</summary><p>A gate reads the nearest free spot, then waits for something slow such as a printer, and only afterwards marks the spot as taken. During the wait, the other gate reads the same list and sees the same spot as free. The repair is to remove the spot from the free structure in the same uninterrupted step as reading it, before any waiting, and to put it back if the rest of the entry fails.</p></details>
+<details><summary>The garage’s software now runs on three servers behind a load balancer. Why is a lock or the claim-first rule inside <code>ParkingLot</code> no longer enough, and what replaces it?</summary><p>Each server has its own memory, so each has its own lock and its own idea of which spots are free. Two servers can both hand out the same spot. The claim has to move to the store they share: one <code>UPDATE</code> that takes a free spot only if it is still free and returns which one, backed by a uniqueness constraint so that a mistake in the application cannot break the rule.</p></details>
+<details><summary>Why does the design have no <code>Floor</code> class, and what request would make you add one?</summary><p>Within the stated scope a floor has no data or behavior of its own. It is a number on a spot, used for ordering. Adding a class for it would produce an empty container. A request such as “close a floor for cleaning” or “show a count on each floor’s sign” gives the floor state and operations, and then it should become a class.</p></details>
+<details><summary>How would you test that a stay of exactly 24 hours and one of 24 hours and one minute are charged correctly?</summary><p>Call the pricing function directly with 1,440 and 1,441 minutes and compare with the expected fees: 24.00, and 27.00 for one capped day and one started hour of the next. No lot, ticket or clock is needed, because pricing is a pure function of the kind of vehicle and the minutes, and <code>leave</code> receives the current time as an argument.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Gayle Laakmann McDowell, <cite>Cracking the Coding Interview</cite>, 6th edition, CareerCup, 2015. Chapter 7, on object-oriented design, includes the parking lot.</li>
+  <li>Fawaz Bokhari, Desmond Zhou and Alex Xu, <cite>Object Oriented Design Interview: An Insider’s Guide</cite>, ByteByteGo, 2025. Another worked treatment of the same problem.</li>
+  <li>SQLite documentation, <a href="https://www.sqlite.org/lang_returning.html">RETURNING</a> and <a href="https://www.sqlite.org/partialindex.html">Partial Indexes</a>. The two features used by this chapter’s atomic claim.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE">SELECT: The Locking Clause</a>. <code>FOR UPDATE</code> and <code>SKIP LOCKED</code>.</li>
+  <li>Thomas H. Cormen, Charles E. Leiserson, Ronald L. Rivest and Clifford Stein, <cite>Introduction to Algorithms</cite>, 4th edition, MIT Press, 2022. The chapter on heapsort covers binary heaps and priority queues.</li>
+</ol>
+</section>

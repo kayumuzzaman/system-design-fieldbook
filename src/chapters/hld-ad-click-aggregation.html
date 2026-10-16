@@ -1,0 +1,711 @@
+<!--meta
+{ "description": "A high-level design of ad click aggregation: clicks recorded with one append and a redirect, counted per ad and minute of event time in a stream, with the watermark delay measured against clicks that miss their window, repeated clicks removed by id, three orders of a consumer's steps measured through twenty crashes, an hourly batch recount reconciled with the stream, and hot ads flattened by combining at the source.",
+  "lede": "Counting clicks is the easiest program in the world until the counts are money. Then three questions decide the design: when a minute is finished, given that clicks arrive late; which events are the same click, given that phones send them twice; and what a crash does to a count. This chapter answers each with a simulation, and then checks the fast answer against a slow, exact one.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a system that counts clicks on online ads. Each click sends the user on to the advertiser’s page and is recorded. Advertisers see clicks per ad per minute on a dashboard within a minute or so, and are billed for their clicks each day. The billed numbers must be exact: no click lost and none counted twice, although phones send clicks late and more than once, and machines crash.</p></div>
+<p>A counter on one machine is a line of code. The difficulty is in three facts about real events. They arrive out of order and sometimes hours late, so “the clicks of 12:00” is never known to be complete. They arrive more than once, because clients and pipelines retry. And the machines doing the counting crash, so a count must survive being computed twice. A fast answer is needed for dashboards and an exact one for billing, and the design produces both from the same events and compares them. In the terms of <x-ref to="hld-method#shapes"></x-ref>, this is counting a stream.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Record each click and redirect the user</th><td>Yes</td></tr>
+<tr><th>Count clicks per ad per minute, and roll them up by hour, day and campaign</th><td>Yes</td></tr>
+<tr><th>Query counts for an ad or a campaign over a time range; top ads in the last hour</th><td>Yes</td></tr>
+<tr><th>Remove invalid clicks by simple rules</th><td>Yes; detecting fraud with models is a follow-up</td></tr>
+<tr><th>Exact daily numbers for billing</th><td>Yes</td></tr>
+<tr><th>Counting impressions, the times an ad is shown</th><td>The same design at a larger volume: a follow-up</td></tr>
+<tr><th>Attributing purchases to clicks</th><td>No</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>1 billion clicks a day on 2 million active ads; the peak 5 times the average</td></tr>
+<tr><th>Latency</th><td>Recording adds little to the redirect: one write; a minute’s counts appear within about 15 seconds of its end</td></tr>
+<tr><th>Correctness</th><td>Dashboards may be revised for a while; billed counts are exact</td></tr>
+<tr><th>Durability</th><td>No click lost once recorded; raw clicks kept for audits</td></tr>
+<tr><th>Availability</th><td>Recording 99.99%, since a lost click is lost revenue; dashboards 99.9%</td></tr>
+</tbody>
+</table>
+<p>An <dfn>invalid click</dfn> is a click that does not come from a person’s real interest in the ad: an accident, a bot, or someone clicking to run up a competitor’s costs. Advertisers do not pay for them, so the count that is billed is the count after they are removed.</p>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">clicks: 1 billion a day ÷ 86,400 s ≈ 11,600 a second; at the peak, 5 times that ≈ 58,000<br>
+raw clicks: 1 billion × 300 bytes = 300 GB a day; about 110 TB a year before compression<br>
+counts: one row per ad per minute in which it was clicked. If the k-th most popular of 2 million ads draws clicks in proportion to 1/k: about 279 million rows a day; by the hour, 44 million; by the day, 2 million<br>
+ids to remember for removing repeats: 58,000 a second × 600 s = 34.7 million, × 40 bytes ≈ 1.4 GB</div>
+<p>The rate is modest for a partitioned log (<x-ref to="event-streaming#sizing"></x-ref>), and the raw volume is ordinary for object storage. The surprise is the third line. Counting by minute shrinks a billion clicks only to about 279 million rows, because most ads are clicked less often than once a minute, and a row for one click saves nothing. So the store must handle hundreds of millions of rows a day, and queries over long ranges should read the hourly and daily rows. Summing fine-grained counts into coarser ones, minutes into hours and hours into days, is a <dfn>rollup</dfn>. The popularity curve is an assumption; the calculator lets you change it.</p>
+
+<div class="widget" data-widget="clicks97">
+<h4>Clicks, rows and memory</h4>
+<p>How many clicks arrive, how much raw data they make, how many count rows remain after counting by minute, hour and day, and the memory needed to remember recent click ids.</p>
+<div class="controls">
+  <label>Clicks a day, millions<input type="number" name="clicks" value="1000" min="0" max="100000" step="100"></label>
+  <label>Peak, times the average<input type="number" name="peak" value="5" min="1" max="50" step="1"></label>
+  <label>Active ads, millions<input type="number" name="ads" value="2" min="0.001" max="100" step="0.5"></label>
+  <label>Popularity skew (0 = even)<input type="number" name="skew" value="1" min="0" max="2" step="0.1"></label>
+  <label>Bytes per raw click<input type="number" name="raw" value="300" min="10" max="10000" step="50"></label>
+  <label>Remember ids for, minutes<input type="number" name="dedup" value="10" min="0" max="1440" step="5"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 170" role="img" aria-label="Bars on a logarithmic scale comparing clicks a day with the rows left after counting per ad by minute, hour and day."><line x1="190" y1="8" x2="190" y2="140" class="grid"></line><text x="190" y="156" class="ts mid">thousand</text><line x1="300" y1="8" x2="300" y2="140" class="grid"></line><text x="300" y="156" class="ts mid">million</text><line x1="410" y1="8" x2="410" y2="140" class="grid"></line><text x="410" y="156" class="ts mid">billion</text><line x1="520" y1="8" x2="520" y2="140" class="grid"></line><text x="520" y="156" class="ts mid">trillion</text><text x="182" y="26" class="ts end">Clicks a day</text><rect x="190" y="14" width="220" height="16" rx="2" class="bar"></rect><circle cx="410" cy="22" r="5" class="dot"></circle><text x="420" y="26" class="ts tb">1 billion</text><text x="182" y="58" class="ts end">Rows, per ad and minute</text><rect x="190" y="46" width="199.7" height="16" rx="2" class="bar store"></rect><text x="399.7" y="58" class="ts tb">279 million</text><text x="182" y="90" class="ts end">Rows, per ad and hour</text><rect x="190" y="78" width="170.2" height="16" rx="2" class="bar store"></rect><text x="370.2" y="90" class="ts tb">43.9 million</text><text x="182" y="122" class="ts end">Rows, per ad and day</text><rect x="190" y="110" width="121" height="16" rx="2" class="bar store"></rect><text x="321" y="122" class="ts tb">2 million</text></svg>
+<dl class="results">
+  <div><dt>Average</dt><dd data-out="avg">11.6 thousand a second</dd></div>
+  <div><dt>Peak</dt><dd data-out="peakrate">57.9 thousand a second</dd></div>
+  <div><dt>Raw clicks a day</dt><dd data-out="rawday">300 GB</dd></div>
+  <div><dt>Rows a day, by minute</dt><dd data-out="minute">279 million</dd></div>
+  <div><dt>By hour</dt><dd data-out="hour">43.9 million</dd></div>
+  <div><dt>By day</dt><dd data-out="day">2 million</dd></div>
+  <div><dt>Ids remembered at the peak</dt><dd data-out="ids">34.7 million, 1.39 GB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">1 billion clicks a day become about 279 million rows counted per ad and minute: 3.6 clicks per row on average, because most ads are clicked less than once a minute. Rolling up to hours leaves 43.9 million rows. Remembering ids for 10 minutes at the peak takes about 1.39 GB across the aggregators.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="The click, and the counts">
+GET /c?ad=7&amp;cid=c-91&amp;sig=9f2c…
+302 Found      Location: https://advertiser.example/spring-sale
+
+GET /v1/ads/7/clicks?from=2026-10-13T12:00Z&amp;to=2026-10-13T13:00Z&amp;step=minute
+200 OK
+{ "ad": 7, "step": "minute", "final_through": "2026-10-13T11:00Z",
+  "points": [["12:00", 412, "provisional"], ["12:01", 398, "provisional"], …] }
+
+GET /v1/campaigns/c-3/top-ads?last=1h&amp;limit=10
+</pre>
+<p>The click id is created when the ad is shown and signed by the ad server, so the click server can check it was not invented, and a phone that sends the same click again sends the same id (<x-ref to="idempotency-and-delivery#keys"></x-ref>). The query answer says which points are still provisional: counts for recent minutes can be revised, and only minutes up to <code>final_through</code> have been checked against the exact recount.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Where</th></tr></thead>
+<tbody>
+<tr><th>Click</th><td>click id</td><td>Ad, campaign, when it happened, when it arrived, device and network details</td><td>The event log for a week, partitioned by ad (<x-ref to="event-streaming#partitions"></x-ref>); then files in object storage, one folder per hour</td></tr>
+<tr><th>Minute counts</th><td>ad, minute</td><td>Clicks, a version, provisional or final</td><td>A column-oriented analytics store (<x-ref to="storage-engines#column"></x-ref>)</td></tr>
+<tr><th>Rollups</th><td>ad or campaign, hour or day</td><td>Clicks</td><td>The same store</td></tr>
+<tr><th>Recent ids</th><td>click id</td><td>When it arrived</td><td>The aggregator’s state, partitioned like the log; kept 10 minutes</td></tr>
+<tr><th>Open windows</th><td>ad, minute</td><td>The running count</td><td>The aggregator’s state; kept 2 hours for corrections</td></tr>
+<tr><th>Billed totals</th><td>advertiser, ad, day</td><td>Reconciled clicks</td><td>A relational database, with the invoices</td></tr>
+</tbody>
+</table>
+<p>Every count is derived. The raw clicks are the truth, kept long enough that any count can be computed again from them, which is what makes the rest of the design safe to get slightly wrong for a while.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 320" role="img" aria-labelledby="f971t f971d">
+<title id="f971t">Ad click aggregation: a fast streaming path and an exact batch path</title>
+<desc id="f971d">Users click ads. Click servers record each click to an event log, partitioned by ad, and redirect the user to the advertiser’s page. A stream aggregator reads the log, removes repeated click ids, counts clicks per ad per minute of event time, and writes the counts to a results store, which a query service reads for advertisers’ dashboards. Another consumer copies every raw click to an archive in object storage. Every hour a batch job recounts the archive exactly, and a reconciliation job compares its counts with the stream’s; billing uses the reconciled numbers.</desc>
+<rect class="n" x="10" y="40" width="80" height="50" rx="6"/>
+<text class="tb mid" x="50" y="69.5">Users</text>
+<rect class="n sig" x="124" y="40" width="130" height="50" rx="6"/>
+<text class="tb mid" x="189" y="61">Click servers</text>
+<text class="ts mid" x="189" y="78">record, redirect</text>
+<rect class="n async" x="290" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="61">Event log</text>
+<text class="ts mid" x="350" y="78">partitioned by ad</text>
+<rect class="n async" x="446" y="40" width="136" height="50" rx="6"/>
+<text class="tb mid" x="514" y="61">Stream aggregator</text>
+<text class="ts mid" x="514" y="78">dedup, windows</text>
+<rect class="n store" x="616" y="40" width="98" height="50" rx="6"/>
+<text class="tb mid" x="665" y="61">Results</text>
+<text class="ts mid" x="665" y="78">per ad, minute</text>
+<rect class="n store" x="290" y="146" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="167">Raw archive</text>
+<text class="ts mid" x="350" y="184">object storage</text>
+<rect class="n async" x="446" y="146" width="136" height="50" rx="6"/>
+<text class="tb mid" x="514" y="167">Batch recount</text>
+<text class="ts mid" x="514" y="184">hourly, exact</text>
+<rect class="n sig" x="616" y="146" width="98" height="50" rx="6"/>
+<text class="tb mid" x="665" y="175.5">Query service</text>
+<rect class="n async" x="446" y="252" width="136" height="50" rx="6"/>
+<text class="tb mid" x="514" y="273">Reconciliation</text>
+<text class="ts mid" x="514" y="290">stream vs batch</text>
+<rect class="n store" x="290" y="252" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="273">Billing</text>
+<text class="ts mid" x="350" y="290">reconciled</text>
+<rect class="n" x="616" y="252" width="98" height="50" rx="6"/>
+<text class="tb mid" x="665" y="273">Advertisers</text>
+<text class="ts mid" x="665" y="290">dashboards</text>
+<path class="e sig both" d="M90 65H124"/>
+<path class="e async" d="M254 65H290"/>
+<path class="e async" d="M410 65H446"/>
+<path class="e async" d="M582 65H616"/>
+<path class="e async" d="M350 90V146"/>
+<text class="ts" x="356" y="122">copy all</text>
+<path class="e async" d="M410 171H446"/>
+<path class="e async" d="M514 196V252"/>
+<text class="ts end" x="508" y="228">exact counts</text>
+<path class="e sig" d="M665 90V146"/>
+<path class="e sig both" d="M665 196V252"/>
+<path class="e async" d="M616 80H600V277H582"/>
+<text class="ts end" x="594" y="228">stream counts</text>
+<path class="e async" d="M446 277H410"/>
+<text class="ts" x="10" y="128">Solid: a user waits.</text>
+<text class="ts" x="10" y="146">Dashed: everything else,</text>
+<text class="ts" x="10" y="162">later and replayable.</text>
+<text class="ts" x="10" y="200">The redirect never waits</text>
+<text class="ts" x="10" y="216">for counting.</text>
+</svg>
+</div>
+<figcaption>The user’s click waits only for one append to the log. Counting happens twice from the same events: quickly in the stream, exactly in the batch, and the two are compared.</figcaption>
+</figure>
+
+<p>The click servers do as little as possible: check the signature, append one record to the log and redirect. The <b>stream aggregator</b> reads the log, removes repeated ids, counts by ad and minute of event time, and writes counts to the results store as each minute closes. A second consumer copies raw clicks to the archive. Every hour a <b>batch recount</b> reads the archive and counts again, exactly and without time pressure, and <b>reconciliation</b> compares the two. This is the lambda pattern (<x-ref to="batch-and-stream-processing#architectures"></x-ref>) kept for one reason: money.</p>
+
+<figure class="fig wide" id="fig-click-path">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f972t f972d">
+<title id="f972t">One click, from the user to a count in the results store</title>
+<desc id="f972d">A user clicks an ad. The click server appends the click, with its id, ad and time, to the event log, waits for the log to acknowledge it, and redirects the user to the advertiser’s page. The aggregator reads the click from the log, checks that its id is new and adds it to the count for its ad and minute. When the watermark passes the end of the minute, it writes the count to the results store, and it saves a checkpoint of its offset and state.</desc>
+<text class="tb mid" x="50" y="20">User</text>
+<line class="axis" x1="50" y1="28" x2="50" y2="294"/>
+<text class="tb mid" x="190" y="20">Click server</text>
+<line class="axis" x1="190" y1="28" x2="190" y2="294"/>
+<text class="tb mid" x="340" y="20">Event log</text>
+<line class="axis" x1="340" y1="28" x2="340" y2="294"/>
+<text class="tb mid" x="490" y="20">Aggregator</text>
+<line class="axis" x1="490" y1="28" x2="490" y2="294"/>
+<text class="tb mid" x="645" y="20">Results store</text>
+<line class="axis" x1="645" y1="28" x2="645" y2="294"/>
+<g data-s="1">
+<path class="e sig" d="M51 58H189"/>
+<text class="ts mid" x="120.0" y="52">1. click ad 7</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M191 86H339"/>
+<text class="ts mid" x="265.0" y="80">2. append c-91, ad 7</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M339 114H191"/>
+<text class="ts mid" x="265.0" y="108">3. stored at 1,042</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M189 142H51"/>
+<text class="ts mid" x="120.0" y="136">4. 302 to the landing page</text>
+</g>
+<g data-s="5">
+<path class="e async" d="M341 170H489"/>
+<text class="ts mid" x="415.0" y="164">5. records from 1,042</text>
+</g>
+<g data-s="6" data-packet="none">
+<rect class="n async" x="413.9" y="184" width="152.2" height="22" rx="4"/>
+<text class="ts mid" x="490" y="199">6. id is new: count it</text>
+</g>
+<g data-s="7" data-packet="none">
+<rect class="n async" x="416.95" y="212" width="146.1" height="22" rx="4"/>
+<text class="ts mid" x="490" y="227">7. watermark 12:01:00</text>
+</g>
+<g data-s="8">
+<path class="e store" d="M491 254H644"/>
+<text class="ts mid" x="567.5" y="248">8. ad 7, 12:00 = 3</text>
+</g>
+<g data-s="9" data-packet="none">
+<rect class="n store" x="423.05" y="268" width="133.9" height="22" rx="4"/>
+<text class="ts mid" x="490" y="283">9. checkpoint 1,042</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Log: offset 1,041; Window 12:00 for ad 7: 2">The user clicks. The link carries the ad and a click id made when the ad was shown, so a repeated request has the same id.</li>
+  <li>The click server appends one record to the partition for ad 7. This is the only work the user waits for.</li>
+  <li data-state="Log: offset 1,042; Window 12:00 for ad 7: 2">The log acknowledges once the record is on its replicas. From here the click cannot be lost.</li>
+  <li>The user is sent on to the advertiser’s page. Counting has not started, and does not need to.</li>
+  <li>The aggregator reads the partition in order, a batch at a time.</li>
+  <li data-msg="none" data-state="Log: offset 1,042; Window 12:00 for ad 7: 3">Click id c-91 has not been seen in the last 10 minutes, so it counts toward ad 7 in the minute it happened.</li>
+  <li data-msg="none">Clicks from later than 12:01:10 have arrived, so the aggregator assumes 12:00 is complete enough to report.</li>
+  <li>It writes the count for the minute as a total, not an increment, so writing it twice does no harm.</li>
+  <li data-msg="none" data-state="Log: offset 1,042; Window 12:00 for ad 7: 3, reported">It saves its read position and its counts together. After a crash it resumes from exactly this point.</li>
+</ol>
+<figcaption>The click waits for one durable append. Everything after that is work the aggregator can repeat from the log, which is what makes exact counting possible.</figcaption>
+</figure>
+
+<p>The simulation behind the deep dives generates 600,000 clicks over two hours on 20,000 ads, with the most popular ad drawing 9.6% of them. Its delays are assumptions meant to resemble a mobile ad network: 95% of clicks arrive within about a second, 4.5% within a minute, as apps send in batches, and 0.5% between a minute and two hours late, from phones that were offline. Two percent of clicks are sent a second time, most within seconds and one in ten when the app is next opened, up to six hours later. That added 12,209 copies.</p>
+
+<h2 id="windows">Step 6a: When is a minute finished?</h2>
+<p>Clicks are counted in the minute they happened, which needs the event time and the windows and watermarks of <x-ref to="batch-and-stream-processing#watermarks"></x-ref>. That chapter explains the mechanism; here is what it does to one ad’s count.</p>
+
+<figure class="fig wide" id="fig-windows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 268" role="img" aria-labelledby="f973t f973d">
+<title id="f973t">A watermark closing a window, a repeated click and a late one</title>
+<desc id="f973d">Seven arrivals for one ad, drawn at the time each click happened. Window 12:00 covers seconds 0 to 60 and window 12:01 the next minute; the watermark trails the newest click time by 10 seconds. Clicks 1, 2 and 3 count in 12:00; clicks 4 and 5 in 12:01. When click 5 moves the watermark to 12:01:02, window 12:00 closes and reports 3. A repeat of click 2 is recognized by its id and removed. Click 6, which happened at 12:00:30 but arrived 65 seconds later, is still accepted because closed windows are kept for corrections, and 12:00 is revised to 4. These are the results of the chapter’s aggregator.</desc>
+<rect class="n sunk" x="70.0" y="34" width="336.0" height="166" rx="0"/>
+<text class="ts mid tb" x="238.0" y="28">window 12:00</text>
+<text class="ts mid tb" x="518.0" y="28">window 12:01</text>
+<line class="axis" x1="70.0" y1="200" x2="630.0" y2="200"/>
+<line class="axis" x1="70.0" y1="200" x2="70.0" y2="205"/>
+<text class="ts mid" x="70.0" y="218">12:00:00</text>
+<line class="axis" x1="182.0" y1="200" x2="182.0" y2="205"/>
+<text class="ts mid" x="182.0" y="218">12:00:20</text>
+<line class="axis" x1="294.0" y1="200" x2="294.0" y2="205"/>
+<text class="ts mid" x="294.0" y="218">12:00:40</text>
+<line class="axis" x1="406.0" y1="200" x2="406.0" y2="205"/>
+<text class="ts mid" x="406.0" y="218">12:01:00</text>
+<line class="axis" x1="518.0" y1="200" x2="518.0" y2="205"/>
+<text class="ts mid" x="518.0" y="218">12:01:20</text>
+<line class="axis" x1="630.0" y1="200" x2="630.0" y2="205"/>
+<text class="ts mid" x="630.0" y="218">12:01:40</text>
+<text class="ts end" x="630.0" y="192">time the click happened</text>
+<text class="ts" x="10" y="30">arrived at</text>
+<g data-s="1">
+<text class="ts" x="10" y="58">5.4 s</text>
+<circle class="fill-sig" cx="98.0" cy="54" r="5"/>
+<text class="ts" x="110.0" y="58">#1</text>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="79">40.3 s</text>
+<circle class="fill-sig" cx="294.0" cy="75" r="5"/>
+<text class="ts" x="306.0" y="79">#2</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="100">63 s</text>
+<circle class="fill-sig" cx="394.8" cy="96" r="5"/>
+<text class="ts end" x="382.79999999999995" y="100">#3</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="121">66.2 s</text>
+<circle class="fill-sig" cx="439.6" cy="117" r="5"/>
+<text class="ts" x="451.59999999999997" y="121">#4</text>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="142">72.3 s</text>
+<circle class="fill-sig" cx="473.2" cy="138" r="5"/>
+<text class="ts" x="485.2" y="142">#5</text>
+</g>
+<g data-s="6">
+<text class="ts" x="10" y="163">80 s</text>
+<path class="x" d="M289.0 154l10 10M299.0 154l-10 10"/>
+<text class="ts" x="306.0" y="163">#2 again: same id, removed</text>
+</g>
+<g data-s="7">
+<text class="ts" x="10" y="184">95 s</text>
+<circle class="fill-store" cx="238.0" cy="180" r="5"/>
+<text class="ts" x="250.0" y="184">#6: late, count revised</text>
+</g>
+<g class="hide" data-s="1" data-e="1">
+<text class="ts tb" x="10" y="246">Watermark: 11:59:55</text>
+<text class="ts" x="190" y="246">12:00: 1   12:01: 0</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<path class="e none dash" d="M238.0 34V200"/>
+<text class="ts tb" x="10" y="246">Watermark: 12:00:30</text>
+<text class="ts" x="190" y="246">12:00: 2   12:01: 0</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<path class="e none dash" d="M338.8 34V200"/>
+<text class="ts tb" x="10" y="246">Watermark: 12:00:48</text>
+<text class="ts" x="190" y="246">12:00: 3   12:01: 0</text>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<path class="e none dash" d="M383.6 34V200"/>
+<text class="ts tb" x="10" y="246">Watermark: 12:00:56</text>
+<text class="ts" x="190" y="246">12:00: 3   12:01: 1</text>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<path class="e none dash" d="M417.2 34V200"/>
+<text class="ts tb" x="10" y="246">Watermark: 12:01:02</text>
+<text class="ts" x="190" y="246">12:00: 3 (closed)   12:01: 2</text>
+<text class="ts tb" x="430" y="246">12:00 reported: 3</text>
+</g>
+<g class="hide" data-s="6" data-e="6">
+<path class="e none dash" d="M417.2 34V200"/>
+<text class="ts tb" x="10" y="246">Watermark: 12:01:02</text>
+<text class="ts" x="190" y="246">12:00: 3 (closed)   12:01: 2</text>
+<text class="ts tb" x="430" y="246">12:00 reported: 3</text>
+</g>
+<g class="hide" data-s="7">
+<path class="e none dash" d="M417.2 34V200"/>
+<text class="ts tb" x="10" y="246">Watermark: 12:01:02</text>
+<text class="ts" x="190" y="246">12:00: 4 (closed)   12:01: 2</text>
+<text class="ts tb" x="430" y="246">12:00 revised: 4</text>
+</g>
+<text class="ts" x="10" y="264">Dashed line: the watermark, 10 seconds behind the newest click time seen.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Watermark: 11:59:55; 12:00: 1; 12:01: 0">Click 1 happened at 12:00:05 and arrives at once. It counts in window 12:00.</li>
+  <li data-msg="none" data-state="Watermark: 12:00:30; 12:00: 2; 12:01: 0">Click 2 counts in 12:00 too. The watermark follows the newest click time, 10 seconds behind.</li>
+  <li data-msg="none" data-state="Watermark: 12:00:48; 12:00: 3; 12:01: 0">Click 3 happened at 12:00:58 but arrives five seconds later, after the minute ended. The window is still open, so it counts.</li>
+  <li data-msg="none" data-state="Watermark: 12:00:56; 12:00: 3; 12:01: 1">Click 4 belongs to 12:01. The watermark is at 12:00:56: 12:00 might still receive clicks, so it stays open.</li>
+  <li data-msg="none" data-state="Watermark: 12:01:02; 12:00: 3; 12:01: 2">Click 5 moves the watermark past 12:01:00. Window 12:00 closes and its first result, 3, is written.</li>
+  <li data-msg="none" data-state="Watermark: 12:01:02; 12:00: 3; 12:01: 2">A second copy of click 2 arrives, sent again by a retrying phone. Its id has been seen, so it is removed.</li>
+  <li data-msg="none" data-state="Watermark: 12:01:02; 12:00: 4; 12:01: 2">Click 6 happened at 12:00:30 and arrives 65 seconds late. The closed window is kept for corrections, so 12:00 is revised to 4.</li>
+</ol>
+<figcaption>Counts belong to the minute a click happened, not the minute it arrived. The watermark decides when to report, ids remove repeats, and kept windows absorb late clicks as corrections.</figcaption>
+</figure>
+
+<p>The watermark delay is a dial between speed and completeness, and the simulation measured it. With the first result written the instant a minute ended, 3.72% of clicks arrived after their window had closed. Waiting 10 seconds left 2.25% late, and a minute 0.69%. After that the curve is almost flat: waiting ten minutes still left 0.60%.</p>
+
+<figure class="fig wide" id="fig-watermark">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f974t f974d">
+<title id="f974t">How long to wait before reporting, and how many clicks miss their window</title>
+<desc id="f974d">For each watermark delay, the share of 600,000 simulated clicks that arrived after their window had closed and would be dropped without corrections: 0 s, 3.72 percent; 1 s, 3.07 percent; 5 s, 2.59 percent; 10 s, 2.25 percent; 30 s, 1.25 percent; 60 s, 0.69 percent; 120 s, 0.68 percent; 300 s, 0.65 percent; 600 s, 0.60 percent. The first result for each window appears that many seconds after the minute ends.</desc>
+<text class="tb" x="10" y="18">Clicks that arrive after their window closed, % of all, by how far the watermark trails</text>
+<line class="grid" x1="70" y1="220.0" x2="700" y2="220.0"/>
+<text class="ts end" x="62" y="224.0">0%</text>
+<line class="grid" x1="70" y1="175.0" x2="700" y2="175.0"/>
+<text class="ts end" x="62" y="179.0">1%</text>
+<line class="grid" x1="70" y1="130.0" x2="700" y2="130.0"/>
+<text class="ts end" x="62" y="134.0">2%</text>
+<line class="grid" x1="70" y1="85.0" x2="700" y2="85.0"/>
+<text class="ts end" x="62" y="89.0">3%</text>
+<line class="grid" x1="70" y1="40.0" x2="700" y2="40.0"/>
+<text class="ts end" x="62" y="44.0">4%</text>
+<path class="line" d="M100.0 52.5 L171.2 81.9 L242.5 103.6 L313.8 118.9 L385.0 163.7 L456.2 189.1 L527.5 189.6 L598.8 190.9 L670.0 192.9"/>
+<circle class="dot" cx="100.0" cy="52.5" r="4"/>
+<text class="ts mid" x="100.0" y="238">0 s</text>
+<text class="ts tb" x="106.0" y="42.5">3.72%</text>
+<circle class="dot" cx="171.2" cy="81.9" r="4"/>
+<text class="ts mid" x="171.2" y="238">1 s</text>
+<circle class="dot" cx="242.5" cy="103.6" r="4"/>
+<text class="ts mid" x="242.5" y="238">5 s</text>
+<circle class="dot" cx="313.8" cy="118.9" r="4"/>
+<text class="ts mid" x="313.8" y="238">10 s</text>
+<text class="ts tb" x="319.8" y="108.9">2.25%</text>
+<circle class="dot" cx="385.0" cy="163.7" r="4"/>
+<text class="ts mid" x="385.0" y="238">30 s</text>
+<circle class="dot" cx="456.2" cy="189.1" r="4"/>
+<text class="ts mid" x="456.2" y="238">1 min</text>
+<text class="ts tb" x="462.2" y="179.1">0.69%</text>
+<circle class="dot" cx="527.5" cy="189.6" r="4"/>
+<text class="ts mid" x="527.5" y="238">2 min</text>
+<circle class="dot" cx="598.8" cy="190.9" r="4"/>
+<text class="ts mid" x="598.8" y="238">5 min</text>
+<circle class="dot" cx="670.0" cy="192.9" r="4"/>
+<text class="ts mid" x="670.0" y="238">10 min</text>
+<text class="ts tb" x="676.0" y="182.9">0.60%</text>
+<text class="ts mid" x="385.0" y="258">watermark delay: the first result for a minute appears this long after the minute ends</text>
+<text class="ts" x="456.25" y="148.0">phones that were offline: no</text>
+<text class="ts" x="456.25" y="164.0">reasonable wait catches them</text>
+<rect class="hit" x="70" y="30" width="60" height="210" data-tip="Watermark 0 s behind|22,330 of 600,000 clicks late (3.72%)|first results a median 0.1 s after the minute ends"/>
+<rect class="hit" x="141.25" y="30" width="60" height="210" data-tip="Watermark 1 s behind|18,412 of 600,000 clicks late (3.07%)|first results a median 1.2 s after the minute ends"/>
+<rect class="hit" x="212.5" y="30" width="60" height="210" data-tip="Watermark 5 s behind|15,522 of 600,000 clicks late (2.59%)|first results a median 5.2 s after the minute ends"/>
+<rect class="hit" x="283.75" y="30" width="60" height="210" data-tip="Watermark 10 s behind|13,484 of 600,000 clicks late (2.25%)|first results a median 10.1 s after the minute ends"/>
+<rect class="hit" x="355" y="30" width="60" height="210" data-tip="Watermark 30 s behind|7,502 of 600,000 clicks late (1.25%)|first results a median 30.1 s after the minute ends"/>
+<rect class="hit" x="426.25" y="30" width="60" height="210" data-tip="Watermark 1 min behind|4,120 of 600,000 clicks late (0.69%)|first results a median 60.2 s after the minute ends"/>
+<rect class="hit" x="497.5" y="30" width="60" height="210" data-tip="Watermark 2 min behind|4,059 of 600,000 clicks late (0.68%)|first results a median 120.2 s after the minute ends"/>
+<rect class="hit" x="568.75" y="30" width="60" height="210" data-tip="Watermark 5 min behind|3,885 of 600,000 clicks late (0.65%)|first results a median 300.2 s after the minute ends"/>
+<rect class="hit" x="640" y="30" width="60" height="210" data-tip="Watermark 10 min behind|3,612 of 600,000 clicks late (0.60%)|first results a median 600.2 s after the minute ends"/>
+</svg>
+</div>
+<figcaption>Measured on the simulated clicks. Waiting a few seconds catches most stragglers; after a minute the curve is flat, because the rest come hours late and need corrections or the batch.</figcaption>
+</figure>
+
+<p>The flat part is the offline phones. No reasonable wait catches a click that arrives two hours late, and every second of waiting delays every count on every dashboard. So the design separates the two: a short watermark, 10 seconds, for the first result, and a long <dfn>allowed lateness</dfn>, the time a stream processor keeps a closed window’s state so that a late event can still update it, of 2 hours. With that setting, no click in the simulation was dropped: 235,254 first results were followed by 13,484 corrections, one for each late click. The results store therefore receives counts as totals that replace earlier ones, never as increments, and the dashboard labels recent minutes provisional. Flink, for one, drops late events by default: its allowed lateness is zero unless set.</p>
+
+<h2 id="duplicates">Step 6b: The same click twice</h2>
+<p>Copies come from phones that retry, from click servers that resend after a timeout, and from the log itself, which delivers at least once (<x-ref to="idempotency-and-delivery#consumers"></x-ref>). Because every copy carries the click id made when the ad was shown, the aggregator can remove them by remembering the ids it has seen. The question is for how long, since every remembered id costs memory.</p>
+<table>
+<thead><tr><th>Ids remembered for</th><th>Ids held at most</th><th>Clicks counted twice</th></tr></thead>
+<tbody>
+<tr><th>Not at all</th><td>0</td><td>12,209</td></tr>
+<tr><th>1 minute</th><td>5,214</td><td>1,793</td></tr>
+<tr><th>10 minutes</th><td>50,346</td><td>1,234</td></tr>
+<tr><th>1 hour</th><td>300,135</td><td>1,061</td></tr>
+<tr><th>7 hours</th><td>600,000, every click</td><td>0</td></tr>
+</tbody>
+</table>
+<p>Ten minutes removes nine copies in ten for a fraction of the memory. The rest arrive hours later and are left to the batch recount, which can afford to compare every id of the day. A Bloom filter would hold far more ids in the same memory, but its false positives would discard real clicks as repeats (<x-ref to="probabilistic-structures#bloom"></x-ref>): acceptable for a trending list, not for an invoice.</p>
+<p>Removing repeats only works if all copies of a click reach the same aggregator. The log is partitioned by ad and the click id carries its ad, so they do.</p>
+
+<h2 id="exactly-once">Step 6c: Counting exactly through crashes</h2>
+<p>An aggregator does three things with each batch it reads: it counts, it writes the counts to the store, and it records the offset it has read up to (<x-ref to="event-streaming#offsets"></x-ref>). It can crash between any two. The simulation ran the same 600,000 clicks through a consumer that crashed 20 times at random points, with the three steps in different orders.</p>
+
+<figure class="fig wide" id="fig-crashes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-labelledby="f975t f975d">
+<title id="f975t">Twenty crashes, three orders of the same steps</title>
+<desc id="f975d">The same 600,000 clicks counted by a consumer that crashes 20 times, in batches of 500. Record the offset, then count: 590,000 counted, −10,000 against the truth, 6,098 counts wrong; Count and write, then record: 604,500 counted, +4,500 against the truth, 2,797 counts wrong; Totals with versions, checkpoints: 600,000 counted, +0 against the truth, 0 counts wrong.</desc>
+<text class="tb" x="10" y="18">Clicks counted minus clicks that happened, after 20 crashes</text>
+<line class="axis" x1="470" y1="30" x2="470" y2="150"/>
+<text class="ts tb" x="10" y="55">Record the offset, then count</text>
+<rect class="bar fault" x="310.0" y="42" width="160.0" height="18" rx="2"/>
+<text class="ts tb end" x="302.0" y="55">−10,000</text>
+<text class="ts" x="10" y="71">at most once: a crash after recording loses the batch</text>
+<text class="ts tb" x="10" y="93">Count and write, then record</text>
+<rect class="bar fault" x="470.0" y="80" width="72.0" height="18" rx="2"/>
+<text class="ts tb " x="550.0" y="93">+4,500</text>
+<text class="ts" x="10" y="109">at least once: a crash before recording counts it twice</text>
+<text class="ts tb" x="10" y="131">Totals with versions, checkpoints</text>
+<circle class="fill-store" cx="470" cy="127" r="5"/>
+<text class="ts tb" x="482" y="131">0: exact</text>
+<text class="ts" x="10" y="147">exactly once in effect: replays rewrite the same totals</text>
+<text class="ts" x="10" y="186">The first two also left 6,098 and 2,797 of the minute counts wrong. The third left none.</text>
+<rect class="hit" x="10" y="38" width="700" height="36" data-tip="Record the offset, then count|counted 590,000 of 600,000|6,098 (ad, minute) counts wrong"/>
+<rect class="hit" x="10" y="76" width="700" height="36" data-tip="Count and write, then record|counted 604,500 of 600,000|2,797 (ad, minute) counts wrong"/>
+<rect class="hit" x="10" y="114" width="700" height="36" data-tip="Totals with versions, checkpoints|counted 600,000 of 600,000|0 (ad, minute) counts wrong"/>
+</svg>
+</div>
+<figcaption>Measured: the same consumer and the same crashes. Only the order of its steps, and whether it writes totals or increments, decides between losing clicks, counting some twice and counting exactly.</figcaption>
+</figure>
+
+<ul>
+  <li><b>Record the offset first.</b> A crash after recording loses the batch: 10,000 clicks never counted.</li>
+  <li><b>Write increments, then record the offset.</b> A crash after writing replays the batch, and its increments are added again: 4,500 clicks counted twice.</li>
+  <li><b>Write totals with a version, and save the offset and the counts together.</b> After a crash the aggregator restores both from its last checkpoint (<x-ref to="batch-and-stream-processing#state"></x-ref>) and reads again from that offset. It produces exactly the same totals as before, and the store ignores a total whose version it already has. All 600,000 were counted once.</li>
+</ul>
+<p>No step happened only once in the third case: batches were read, counted and written more than once. What holds is that each click affects the result once, which is what “exactly once” means in practice (<x-ref to="idempotency-and-delivery#exactly-once-systems"></x-ref>). Stream processors offer it as a checkpoint plus an output that is either transactional, written only when the checkpoint completes, or idempotent, as the versioned totals are here.</p>
+
+<h2 id="reconciliation">Step 6d: Checking the stream against a recount</h2>
+<p>The stream’s counts are fast and nearly right. The batch recount is slow and right: it runs after the hour is over, so nothing is late, and it can remove every repeat of the day. Reconciliation compares them count by count (<x-ref to="distributed-transactions#reconciliation"></x-ref>).</p>
+<p>For the two simulated hours, with a 10-second watermark, 2 hours of allowed lateness and ids remembered for 10 minutes, the stream matched the recount in 237,778 of 238,921 ad-and-minute counts. None was too low. The other 1,143 were too high by 1,234 clicks in total, and the test checks that this is exactly the number of copies that arrived 10 minutes or more after the first copy of their click. A reconciliation that cannot explain its differences is a fire alarm; one that explains every one of them is how the team knows the stream is correct. With ids remembered for 7 hours, every count matched.</p>
+<p>What the business does with the difference is a policy. Here the batch is the referee: billed totals come from the recount, dashboards show the stream until the hour is final, and the store marks reconciled minutes as final. The batch also applies the slower checks for invalid clicks that need a whole day of a device’s or a network’s activity.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>The event log, briefly</th><td>Nothing: the redirect still happens</td><td>Click servers keep clicks on local disk and send them when the log returns; they arrive late and are counted as corrections</td></tr>
+<tr><th>An aggregator</th><td>Dashboards pause for seconds</td><td>Another restores the checkpoint and replays from its offset; versioned totals make the replay harmless</td></tr>
+<tr><th>The results store</th><td>Dashboards unavailable</td><td>Counting continues; results wait in the aggregator’s output, or are recomputed from the log</td></tr>
+<tr><th>A bug that miscounted for a day</th><td>Wrong dashboards, then a correction</td><td>Fix, then recount from the archive; the log and the raw files are the truth</td></tr>
+<tr><th>Clicks from a botnet</th><td>An advertiser’s spend jumps</td><td>Rules in the stream catch the obvious; the batch removes more, and billing credits the rest</td></tr>
+<tr><th>One ad goes viral</th><td>Its partition falls behind</td><td>Combining at the click servers, below</td></tr>
+</tbody>
+</table>
+<p>Partitioning by ad sends all of one ad’s clicks to one partition. That keeps its copies together, and it also makes the popular ad a hot key (<x-ref to="partitioning#hot-keys"></x-ref>).</p>
+
+<figure class="fig wide" id="fig-hot">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f976t f976d">
+<title id="f976t">One popular ad loads one partition</title>
+<desc id="f976d">Messages on each of 32 partitions in 20 seconds at 11,574 clicks a second over 2 million ads with skewed popularity. Keyed by ad: the busiest partition takes 9.0 percent against an average of 3.1 percent, 231,480 messages in all. Combined first at each of 50 click servers into one message per ad per second: the busiest takes 3.4 percent, 186,872 messages.</desc>
+<text class="tb" x="12" y="18">Keyed by ad</text>
+<line class="grid" x1="40" y1="200.0" x2="352" y2="200.0"/>
+<text class="ts end" x="34" y="204.0">0%</text>
+<line class="grid" x1="40" y1="125.0" x2="352" y2="125.0"/>
+<text class="ts end" x="34" y="129.0">5%</text>
+<line class="grid" x1="40" y1="50.0" x2="352" y2="50.0"/>
+<text class="ts end" x="34" y="54.0">10%</text>
+<rect class="bar fault" x="44.0" y="65.4" width="7" height="134.6" rx="1"/>
+<rect class="bar" x="53.6" y="161.0" width="7" height="39.0" rx="1"/>
+<rect class="bar" x="63.2" y="150.7" width="7" height="49.3" rx="1"/>
+<rect class="bar" x="72.8" y="163.3" width="7" height="36.7" rx="1"/>
+<rect class="bar" x="82.4" y="157.6" width="7" height="42.4" rx="1"/>
+<rect class="bar" x="92.0" y="164.6" width="7" height="35.4" rx="1"/>
+<rect class="bar" x="101.6" y="159.9" width="7" height="40.1" rx="1"/>
+<rect class="bar" x="111.2" y="148.1" width="7" height="51.9" rx="1"/>
+<rect class="bar" x="120.8" y="162.8" width="7" height="37.2" rx="1"/>
+<rect class="bar" x="130.4" y="156.3" width="7" height="43.7" rx="1"/>
+<rect class="bar" x="140.0" y="162.8" width="7" height="37.2" rx="1"/>
+<rect class="bar" x="149.6" y="161.0" width="7" height="39.0" rx="1"/>
+<rect class="bar" x="159.2" y="144.4" width="7" height="55.6" rx="1"/>
+<rect class="bar" x="168.8" y="162.4" width="7" height="37.6" rx="1"/>
+<rect class="bar" x="178.4" y="157.2" width="7" height="42.8" rx="1"/>
+<rect class="bar" x="188.0" y="163.2" width="7" height="36.8" rx="1"/>
+<rect class="bar" x="197.6" y="160.6" width="7" height="39.4" rx="1"/>
+<rect class="bar" x="207.2" y="138.7" width="7" height="61.3" rx="1"/>
+<rect class="bar" x="216.8" y="161.8" width="7" height="38.2" rx="1"/>
+<rect class="bar" x="226.4" y="155.9" width="7" height="44.1" rx="1"/>
+<rect class="bar" x="236.0" y="163.6" width="7" height="36.4" rx="1"/>
+<rect class="bar" x="245.6" y="158.4" width="7" height="41.6" rx="1"/>
+<rect class="bar" x="255.2" y="131.4" width="7" height="68.6" rx="1"/>
+<rect class="bar" x="264.8" y="162.3" width="7" height="37.7" rx="1"/>
+<rect class="bar" x="274.4" y="154.4" width="7" height="45.6" rx="1"/>
+<rect class="bar" x="284.0" y="162.8" width="7" height="37.2" rx="1"/>
+<rect class="bar" x="293.6" y="159.1" width="7" height="40.9" rx="1"/>
+<rect class="bar" x="303.2" y="114.7" width="7" height="85.3" rx="1"/>
+<rect class="bar" x="312.8" y="161.9" width="7" height="38.1" rx="1"/>
+<rect class="bar" x="322.4" y="152.4" width="7" height="47.6" rx="1"/>
+<rect class="bar" x="332.0" y="162.5" width="7" height="37.5" rx="1"/>
+<rect class="bar" x="341.6" y="158.8" width="7" height="41.2" rx="1"/>
+<text class="ts" x="40" y="222">busiest 9.0%, average 3.1%; 231,480 messages</text>
+<rect class="hit" x="43" y="40" width="9.6" height="162" data-tip="Partition 1|20,764 messages|9.0% of the total"/>
+<rect class="hit" x="52.6" y="40" width="9.6" height="162" data-tip="Partition 2|6,023 messages|2.6% of the total"/>
+<rect class="hit" x="62.2" y="40" width="9.6" height="162" data-tip="Partition 3|7,601 messages|3.3% of the total"/>
+<rect class="hit" x="71.8" y="40" width="9.6" height="162" data-tip="Partition 4|5,659 messages|2.4% of the total"/>
+<rect class="hit" x="81.4" y="40" width="9.6" height="162" data-tip="Partition 5|6,544 messages|2.8% of the total"/>
+<rect class="hit" x="91" y="40" width="9.6" height="162" data-tip="Partition 6|5,460 messages|2.4% of the total"/>
+<rect class="hit" x="100.6" y="40" width="9.6" height="162" data-tip="Partition 7|6,190 messages|2.7% of the total"/>
+<rect class="hit" x="110.2" y="40" width="9.6" height="162" data-tip="Partition 8|8,011 messages|3.5% of the total"/>
+<rect class="hit" x="119.8" y="40" width="9.6" height="162" data-tip="Partition 9|5,740 messages|2.5% of the total"/>
+<rect class="hit" x="129.4" y="40" width="9.6" height="162" data-tip="Partition 10|6,742 messages|2.9% of the total"/>
+<rect class="hit" x="139" y="40" width="9.6" height="162" data-tip="Partition 11|5,744 messages|2.5% of the total"/>
+<rect class="hit" x="148.6" y="40" width="9.6" height="162" data-tip="Partition 12|6,018 messages|2.6% of the total"/>
+<rect class="hit" x="158.2" y="40" width="9.6" height="162" data-tip="Partition 13|8,581 messages|3.7% of the total"/>
+<rect class="hit" x="167.8" y="40" width="9.6" height="162" data-tip="Partition 14|5,795 messages|2.5% of the total"/>
+<rect class="hit" x="177.4" y="40" width="9.6" height="162" data-tip="Partition 15|6,611 messages|2.9% of the total"/>
+<rect class="hit" x="187" y="40" width="9.6" height="162" data-tip="Partition 16|5,675 messages|2.5% of the total"/>
+<rect class="hit" x="196.6" y="40" width="9.6" height="162" data-tip="Partition 17|6,080 messages|2.6% of the total"/>
+<rect class="hit" x="206.2" y="40" width="9.6" height="162" data-tip="Partition 18|9,465 messages|4.1% of the total"/>
+<rect class="hit" x="215.8" y="40" width="9.6" height="162" data-tip="Partition 19|5,896 messages|2.5% of the total"/>
+<rect class="hit" x="225.4" y="40" width="9.6" height="162" data-tip="Partition 20|6,799 messages|2.9% of the total"/>
+<rect class="hit" x="235" y="40" width="9.6" height="162" data-tip="Partition 21|5,624 messages|2.4% of the total"/>
+<rect class="hit" x="244.6" y="40" width="9.6" height="162" data-tip="Partition 22|6,415 messages|2.8% of the total"/>
+<rect class="hit" x="254.2" y="40" width="9.6" height="162" data-tip="Partition 23|10,587 messages|4.6% of the total"/>
+<rect class="hit" x="263.8" y="40" width="9.6" height="162" data-tip="Partition 24|5,825 messages|2.5% of the total"/>
+<rect class="hit" x="273.4" y="40" width="9.6" height="162" data-tip="Partition 25|7,041 messages|3.0% of the total"/>
+<rect class="hit" x="283" y="40" width="9.6" height="162" data-tip="Partition 26|5,741 messages|2.5% of the total"/>
+<rect class="hit" x="292.6" y="40" width="9.6" height="162" data-tip="Partition 27|6,307 messages|2.7% of the total"/>
+<rect class="hit" x="302.2" y="40" width="9.6" height="162" data-tip="Partition 28|13,167 messages|5.7% of the total"/>
+<rect class="hit" x="311.8" y="40" width="9.6" height="162" data-tip="Partition 29|5,886 messages|2.5% of the total"/>
+<rect class="hit" x="321.4" y="40" width="9.6" height="162" data-tip="Partition 30|7,348 messages|3.2% of the total"/>
+<rect class="hit" x="331" y="40" width="9.6" height="162" data-tip="Partition 31|5,784 messages|2.5% of the total"/>
+<rect class="hit" x="340.6" y="40" width="9.6" height="162" data-tip="Partition 32|6,357 messages|2.7% of the total"/>
+<text class="tb" x="376" y="18">Combined per server and second first</text>
+<line class="grid" x1="404" y1="200.0" x2="716" y2="200.0"/>
+<text class="ts end" x="398" y="204.0">0%</text>
+<line class="grid" x1="404" y1="125.0" x2="716" y2="125.0"/>
+<text class="ts end" x="398" y="129.0">5%</text>
+<line class="grid" x1="404" y1="50.0" x2="716" y2="50.0"/>
+<text class="ts end" x="398" y="54.0">10%</text>
+<rect class="bar" x="408.0" y="149.2" width="7" height="50.8" rx="1"/>
+<rect class="bar" x="417.6" y="154.0" width="7" height="46.0" rx="1"/>
+<rect class="bar" x="427.2" y="150.2" width="7" height="49.8" rx="1"/>
+<rect class="bar" x="436.8" y="156.6" width="7" height="43.4" rx="1"/>
+<rect class="bar" x="446.4" y="152.3" width="7" height="47.7" rx="1"/>
+<rect class="bar" x="456.0" y="157.6" width="7" height="42.4" rx="1"/>
+<rect class="bar" x="465.6" y="153.5" width="7" height="46.5" rx="1"/>
+<rect class="bar" x="475.2" y="149.6" width="7" height="50.4" rx="1"/>
+<rect class="bar" x="484.8" y="155.8" width="7" height="44.2" rx="1"/>
+<rect class="bar" x="494.4" y="151.7" width="7" height="48.3" rx="1"/>
+<rect class="bar" x="504.0" y="155.2" width="7" height="44.8" rx="1"/>
+<rect class="bar" x="513.6" y="154.4" width="7" height="45.6" rx="1"/>
+<rect class="bar" x="523.2" y="150.0" width="7" height="50.0" rx="1"/>
+<rect class="bar" x="532.8" y="155.8" width="7" height="44.2" rx="1"/>
+<rect class="bar" x="542.4" y="152.5" width="7" height="47.5" rx="1"/>
+<rect class="bar" x="552.0" y="155.9" width="7" height="44.1" rx="1"/>
+<rect class="bar" x="561.6" y="154.2" width="7" height="45.8" rx="1"/>
+<rect class="bar" x="571.2" y="148.8" width="7" height="51.2" rx="1"/>
+<rect class="bar" x="580.8" y="154.9" width="7" height="45.1" rx="1"/>
+<rect class="bar" x="590.4" y="152.1" width="7" height="47.9" rx="1"/>
+<rect class="bar" x="600.0" y="156.3" width="7" height="43.7" rx="1"/>
+<rect class="bar" x="609.6" y="152.2" width="7" height="47.8" rx="1"/>
+<rect class="bar" x="619.2" y="149.0" width="7" height="51.0" rx="1"/>
+<rect class="bar" x="628.8" y="155.3" width="7" height="44.7" rx="1"/>
+<rect class="bar" x="638.4" y="151.1" width="7" height="48.9" rx="1"/>
+<rect class="bar" x="648.0" y="155.5" width="7" height="44.5" rx="1"/>
+<rect class="bar" x="657.6" y="153.2" width="7" height="46.8" rx="1"/>
+<rect class="bar" x="667.2" y="148.7" width="7" height="51.3" rx="1"/>
+<rect class="bar" x="676.8" y="155.6" width="7" height="44.4" rx="1"/>
+<rect class="bar" x="686.4" y="150.4" width="7" height="49.6" rx="1"/>
+<rect class="bar" x="696.0" y="155.1" width="7" height="44.9" rx="1"/>
+<rect class="bar" x="705.6" y="153.3" width="7" height="46.7" rx="1"/>
+<text class="ts" x="404" y="222">busiest 3.4%, average 3.1%; 186,872 messages</text>
+<rect class="hit" x="407" y="40" width="9.6" height="162" data-tip="Partition 1|6,325 messages|3.4% of the total"/>
+<rect class="hit" x="416.6" y="40" width="9.6" height="162" data-tip="Partition 2|5,731 messages|3.1% of the total"/>
+<rect class="hit" x="426.2" y="40" width="9.6" height="162" data-tip="Partition 3|6,209 messages|3.3% of the total"/>
+<rect class="hit" x="435.8" y="40" width="9.6" height="162" data-tip="Partition 4|5,406 messages|2.9% of the total"/>
+<rect class="hit" x="445.4" y="40" width="9.6" height="162" data-tip="Partition 5|5,938 messages|3.2% of the total"/>
+<rect class="hit" x="455" y="40" width="9.6" height="162" data-tip="Partition 6|5,280 messages|2.8% of the total"/>
+<rect class="hit" x="464.6" y="40" width="9.6" height="162" data-tip="Partition 7|5,799 messages|3.1% of the total"/>
+<rect class="hit" x="474.2" y="40" width="9.6" height="162" data-tip="Partition 8|6,285 messages|3.4% of the total"/>
+<rect class="hit" x="483.8" y="40" width="9.6" height="162" data-tip="Partition 9|5,511 messages|2.9% of the total"/>
+<rect class="hit" x="493.4" y="40" width="9.6" height="162" data-tip="Partition 10|6,012 messages|3.2% of the total"/>
+<rect class="hit" x="503" y="40" width="9.6" height="162" data-tip="Partition 11|5,583 messages|3.0% of the total"/>
+<rect class="hit" x="512.6" y="40" width="9.6" height="162" data-tip="Partition 12|5,684 messages|3.0% of the total"/>
+<rect class="hit" x="522.2" y="40" width="9.6" height="162" data-tip="Partition 13|6,229 messages|3.3% of the total"/>
+<rect class="hit" x="531.8" y="40" width="9.6" height="162" data-tip="Partition 14|5,511 messages|2.9% of the total"/>
+<rect class="hit" x="541.4" y="40" width="9.6" height="162" data-tip="Partition 15|5,916 messages|3.2% of the total"/>
+<rect class="hit" x="551" y="40" width="9.6" height="162" data-tip="Partition 16|5,495 messages|2.9% of the total"/>
+<rect class="hit" x="560.6" y="40" width="9.6" height="162" data-tip="Partition 17|5,703 messages|3.1% of the total"/>
+<rect class="hit" x="570.2" y="40" width="9.6" height="162" data-tip="Partition 18|6,374 messages|3.4% of the total"/>
+<rect class="hit" x="579.8" y="40" width="9.6" height="162" data-tip="Partition 19|5,619 messages|3.0% of the total"/>
+<rect class="hit" x="589.4" y="40" width="9.6" height="162" data-tip="Partition 20|5,968 messages|3.2% of the total"/>
+<rect class="hit" x="599" y="40" width="9.6" height="162" data-tip="Partition 21|5,442 messages|2.9% of the total"/>
+<rect class="hit" x="608.6" y="40" width="9.6" height="162" data-tip="Partition 22|5,961 messages|3.2% of the total"/>
+<rect class="hit" x="618.2" y="40" width="9.6" height="162" data-tip="Partition 23|6,350 messages|3.4% of the total"/>
+<rect class="hit" x="627.8" y="40" width="9.6" height="162" data-tip="Partition 24|5,573 messages|3.0% of the total"/>
+<rect class="hit" x="637.4" y="40" width="9.6" height="162" data-tip="Partition 25|6,087 messages|3.3% of the total"/>
+<rect class="hit" x="647" y="40" width="9.6" height="162" data-tip="Partition 26|5,540 messages|3.0% of the total"/>
+<rect class="hit" x="656.6" y="40" width="9.6" height="162" data-tip="Partition 27|5,829 messages|3.1% of the total"/>
+<rect class="hit" x="666.2" y="40" width="9.6" height="162" data-tip="Partition 28|6,393 messages|3.4% of the total"/>
+<rect class="hit" x="675.8" y="40" width="9.6" height="162" data-tip="Partition 29|5,532 messages|3.0% of the total"/>
+<rect class="hit" x="685.4" y="40" width="9.6" height="162" data-tip="Partition 30|6,174 messages|3.3% of the total"/>
+<rect class="hit" x="695" y="40" width="9.6" height="162" data-tip="Partition 31|5,592 messages|3.0% of the total"/>
+<rect class="hit" x="704.6" y="40" width="9.6" height="162" data-tip="Partition 32|5,821 messages|3.1% of the total"/>
+<text class="ts" x="10" y="244">Each bar is one partition of the log. The aggregator reading the tall one sets the pace for all.</text>
+</svg>
+</div>
+<figcaption>Measured: with skewed popularity, partitioning by ad gives one partition three times the average. Combining at the source flattens it, because a hot ad becomes one message per server per second.</figcaption>
+</figure>
+
+<p>In the simulation of one billion clicks a day over 2 million ads, the busiest of 32 partitions took 9.0% of all messages, about three times its share. The fix is <dfn>pre-aggregation</dfn>: combining events into partial counts before they are sent on, so that the next stage receives a count instead of each event. If each of 50 click servers sends one message per ad per second, carrying a count, a viral ad becomes at most 50 messages a second, and the busiest partition fell to 3.4%. The total fell by only 19%, because most ads are clicked less than once a second on any one server. The raw clicks still go to the archive one by one, and the ids travel with the partial counts so that repeats can still be removed.</p>
+<p><b>At ten times the volume</b>, 10 billion clicks a day, the peak reaches 580,000 a second: more partitions and aggregators, and the same design. The id memory grows to about 14 GB, spread across the aggregators. <b>At a hundred times</b>, the usual reason is impressions rather than clicks. Exact counts of impressions are still needed for billing by impression, but questions such as how many different people saw an ad switch to sketches (<x-ref to="probabilistic-structures#hll"></x-ref>), and the store keeps fine-grained rows for days and only rollups after that.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li>Uber described its ad event pipeline on 23 September 2021: Flink jobs reading and writing Kafka with exactly-once settings, results committed at each checkpoint, clicks and impressions counted in one-minute windows keyed by ad and minute, and a record id used as an idempotency key, with Pinot’s upsert so that a record is never stored twice. It named the checkpoint interval, two minutes, as the main limit on freshness.</li>
+  <li>Google’s Photon, described at SIGMOD 2013, joins web search queries with ad clicks across data centers. Its output never contains duplicates and becomes exactly once eventually; it handled millions of events a minute at peak with an average end-to-end latency under 10 seconds, and survives the loss of a data center without manual intervention.</li>
+  <li>Google Ads says invalid clicks are filtered out of advertisers’ reports and billing, and that clicks found invalid after billing are credited back (help page, checked October 2026).</li>
+  <li>In Apache Flink, a window’s allowed lateness is zero by default, and elements later than that are dropped (API documentation, checked October 2026).</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Count impressions too</th><td>A hundred times the volume: more partitions, and sketches for distinct users</td><td>Windows, ids, checkpoints, reconciliation</td></tr>
+<tr><th>Top 100 ads in the last minute</th><td>Top lists per partition, merged; a count-min sketch if approximate is acceptable (<x-ref to="probabilistic-structures#topk"></x-ref>)</td><td>The exact counts for billing</td></tr>
+<tr><th>Advertisers in many time zones</th><td>Daily rollups per time zone, or days computed from hours at query time</td><td>Minutes stored in UTC</td></tr>
+<tr><th>Detect click fraud with a model</th><td>A scoring stage in the batch, and credits for clicks removed after billing</td><td>Raw clicks as the source of every count</td></tr>
+<tr><th>Two regions, both active</th><td>Each counts its own clicks; totals are sums, since a click id belongs to one region</td><td>Removing repeats within a region</td></tr>
+<tr><th>The counting logic changes</th><td>Run the new version over the log or the archive beside the old one, and switch when it catches up</td><td>The raw clicks</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Establish early that billing needs exact counts and dashboards need fast ones. Draw the click path with one append and a redirect, then the stream and the batch from the same log. Spend the deep dives on event time and the watermark with allowed lateness, on removing repeats by click id, and on how a checkpoint with versioned totals survives a crash. Finish with reconciliation and the hot ad.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Counting by the time a click arrives</th><td>Counts shift between minutes with network delays and outages</td><td>Count by event time, with a watermark</td></tr>
+<tr><th>A long watermark to catch everything</th><td>Every dashboard waits, and the offline tail is still missed</td><td>A short watermark, allowed lateness, and the batch</td></tr>
+<tr><th>Dropping late clicks silently</th><td>Under-billing that nobody can explain</td><td>Corrections, and a count of what was dropped</td></tr>
+<tr><th>Writing increments to the store</th><td>A replay after a crash counts twice: 4,500 extra clicks in the test</td><td>Totals with versions, or transactional output</td></tr>
+<tr><th>Removing repeats with a Bloom filter</th><td>Real clicks discarded as false positives</td><td>Exact ids for a bounded time, then the batch</td></tr>
+<tr><th>Doing the counting before the redirect</th><td>Users wait, and a slow counter loses clicks</td><td>Append, redirect, count later</td></tr>
+<tr><th>No reconciliation</th><td>Nobody knows whether the stream is right</td><td>Recount from raw clicks and explain every difference</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="batch-and-stream-processing#watermarks"></x-ref>: event time, windows and late data, here measured.</li>
+  <li><x-ref to="idempotency-and-delivery#exactly-once-systems"></x-ref>: what exactly once can mean.</li>
+  <li><x-ref to="event-streaming#semantics"></x-ref>: transactions between a log and a stream processor.</li>
+  <li><x-ref to="distributed-transactions#reconciliation"></x-ref>: comparing two records of the same facts.</li>
+  <li><x-ref to="hld-metrics-and-logging"></x-ref>: the same shape, with millions of time series instead of ads.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Recording a click is one durable append and a redirect; all counting happens later, from the log.</li>
+  <li>Count by when a click happened. A short watermark gives fast first results; allowed lateness turns late clicks into corrections instead of losses.</li>
+  <li>The delay curve has two parts: seconds of network, which a watermark handles, and hours of offline phones, which only corrections or the batch catch.</li>
+  <li>Remove repeats by click id, for as long as memory allows; the batch removes the rest.</li>
+  <li>Through crashes, write totals with versions and checkpoint the offset with the counts. Increments after a replay double count.</li>
+  <li>Recount exactly from raw clicks, reconcile, and be able to explain every difference.</li>
+  <li>Partitioning by ad makes a popular ad a hot partition; combining at the source flattens it.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A click happened at 12:00:58 and arrived at 12:01:03. In which minute is it counted, and does it count if the watermark trails by 10 seconds?</summary><p>In 12:00, the minute it happened. It counts: when it arrives at 12:01:03, no click seen so far can have happened later than that, so the watermark is at most 12:00:53, before the end of the minute, and window 12:00 is still open.</p></details>
+<details><summary>Why not set the watermark delay to two hours, so that almost nothing is late?</summary><p>Because every first result would then appear two hours after its minute, and dashboards would be useless. The simulation showed that beyond a minute, waiting longer gains almost nothing, because the remaining late clicks come from offline phones hours later. Allowed lateness gets the same completeness with results after 10 seconds.</p></details>
+<details><summary>What must the results store support for allowed lateness to work?</summary><p>Replacing a count it already holds: the aggregator sends the new total for a minute, keyed by ad and minute, and the store overwrites the earlier one. Consumers of the store must accept that recent values change, which is why the API marks them provisional.</p></details>
+<details><summary>An aggregator writes increments and then commits its offset. It crashes between the two. What happens, and how do you fix it?</summary><p>It restarts from the old offset, counts the same batch again and adds the increments a second time: clicks counted twice, 4,500 in the test’s 20 crashes. Write totals with a version instead, and save the offset and the counts in one checkpoint, so a replay rewrites the same totals and the store ignores versions it has.</p></details>
+<details><summary>Ids are remembered for 10 minutes. Which repeated clicks get through, and who catches them?</summary><p>Copies that arrive 10 minutes or more after the first copy of their click, such as a queue resent when the app is next opened. In the simulation that was 1,234 clicks. The hourly batch recount removes every repeat across the whole day, and reconciliation shows the difference.</p></details>
+<details><summary>Why is a Bloom filter a poor choice for removing repeated clicks before billing?</summary><p>Its errors go in the wrong direction. A false positive says “seen” for an id that was never seen, so a real click is thrown away and the advertiser is under-billed with no record of why. Exact ids for a bounded time, plus the batch, never discard a real click.</p></details>
+<details><summary>One ad gets a tenth of all clicks. What does that do to a log partitioned by ad, and what helps?</summary><p>Its partition receives far more than its share, and the aggregator reading it falls behind while others idle: 9.0% against an average of 3.1% in the simulation. Combining at the click servers, one message per ad per server per second with a count, caps the hot ad at one message per server per second and brought the busiest partition to 3.4%.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Jacob Tsafatinos, Yuriy Bondaruk and Yupeng Fu, <a href="https://www.uber.com/en-US/blog/real-time-exactly-once-ad-event-processing/">Real-Time Exactly-Once Ad Event Processing with Apache Flink, Kafka, and Pinot</a>, Uber Engineering, 23 September 2021.</li>
+  <li>Rajagopal Ananthanarayanan and others, <a href="https://research.google/pubs/photon-fault-tolerant-and-scalable-joining-of-continuous-data-streams/">Photon: Fault-tolerant and Scalable Joining of Continuous Data Streams</a>, SIGMOD 2013. Joining queries and ad clicks exactly once across data centers.</li>
+  <li>Tyler Akidau and others, <a href="https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/">The Dataflow Model</a>, VLDB 2015. Event time, watermarks, triggers and accumulation of late data.</li>
+  <li>Apache Flink, <a href="https://ci.apache.org/projects/flink/flink-docs-master/api/python/reference/pyflink.datastream/api/pyflink.datastream.data_stream.WindowedStream.allowed_lateness.html">WindowedStream.allowed_lateness</a>, PyFlink API documentation, checked October 2026. The default of zero.</li>
+  <li>Google, <a href="https://support.google.com/google-ads/answer/42995">About invalid traffic</a>, Google Ads Help, checked October 2026. Invalid clicks filtered from reports and billing, with credits.</li>
+</ol>
+</section>

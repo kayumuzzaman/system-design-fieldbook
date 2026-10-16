@@ -1,0 +1,598 @@
+<!--meta
+{ "description": "Relational, document, key-value, wide-column and graph data models explained with one running example, plus row and column storage, what NoSQL gave up and got back, and a procedure for choosing a database.",
+  "lede": "Code is rewritten every few years. Data stays. The way you choose to shape and store it decides which questions are easy to ask, which are slow, and which are impossible without a migration. This chapter introduces the main data models using one example, and gives a method for choosing between them.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">The decision that outlives the code</h2>
+<p>Part II followed a request across the network to your servers. From here on, the book is about what those servers do with it, and nearly always the answer is that they read or write data. Part III covers how data is stored on one machine and then across many.</p>
+<p>The choice of database deserves more care than most early decisions, for three reasons.</p>
+<ul>
+  <li><b>Data outlives code.</b> An application can be rewritten in a new language over a few months. Moving ten years of customer records to a different kind of database is a project measured in quarters, done while the system stays live.</li>
+  <li><b>The model decides which questions are cheap.</b> Every database makes some queries fast by arranging data to suit them, and that same arrangement makes other queries slow.</li>
+  <li><b>Correctness lives here.</b> Whether two people can buy the last ticket, or whether a payment can be half recorded, is settled by what the database guarantees and not by application code.</li>
+</ul>
+<p>A <dfn>data model</dfn> is the set of shapes a database lets you put data into and the operations it offers on those shapes. There are five in wide use for application data. This chapter describes each using the photo app from Part I, with users who post photos, comment on them and follow one another.</p>
+
+<figure class="fig wide" id="fig-models">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 326" role="img" aria-labelledby="f151t f151d">
+<title id="f151t">The same photo, its owner and its comments in four data models</title>
+<desc id="f151d">In the relational model there are three tables: users, photos and comments. Each photo row holds the id of its owner and each comment row holds the id of its photo and of its author. In the document model the photo is one nested record that contains its owner’s name and a list of comments. In the key-value model there are keys such as photo:871 and user:42, each pointing at a value the store does not interpret. In the graph model Ana and Ben are nodes, the photo is a node, and labeled links say that Ana posted it, Ben liked it and Ben follows Ana.</desc>
+<text class="tl" x="10" y="20">Relational: rows in tables, linked by keys</text>
+<rect class="n sunk" x="10" y="34" width="44" height="24" rx="0"/>
+<text class="ts tb" x="17" y="50">id</text>
+<rect class="n sunk" x="54" y="34" width="70" height="24" rx="0"/>
+<text class="ts tb" x="61" y="50">name</text>
+<rect class="n" x="10" y="58" width="44" height="24" rx="0"/>
+<text class="ts" x="17" y="74">42</text>
+<rect class="n" x="54" y="58" width="70" height="24" rx="0"/>
+<text class="ts" x="61" y="74">Ana</text>
+<rect class="n" x="10" y="82" width="44" height="24" rx="0"/>
+<text class="ts" x="17" y="98">57</text>
+<rect class="n" x="54" y="82" width="70" height="24" rx="0"/>
+<text class="ts" x="61" y="98">Ben</text>
+<rect class="n sunk" x="200" y="34" width="50" height="24" rx="0"/>
+<text class="ts tb" x="207" y="50">id</text>
+<rect class="n sunk" x="250" y="34" width="76" height="24" rx="0"/>
+<text class="ts tb" x="257" y="50">owner_id</text>
+<rect class="n sunk" x="326" y="34" width="90" height="24" rx="0"/>
+<text class="ts tb" x="333" y="50">caption</text>
+<rect class="n" x="200" y="58" width="50" height="24" rx="0"/>
+<text class="ts" x="207" y="74">871</text>
+<rect class="n" x="250" y="58" width="76" height="24" rx="0"/>
+<text class="ts" x="257" y="74">42</text>
+<rect class="n" x="326" y="58" width="90" height="24" rx="0"/>
+<text class="ts" x="333" y="74">Sunset</text>
+<rect class="n" x="200" y="82" width="50" height="24" rx="0"/>
+<text class="ts" x="207" y="98">872</text>
+<rect class="n" x="250" y="82" width="76" height="24" rx="0"/>
+<text class="ts" x="257" y="98">42</text>
+<rect class="n" x="326" y="82" width="90" height="24" rx="0"/>
+<text class="ts" x="333" y="98">Harbor</text>
+<rect class="n sunk" x="490" y="34" width="72" height="24" rx="0"/>
+<text class="ts tb" x="497" y="50">photo_id</text>
+<rect class="n sunk" x="562" y="34" width="62" height="24" rx="0"/>
+<text class="ts tb" x="569" y="50">user_id</text>
+<rect class="n sunk" x="624" y="34" width="86" height="24" rx="0"/>
+<text class="ts tb" x="631" y="50">text</text>
+<rect class="n" x="490" y="58" width="72" height="24" rx="0"/>
+<text class="ts" x="497" y="74">871</text>
+<rect class="n" x="562" y="58" width="62" height="24" rx="0"/>
+<text class="ts" x="569" y="74">57</text>
+<rect class="n" x="624" y="58" width="86" height="24" rx="0"/>
+<text class="ts" x="631" y="74">Great shot</text>
+<rect class="n" x="490" y="82" width="72" height="24" rx="0"/>
+<text class="ts" x="497" y="98">871</text>
+<rect class="n" x="562" y="82" width="62" height="24" rx="0"/>
+<text class="ts" x="569" y="98">42</text>
+<rect class="n" x="624" y="82" width="86" height="24" rx="0"/>
+<text class="ts" x="631" y="98">Thanks</text>
+<text class="ts mid" x="67" y="122">users</text>
+<text class="ts mid" x="308" y="122">photos</text>
+<text class="ts mid" x="600" y="122">comments</text>
+<path class="e store" d="M200 70H124"/>
+<text class="ts mid" x="162" y="62">owner_id</text>
+<path class="e store" d="M490 70H416"/>
+<text class="ts mid" x="453" y="62">photo_id</text>
+<line class="grid" x1="10" y1="140" x2="710" y2="140"/>
+<text class="tl" x="10" y="164">Document: one nested record</text>
+<rect class="n" x="10" y="176" width="252" height="142" rx="6"/>
+<text class="ts" x="22" y="196">{ id: 871, caption: "Sunset",</text>
+<text class="ts" x="33" y="213">owner: { id: 42, name: "Ana" },</text>
+<text class="ts" x="33" y="230">comments: [</text>
+<text class="ts" x="49" y="247">{ by: "Ben", text: "Great shot" },</text>
+<text class="ts" x="49" y="264">{ by: "Ana", text: "Thanks" }</text>
+<text class="ts" x="33" y="281">]</text>
+<text class="ts" x="22" y="298">}</text>
+<text class="tl" x="286" y="164">Key-value: look up by key</text>
+<rect class="n sig" x="286" y="176" width="92" height="28" rx="5"/>
+<text class="ts mid" x="332" y="194.5">photo:871</text>
+<path class="e" d="M378 190H398"/>
+<rect class="n sunk" x="398" y="176" width="94" height="28" rx="5"/>
+<text class="ts mid" x="445" y="194.5">{ … }</text>
+<rect class="n sig" x="286" y="214" width="92" height="28" rx="5"/>
+<text class="ts mid" x="332" y="232.5">user:42</text>
+<path class="e" d="M378 228H398"/>
+<rect class="n sunk" x="398" y="214" width="94" height="28" rx="5"/>
+<text class="ts mid" x="445" y="232.5">{ … }</text>
+<rect class="n sig" x="286" y="252" width="92" height="28" rx="5"/>
+<text class="ts mid" x="332" y="270.5">feed:42</text>
+<path class="e" d="M378 266H398"/>
+<rect class="n sunk" x="398" y="252" width="94" height="28" rx="5"/>
+<text class="ts mid" x="445" y="270.5">[871, 872]</text>
+<text class="ts" x="286" y="300">The store does not look</text>
+<text class="ts" x="286" y="316">inside the value.</text>
+<text class="tl" x="516" y="164">Graph: things and links</text>
+<rect class="n sig" x="516" y="190" width="56" height="30" rx="15"/>
+<text class="ts mid" x="544" y="209.5">Ana</text>
+<rect class="n sig" x="654" y="190" width="56" height="30" rx="15"/>
+<text class="ts mid" x="682" y="209.5">Ben</text>
+<rect class="n store" x="571" y="280" width="84" height="30" rx="15"/>
+<text class="ts mid" x="613" y="299.5">Photo 871</text>
+<path class="e" d="M654 205H572"/>
+<text class="ts mid" x="613" y="198">follows</text>
+<path class="e" d="M546 220 598 280"/>
+<text class="ts end" x="560" y="256">posted</text>
+<path class="e" d="M680 220 630 280"/>
+<text class="ts" x="668" y="256">liked</text>
+
+</svg>
+</div>
+<figcaption>One photo with its owner and comments, stored four ways. The information is the same. What differs is which pieces sit together, and therefore which questions can be answered without assembling anything.</figcaption>
+</figure>
+
+<h2 id="relational">The relational model</h2>
+<p>The <dfn>relational model</dfn> stores data as <dfn>tables</dfn>. Each table holds one kind of thing, each <dfn>row</dfn> is one instance of it, and each <dfn>column</dfn> is one attribute with a declared type. A <dfn>primary key</dfn> identifies each row. A <dfn>foreign key</dfn> is a column holding the primary key of a row in another table, and that is how rows refer to each other.</p>
+<pre data-lang="sql" data-title="The photo app as tables">
+CREATE TABLE users (
+  id         BIGINT PRIMARY KEY,
+  username   TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE photos (
+  id         BIGINT PRIMARY KEY,
+  owner_id   BIGINT NOT NULL REFERENCES users (id),
+  caption    TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE comments (
+  id         BIGINT PRIMARY KEY,
+  photo_id   BIGINT NOT NULL REFERENCES photos (id),
+  user_id    BIGINT NOT NULL REFERENCES users (id),
+  body       TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+</pre>
+<p>Each fact is stored once. Ana’s username appears in one row of <code>users</code>, and every photo and comment of hers points to it. Change the username and every page that shows it is correct at once. The database also enforces the declared rules: it will refuse a comment on a photo that does not exist, or a second user with the same name. This checking when data is written is called <dfn>schema on write</dfn>.</p>
+<p>The model’s great strength is the <dfn>join</dfn>: combining rows from several tables in a query. Because data is stored in small independent pieces, it can be recombined to answer questions nobody had in mind when the tables were designed.</p>
+<pre data-lang="sql" data-title="A question nobody planned for: who comments most on Ana’s photos?">
+SELECT u.username, count(*) AS comments
+FROM comments c
+JOIN photos p ON p.id = c.photo_id
+JOIN users  u ON u.id = c.user_id
+WHERE p.owner_id = 42
+GROUP BY u.username
+ORDER BY comments DESC
+LIMIT 10;
+</pre>
+<p>The language is <dfn>SQL</dfn>. It is declarative: the query states what result is wanted, and a component called the query planner decides how to get it (<x-ref to="indexes-and-queries"></x-ref>). Relational databases also provide <dfn>transactions</dfn>, which let a group of changes succeed or fail as one (<x-ref to="transactions"></x-ref>).</p>
+<p>The costs are real too.</p>
+<ul>
+  <li><b>Assembling a result takes work.</b> Showing one photo page needs rows from three tables. With good indexes this is fast, and it is still more work than fetching one pre-assembled record.</li>
+  <li><b>The shape of the data and the shape of the code differ.</b> Programs work with nested objects, and tables are flat. Translating between the two is the job of an object-relational mapper, a kind of library that is convenient and that hides costly queries from the people writing them.</li>
+  <li><b>Writes are hard to spread across machines.</b> Joins and transactions are easy when all the data is on one server. Splitting a relational database across many servers is possible and is one of the harder tasks in this book (<x-ref to="partitioning"></x-ref>).</li>
+</ul>
+<p>Examples: PostgreSQL, MySQL, SQLite, Microsoft SQL Server, Oracle.</p>
+
+<h2 id="document">The document model</h2>
+<p>A <dfn>document database</dfn> stores each record as a self-contained <dfn>document</dfn>, usually in a JSON-like format, that can contain nested objects and lists. Documents live in <dfn>collections</dfn>, and documents in one collection need not have the same fields.</p>
+<pre data-lang="js" data-title="A photo as one document">
+{
+  "_id": 871,
+  "caption": "Sunset",
+  "owner": { "id": 42, "username": "ana" },
+  "tags": ["beach", "evening"],
+  "comments": [
+    { "by": "ben", "body": "Great shot", "at": "2026-10-01T18:04:00Z" },
+    { "by": "ana", "body": "Thanks",     "at": "2026-10-01T18:09:00Z" }
+  ]
+}
+</pre>
+<p>Everything needed to show the photo page arrives in one read, with no joins. The document also matches the object in application code, so little translation is needed. Because the database does not insist on a fixed structure, adding a field is a change to the code alone. This is called <dfn>schema on read</dfn>: the structure is interpreted by whoever reads the data. The schema has not gone away. It has moved into the application, which must now cope with every shape of document ever written.</p>
+<p>The central design decision is <dfn>embedding</dfn> against <dfn>referencing</dfn>. The document above embeds its comments and a copy of the owner’s username. Embedding is right for data that belongs to its parent, is read with it, and is limited in size. It goes wrong in two situations.</p>
+<ul>
+  <li><b>Shared data gets copied.</b> Ana’s username is now inside every one of her photos. If she changes it, every copy must be found and updated, or some pages will show the old name.</li>
+  <li><b>Lists grow without limit.</b> A popular photo with 200,000 comments makes a document too large to read or rewrite efficiently, and databases cap document size. MongoDB’s limit is 16 MB.</li>
+</ul>
+<p>The alternative is to store comments as their own documents that hold the photo’s ID, which is a foreign key under another name, and to fetch them separately. Do that for every relationship and you have rebuilt the relational model without its guarantees. Document databases suit data that naturally forms separate, self-contained units: a product catalog where each product has different attributes, a content management system, user profiles and settings, the state of a game session.</p>
+<aside class="sn"><b>You may not need a separate database</b>PostgreSQL and MySQL both store and index JSON columns. A table can have ordinary typed columns for the fields you query and join on, and one JSON column for the parts that vary. For many applications this gives the flexibility of documents where it helps, without running a second system.</aside>
+<p>Examples: MongoDB, Couchbase, Google Firestore, Amazon DocumentDB.</p>
+
+<h2 id="key-value">The key-value model</h2>
+<p>A <dfn>key-value store</dfn> is the simplest model: it keeps values under keys and retrieves them by exact key. To the store the value is opaque bytes. There are no joins and no queries by content, only <code>get</code>, <code>put</code> and <code>delete</code>.</p>
+<p>What you get in return for giving up so much is speed and scale. A lookup by key is the cheapest operation a database can perform, and since no operation involves more than one key, the data can be spread over many machines by key with no coordination between them. Stores that keep everything in memory, such as Redis, Valkey and Memcached, answer in well under a millisecond and are the usual home for caches, sessions, rate-limit counters and leaderboards (<x-ref to="caching"></x-ref>). Durable ones such as Amazon DynamoDB hold primary data at very large scale.</p>
+<p>Designing for a key-value store reverses the relational habit. With tables you model the data and work out the queries later. Here you must list the questions first, because each question needs a key that answers it directly. For the photo app:</p>
+<table>
+<thead><tr><th>Question</th><th>Key</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Show a photo</td><td><code>photo:871</code></td><td>The photo’s data</td></tr>
+<tr><td>Who is logged in with this session?</td><td><code>session:9f2c…</code></td><td>A user ID, with an expiry time</td></tr>
+<tr><td>What is in Ana’s feed?</td><td><code>feed:42</code></td><td>A list of recent photo IDs</td></tr>
+<tr><td>How many likes does this photo have?</td><td><code>likes:871</code></td><td>A counter</td></tr>
+</tbody>
+</table>
+<p>A question you did not plan for, such as “which photos mention beaches?”, cannot be answered without reading everything. Many stores soften this with richer value types (lists, sets, sorted sets and counters in Redis) or with secondary indexes, at which point they begin to shade into the next two models.</p>
+
+<h2 id="wide-column">The wide-column model</h2>
+<p>A <dfn>wide-column store</dfn> sits between key-value and relational. Data is in tables with rows and columns, and each table is designed around exactly one query. The primary key has two parts:</p>
+<ul>
+  <li>The <dfn>partition key</dfn> decides which machine holds the row. All rows with the same partition key are stored together.</li>
+  <li>The <dfn>clustering key</dfn> decides the order of rows inside a partition. They are kept sorted on disk.</li>
+</ul>
+
+<figure class="fig wide" id="fig-wide-column">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 204" role="img" aria-labelledby="f152t f152d">
+<title id="f152t">Rows in a wide-column store, grouped by partition key and sorted by clustering key</title>
+<desc id="f152d">Two partitions, one for channel 7 and one for channel 9. Inside each, message rows are stored next to one another in time order. A query that names a channel reads a run of neighboring rows. A query across channels cannot be served from this table.</desc>
+<text class="ts mid" x="65" y="24">partition key</text>
+<text class="ts" x="140" y="24">rows inside the partition, kept sorted by time</text>
+<rect class="n sig" x="10" y="36" width="110" height="44" rx="6"/>
+<text class="tb mid" x="65" y="62.5">channel 7</text>
+<rect class="n" x="140" y="36" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="210" y="54">10:01</text>
+<text class="ts mid" x="210" y="71">Ana: hi</text>
+<rect class="n" x="290" y="36" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="360" y="54">10:02</text>
+<text class="ts mid" x="360" y="71">Ben: hello</text>
+<rect class="n" x="440" y="36" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="510" y="54">10:05</text>
+<text class="ts mid" x="510" y="71">Ana: lunch?</text>
+<rect class="n ghost" x="590" y="36" width="120" height="44" rx="6"/>
+<text class="ts mid" x="650" y="62.5">newer rows …</text>
+<rect class="n sig" x="10" y="96" width="110" height="44" rx="6"/>
+<text class="tb mid" x="65" y="122.5">channel 9</text>
+<rect class="n" x="140" y="96" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="210" y="114">09:30</text>
+<text class="ts mid" x="210" y="131">Chi: deploy done</text>
+<rect class="n" x="290" y="96" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="360" y="114">09:41</text>
+<text class="ts mid" x="360" y="131">Ben: thanks</text>
+<rect class="n" x="440" y="96" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="510" y="114">11:15</text>
+<text class="ts mid" x="510" y="131">Chi: rollback</text>
+<rect class="n ghost" x="590" y="96" width="120" height="44" rx="6"/>
+<text class="ts mid" x="650" y="122.5">newer rows …</text>
+<text class="ts" x="10" y="176">A query names one partition and reads a run of neighboring rows: “the last 50 messages in channel 7”.</text>
+<text class="ts" x="10" y="193">Asking across partitions, such as “every message Ana wrote”, needs a second table built for that question.</text>
+
+</svg>
+</div>
+<figcaption>A chat history table keyed by channel and time. The layout on disk is the query plan: one partition, one sequential read.</figcaption>
+</figure>
+
+<pre data-lang="sql" data-title="The same table in Cassandra’s query language">
+CREATE TABLE messages_by_channel (
+  channel_id BIGINT,
+  sent_at    TIMESTAMP,
+  author     TEXT,
+  body       TEXT,
+  PRIMARY KEY ((channel_id), sent_at)
+) WITH CLUSTERING ORDER BY (sent_at DESC);
+
+SELECT * FROM messages_by_channel WHERE channel_id = 7 LIMIT 50;
+</pre>
+<p>That query is as fast with a trillion messages in the table as with a thousand, because it goes to one partition and reads fifty adjacent rows. Writes are fast as well, for reasons that <x-ref to="storage-engines"></x-ref> explains, and the cluster grows by adding machines. Discord stores its message history this way. In 2023 it described moving trillions of messages from 177 Cassandra nodes to 72 ScyllaDB nodes, with messages partitioned by channel and a time window.</p>
+<p>The price is rigidity. There are no joins, and a query that does not start with a partition key is rejected or painfully slow. A second question needs a second table holding the same data under a different key, which your application must write to as well. A partition that grows too large or receives too much traffic becomes a hot spot, which is the problem Discord’s time window exists to limit.</p>
+<p>Use this model when the write volume is beyond what one machine can take, the queries are few and known, and the data has a natural grouping: messages by conversation, events by device, measurements by sensor. Examples: Apache Cassandra, ScyllaDB, Google Bigtable, Apache HBase.</p>
+
+<h2 id="graph">The graph model</h2>
+<p>A <dfn>graph database</dfn> stores <dfn>nodes</dfn> (things) and <dfn>edges</dfn> (relationships between two things), either of which can carry properties. Its special ability is the <dfn>traversal</dfn>: starting at a node and following edges, hop after hop.</p>
+<p>Relational databases can represent a graph with a table of edges, and can follow one or two hops with joins. The difficulty comes when the number of hops is large or unknown. “People followed by the people I follow” is two joins. “The shortest chain of follows between Ana and Chi” has no fixed number of joins. A graph database stores each node with direct pointers to its neighbors, so the cost of each hop depends on how many neighbors a node has and not on the size of the whole data set.</p>
+<pre data-lang="text" data-title="Suggest people to follow, in the Cypher query language">
+MATCH (me:User {id: 42})-[:FOLLOWS]->(:User)-[:FOLLOWS]->(suggestion:User)
+WHERE NOT (me)-[:FOLLOWS]->(suggestion) AND suggestion <> me
+RETURN suggestion.name, count(*) AS mutual
+ORDER BY mutual DESC LIMIT 10
+</pre>
+<p>Graph databases fit problems where the relationships are the point: fraud rings in which many accounts share a device or a card, permission systems where access is inherited through groups and folders, recommendation, network and dependency maps. They are harder to spread across machines than the other models, because a traversal can wander anywhere and no way of cutting up the graph keeps related nodes together for every query.</p>
+<p>Many products with a “social graph” do not use a graph database. A follows table in a relational or wide-column store answers “who does Ana follow?” perfectly well. Reach for a graph database when the queries are multi-hop and varied. A query language for graphs, GQL, became an ISO standard in April 2024. Examples: Neo4j, Amazon Neptune, Memgraph.</p>
+
+<h2 id="oltp-olap">Two kinds of work: transactions and analytics</h2>
+<p>Cutting across the models is a distinction that explains a great deal of database design. It is about the kind of work being done.</p>
+<table>
+<thead><tr><th></th><th>Transaction processing (OLTP)</th><th>Analytics (OLAP)</th></tr></thead>
+<tbody>
+<tr><th>Typical question</th><td>Show order 5512. Add a comment.</td><td>What was revenue per country per week this year?</td></tr>
+<tr><th>Rows touched per query</th><td>A handful</td><td>Millions or billions</td></tr>
+<tr><th>Columns touched</th><td>Most of the row</td><td>A few out of many</td></tr>
+<tr><th>Who asks</th><td>The application, on behalf of users, thousands of times a second</td><td>Analysts, dashboards and reports, far less often</td></tr>
+<tr><th>What matters</th><td>Low latency and correctness under concurrency</td><td>Scan speed over large volumes</td></tr>
+<tr><th>Data</th><td>Current state</td><td>History</td></tr>
+</tbody>
+</table>
+<p>The two workloads want opposite storage layouts.</p>
+
+<figure class="fig wide" id="fig-row-column">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-labelledby="f153t f153d">
+<title id="f153t">Row-oriented storage compared with column-oriented storage</title>
+<desc id="f153d">Three orders with the columns id, user, amount and country. In row-oriented storage the four values of each order sit together, so reading order 2 touches one place. In column-oriented storage all the ids sit together, then all the users, then all the amounts, then all the countries, so adding up the amount column reads only that column.</desc>
+<text class="tl" x="10" y="18">Row-oriented storage</text>
+<text class="ts mid" x="45" y="40">id</text>
+<text class="ts mid" x="119" y="40">user</text>
+<text class="ts mid" x="193" y="40">amount</text>
+<text class="ts mid" x="267" y="40">country</text>
+<rect class="n" x="10" y="48" width="70" height="26" rx="3"/>
+<text class="ts mid" x="45" y="65.5">1</text>
+<rect class="n" x="84" y="48" width="70" height="26" rx="3"/>
+<text class="ts mid" x="119" y="65.5">Ana</text>
+<rect class="n" x="158" y="48" width="70" height="26" rx="3"/>
+<text class="ts mid" x="193" y="65.5">30</text>
+<rect class="n" x="232" y="48" width="70" height="26" rx="3"/>
+<text class="ts mid" x="267" y="65.5">BD</text>
+<rect class="n sig" x="10" y="80" width="70" height="26" rx="3"/>
+<text class="ts mid" x="45" y="97.5">2</text>
+<rect class="n sig" x="84" y="80" width="70" height="26" rx="3"/>
+<text class="ts mid" x="119" y="97.5">Ben</text>
+<rect class="n sig" x="158" y="80" width="70" height="26" rx="3"/>
+<text class="ts mid" x="193" y="97.5">12</text>
+<rect class="n sig" x="232" y="80" width="70" height="26" rx="3"/>
+<text class="ts mid" x="267" y="97.5">IN</text>
+<rect class="n" x="10" y="112" width="70" height="26" rx="3"/>
+<text class="ts mid" x="45" y="129.5">3</text>
+<rect class="n" x="84" y="112" width="70" height="26" rx="3"/>
+<text class="ts mid" x="119" y="129.5">Chi</text>
+<rect class="n" x="158" y="112" width="70" height="26" rx="3"/>
+<text class="ts mid" x="193" y="129.5">55</text>
+<rect class="n" x="232" y="112" width="70" height="26" rx="3"/>
+<text class="ts mid" x="267" y="129.5">BD</text>
+<text class="ts" x="10" y="166">Each row is stored together. Reading or changing</text>
+<text class="ts" x="10" y="183">order 2 touches one small spot on disk.</text>
+<path class="e none dash" d="M350 8V196"/>
+<text class="tl" x="376" y="18">Column-oriented storage</text>
+<text class="ts mid" x="411" y="40">id</text>
+<rect class="n" x="376" y="48" width="70" height="26" rx="3"/>
+<text class="ts mid" x="411" y="65.5">1</text>
+<rect class="n" x="376" y="76" width="70" height="26" rx="3"/>
+<text class="ts mid" x="411" y="93.5">2</text>
+<rect class="n" x="376" y="104" width="70" height="26" rx="3"/>
+<text class="ts mid" x="411" y="121.5">3</text>
+<text class="ts mid" x="495" y="40">user</text>
+<rect class="n" x="460" y="48" width="70" height="26" rx="3"/>
+<text class="ts mid" x="495" y="65.5">Ana</text>
+<rect class="n" x="460" y="76" width="70" height="26" rx="3"/>
+<text class="ts mid" x="495" y="93.5">Ben</text>
+<rect class="n" x="460" y="104" width="70" height="26" rx="3"/>
+<text class="ts mid" x="495" y="121.5">Chi</text>
+<text class="ts mid" x="579" y="40">amount</text>
+<rect class="n store" x="544" y="48" width="70" height="26" rx="3"/>
+<text class="ts mid" x="579" y="65.5">30</text>
+<rect class="n store" x="544" y="76" width="70" height="26" rx="3"/>
+<text class="ts mid" x="579" y="93.5">12</text>
+<rect class="n store" x="544" y="104" width="70" height="26" rx="3"/>
+<text class="ts mid" x="579" y="121.5">55</text>
+<text class="ts mid" x="663" y="40">country</text>
+<rect class="n" x="628" y="48" width="70" height="26" rx="3"/>
+<text class="ts mid" x="663" y="65.5">BD</text>
+<rect class="n" x="628" y="76" width="70" height="26" rx="3"/>
+<text class="ts mid" x="663" y="93.5">IN</text>
+<rect class="n" x="628" y="104" width="70" height="26" rx="3"/>
+<text class="ts mid" x="663" y="121.5">BD</text>
+<text class="ts" x="376" y="166">Each column is stored together. Adding up “amount” over a</text>
+<text class="ts" x="376" y="183">billion orders reads one column and skips the rest.</text>
+
+</svg>
+</div>
+<figcaption>The same three orders laid out two ways. Row storage serves “give me this record”. Column storage serves “compute something over this field for every record”.</figcaption>
+</figure>
+
+<p>A <dfn>column-oriented</dfn> database gains twice. It reads only the columns a query mentions, and since a column holds values of one type that often repeat, it compresses to a fraction of its size. Summing one column out of fifty reads perhaps a hundredth of the bytes a row store would.</p>
+<p>The standard arrangement is to run the application on a row-oriented database and copy the data continuously into a column-oriented one for analysis. Running heavy reports against the database that serves users is one of the most common ways to slow a product down for everyone. <x-ref to="batch-and-stream-processing"></x-ref> covers the analytical side. Examples of column-oriented systems: ClickHouse, DuckDB, Snowflake, Google BigQuery, Amazon Redshift.</p>
+<p>Several further models exist for particular kinds of data: time series, full-text search, geospatial and vector search. <x-ref to="search-systems"></x-ref> and <x-ref to="specialized-databases"></x-ref> cover them.</p>
+
+<h2 id="convergence">What “NoSQL” gave up, and what came back</h2>
+<p>Some history makes the present landscape easier to read. Until the mid-2000s, nearly all application data lived in relational databases on a single large server. Web companies then met volumes that no single server could hold, and found that joins and transactions were exactly the features that prevented spreading data across many machines. Google’s Bigtable paper in 2006 and Amazon’s Dynamo paper in 2007 described systems that dropped those features to gain scale and availability. The open-source databases built on their ideas were grouped under the name <dfn>NoSQL</dfn>.</p>
+<p>The trade was real, and each side has been moving toward the other ever since.</p>
+<ul>
+  <li><b>NoSQL systems added back what they had removed.</b> MongoDB has multi-document transactions. Cassandra and DynamoDB have query languages that look like SQL and limited transactions.</li>
+  <li><b>Relational systems learned to scale out.</b> Google’s Spanner showed in 2012 that a database could offer SQL and transactions across data centers. CockroachDB, YugabyteDB, TiDB and Amazon Aurora DSQL follow that design and are known as <dfn>distributed SQL</dfn>.</li>
+  <li><b>Relational systems absorbed other models.</b> PostgreSQL has JSON documents, full-text search, geospatial types and, through extensions, vector search and time-series features.</li>
+</ul>
+<p>The practical result is that “SQL or NoSQL” is no longer a useful question. The useful questions are about access patterns, scale and guarantees, which the next section turns into a procedure.</p>
+
+<h2 id="choosing">Choosing a database</h2>
+<p>Start from the workload and not from the product. Write down the answers to five questions before naming any database.</p>
+<ol>
+  <li><b>What are the access patterns?</b> List the actual reads and writes, as in the key-value table above. Note which are by key, which are ranges, which combine several kinds of record, and which you cannot predict.</li>
+  <li><b>How much, and how fast?</b> Use the estimation method from <x-ref to="estimation"></x-ref> for data volume, reads per second and writes per second. Most systems fit comfortably on one well-provisioned database server with replicas, and that is worth knowing before designing for a scale you do not have.</li>
+  <li><b>What must never go wrong?</b> Money, inventory and anything with uniqueness rules need transactions and constraints. A view counter does not.</li>
+  <li><b>How will the data change shape?</b> Stable and well understood, or varied and evolving?</li>
+  <li><b>Who will operate it?</b> A database your team knows well, with mature backups and monitoring, is worth more than a theoretically better one nobody has run in production.</li>
+</ol>
+
+<figure class="fig wide" id="fig-choose">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 346" role="img" aria-labelledby="f154t f154d">
+<title id="f154t">A sequence of questions for choosing a data model</title>
+<desc id="f154d">Five questions in order. If you need joins, transactions or unpredictable queries, choose relational. Otherwise, if each record is self-contained and read whole, choose document. Otherwise, if every access is a lookup by one key at very high rates, choose key-value. Otherwise, if write volume is enormous and queries are known in advance, choose wide-column. Otherwise, if the questions are about paths through relationships, choose graph. If still unsure, start with a relational database.</desc>
+<rect class="n" x="10" y="10" width="400" height="40" rx="6"/>
+<text class=" mid" x="210" y="34.5">Need joins, transactions, or queries you cannot predict?</text>
+<path class="e store" d="M410 30H490"/>
+<text class="ts mid" x="450" y="22">yes</text>
+<rect class="n store" x="490" y="10" width="220" height="40" rx="6"/>
+<text class="tb mid" x="600" y="26">Relational</text>
+<text class="ts mid" x="600" y="43">PostgreSQL, MySQL</text>
+<path class="e" d="M210 50V68"/>
+<text class="ts" x="220" y="63">no</text>
+<rect class="n" x="10" y="68" width="400" height="40" rx="6"/>
+<text class=" mid" x="210" y="92.5">Is each record self-contained and read as a whole?</text>
+<path class="e store" d="M410 88H490"/>
+<text class="ts mid" x="450" y="80">yes</text>
+<rect class="n store" x="490" y="68" width="220" height="40" rx="6"/>
+<text class="tb mid" x="600" y="84">Document</text>
+<text class="ts mid" x="600" y="101">MongoDB, or JSON columns</text>
+<path class="e" d="M210 108V126"/>
+<text class="ts" x="220" y="121">no</text>
+<rect class="n" x="10" y="126" width="400" height="40" rx="6"/>
+<text class=" mid" x="210" y="150.5">Is every access a lookup by one key, at very high rates?</text>
+<path class="e store" d="M410 146H490"/>
+<text class="ts mid" x="450" y="138">yes</text>
+<rect class="n store" x="490" y="126" width="220" height="40" rx="6"/>
+<text class="tb mid" x="600" y="142">Key-value</text>
+<text class="ts mid" x="600" y="159">Redis, Valkey, DynamoDB</text>
+<path class="e" d="M210 166V184"/>
+<text class="ts" x="220" y="179">no</text>
+<rect class="n" x="10" y="184" width="400" height="40" rx="6"/>
+<text class=" mid" x="210" y="208.5">Enormous write volume, with queries known in advance?</text>
+<path class="e store" d="M410 204H490"/>
+<text class="ts mid" x="450" y="196">yes</text>
+<rect class="n store" x="490" y="184" width="220" height="40" rx="6"/>
+<text class="tb mid" x="600" y="200">Wide-column</text>
+<text class="ts mid" x="600" y="217">Cassandra, ScyllaDB, Bigtable</text>
+<path class="e" d="M210 224V242"/>
+<text class="ts" x="220" y="237">no</text>
+<rect class="n" x="10" y="242" width="400" height="40" rx="6"/>
+<text class=" mid" x="210" y="266.5">Are the questions about paths through relationships?</text>
+<path class="e store" d="M410 262H490"/>
+<text class="ts mid" x="450" y="254">yes</text>
+<rect class="n store" x="490" y="242" width="220" height="40" rx="6"/>
+<text class="tb mid" x="600" y="258">Graph</text>
+<text class="ts mid" x="600" y="275">Neo4j, or recursive SQL</text>
+<path class="e" d="M210 282V300"/>
+<text class="ts" x="220" y="295">no</text>
+<rect class="n sig" x="10" y="300" width="700" height="40" rx="6"/>
+<text class=" mid" x="360" y="324.5">Still unsure? Start with a relational database and move one workload out when you have measurements.</text>
+
+</svg>
+</div>
+<figcaption>The first question that gets a clear yes decides. The order is deliberate: the relational model comes first because it leaves the most options open.</figcaption>
+</figure>
+
+<p>The advice to begin with a relational database is a statement about risk. Early in a product’s life you know least about how the data will be queried. The relational model is the only one that handles questions you did not anticipate, and it gives you transactions and constraints while the rules of the business are still being discovered. If one workload later outgrows it, such as a feed, a message history or a search box, you can move that workload to a specialized store with real measurements to guide you. Going the other way, from a store built for one query to a general one, is much harder.</p>
+<p>Developers’ habits reflect this. In the 2025 Stack Overflow survey, the most recent I could verify, the four most used databases were all relational.</p>
+
+<figure class="fig wide" id="fig-usage">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f155t f155d">
+<title id="f155t">Databases used by developers, Stack Overflow survey 2025</title>
+<desc id="f155d">A bar chart of the share of respondents who used each database in the past year. PostgreSQL 55.6 percent, MySQL 40.5, SQLite 37.5, Microsoft SQL Server 30.1, Redis 28, MongoDB 24, MariaDB 22.5, Elasticsearch 16.7, DynamoDB 9.8.</desc>
+<line class="grid" x1="170" y1="8" x2="170" y2="246"/>
+<text class="ts mid" x="170" y="262">0%</text>
+<line class="grid" x1="256" y1="8" x2="256" y2="246"/>
+<text class="ts mid" x="256" y="262">10%</text>
+<line class="grid" x1="342" y1="8" x2="342" y2="246"/>
+<text class="ts mid" x="342" y="262">20%</text>
+<line class="grid" x1="428" y1="8" x2="428" y2="246"/>
+<text class="ts mid" x="428" y="262">30%</text>
+<line class="grid" x1="514" y1="8" x2="514" y2="246"/>
+<text class="ts mid" x="514" y="262">40%</text>
+<line class="grid" x1="600" y1="8" x2="600" y2="246"/>
+<text class="ts mid" x="600" y="262">50%</text>
+<line class="grid" x1="686" y1="8" x2="686" y2="246"/>
+<text class="ts mid" x="686" y="262">60%</text>
+<text class="ts end" x="160" y="26">PostgreSQL</text>
+<path class="bar" d="M170 12h474.2a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-474.2z"/>
+<text class="ts" x="655" y="26">55.6%</text>
+<text class="ts end" x="160" y="52">MySQL</text>
+<path class="bar" d="M170 38h344.3a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-344.3z"/>
+<text class="ts" x="525" y="52">40.5%</text>
+<text class="ts end" x="160" y="78">SQLite</text>
+<path class="bar" d="M170 64h318.5a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-318.5z"/>
+<text class="ts" x="500" y="78">37.5%</text>
+<text class="ts end" x="160" y="104">Microsoft SQL Server</text>
+<path class="bar" d="M170 90h254.9a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-254.9z"/>
+<text class="ts" x="436" y="104">30.1%</text>
+<text class="ts end" x="160" y="130">Redis</text>
+<path class="bar" d="M170 116h236.8a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-236.8z"/>
+<text class="ts" x="418" y="130">28%</text>
+<text class="ts end" x="160" y="156">MongoDB</text>
+<path class="bar" d="M170 142h202.4a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-202.4z"/>
+<text class="ts" x="383" y="156">24%</text>
+<text class="ts end" x="160" y="182">MariaDB</text>
+<path class="bar" d="M170 168h189.5a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-189.5z"/>
+<text class="ts" x="370" y="182">22.5%</text>
+<text class="ts end" x="160" y="208">Elasticsearch</text>
+<path class="bar" d="M170 194h139.6a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-139.6z"/>
+<text class="ts" x="321" y="208">16.7%</text>
+<text class="ts end" x="160" y="234">DynamoDB</text>
+<path class="bar" d="M170 220h80.3a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-80.3z"/>
+<text class="ts" x="261" y="234">9.8%</text>
+<line class="axis" x1="170" y1="8" x2="170" y2="246"/>
+
+<rect class="hit" x="6" y="9" width="708" height="24" data-tip="PostgreSQL|55.6% of respondents used it in the past year"/>
+<rect class="hit" x="6" y="35" width="708" height="24" data-tip="MySQL|40.5% of respondents used it in the past year"/>
+<rect class="hit" x="6" y="61" width="708" height="24" data-tip="SQLite|37.5% of respondents used it in the past year"/>
+<rect class="hit" x="6" y="87" width="708" height="24" data-tip="Microsoft SQL Server|30.1% of respondents used it in the past year"/>
+<rect class="hit" x="6" y="113" width="708" height="24" data-tip="Redis|28% of respondents used it in the past year"/>
+<rect class="hit" x="6" y="139" width="708" height="24" data-tip="MongoDB|24% of respondents used it in the past year"/>
+<rect class="hit" x="6" y="165" width="708" height="24" data-tip="MariaDB|22.5% of respondents used it in the past year"/>
+<rect class="hit" x="6" y="191" width="708" height="24" data-tip="Elasticsearch|16.7% of respondents used it in the past year"/>
+<rect class="hit" x="6" y="217" width="708" height="24" data-tip="DynamoDB|9.8% of respondents used it in the past year"/>
+</svg>
+</div>
+<figcaption>Share of all respondents who reported using each database in the past year. Respondents could choose several, which is why the bars add up to more than 100%. Source: Stack Overflow Developer Survey 2025.</figcaption>
+</figure>
+
+<p>Large systems end up using several databases, each for the workload it suits. The photo app at scale might keep users and photo records in PostgreSQL, sessions and feeds in a key-value store, message history in a wide-column store, the image files in object storage and a search index beside them. This is called <dfn>polyglot persistence</dfn>, and it has a cost that is easy to underestimate. Every additional database needs its own backups, monitoring, upgrades, capacity planning and expertise. Worse, data that lives in two systems must be kept in agreement, and there is no transaction that spans them. <x-ref to="change-data-capture"></x-ref> covers how to do that properly.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Name the kind of database and give the reason in terms of the workload: “a relational database for orders, because we need transactions and will query them in several ways”, or “a wide-column store for the event log, because it is write-heavy and we only ever read by device and time range”. Naming a product without a reason, or choosing a distributed database for 10 GB of data, invites the question you least want.</p></div>
+
+<h2 id="landscape">The landscape, as of October 2026</h2>
+<table>
+<thead><tr><th>Model</th><th>Widely used systems</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Relational</th><td>PostgreSQL, MySQL, SQLite, SQL Server, Oracle</td><td>PostgreSQL 18 (September 2025) is the current release, with version 19 in beta. MySQL 9.7 (April 2026) is the current long-term support release, and MySQL 8.0 reached end of life in April 2026.</td></tr>
+<tr><th>Distributed SQL</th><td>Google Spanner, CockroachDB, YugabyteDB, TiDB, Amazon Aurora DSQL</td><td>SQL and transactions across many machines and regions. More latency per query and more operational weight than a single server.</td></tr>
+<tr><th>Document</th><td>MongoDB, Couchbase, Firestore</td><td>MongoDB 9.0 was released in September 2026.</td></tr>
+<tr><th>Key-value</th><td>Redis, Valkey, Memcached, DynamoDB</td><td>Redis changed its license in 2024, which led to the Valkey fork under the Linux Foundation. Since version 8 (May 2025) Redis is again available under an open-source license, the AGPL. Valkey remains BSD-licensed.</td></tr>
+<tr><th>Wide-column</th><td>Cassandra, ScyllaDB, Bigtable, HBase</td><td>ScyllaDB is compatible with Cassandra’s query language.</td></tr>
+<tr><th>Graph</th><td>Neo4j, Amazon Neptune, Memgraph</td><td>The GQL query language is an ISO standard since 2024.</td></tr>
+<tr><th>Column-oriented analytics</th><td>ClickHouse, DuckDB, Snowflake, BigQuery, Redshift</td><td>For analysis, not for serving the application’s transactions.</td></tr>
+</tbody>
+</table>
+<p>Nearly all of these are offered as managed services by cloud providers or by their vendors. For most teams a managed service is the right default, because backups, failover and upgrades are where self-run databases go wrong. Version numbers and licenses change, so check them before you commit.</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Choosing by fashion or by scale you do not have.</b> A distributed database solves problems most systems never meet and brings limits that every system feels.</li>
+  <li><b>Choosing “schemaless” to avoid thinking about the schema.</b> The structure still exists. It is now enforced by nothing.</li>
+  <li><b>Embedding lists that grow without limit</b> in a document.</li>
+  <li><b>Designing a key-value or wide-column table before listing the queries.</b> In those models the queries are the design.</li>
+  <li><b>Running analytics on the transactional database.</b> One large report can slow every user request.</li>
+  <li><b>Adding a database for every new feature.</b> Each one is a system to run and a copy of the data to keep consistent.</li>
+  <li><b>Using a graph database because the product has a “graph”.</b> What matters is whether the queries traverse many hops.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="indexes-and-queries"></x-ref> and <x-ref to="transactions"></x-ref>: how a relational database makes queries fast and keeps data correct.</li>
+  <li><x-ref to="storage-engines"></x-ref>: why wide-column stores write so fast, and what row and column layouts look like on disk.</li>
+  <li><x-ref to="schema-design"></x-ref>: designing the tables and changing them safely.</li>
+  <li><x-ref to="replication"></x-ref> and <x-ref to="partitioning"></x-ref>: copying and splitting data across machines, which is where the models differ most.</li>
+  <li><x-ref to="consistency-models"></x-ref>: what the scaled-out systems promise about reading your own writes.</li>
+  <li><x-ref to="hld-key-value-store"></x-ref> and <x-ref to="hld-chat"></x-ref>: designs that depend on these choices.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A data model makes some questions cheap by arranging data to suit them, and other questions expensive.</li>
+  <li>Relational: facts stored once in tables and recombined with joins. The only model that handles unplanned queries, with transactions and constraints.</li>
+  <li>Document: self-contained nested records. Good when data is read as a whole. Embed what belongs to the parent and is bounded in size.</li>
+  <li>Key-value: lookups by exact key, extremely fast and easy to spread across machines. Every question needs its own key.</li>
+  <li>Wide-column: tables built around one query, with a partition key and a sort order. Very high write rates, no flexibility.</li>
+  <li>Graph: for queries that follow relationships across many hops.</li>
+  <li>Row storage serves transactions and column storage serves analytics. Keep the two workloads on separate systems.</li>
+  <li>Start with a relational database unless the workload clearly says otherwise, and add specialized stores when measurements justify them.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A document for each blog post embeds the author’s display name. What happens when an author changes their name, and what are the two ways to handle it?</summary><p>Every post by that author holds a stale copy. Either update all the copies whenever a name changes, accepting a period of inconsistency and the cost of the update, or store only the author’s ID in the post and look the name up when reading. The first favors fast reads, and the second favors correctness and simple writes.</p></details>
+<details><summary>Why can a wide-column store answer “the last 50 messages in channel 7” quickly however large the table is, and not “all messages by Ana”?</summary><p>The table is partitioned by channel and sorted by time within each partition, so the first query goes to one partition and reads 50 adjacent rows. Ana’s messages are scattered through every partition, and there is no structure that finds them without scanning everything. Serving that query needs a second table partitioned by author.</p></details>
+<details><summary>Your team wants to run a monthly revenue report directly on the production order database. What is the risk and what is the usual alternative?</summary><p>The report scans a large share of the table, competing with user requests for memory, disk and CPU, and can slow or stall them. The usual arrangement is to copy the data to a separate column-oriented system built for scans and run reports there, or at least to run them against a read replica.</p></details>
+<details><summary>What does “schema on read” move, and to where?</summary><p>It moves the responsibility for knowing the structure of the data from the database to the application. The database accepts any shape, so every reader must handle every shape that has ever been written, including old versions and mistakes.</p></details>
+<details><summary>A new product has uncertain requirements and about 20 GB of data expected in its first two years. Which model would you start with, and why?</summary><p>Relational. The data fits easily on one server, the queries are not yet known and the relational model is the one that answers unplanned questions, and transactions and constraints protect the data while the rules are still changing.</p></details>
+<details><summary>When is a graph database justified for a social product?</summary><p>When the important queries follow relationships across several hops or a variable number of them, such as friend-of-friend recommendations, shortest paths or detecting rings of connected accounts. If the queries are single hops such as “who follows Ana?”, an ordinary table of follows is simpler and scales more easily.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 2, “Data Models and Query Languages”. The standard treatment of this subject.</li>
+  <li>E. F. Codd, <a href="https://www.seas.upenn.edu/~zives/03f/cis550/codd.pdf">A Relational Model of Data for Large Shared Data Banks</a>, Communications of the ACM, 1970. The paper that introduced the relational model.</li>
+  <li>Fay Chang and others, <a href="https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/">Bigtable: A Distributed Storage System for Structured Data</a>, OSDI 2006.</li>
+  <li>Giuseppe DeCandia and others, <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon’s Highly Available Key-value Store</a>, SOSP 2007.</li>
+  <li>Bo Ingram, <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages">How Discord Stores Trillions of Messages</a>, March 2023.</li>
+  <li>Stack Overflow, <a href="https://survey.stackoverflow.co/2025/technology">2025 Developer Survey: Technology</a>. The database usage figures.</li>
+  <li>MongoDB documentation, <a href="https://www.mongodb.com/docs/manual/data-modeling/embedding/">Embedded data</a> and <a href="https://www.mongodb.com/docs/manual/reference/limits/">Limits and thresholds</a>. Embedding, referencing and the 16 MB document size limit.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/datatype-json.html">JSON types</a>.</li>
+  <li>endoflife.date, release tables for <a href="https://endoflife.date/postgresql">PostgreSQL</a>, <a href="https://endoflife.date/mysql">MySQL</a>, <a href="https://endoflife.date/mongodb">MongoDB</a>, <a href="https://endoflife.date/redis">Redis</a> and <a href="https://endoflife.date/valkey">Valkey</a>. Versions and license notes, checked October 2026.</li>
+</ol>
+</section>

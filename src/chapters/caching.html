@@ -1,0 +1,525 @@
+<!--meta
+{ "description": "Caching in system design: where caches sit, hit ratio and what it does to latency, cache-aside, write-through and write-behind, invalidation and its race conditions, eviction policies, stampedes and other failure modes, and Redis, Valkey and Memcached.",
+  "lede": "A cache keeps the answer to a question so that the question need not be worked out again. It is the most effective way to make a read-heavy system faster, and the easiest way to make a correct system subtly wrong. This chapter covers how to use one, how they fail, and how to decide whether you need one at all.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="what">A copy kept close</h2>
+<p>A <dfn>cache</dfn> is a store of results kept somewhere faster or nearer than the place they came from. When a result is needed again, it is taken from the cache instead of being fetched or computed afresh. Caching works because real workloads are repetitive: the same profile, product and query are requested over and over, and most data is read far more often than it changes.</p>
+<p>You have met several caches in this book already. They sit at every layer between a user and the data.</p>
+
+<figure class="fig wide" id="fig-layers">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 150" role="img" aria-labelledby="f221t f221d">
+<title id="f221t">The caches along the path of a request</title>
+<desc id="f221d">A request passes five places that can hold a cached copy: the browser’s own cache, a CDN’s edge cache, a cache inside the application process, dedicated cache servers such as Redis or Valkey, and the database’s buffer pool. A hit at any of them avoids all the work to its right. Caches nearer the user are cheapest to hit and hardest to invalidate.</desc>
+<rect class="n sig" x="10" y="30" width="116" height="56" rx="6"/>
+<text class="tb mid" x="68" y="54">Browser</text>
+<text class="ts mid" x="68" y="71">browser cache</text>
+<path class="e" d="M126 58H146"/>
+<rect class="n sig" x="146" y="30" width="116" height="56" rx="6"/>
+<text class="tb mid" x="204" y="54">CDN</text>
+<text class="ts mid" x="204" y="71">edge cache</text>
+<path class="e" d="M262 58H282"/>
+<rect class="n sig" x="282" y="30" width="136" height="56" rx="6"/>
+<text class="tb mid" x="350" y="54">Application</text>
+<text class="ts mid" x="350" y="71">in-process cache</text>
+<path class="e" d="M418 58H438"/>
+<rect class="n store" x="438" y="30" width="126" height="56" rx="6"/>
+<text class="tb mid" x="501" y="54">Cache servers</text>
+<text class="ts mid" x="501" y="71">Redis, Valkey</text>
+<path class="e" d="M564 58H584"/>
+<rect class="n" x="584" y="30" width="126" height="56" rx="6"/>
+<text class="tb mid" x="647" y="54">Database</text>
+<text class="ts mid" x="647" y="71">buffer pool</text>
+<path class="e none" d="M10 116H710"/>
+<text class="ts" x="10" y="108">a hit here saves everything to the right</text>
+<text class="ts" x="10" y="138">nearest the user: cheapest hit, hardest to invalidate</text>
+<text class="ts end" x="710" y="138">nearest the data: always correct, most expensive</text>
+</svg>
+</div>
+<figcaption>Every layer can answer from memory. The further left the hit, the more work is saved and the less control you have over the copy.</figcaption>
+</figure>
+
+<p>Browser and CDN caching were covered in <x-ref to="http-and-tls#caching"></x-ref> and <x-ref to="cdn-and-edge"></x-ref>, and the buffer pool in <x-ref to="storage-engines#btree-engine"></x-ref>. This chapter is about the two in the middle, which you design yourself: a cache inside the application, and a shared cache service beside it.</p>
+<p>Every cache makes the same trade. It gives speed and takes away certainty, because a copy can be out of date. All the difficulty of caching is in managing that.</p>
+
+<h2 id="math">What a cache buys</h2>
+<p>The benefit depends on one number, the <dfn>hit ratio</dfn>: the share of lookups the cache can answer. A <dfn>hit</dfn> costs one fast lookup. A <dfn>miss</dfn> costs that lookup and then the full original work.</p>
+
+<div class="widget" data-widget="cachemath">
+<h4>Latency with a cache in front of a database</h4>
+<p>A miss pays for the cache lookup and then for the database query.</p>
+<div class="controls">
+  <label>Cache hit ratio <output data-out="hit">90%</output><input type="range" name="hit" min="0" max="100" value="90" step="0.5"></label>
+  <label>Cache lookup, in ms<input type="number" name="cache" value="1" min="0" step="0.5"></label>
+  <label>Database query, in ms<input type="number" name="db" value="20" min="0" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Average latency</dt><dd data-out="avg">3 ms</dd></div>
+  <div><dt>99th percentile</dt><dd data-out="p99">21 ms</dd></div>
+  <div><dt>Requests reaching the database</dt><dd data-out="db">10%</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">The average falls from 20 ms without a cache to 3 ms. The 99th percentile is still a miss at 21 ms, because more than 1 request in 100 misses. A cache improves the typical request long before it improves the slowest ones.</p>
+</div>
+
+<p>Two lessons come out of the arithmetic. First, the load on the database follows the miss ratio, so the argument from <x-ref to="cdn-and-edge#hit-ratio"></x-ref> applies here too: going from 90% to 95% hits halves the database’s work. Second, a cache does little for tail latency until the hit ratio is very high, since the slowest requests are the misses. If your problem is the 99th percentile, a cache alone will not solve it.</p>
+<p>A third consequence is easy to overlook. Once a system depends on its cache, the database behind it is sized for the misses and not for the full load. If the cache is lost or emptied, the database receives ten times its usual traffic. A cache added for speed has become something the system cannot run without. Keep that in mind through the rest of the chapter.</p>
+
+<h2 id="aside">Cache-aside</h2>
+<p>The standard pattern is <dfn>cache-aside</dfn>, also called lazy loading. The application manages the cache itself. On a read it looks in the cache first, and on a miss it loads from the database and stores the result. On a write it changes the database and removes the cached entry.</p>
+
+<figure class="fig wide" id="fig-aside">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f222t f222d">
+<title id="f222t">The cache-aside pattern for a read and for a write</title>
+<desc id="f222d">Read: the application asks the cache for a key and gets a miss, queries the database, receives the row and stores it in the cache with a time to live. Write: the application updates the database, waits for the commit, then deletes the key from the cache.</desc>
+<g data-scene="read">
+<text class="tl" x="10" y="18">Read</text>
+<text class="ts mid" x="50" y="42">App</text>
+<text class="ts mid" x="180" y="42">Cache</text>
+<text class="ts mid" x="310" y="42">Database</text>
+<line class="axis" x1="50" y1="50" x2="50" y2="210"/>
+<line class="axis" x1="180" y1="50" x2="180" y2="210"/>
+<line class="axis" x1="310" y1="50" x2="310" y2="210"/>
+<g data-s="1">
+<path class="e sig" d="M51 74H179"/>
+<text class="ts mid" x="115.0" y="68">1. get photo:871</text>
+</g>
+<g data-s="2">
+<path class="e dash" d="M179 100H51"/>
+<text class="ts mid" x="115.0" y="94">2. miss</text>
+</g>
+<g data-s="3">
+<path class="e" d="M51 134H309"/>
+<text class="ts mid" x="245.0" y="128">3. SELECT …</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M309 160H51"/>
+<text class="ts mid" x="245.0" y="154">4. the row</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M51 194H179"/>
+<text class="ts mid" x="115.0" y="188">5. set, with a TTL</text>
+</g>
+</g>
+<path class="e none dash" d="M360 8V250"/>
+<g data-scene="write">
+<text class="tl" x="380" y="18">Write</text>
+<text class="ts mid" x="420" y="42">App</text>
+<text class="ts mid" x="550" y="42">Cache</text>
+<text class="ts mid" x="680" y="42">Database</text>
+<line class="axis" x1="420" y1="50" x2="420" y2="210"/>
+<line class="axis" x1="550" y1="50" x2="550" y2="210"/>
+<line class="axis" x1="680" y1="50" x2="680" y2="210"/>
+<g data-s="1">
+<path class="e" d="M421 74H679"/>
+<text class="ts mid" x="615.0" y="68">1. UPDATE …</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M679 100H421"/>
+<text class="ts mid" x="615.0" y="94">2. committed</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M421 134H549"/>
+<text class="ts mid" x="485.0" y="128">3. delete photo:871</text>
+</g>
+</g>
+<g data-scene="read">
+<g data-s="5">
+<text class="ts" x="10" y="236">The next read after step 5 is a hit and stops at step 1.</text>
+</g>
+</g>
+<g data-scene="write">
+<g data-s="3">
+<text class="ts" x="380" y="236">The next read misses and reloads the new value.</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="read" data-label="A read that misses">
+  <li data-state="Cache: no photo:871; Database: has the row">The application asks the cache for the key <code>photo:871</code>.</li>
+  <li>The cache does not have it. This is a miss.</li>
+  <li data-msg="SELECT">So the application queries the database. This is the slow step the cache exists to avoid.</li>
+  <li data-msg="the row">The database returns the row.</li>
+  <li data-state="Cache: photo:871, with a TTL; Database: has the row">The application stores the row in the cache with a time to live. The next read is a hit and stops at step 1.</li>
+</ol>
+<ol class="steps" data-scene="write" data-label="A write">
+  <li data-msg="UPDATE" data-state="Database: new value; Cache: old value">The application updates the row in the database first.</li>
+  <li data-msg="committed">It waits until the database confirms the commit.</li>
+  <li data-state="Database: new value; Cache: key deleted">Only then does it delete the key from the cache. The next read misses and reloads the new value.</li>
+</ol>
+<figcaption>Cache-aside. The cache is filled by reads and emptied by writes. The database is always written first and remains the source of truth.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Cache-aside in application code">
+async function getPhoto(id: number): Promise<Photo | null> {
+  const key = `photo:v1:${id}`;
+
+  const cached = await cache.get(key);
+  if (cached !== null) return JSON.parse(cached);              // hit
+
+  const photo = await db.queryOne("SELECT * FROM photos WHERE id = $1", [id]);
+  if (photo) {
+    const ttl = 300 + Math.floor(Math.random() * 60);          // 5 to 6 minutes
+    await cache.set(key, JSON.stringify(photo), { EX: ttl });
+  } else {
+    await cache.set(key, "null", { EX: 30 });                  // remember "not found", briefly
+  }
+  return photo;
+}
+
+async function updateCaption(id: number, caption: string): Promise<void> {
+  await db.query("UPDATE photos SET caption = $1 WHERE id = $2", [caption, id]);
+  await cache.del(`photo:v1:${id}`);                           // delete, do not update
+}
+</pre>
+<p>Several decisions are packed into those few lines, and each is deliberate.</p>
+<ul>
+  <li><b>Every entry has a time to live</b> (TTL), after which the cache discards it. Even with explicit deletion on writes, the TTL is the safety net that bounds how long any mistake can last.</li>
+  <li><b>The TTL is randomized.</b> If many entries are written at the same moment with the same lifetime, they expire at the same moment. A little randomness spreads the reloads out.</li>
+  <li><b>“Not found” is cached too</b>, for a short time. Otherwise every request for something that does not exist goes to the database.</li>
+  <li><b>The key carries a version.</b> When the shape of the cached value changes in a new release, changing <code>v1</code> to <code>v2</code> makes old entries invisible to new code without having to clear anything.</li>
+  <li><b>A write deletes the entry and does not replace it.</b> The next section explains why.</li>
+</ul>
+<p>Cache-aside is popular because it fails safely. If the cache is unavailable, the code can fall through to the database. Only data that is actually requested gets cached. Its weaknesses are that the first request for anything is a miss, and that it has a race condition, described below.</p>
+
+<h2 id="write-patterns">Other read and write patterns</h2>
+<table>
+<thead><tr><th>Pattern</th><th>How it works</th><th>Strength</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>Cache-aside</th><td>Application reads the cache, loads on a miss, deletes on a write</td><td>Simple, tolerant of cache failure</td><td>First read misses. A stale entry can be written in a race.</td></tr>
+<tr><th>Read-through</th><td>The cache itself loads from the database on a miss</td><td>Loading logic lives in one place</td><td>Needs a cache or library that supports it</td></tr>
+<tr><th>Write-through</th><td>Every write goes to the cache and the database together</td><td>Cache is always warm and current</td><td>Slower writes. Caches data that may never be read.</td></tr>
+<tr><th>Write-behind</th><td>Writes go to the cache, which saves them to the database later, in batches</td><td>Very fast writes. Absorbs bursts.</td><td>Data is lost if the cache fails before saving. The cache is now the source of truth.</td></tr>
+<tr><th>Refresh-ahead</th><td>Entries are reloaded shortly before they expire</td><td>Popular keys never miss</td><td>Wasted work on keys nobody asks for again</td></tr>
+</tbody>
+</table>
+<p>Write-behind deserves caution. It is how a view counter or a “last seen” timestamp can be updated thousands of times a second without touching the database each time, and it is acceptable there because losing a few seconds of such updates does no harm. For anything that matters, the durability of the data has been handed to a system built for speed.</p>
+
+<h2 id="invalidation">Invalidation</h2>
+<p>There is an old remark that the two hard problems in computing are naming things and cache invalidation. <dfn>Invalidation</dfn> means making sure a cached copy stops being used once the original has changed. There are only three tools.</p>
+<ul>
+  <li><b>Expiry.</b> Let entries age out. Simple and always works, at the cost of serving data up to one TTL old. For much data this is fine: a follower count that is a minute behind harms nobody.</li>
+  <li><b>Explicit removal.</b> Delete or replace the entry when the data changes. Fresher, and it requires every code path that changes the data to know every cache entry that depends on it.</li>
+  <li><b>Versioned keys.</b> Put a version or timestamp of the underlying data in the key. When the data changes, the key changes, and the old entry is never asked for again. It expires on its own.</li>
+</ul>
+<p>Explicit removal is harder than it looks, because the cache and the database are two systems with no transaction between them (<x-ref to="transactions#beyond"></x-ref>).</p>
+
+<h3 id="race">The race in cache-aside</h3>
+
+<figure class="fig wide" id="fig-race">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f223t f223d">
+<title id="f223t">A race between a read and a write that leaves a stale value in the cache</title>
+<desc id="f223d">A table of five steps. Request A, a read, misses the cache and reads the value 100 from the database. Request B, a write, then changes the database to 101 and deletes the cache key, which is already empty. Finally request A stores the value 100 in the cache. The cache holds 100 while the database holds 101.</desc>
+<rect class="n sunk" x="10" y="14" width="50" height="26" rx="0"/>
+<text class="ts tb" x="17" y="31">step</text>
+<rect class="n sunk" x="60" y="14" width="210" height="26" rx="0"/>
+<text class="ts tb" x="67" y="31">Request A (a read)</text>
+<rect class="n sunk" x="270" y="14" width="190" height="26" rx="0"/>
+<text class="ts tb" x="277" y="31">Request B (a write)</text>
+<rect class="n sunk" x="460" y="14" width="120" height="26" rx="0"/>
+<text class="ts tb" x="467" y="31">cache holds</text>
+<rect class="n sunk" x="580" y="14" width="120" height="26" rx="0"/>
+<text class="ts tb" x="587" y="31">database holds</text>
+<g data-s="1">
+<rect class="n" x="10" y="40" width="50" height="26" rx="0"/>
+<text class="ts" x="17" y="57">1</text>
+<rect class="n" x="60" y="40" width="210" height="26" rx="0"/>
+<text class="ts" x="67" y="57">cache miss</text>
+<rect class="n" x="270" y="40" width="190" height="26" rx="0"/>
+<text class="ts" x="277" y="57"></text>
+<rect class="n" x="460" y="40" width="120" height="26" rx="0"/>
+<text class="ts" x="467" y="57">empty</text>
+<rect class="n" x="580" y="40" width="120" height="26" rx="0"/>
+<text class="ts" x="587" y="57">100</text>
+</g>
+<g data-s="2">
+<rect class="n" x="10" y="66" width="50" height="26" rx="0"/>
+<text class="ts" x="17" y="83">2</text>
+<rect class="n" x="60" y="66" width="210" height="26" rx="0"/>
+<text class="ts" x="67" y="83">reads 100 from the database</text>
+<rect class="n" x="270" y="66" width="190" height="26" rx="0"/>
+<text class="ts" x="277" y="83"></text>
+<rect class="n" x="460" y="66" width="120" height="26" rx="0"/>
+<text class="ts" x="467" y="83">empty</text>
+<rect class="n" x="580" y="66" width="120" height="26" rx="0"/>
+<text class="ts" x="587" y="83">100</text>
+</g>
+<g data-s="3">
+<rect class="n" x="10" y="92" width="50" height="26" rx="0"/>
+<text class="ts" x="17" y="109">3</text>
+<rect class="n" x="60" y="92" width="210" height="26" rx="0"/>
+<text class="ts" x="67" y="109"></text>
+<rect class="n" x="270" y="92" width="190" height="26" rx="0"/>
+<text class="ts" x="277" y="109">writes 101, commits</text>
+<rect class="n" x="460" y="92" width="120" height="26" rx="0"/>
+<text class="ts" x="467" y="109">empty</text>
+<rect class="n" x="580" y="92" width="120" height="26" rx="0"/>
+<text class="ts" x="587" y="109">101</text>
+</g>
+<g data-s="4">
+<rect class="n" x="10" y="118" width="50" height="26" rx="0"/>
+<text class="ts" x="17" y="135">4</text>
+<rect class="n" x="60" y="118" width="210" height="26" rx="0"/>
+<text class="ts" x="67" y="135"></text>
+<rect class="n" x="270" y="118" width="190" height="26" rx="0"/>
+<text class="ts" x="277" y="135">deletes the cache key</text>
+<rect class="n" x="460" y="118" width="120" height="26" rx="0"/>
+<text class="ts" x="467" y="135">empty</text>
+<rect class="n" x="580" y="118" width="120" height="26" rx="0"/>
+<text class="ts" x="587" y="135">101</text>
+</g>
+<g data-s="5">
+<rect class="n" x="10" y="144" width="50" height="26" rx="0"/>
+<text class="ts" x="17" y="161">5</text>
+<rect class="n" x="60" y="144" width="210" height="26" rx="0"/>
+<text class="ts" x="67" y="161">stores 100 in the cache</text>
+<rect class="n" x="270" y="144" width="190" height="26" rx="0"/>
+<text class="ts" x="277" y="161"></text>
+<rect class="n fault" x="460" y="144" width="120" height="26" rx="0"/>
+<text class="ts" x="467" y="161">100</text>
+<rect class="n" x="580" y="144" width="120" height="26" rx="0"/>
+<text class="ts" x="587" y="161">101</text>
+<text class="ts" x="10" y="192">Request A read the old value before B’s write and stored it after B’s delete. The cache now holds 100 and the database 101,</text>
+<text class="ts" x="10" y="208">and nothing will correct it until the entry expires.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Cache: empty; Database: 100; A holds: nothing">Request A, a read, looks in the cache and misses.</li>
+  <li data-state="Cache: empty; Database: 100; A holds: 100">A reads the value from the database: 100.</li>
+  <li data-state="Cache: empty; Database: 101; A holds: 100">Before A can store it, request B writes 101 to the database and commits.</li>
+  <li>B deletes the cache key, as the pattern says. The cache was already empty, so nothing changes.</li>
+  <li data-state="Cache: 100; Database: 101; A holds: 100">Now A stores the 100 it read earlier. The cache holds a value the database no longer has, and nothing will correct it until the entry expires.</li>
+</ol>
+<figcaption>Each request followed the pattern correctly. The interleaving left the cache wrong, and it stays wrong until the entry expires.</figcaption>
+</figure>
+
+<p>The window is small, since it needs a read to straddle a write, and at thousands of requests a second small windows are hit daily. This is why every entry needs a TTL even when writes delete: the TTL turns “wrong forever” into “wrong for five minutes”. For data where that is still too long, there are stronger measures:</p>
+<ul>
+  <li><b>Delete after commit, never before.</b> Deleting first widens the window, because a read can reload the old value before the write lands.</li>
+  <li><b>Delete twice.</b> Once at the write, and again a second or so later, to remove anything a slow reader stored in between.</li>
+  <li><b>Compare versions.</b> Store a version number with each entry and refuse to overwrite a newer version with an older one.</li>
+  <li><b>Invalidate from the database’s change log.</b> A separate process follows the stream of committed changes and deletes the affected keys. Writers no longer need to know about the cache, and no change is missed. <x-ref to="change-data-capture"></x-ref> describes the mechanism.</li>
+</ul>
+<aside class="sn"><b>Why delete instead of update</b>If two writers each update the database and then set the cache, their cache writes can arrive in the opposite order from their database writes, leaving the older value cached. Deleting has no such problem: whichever order the deletes arrive in, the entry ends up gone, and the next reader loads the current value.</aside>
+<p>The practical position is to decide, for each kind of data, how stale it may be. That one decision usually settles the design.</p>
+<table>
+<thead><tr><th>Data</th><th>Tolerable staleness</th><th>Approach</th></tr></thead>
+<tbody>
+<tr><th>Like and follower counts, trending lists</th><td>Minutes</td><td>TTL alone</td></tr>
+<tr><th>A public profile or product page</th><td>Seconds to a minute</td><td>TTL, plus delete on write</td></tr>
+<tr><th>A user’s own settings, just changed</th><td>None visible to that user</td><td>Delete on write, and read your own writes from the database</td></tr>
+<tr><th>Permissions, prices at checkout, stock</th><td>None</td><td>Do not cache, or cache for a very short time with careful invalidation</td></tr>
+</tbody>
+</table>
+
+<h2 id="eviction">Eviction</h2>
+<p>A cache has a fixed amount of memory. When it is full and a new entry arrives, something must be removed. The rule for choosing what is the <dfn>eviction policy</dfn>, and it should keep the entries most likely to be asked for again.</p>
+<table>
+<thead><tr><th>Policy</th><th>Removes</th><th>Good when</th></tr></thead>
+<tbody>
+<tr><th>Least recently used (LRU)</th><td>The entry unused for the longest time</td><td>Recent use predicts future use. The usual default.</td></tr>
+<tr><th>Least frequently used (LFU)</th><td>The entry used the fewest times</td><td>A stable set of popular items. Resists a one-off scan flushing the cache.</td></tr>
+<tr><th>First in, first out</th><td>The oldest entry</td><td>Simplicity matters more than hit ratio</td></tr>
+<tr><th>Shortest time to live</th><td>The entry closest to expiring</td><td>Lifetimes reflect importance</td></tr>
+<tr><th>None</th><td>Nothing. New writes are refused.</td><td>The store holds data that must not vanish</td></tr>
+</tbody>
+</table>
+<p>Redis and Valkey let you choose with the <code>maxmemory-policy</code> setting. The default is to evict nothing and return errors on writes when memory is full, which is right for a primary data store and a surprise for a cache. Set a memory limit and a policy such as <code>allkeys-lru</code> deliberately. <x-ref to="lld-lru-cache"></x-ref> implements LRU from scratch.</p>
+<p>How large should a cache be? Large enough to hold the working set, the items that account for most requests. Because popularity is very uneven, a cache holding a small fraction of all items often serves a large fraction of all requests. Measure the hit ratio and the eviction rate. A high eviction rate with a low hit ratio means the cache is too small for the workload.</p>
+
+<h2 id="failures">How caches fail</h2>
+<p>Caches cause a distinctive family of outages, all variations on the database suddenly receiving traffic the cache had been absorbing.</p>
+
+<h3 id="stampede">Stampede</h3>
+<p>A popular entry expires. In the moment before anyone has reloaded it, every request for it misses, and each one runs the same expensive query. This is a <dfn>cache stampede</dfn>, also called a thundering herd or dogpile.</p>
+
+<figure class="fig wide" id="fig-stampede">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-labelledby="f224t f224d">
+<title id="f224t">A cache stampede, and the same event with single flight</title>
+<desc id="f224d">When a popular key expires, one thousand concurrent requests all miss and send one thousand identical queries to the database. With single flight, the first request sends one query and the other 999 wait for its result.</desc>
+<g data-scene="herd">
+<text class="tl" x="10" y="18">A popular key expires</text>
+<rect class="n" x="10" y="60" width="110" height="70" rx="6"/>
+<text class="tb mid" x="65" y="91">Requests</text>
+<text class="ts mid" x="65" y="108">1,000 at once</text>
+<rect class="n store" x="230" y="60" width="110" height="70" rx="6"/>
+<text class="tb mid" x="285" y="99.5">Database</text>
+<g data-s="1">
+<path class="e fault" d="M120 68H230"/>
+<path class="e fault" d="M120 77H230"/>
+<path class="e fault" d="M120 86H230"/>
+<path class="e fault" d="M120 95H230"/>
+<path class="e fault" d="M120 104H230"/>
+<path class="e fault" d="M120 113H230"/>
+<path class="e fault" d="M120 122H230"/>
+<text class="ts mid" x="175" y="56">1,000 identical queries</text>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="156">Every request misses, and every one</text>
+<text class="ts" x="10" y="172">recomputes the same value.</text>
+</g>
+</g>
+<path class="e none dash" d="M360 8V196"/>
+<g data-scene="single">
+<text class="tl" x="380" y="18">With single flight</text>
+<rect class="n" x="380" y="60" width="110" height="70" rx="6"/>
+<text class="tb mid" x="435" y="91">Requests</text>
+<text class="ts mid" x="435" y="108">1,000 at once</text>
+<rect class="n store" x="600" y="60" width="110" height="70" rx="6"/>
+<text class="tb mid" x="655" y="99.5">Database</text>
+<g data-s="1">
+<path class="e sig" d="M490 95H600"/>
+<text class="ts mid" x="545" y="86">1 query</text>
+</g>
+<g data-s="2">
+<text class="ts" x="380" y="156">The first request loads the value.</text>
+<text class="ts" x="380" y="172">The other 999 wait for its result.</text>
+</g>
+</g>
+
+</svg>
+</div>
+<ol class="steps" data-scene="herd" data-label="No coordination">
+  <li data-msg="query" data-state="Cache: expired; Queries on the database: 1,000">A popular key expires. The thousand requests that arrive next all miss, and each sends the same query to the database.</li>
+  <li>The database does the same work a thousand times, at the moment it is busiest.</li>
+</ol>
+<ol class="steps" data-scene="single" data-label="Single flight">
+  <li data-state="Cache: expired; Queries on the database: 1; Requests waiting for it: 999">With single flight, only the first request to miss goes to the database.</li>
+  <li data-state="Cache: expired; Queries on the database: 1; Requests that shared its result: 999">The other 999 wait for that one result and share it. The work is done once.</li>
+</ol>
+<figcaption>The work to be done is one query. Without coordination it is done a thousand times, at the worst possible moment.</figcaption>
+</figure>
+
+<p>The fix is to make sure only one caller rebuilds a given entry while the rest wait for it. Within one process this is a few lines:</p>
+<pre data-lang="ts" data-title="Single flight: concurrent requests for the same key share one load">
+const inFlight = new Map<string, Promise<unknown>>();
+
+function singleFlight<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const existing = inFlight.get(key);
+  if (existing) return existing as Promise<T>;        // someone is already loading it
+
+  const promise = load().finally(() => inFlight.delete(key));
+  inFlight.set(key, promise);
+  return promise;
+}
+
+// Usage: the database is asked once, however many callers arrive together.
+const photo = await singleFlight(`photo:${id}`, () => loadPhotoFromDatabase(id));
+</pre>
+<p>Across many application servers the same idea needs a lock held in the cache itself, taken with an atomic “set if absent” operation and a short expiry. Two other techniques avoid the stampede altogether. <dfn>Stale-while-revalidate</dfn> keeps serving the old value while one caller refreshes it in the background. Refreshing early, at a random time shortly before expiry, means a popular entry is renewed by a single request before it ever expires.</p>
+
+<h3 id="other-failures">The rest of the family</h3>
+<table>
+<thead><tr><th>Failure</th><th>What happens</th><th>Defense</th></tr></thead>
+<tbody>
+<tr><th>Mass expiry</th><td>Many entries expire at once, for example an hour after a bulk load, and the database is flooded</td><td>Randomize TTLs</td></tr>
+<tr><th>Misses for nonexistent keys</th><td>Requests for IDs that do not exist can never be hits, so each reaches the database. An attacker can do this on purpose.</td><td>Cache “not found”. Validate IDs. A Bloom filter of existing keys.</td></tr>
+<tr><th>Cold start</th><td>A restarted or newly deployed cache is empty and the database takes the full load</td><td>Warm the cache before sending traffic. Bring nodes in gradually.</td></tr>
+<tr><th>Cache node failure</th><td>A share of keys is lost at once</td><td>Replicas. Consistent hashing, so only that node’s keys are affected. A database sized to survive it.</td></tr>
+<tr><th>Hot key</th><td>One key receives so much traffic that the node holding it is saturated</td><td>A small in-process cache in front. Several copies of the key.</td></tr>
+<tr><th>Very large values</th><td>Megabyte-sized entries block the cache server and saturate the network</td><td>Split or compress them. Cache references instead.</td></tr>
+</tbody>
+</table>
+<div class="note production"><p><span class="label">In production.</span> Ask of every cache: if it were emptied right now, would the system survive? If the answer is no, the cache is a critical dependency and needs the treatment that implies: replication, monitoring, a tested recovery procedure, and protection for the database behind it such as load shedding (<x-ref to="resilience-patterns"></x-ref>).</p></div>
+
+<h2 id="distributed">Where the cache lives</h2>
+<p>An <dfn>in-process cache</dfn> is a data structure inside the application’s own memory. It is the fastest possible, with no network involved, and each server has its own, so ten servers hold ten copies that can disagree and that all vanish on deployment. It suits small, slowly changing data such as configuration and feature flags.</p>
+<p>A <dfn>distributed cache</dfn> is a separate service that all application servers share. It costs a network round trip of a fraction of a millisecond per lookup, survives deployments, and gives every server the same view. The two are often layered: a tiny in-process cache with a lifetime of a few seconds in front of a shared cache.</p>
+<p>The common choices for the shared cache:</p>
+<table>
+<thead><tr><th></th><th>Memcached</th><th>Redis and Valkey</th></tr></thead>
+<tbody>
+<tr><th>Data model</th><td>Strings only</td><td>Strings, hashes, lists, sets, sorted sets, streams and more</td></tr>
+<tr><th>Persistence</th><td>None</td><td>Optional snapshots and an append-only log</td></tr>
+<tr><th>Replication and failover</th><td>Not built in</td><td>Built in</td></tr>
+<tr><th>Scaling out</th><td>Clients spread keys over servers with consistent hashing</td><td>Cluster mode: 16,384 slots spread over nodes</td></tr>
+<tr><th>Other uses</th><td>Caching</td><td>Counters, rate limiters, queues, leaderboards, locks, publish and subscribe</td></tr>
+<tr><th>Character</th><td>Very simple and predictable</td><td>Far more capable, with more ways to misuse</td></tr>
+</tbody>
+</table>
+<p>Valkey is the open-source fork of Redis created in 2024 and maintained under the Linux Foundation. The two remain largely compatible, and managed services offer both (<x-ref to="data-models#landscape"></x-ref>). The richer data types are a real advantage. A sorted set gives a leaderboard, and an atomic increment with an expiry gives a rate limiter, with no read-modify-write in the application.</p>
+<p>Two cautions about these stores. Replication between a cache node and its replica is asynchronous, so a failover can lose recent writes (<x-ref to="replication#sync-async"></x-ref>). That is acceptable for a cache and is the reason not to keep the only copy of anything important there. And they execute commands one at a time, so a single slow command, such as listing all keys, stalls every other client.</p>
+
+<h2 id="what-to-cache">What to cache, and what not to</h2>
+<p>Good candidates share three properties: they are read much more often than they change, they are expensive to produce, and being slightly out of date is acceptable.</p>
+<ul>
+  <li><b>Results of expensive queries</b>: aggregates, counts, rankings, the first page of a popular list.</li>
+  <li><b>Assembled objects</b> that take several queries to build, such as a profile with its counts.</li>
+  <li><b>Responses from other services</b>, especially slow or rate-limited ones.</li>
+  <li><b>Sessions and tokens</b> looked up on every request.</li>
+  <li><b>Rendered fragments</b> of pages.</li>
+</ul>
+<p>Poor candidates are data that changes as often as it is read, data that must be exact such as balances and stock at the moment of purchase, and results unique to one request that will never be asked for again.</p>
+<p>Take care with keys. A cache key must include everything the result depends on. If a response varies by user, language or permission level and the key does not, one user receives another’s data, which is the same failure as the CDN one in <x-ref to="cdn-and-edge#cache-key"></x-ref> and just as serious.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Adding a cache to hide a slow query. The query is still slow on every miss, the system now has invalidation bugs it did not have before, and the database is sized on the assumption that the cache works. Fix the query first (<x-ref to="indexes-and-queries"></x-ref>). Cache when the work is inherently expensive or the volume is inherently high.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> When you add a cache, state four things: what is cached and under what key, the pattern (usually cache-aside), how it is invalidated and how stale it can be, and what happens on a miss storm. “Redis in front of the database” with none of these is a box on a diagram. With them it is a design.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>No TTL</b>, so a missed invalidation lasts forever.</li>
+  <li><b>Identical TTLs</b> on entries created together.</li>
+  <li><b>Updating the cache on write</b> instead of deleting, and invalidating before the database commit.</li>
+  <li><b>A key that omits something the value depends on.</b></li>
+  <li><b>No protection against stampedes</b> on popular keys.</li>
+  <li><b>Not caching “not found”.</b></li>
+  <li><b>A database that cannot survive an empty cache</b>, with no plan for when it happens.</li>
+  <li><b>Treating the cache as durable storage.</b></li>
+  <li><b>Never measuring the hit ratio</b>, so nobody knows whether the cache is earning its complexity.</li>
+  <li><b>Caching to hide a problem that should be fixed.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="cdn-and-edge"></x-ref> and <x-ref to="http-and-tls"></x-ref>: the same ideas outside your system.</li>
+  <li><x-ref to="schema-design#denormalization"></x-ref>: a counter column is a cache with the same invalidation questions.</li>
+  <li><x-ref to="partitioning#consistent-hashing"></x-ref>: how keys are spread across cache nodes.</li>
+  <li><x-ref to="change-data-capture"></x-ref>: invalidating from the database’s log.</li>
+  <li><x-ref to="consistency-models"></x-ref>: what “eventually consistent” permits.</li>
+  <li><x-ref to="lld-lru-cache"></x-ref> and <x-ref to="hld-rate-limiter"></x-ref>: building a cache, and building on one.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A cache trades certainty for speed. Its value is set by the hit ratio, and the database’s load by the miss ratio.</li>
+  <li>Caches improve average latency long before they improve the tail.</li>
+  <li>Cache-aside is the default: read the cache, load on a miss, write the database then delete the entry.</li>
+  <li>Give every entry a TTL, and randomize it. Decide for each kind of data how stale it may be.</li>
+  <li>Invalidation spans two systems with no transaction between them, so races exist. The TTL bounds the damage.</li>
+  <li>When memory is full an eviction policy decides what goes. LRU is the usual choice.</li>
+  <li>Stampedes, mass expiry and cold starts all send the database traffic it was not sized for. Coordinate reloads and plan for an empty cache.</li>
+  <li>Fix slow queries before caching them.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A cache has a 95% hit ratio. A hit takes 1 ms and a database query 40 ms. What is the average latency, and what is the 99th percentile?</summary><p>The average is 0.95 × 1 + 0.05 × 41 = 3 ms. The 99th percentile is 41 ms, because 5% of requests miss and the slowest 1% are all among them.</p></details>
+<details><summary>Why does a write delete the cached entry instead of writing the new value into it?</summary><p>Two concurrent writers can update the database in one order and the cache in the other, leaving the older value cached. Deletes have no order to get wrong: the entry ends up absent and the next read loads the current value from the database.</p></details>
+<details><summary>A dashboard loads slowly for a few seconds exactly every ten minutes. What is the likely cause and fix?</summary><p>A stampede. A popular entry with a ten-minute TTL expires and many requests recompute it at once. Have one caller rebuild it while the others wait or are served the old value, or refresh it shortly before it expires.</p></details>
+<details><summary>After a deployment that restarted the cache cluster, the database fell over. Why, and what would have prevented it?</summary><p>The cache came back empty, so every request missed and the database received the whole load, which it had not been sized for. Prevent it by restarting cache nodes one at a time, warming the cache before taking traffic, using persistence or replicas, and limiting the rate of requests allowed through to the database.</p></details>
+<details><summary>Requests arrive for thousands of user IDs that do not exist. The cache hit ratio drops and database load rises. What is happening?</summary><p>Nonexistent keys are never cached, so every one of those requests reaches the database. Cache the “not found” result for a short time, reject IDs that are malformed, and consider a Bloom filter of valid IDs in front.</p></details>
+<details><summary>Which would you cache with a five-minute TTL and which not at all: a product’s review count, a user’s permission to view a document, the stock level shown on a product page, the stock check at checkout?</summary><p>The review count and the stock level shown while browsing can be cached, since a few minutes of staleness does no harm. The permission check and the stock check at checkout should read current data, because acting on a stale answer shows someone a private document or sells something that is not there.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Rajesh Nishtala and others, <a href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala">Scaling Memcache at Facebook</a>, NSDI 2013. Leases against stale sets and stampedes, and operating a cache at very large scale.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html">Database Caching Strategies Using Redis: Caching patterns</a>.</li>
+  <li>Redis documentation, <a href="https://redis.io/docs/latest/develop/reference/eviction/">Key eviction</a>. The <code>maxmemory-policy</code> options and the default.</li>
+  <li><a href="https://valkey.io/">Valkey</a> and <a href="https://memcached.org/">Memcached</a> project sites.</li>
+  <li>A. Vattani, F. Chierichetti and K. Lowenstein, Optimal Probabilistic Cache Stampede Prevention, Proceedings of the VLDB Endowment, 2015. Early refresh at a random time.</li>
+  <li>M. Nottingham, <a href="https://www.rfc-editor.org/rfc/rfc5861">RFC 5861: HTTP Cache-Control Extensions for Stale Content</a>. Stale-while-revalidate.</li>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 11, on keeping derived data in step with its source.</li>
+  <li>Go documentation, <a href="https://pkg.go.dev/golang.org/x/sync/singleflight">singleflight</a>. The package that gave the technique its common name.</li>
+</ol>
+</section>

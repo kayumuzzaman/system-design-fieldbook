@@ -1,0 +1,572 @@
+<!--meta
+{ "description": "Change data capture and data pipelines for system design: why dual writes fail, polling and trigger-based capture, log-based CDC from the PostgreSQL write-ahead log and MySQL binlog with Debezium, snapshots, ordering and idempotent sinks, the outbox with CDC, operating replication slots, and ETL, ELT, warehouses and lakehouses.",
+  "lede": "The same data has to live in more than one place: in the database that owns it, in a search index, in a cache, in a warehouse for analysis, in other services that need a copy. Keeping those copies correct is one of the most common sources of quiet, permanent bugs. This chapter explains why the obvious approach fails and how reading the database’s own log solves it, then follows the data onward into the pipelines that feed analytics.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="problem">One fact, many copies</h2>
+<p>When Ana changes a photo’s caption, the new caption belongs in the photo table. It also belongs in the search index, so that the photo can be found by it. A cached copy of the photo page must be discarded. The analytics warehouse needs to know. A recommendation service keeps its own table of photos and their tags.</p>
+<p>The photo table is the <dfn>system of record</dfn>, the authoritative copy. The rest are <dfn>derived data</dfn>: copies in other shapes for other purposes, which could in principle be rebuilt from the original. The question is how each change gets from the first to the others, every time, in the right order.</p>
+
+<h2 id="dual-write">Why writing to both does not work</h2>
+<p>The first idea is for the application to do it: update the database, then update the search index. This is a <dfn>dual write</dfn>, and <x-ref to="search-systems#sync"></x-ref> and <x-ref to="distributed-transactions#outbox"></x-ref> have already warned against it. There are two separate ways it goes wrong.</p>
+
+<figure class="fig wide" id="fig-dual">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f371t f371d">
+<title id="f371t">Two ways a dual write leaves a database and a search index in permanent disagreement</title>
+<desc id="f371d">On the left, the application saves a caption to the database and crashes before sending it to the search index, so the database says Sunrise and the index still says Sunset. On the right, Ana and Ben each update both stores. The database receives Ana’s update and then Ben’s, ending with Ben’s value. The search index receives Ben’s and then Ana’s, ending with Ana’s value. Nothing failed and the stores still disagree.</desc>
+<g data-scene="crash">
+<text class="tb" x="10" y="18">A crash between the two writes</text>
+<rect class="n sig" x="10" y="70" width="90" height="44" rx="6"/>
+<text class="tb mid" x="55" y="96.5">App</text>
+<rect class="n store" x="200" y="36" width="140" height="44" rx="6"/>
+<text class="tb mid" x="270" y="54">Database</text>
+<text class="ts mid" x="270" y="71">caption = Sunrise</text>
+<rect class="n fault" x="200" y="104" width="140" height="44" rx="6"/>
+<text class="tb mid" x="270" y="122">Search index</text>
+<text class="ts mid" x="270" y="139">caption = Sunset</text>
+<g data-s="1">
+<path class="e store" d="M100 84C150 84 150 58 200 58"/>
+<text class="ts" x="128" y="56">1. saved</text>
+</g>
+<g data-s="2">
+<path class="e fault dash" d="M100 100C150 100 150 126 200 126"/>
+<path class="x" d="M143 110l14 14M157 110l-14 14"/>
+<text class="ts" x="100" y="146">2. never sent</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="184">The app crashed after step 1. The two stores now</text>
+<text class="ts" x="10" y="200">disagree, and nothing will ever correct it.</text>
+</g>
+</g>
+<path class="e none dash" d="M360 8V220"/>
+<g data-scene="order">
+<text class="tb" x="380" y="18">Two updates that arrive in different orders</text>
+<rect class="n sig" x="380" y="40" width="70" height="36" rx="6"/>
+<text class="tb mid" x="415" y="62.5">Ana</text>
+<rect class="n sig" x="380" y="112" width="70" height="36" rx="6"/>
+<text class="tb mid" x="415" y="134.5">Ben</text>
+<rect class="n store" x="570" y="36" width="140" height="44" rx="6"/>
+<text class="tb mid" x="640" y="54">Database</text>
+<text class="ts mid" x="640" y="71">A then B: ends as B</text>
+<rect class="n fault" x="570" y="104" width="140" height="44" rx="6"/>
+<text class="tb mid" x="640" y="122">Search index</text>
+<text class="ts mid" x="640" y="139">B then A: ends as A</text>
+<g data-s="1">
+<path class="e store" d="M450 52H570"/>
+</g>
+<g data-s="2">
+<path class="e fault" d="M450 136H570"/>
+</g>
+<g data-s="3">
+<path class="e fault" d="M450 64C510 64 510 120 570 120"/>
+</g>
+<g data-s="2">
+<path class="e store" d="M450 124C510 124 510 68 570 68"/>
+</g>
+<g data-s="4">
+<text class="ts" x="380" y="184">Both apps wrote to both stores and nothing failed.</text>
+<text class="ts" x="380" y="200">The stores still disagree, permanently.</text>
+</g>
+</g>
+
+</svg>
+</div>
+<ol class="steps" data-scene="crash" data-label="A crash between the writes">
+  <li data-msg="“Sunrise”" data-state="Database: “Sunrise”; Search index: “Sunset”">The app saves the new caption, “Sunrise”, to the database.</li>
+  <li data-msg="none">It crashes before it can send the same change to the search index, which still says “Sunset”.</li>
+  <li>The two stores now disagree, and nothing will ever correct it.</li>
+</ol>
+<ol class="steps" data-scene="order" data-label="Two orders of arrival">
+  <li data-msg="Ana’s update" data-state="Database: Ana’s value; Search index: the old value">Ana and Ben change the same caption at almost the same moment. Ana’s update reaches the database first.</li>
+  <li data-msg="Ben’s update" data-state="Database: Ben’s value; Search index: Ben’s value">Ben’s update reaches the database second, and the search index first.</li>
+  <li data-msg="Ana’s update" data-state="Database: Ben’s value; Search index: Ana’s value">Ana’s update reaches the search index last.</li>
+  <li>The database ends with Ben’s value and the index with Ana’s. Both apps wrote to both stores, nothing failed, and the stores disagree for good.</li>
+</ol>
+<figcaption>A dual write can diverge through failure, and also through nothing but timing. Neither case raises an error.</figcaption>
+</figure>
+
+<p><b>Partial failure.</b> The application can crash, or lose its connection, after the first write and before the second. One store has the change and the other never will. Reversing the order only reverses which store is wrong.</p>
+<p><b>Racing writers.</b> Even when every write succeeds, two concurrent updates can reach the two stores in different orders. Each store ends with a different final value, and both believe they are up to date.</p>
+<p>Both failures are silent and permanent. No exception is thrown and no alert fires. Weeks later a user searches for a photo by its caption and does not find it. The underlying cause is that two systems are being written independently with nothing ensuring they see the same changes in the same order. The fix is to have a single ordered sequence of changes that both follow.</p>
+
+<h2 id="options">Ways to capture changes</h2>
+<p>The database already receives every change. <dfn>Change data capture</dfn>, or CDC, means getting those changes out of the database as a stream that other systems can follow. There are four techniques.</p>
+<table>
+<thead><tr><th>Technique</th><th>How it works</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>Polling</th><td>A job repeatedly asks for rows whose <code>updated_at</code> is newer than its last run</td><td>Misses deletes and intermediate values, can skip rows, and loads the database</td></tr>
+<tr><th>Triggers</th><td>A database trigger copies each change into a changes table, which a job reads</td><td>Adds work to every write, and the trigger logic is hidden in the database</td></tr>
+<tr><th>Outbox</th><td>The application writes a message row in the same transaction as the change</td><td>Captures only what the code remembers to write. Reliable for designed events.</td></tr>
+<tr><th>Log-based</th><td>A connector reads the database’s replication log</td><td>More to set up and operate. Captures everything.</td></tr>
+</tbody>
+</table>
+
+<h3 id="polling">The trouble with polling</h3>
+<p>Polling deserves a closer look, because it is what most teams build first and it fails in a way that is hard to see.</p>
+
+<figure class="fig wide" id="fig-polling">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 234" role="img" aria-labelledby="f372t f372d">
+<title id="f372t">A poller missing a row whose transaction committed after the poll</title>
+<desc id="f372d">A timeline from 10:00:00 to 10:00:04. A transaction sets a row’s updated_at to 10:00:00.5 and commits at 10:00:02.5. The first poll at 10:00:01.5 does not see the row because it is not yet committed. The second poll asks for changes after 10:00:01.5, and the row’s timestamp of 10:00:00.5 is earlier than that, so it is skipped. The change is never captured.</desc>
+<text class="tb" x="10" y="18">Polling for rows changed “since the last poll” can skip a row for good</text>
+<line class="axis" x1="60" y1="150" x2="690" y2="150"/>
+<line class="axis" x1="60" y1="146" x2="60" y2="154"/>
+<text class="ts mid" x="60.0" y="170">10:00:00</text>
+<line class="axis" x1="217.5" y1="146" x2="217.5" y2="154"/>
+<text class="ts mid" x="217.5" y="170">10:00:01</text>
+<line class="axis" x1="375" y1="146" x2="375" y2="154"/>
+<text class="ts mid" x="375.0" y="170">10:00:02</text>
+<line class="axis" x1="532.5" y1="146" x2="532.5" y2="154"/>
+<text class="ts mid" x="532.5" y="170">10:00:03</text>
+<line class="axis" x1="690" y1="146" x2="690" y2="154"/>
+<text class="ts mid" x="690.0" y="170">10:00:04</text>
+<g data-s="1">
+<rect class="n sig" x="138.75" y="46" width="315" height="30" rx="4"/>
+<text class="ts mid" x="296.25" y="66">transaction open</text>
+<text class="ts" x="138.75" y="40">sets updated_at = 10:00:00.5</text>
+</g>
+<g data-s="3">
+<text class="ts end" x="453.75" y="40">commits at 10:00:02.5</text>
+</g>
+<g data-s="1">
+<path class="e none dash" d="M138.75 76V150"/>
+</g>
+<g data-s="3">
+<path class="e none dash" d="M453.75 76V150"/>
+</g>
+<g data-s="2">
+<path class="e fault" d="M296.25 122V150"/>
+</g>
+<g data-s="4">
+<path class="e fault" d="M611.25 122V150"/>
+</g>
+<g data-s="2">
+<text class="ts" x="168.25" y="96">poll 1 at 10:00:01.5:</text>
+<text class="ts" x="168.25" y="111">row not committed yet, unseen</text>
+</g>
+<g data-s="4">
+<text class="ts" x="493.25" y="96">poll 2 asks for changes after</text>
+<text class="ts" x="493.25" y="111">10:00:01.5: the row says 10:00:00.5</text>
+<text class="ts" x="10" y="198">The row’s timestamp was set when the statement ran and became visible only when the transaction committed, after the poller had</text>
+<text class="ts" x="10" y="214">moved on. The change is never captured. Deletes are missed as well, because a deleted row is not there to be found.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="The row: changed, stamped 10:00:00.5, not committed; Poller has read up to: an earlier poll">A transaction starts and updates a row at 10:00:00.5. That time goes into the row’s <code>updated_at</code> column. The transaction stays open.</li>
+  <li data-msg="poll 1" data-state="The row: changed, stamped 10:00:00.5, not committed; Poller has read up to: 10:00:01.5">Poll 1 runs at 10:00:01.5 and asks for rows changed since the poll before it. The row is not committed yet, so the poll cannot see it.</li>
+  <li data-state="The row: committed, still stamped 10:00:00.5; Poller has read up to: 10:00:01.5">The transaction commits at 10:00:02.5. The row becomes visible, still stamped 10:00:00.5.</li>
+  <li data-msg="poll 2" data-state="The row: committed, still stamped 10:00:00.5; Poller has read up to: the time of poll 2; Captured: never">Poll 2 asks for changes after 10:00:01.5. The row says 10:00:00.5, so it is skipped, this time and every time after.</li>
+</ol>
+<figcaption>The timestamp records when the statement ran. Visibility begins at commit. A poller that advances past the gap between them loses the row.</figcaption>
+</figure>
+
+<p>The usual patch is to poll with an overlap, asking for changes since a minute before the last poll, and to rely on the consumer ignoring repeats. That narrows the hole without closing it, since a transaction can stay open longer than any overlap. Polling also cannot see a deleted row, cannot see values a row held between two polls, and puts a query load on the primary database that grows with how fresh you want the data. It is acceptable for small tables and loose requirements. It is not a foundation.</p>
+
+<h2 id="log-based">Reading the database’s log</h2>
+<p>Every serious database already produces exactly the stream that is needed. To survive crashes it writes each change to a write-ahead log before applying it (<x-ref to="storage-engines#wal"></x-ref>). To feed replicas it ships that log to them (<x-ref to="replication#leader-follower"></x-ref>). The log contains every committed change, in commit order, including deletes, with nothing skipped.</p>
+<p><dfn>Log-based CDC</dfn> connects to the database as if it were a replica, reads that log, and turns each change into an event.</p>
+
+<figure class="fig wide" id="fig-cdc">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f373t f373d">
+<title id="f373t">Log-based change data capture</title>
+<desc id="f373d">The application writes only to its database. Inside the database, changes to tables are recorded in the write-ahead log in order. A CDC connector reads that log as a replica would, and publishes the changes to a log with one topic per table. A search index, a cache, a data warehouse and other services each consume those topics.</desc>
+<rect class="n sig" x="10" y="50" width="80" height="44" rx="6"/>
+<text class="tb mid" x="50" y="76.5">App</text>
+<rect class="grp" x="120" y="14" width="170" height="150" rx="8"/>
+<text class="tb" x="130" y="32">Database</text>
+<rect class="n store" x="132" y="44" width="146" height="40" rx="6"/>
+<text class="ts tb mid" x="205" y="68.5">Tables</text>
+<rect class="n store" x="132" y="108" width="146" height="40" rx="6"/>
+<text class="ts tb mid" x="205" y="124">Write-ahead log</text>
+<text class="ts mid" x="205" y="141">every change, in order</text>
+<g data-s="1">
+<path class="e sig" d="M90 72H120"/>
+</g>
+<g data-s="2">
+<path class="e store" d="M205 84V108"/>
+</g>
+<rect class="n" x="322" y="104" width="124" height="48" rx="6"/>
+<text class="ts tb mid" x="384" y="124">CDC connector</text>
+<text class="ts mid" x="384" y="141">reads like a replica</text>
+<g data-s="3">
+<path class="e store" d="M278 128H322"/>
+</g>
+<rect class="n async" x="476" y="104" width="104" height="48" rx="6"/>
+<text class="ts tb mid" x="528" y="124">Log</text>
+<text class="ts mid" x="528" y="141">a topic per table</text>
+<g data-s="4">
+<path class="e async" d="M446 128H476"/>
+</g>
+<rect class="n" x="622" y="14" width="92" height="30" rx="6"/>
+<text class="ts mid" x="668" y="33.5">Search index</text>
+<g data-s="5">
+<path class="e async" d="M580 128C602 128 600 29 622 29"/>
+</g>
+<rect class="n" x="622" y="54" width="92" height="30" rx="6"/>
+<text class="ts mid" x="668" y="73.5">Cache</text>
+<g data-s="5">
+<path class="e async" d="M580 128C602 128 600 69 622 69"/>
+</g>
+<rect class="n" x="622" y="94" width="92" height="30" rx="6"/>
+<text class="ts mid" x="668" y="113.5">Warehouse</text>
+<g data-s="5">
+<path class="e async" d="M580 128C602 128 600 109 622 109"/>
+</g>
+<rect class="n" x="622" y="134" width="92" height="30" rx="6"/>
+<text class="ts mid" x="668" y="153.5">Other services</text>
+<g data-s="5">
+<path class="e async" d="M580 128C602 128 600 149 622 149"/>
+<text class="ts" x="10" y="200">The application writes to one place. Everything else learns of the change from the database’s own log, in commit order,</text>
+<text class="ts" x="10" y="216">including changes made by scripts, migrations and other applications that the app’s code never sees.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="write">The application writes to the database and nowhere else.</li>
+  <li data-msg="change">The database records every change in its write-ahead log, in commit order, as it always does.</li>
+  <li data-msg="change">A CDC connector reads that log, in the way a replica would.</li>
+  <li data-msg="change">It publishes each change to a log of its own, with a topic for each table.</li>
+  <li data-msg="change">The search index, the cache, the warehouse and other services each follow the topics. They also see changes made by scripts and migrations, which the application’s own code would never have told them about.</li>
+</ol>
+<figcaption>One write, one ordered record of it, many followers. The application’s code path contains a single database transaction and nothing else.</figcaption>
+</figure>
+
+<p>Compared with the alternatives:</p>
+<ul>
+  <li><b>Nothing is missed.</b> If it committed, it is in the log. That includes changes made by a migration script, an administrator at a console or a second application, none of which pass through your code.</li>
+  <li><b>Order is the database’s own.</b> The log is the definitive sequence in which changes took effect, so followers cannot disagree about it.</li>
+  <li><b>No extra load on queries.</b> Reading the log does not run queries against tables.</li>
+  <li><b>It is close to real time.</b> Changes typically arrive within a second.</li>
+  <li><b>The application is unchanged.</b> No code in the write path, so no dual write.</li>
+</ul>
+<p>Each database exposes its log differently. PostgreSQL offers <dfn>logical decoding</dfn>, which translates the write-ahead log into row-level changes. MySQL has the binary log, or binlog, in row format. MongoDB has change streams, built on its operation log. The most widely used open-source tool is Debezium, which has connectors for these and many other databases and publishes to Kafka. Version 3.6 was released in July 2026. Cloud providers offer managed equivalents.</p>
+
+<h3 id="event-format">What a change event contains</h3>
+<pre data-lang="js" data-title="A change event for an updated row, in the shape Debezium uses (trimmed)">
+{
+  "op": "u",                                   // c = create, u = update, d = delete, r = read (snapshot)
+  "before": { "id": 871, "caption": "Sunset",  "owner_id": 42 },
+  "after":  { "id": 871, "caption": "Sunrise", "owner_id": 42 },
+  "source": {
+    "db": "photoapp", "table": "photos",
+    "lsn": 24023128,                           // position in the log: the ordering key
+    "txId": 5571,
+    "ts_ms": 1791623643120                     // when the database committed it
+  }
+}
+</pre>
+<p>The log position, called the LSN in PostgreSQL, is the important field. It increases with every change, so it works as a version number for free: a consumer that remembers the position of the last change it applied to each row can ignore anything older.</p>
+
+<h3 id="setup">Setting it up in PostgreSQL</h3>
+<pre data-lang="sql" data-title="Publishing two tables and creating a slot for a consumer">
+-- In postgresql.conf:  wal_level = logical
+
+CREATE PUBLICATION photo_changes FOR TABLE photos, comments;
+
+SELECT pg_create_logical_replication_slot('search_indexer', 'pgoutput');
+</pre>
+<p>A <dfn>publication</dfn> names the tables to expose. A <dfn>replication slot</dfn> is the database’s record of one consumer’s position in the log. The database promises not to discard any log that a slot has not yet read, which is what makes delivery reliable. It is also the main operational hazard, as a later section explains.</p>
+
+<h2 id="snapshot">Starting on a table that already has data</h2>
+<p>The log goes back only so far. Old log files are deleted once nothing needs them. A new consumer, such as a search index being built for the first time, needs all the existing rows and then every change after them, with no gap and no missed update in between.</p>
+
+<figure class="fig wide" id="fig-snapshot">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 252" role="img" aria-labelledby="f374t f374d">
+<title id="f374t">Taking an initial snapshot and then streaming from the log without a gap</title>
+<desc id="f374d">The database’s log grows to the right. Step one notes the current log position P. Step two reads every existing row as it was at P, which takes some time. Step three streams the log starting from P. Changes made while the snapshot was running lie after P in the log, so step three delivers them. Some rows are seen twice, which is harmless if the consumer is idempotent.</desc>
+<text class="tb" x="10" y="18">Starting a connector on a table that already has data</text>
+<line class="axis" x1="30" y1="70" x2="690" y2="70"/>
+<text class="ts end" x="690" y="92">the database’s log, growing to the right</text>
+<g data-s="1">
+<line class="axis" x1="200" y1="62" x2="200" y2="78"/>
+<text class="ts mid" x="200" y="54">position P</text>
+</g>
+<g data-s="2">
+<line class="axis" x1="460" y1="62" x2="460" y2="78"/>
+<text class="ts mid" x="460" y="54">snapshot finishes</text>
+<rect class="n sig" x="200" y="104" width="260" height="34" rx="4"/>
+<text class="ts mid" x="330.0" y="126">2. read every existing row, as of P</text>
+</g>
+<g data-s="3">
+<rect class="n store" x="468" y="158" width="222" height="34" rx="4"/>
+<text class="ts mid" x="579.0" y="180">3. stream the log</text>
+<path class="e none dash" d="M200 78V175"/>
+<path class="e store" d="M200 175H468"/>
+<text class="ts mid" x="334.0" y="167">starting from P, not from where the snapshot ended</text>
+</g>
+<g data-s="1">
+<text class="ts" x="30" y="126">1. note position P</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="222">Changes made while the snapshot was running are after P in the log, so step 3 delivers them. Some rows are seen twice, once in</text>
+<text class="ts" x="10" y="238">the snapshot and once from the log, which is harmless if the consumer applies changes idempotently.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>The table already holds data. First the connector notes the current position in the database’s log: P.</li>
+  <li>It reads every existing row as the table stood at P. This takes a while and writes carry on in the meantime, so by the time the snapshot finishes the log has grown.</li>
+  <li>The connector then streams the log starting from P, not from where the snapshot ended, so the changes made during the snapshot are delivered.</li>
+  <li>A change made during the snapshot may be seen twice, once in the snapshot and once from the log. That is harmless as long as the consumer applies changes idempotently.</li>
+</ol>
+<figcaption>The handover from snapshot to stream is safe because streaming begins at the position where the snapshot’s view of the data was taken.</figcaption>
+</figure>
+
+<p>A snapshot of a large table can take hours. Newer connectors can take it incrementally, in chunks interleaved with live changes, so that the stream is not held up and the snapshot can be paused, resumed or rerun for a single table. The technique was published by Netflix as DBLog and adopted by Debezium.</p>
+
+<h2 id="guarantees">What consumers must handle</h2>
+<p>CDC delivers at least once. A connector that crashes after publishing a change and before recording its position will publish that change again on restart. And although the database’s log is totally ordered, the stream is usually published to a partitioned log, where order is kept for each key and not across keys (<x-ref to="event-streaming#partitions"></x-ref>).</p>
+<p>A correct consumer therefore needs three properties.</p>
+<ul>
+  <li><b>Changes are keyed by primary key</b>, so that all changes to one row stay in order.</li>
+  <li><b>Applying a change twice is harmless.</b> Write the whole row by key instead of applying differences.</li>
+  <li><b>Older changes do not overwrite newer ones</b>, and a row that has been deleted is not brought back by a late update.</li>
+</ul>
+<pre data-lang="ts" data-title="A consumer that tolerates duplicates, reordering and late updates after a delete">
+interface ChangeEvent {
+  op: "c" | "u" | "d" | "r";                  // create, update, delete, or read during the snapshot
+  key: number;                                // the row's primary key
+  after: Record<string, unknown> | null;      // the row after the change; null for a delete
+  lsn: number;                                // position in the database's log, always increasing
+}
+
+class SearchIndexSink {
+  private docs = new Map<number, { doc: Record<string, unknown>; lsn: number }>();
+  private deletedAt = new Map<number, number>();           // remember deletes, and where they happened
+
+  apply(event: ChangeEvent): void {
+    const seen = this.docs.get(event.key)?.lsn ?? this.deletedAt.get(event.key) ?? -1;
+    if (event.lsn <= seen) return;                         // a duplicate or an older change: ignore it
+
+    if (event.op === "d") {
+      this.docs.delete(event.key);
+      this.deletedAt.set(event.key, event.lsn);
+    } else {
+      this.docs.set(event.key, { doc: event.after!, lsn: event.lsn });
+      this.deletedAt.delete(event.key);
+    }
+  }
+
+  get(key: number): Record<string, unknown> | undefined {
+    return this.docs.get(key)?.doc;
+  }
+}
+</pre>
+<p>Fed four changes to two rows, this sink reaches the same final state whichever of the 24 possible orders they arrive in, and however many times each is repeated. The record of deletions is what prevents a late update from resurrecting a deleted row. In a real system that record can be dropped after a period longer than any plausible delay.</p>
+<p>Two more things arrive in the stream and need a plan.</p>
+<ul>
+  <li><b>Schema changes.</b> When a column is added or renamed in the source, the events change shape. Connectors can publish schemas to a registry (<x-ref to="event-driven-architecture#versioning"></x-ref>), and the expand-and-contract migrations of <x-ref to="schema-design#migrations"></x-ref> keep the changes compatible.</li>
+  <li><b>Transactions.</b> One transaction that touches five rows appears as five separate events. A consumer may briefly see some and not others. If consumers need changes grouped as the transaction made them, the transaction ID is in each event.</li>
+</ul>
+
+<h2 id="outbox">CDC with an outbox</h2>
+<p>Raw CDC publishes your tables. Consumers that read those events are coupled to your schema: rename a column, split a table, and every downstream system breaks. For feeding your own search index or cache, that is acceptable, since you own both ends. For events that other teams consume, it turns your private storage layout into a public interface.</p>
+<p>The answer combines the two reliable techniques. The application writes designed business events to an outbox table in the same transaction as its changes, as in <x-ref to="distributed-transactions#outbox"></x-ref>. CDC is pointed at the outbox table alone and publishes its rows as events. This gives:</p>
+<ul>
+  <li>events that are atomic with the change, because they are written in the same transaction,</li>
+  <li>prompt delivery without a polling relay, because CDC streams from the log,</li>
+  <li>a deliberately designed public contract, because the events are written by code and not derived from table structure.</li>
+</ul>
+<table>
+<thead><tr><th>Stream</th><th>Contains</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><th>Raw table changes</th><td>Rows as stored, before and after</td><td>Your own derived stores: search, caches, replicas, the warehouse</td></tr>
+<tr><th>Outbox events</th><td>Business events with a designed schema</td><td>Other services and other teams</td></tr>
+</tbody>
+</table>
+
+<h2 id="operations">Operating CDC</h2>
+<p>CDC attaches a new dependency to your primary database’s most critical internal structure. Most of the risks are specific and well known.</p>
+<p><b>A stalled consumer can fill the database’s disk.</b> A replication slot makes the database keep all log that the slot has not consumed. If the connector stops, for an hour or for a week, the log accumulates. When the disk fills, the database stops accepting writes. An abandoned slot, left behind by a decommissioned consumer, does this slowly and with no other symptom.</p>
+<pre data-lang="sql" data-title="How much log is each slot holding back?">
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots;
+</pre>
+<p>Alert on that number. Set <code>max_slot_wal_keep_size</code> so that a slot which falls too far behind is invalidated instead of taking the database down with it. The consumer then needs a new snapshot, which is a far better failure than an outage of the primary.</p>
+<ul>
+  <li><b>Failover.</b> When the primary fails and a replica is promoted, the connector must continue from the right position on the new primary. PostgreSQL has been able to synchronize logical slots to standbys since version 17. Earlier versions need extra tooling or a fresh snapshot.</li>
+  <li><b>Log retention.</b> In MySQL the binlog is deleted on a schedule regardless of consumers. A connector that is down for longer than the retention period has lost its place and must snapshot again.</li>
+  <li><b>Very large transactions.</b> A bulk update of ten million rows becomes ten million events. Batch such jobs, and warn the owners of downstream systems.</li>
+  <li><b>Lag.</b> Monitor the delay between a commit and its arrival downstream, end to end. Every derived store is stale by at least that much.</li>
+  <li><b>Sensitive columns.</b> Everything in a published table flows out. Exclude or mask columns such as password hashes and personal data at the connector.</li>
+</ul>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Creating a replication slot for an experiment and forgetting it. Nothing reads from it, so the database retains write-ahead log from that moment on. Weeks later the disk fills and writes stop, and the cause is a slot nobody remembers. List slots as part of routine monitoring, and drop any that are inactive without a known reason.</p></div>
+
+<h2 id="pipelines">From changes to analytics</h2>
+<p>The largest consumer of change data in most companies is analytics. The transactional database is built to read and write single rows quickly. Analytical questions, such as uploads per country per week for the past two years, scan billions of rows and belong in a system built for that (<x-ref to="data-models#oltp-olap"></x-ref>). A <dfn>data pipeline</dfn> moves and reshapes data from where it is produced to where it is analyzed.</p>
+
+<figure class="fig wide" id="fig-pipeline">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-labelledby="f375t f375d">
+<title id="f375t">The stages of an analytics data pipeline</title>
+<desc id="f375d">Four stages from left to right. Sources: application databases, event streams, and files and software-as-a-service tools. Ingest: change data capture, stream consumers and batch loads. Store and transform: raw data as it arrived, then cleaned and joined data, then models built for one use. Serve: dashboards, machine learning, and data sent back into applications. In ELT the data is loaded raw and transformed in the store with SQL. In the older ETL pattern cleaning happened before loading and the raw data was discarded.</desc>
+<text class="tb" x="10" y="18">Sources</text>
+<rect class="n" x="10" y="30" width="160" height="36" rx="6"/>
+<text class="ts mid" x="90" y="52.5">App databases</text>
+<rect class="n" x="10" y="76" width="160" height="36" rx="6"/>
+<text class="ts mid" x="90" y="98.5">Event streams</text>
+<rect class="n" x="10" y="122" width="160" height="36" rx="6"/>
+<text class="ts mid" x="90" y="144.5">Files and SaaS</text>
+<text class="tb" x="190" y="18">Ingest</text>
+<rect class="n async" x="190" y="30" width="160" height="36" rx="6"/>
+<text class="ts mid" x="270" y="52.5">CDC</text>
+<rect class="n async" x="190" y="76" width="160" height="36" rx="6"/>
+<text class="ts mid" x="270" y="98.5">Stream consumers</text>
+<rect class="n async" x="190" y="122" width="160" height="36" rx="6"/>
+<text class="ts mid" x="270" y="144.5">Batch loads</text>
+<text class="tb" x="370" y="18">Store and transform</text>
+<rect class="n store" x="370" y="30" width="160" height="36" rx="6"/>
+<text class="ts mid" x="450" y="52.5">Raw: as it arrived</text>
+<rect class="n store" x="370" y="76" width="160" height="36" rx="6"/>
+<text class="ts mid" x="450" y="98.5">Cleaned and joined</text>
+<rect class="n store" x="370" y="122" width="160" height="36" rx="6"/>
+<text class="ts mid" x="450" y="144.5">Models for one use</text>
+<text class="tb" x="550" y="18">Serve</text>
+<rect class="n sig" x="550" y="30" width="160" height="36" rx="6"/>
+<text class="ts mid" x="630" y="52.5">Dashboards</text>
+<rect class="n sig" x="550" y="76" width="160" height="36" rx="6"/>
+<text class="ts mid" x="630" y="98.5">Machine learning</text>
+<rect class="n sig" x="550" y="122" width="160" height="36" rx="6"/>
+<text class="ts mid" x="630" y="144.5">Back into apps</text>
+<path class="e" d="M170 94H190"/>
+<path class="e" d="M350 94H370"/>
+<path class="e" d="M530 94H550"/>
+<path class="e store" d="M450 66V76"/>
+<path class="e store" d="M450 112V122"/>
+<path class="e none dash" d="M370 176v8h160v-8"/>
+<text class="ts mid" x="450" y="200">ELT: loaded raw, then transformed here with SQL</text>
+<text class="ts" x="10" y="226">In the older ETL pattern the cleaning happened before loading, in a separate system, and the raw data was discarded.</text>
+<text class="ts" x="10" y="242">Keeping the raw data means a mistake in a transformation can be fixed and rerun.</text>
+
+</svg>
+</div>
+<figcaption>A modern pipeline. The raw layer is kept, so every later layer can be recomputed when a mistake is found or a new question is asked.</figcaption>
+</figure>
+
+<h3 id="etl-elt">ETL and ELT</h3>
+<p>The two acronyms differ in the order of the same three steps: extract, transform, load.</p>
+<table>
+<thead><tr><th></th><th>ETL</th><th>ELT</th></tr></thead>
+<tbody>
+<tr><th>Order</th><td>Transform in a separate system, then load the result</td><td>Load the raw data, then transform it inside the warehouse</td></tr>
+<tr><th>Raw data</th><td>Usually not kept</td><td>Kept</td></tr>
+<tr><th>Transformations written in</th><td>A pipeline tool or custom code</td><td>SQL, version-controlled and tested like code</td></tr>
+<tr><th>Fixing a mistake in a transformation</th><td>Extract from the sources again, if they still have the data</td><td>Correct the SQL and rerun it over the raw data</td></tr>
+<tr><th>Arose when</th><td>Warehouse storage and compute were expensive</td><td>Both became cheap and elastic</td></tr>
+</tbody>
+</table>
+<p>ELT is the usual choice today. Storage is cheap enough to keep everything, and warehouses are powerful enough to do the transforming. Tools such as dbt manage the SQL transformations as a dependency graph with tests. ETL remains right where data must be reduced or scrubbed before it is allowed to land, for example to remove personal data.</p>
+
+<h3 id="lakehouse">Warehouses, lakes and lakehouses</h3>
+<ul>
+  <li>A <dfn>data warehouse</dfn> is a database built for analytical queries over structured tables, with columnar storage (<x-ref to="storage-engines#column"></x-ref>). Snowflake, BigQuery and Redshift are examples.</li>
+  <li>A <dfn>data lake</dfn> is files in object storage, in open formats such as Parquet, queried by separate engines. It is cheap and flexible, and without discipline it turns into a heap of files nobody trusts.</li>
+  <li>A <dfn>lakehouse</dfn> adds a table format on top of those files, which tracks which files make up each table and provides atomic commits, schema evolution and the ability to query a table as it was at an earlier time. Apache Iceberg and Delta Lake are the main formats. Several engines can then read and write the same tables safely.</li>
+</ul>
+<p>Whichever is used, data arrives by one of two routes: periodic batch loads, which are simple and hours behind, or streaming ingestion from CDC and event logs, which is minutes or seconds behind and needs the machinery of the next chapter.</p>
+
+<h3 id="quality">Keeping pipelines trustworthy</h3>
+<p>A pipeline that silently produces wrong numbers is worse than one that fails. The defenses are the ones this book keeps returning to, applied to data.</p>
+<ul>
+  <li><b>Idempotent, rerunnable steps.</b> A step that runs twice, or is rerun for last Tuesday, must produce the same result. Overwrite a partition instead of appending to it.</li>
+  <li><b>Contracts on the inputs.</b> Schema checks at ingestion, so that an upstream column change fails loudly at the door.</li>
+  <li><b>Tests on the outputs.</b> Row counts, uniqueness, null rates and totals that must reconcile with the source (<x-ref to="distributed-transactions#reconciliation"></x-ref>).</li>
+  <li><b>Freshness alerts.</b> A table that has not been updated on schedule should alert before someone makes a decision from stale figures.</li>
+  <li><b>Lineage.</b> A record of which tables feed which, so that the effect of a change or an error can be traced.</li>
+</ul>
+
+<h2 id="derived">The database, inside out</h2>
+<p>Step back and a pattern is visible. Inside a database, the log is the truth, and tables, indexes and materialized views are structures derived from it and kept up to date automatically. CDC extends the same arrangement beyond the database’s walls. The search index is an index. The cache is a materialized view. The warehouse is a replica in a different shape. All of them follow one log.</p>
+<p>This view has practical consequences. Derived stores hold nothing original, so they can be rebuilt from the source by taking a snapshot and replaying. A new kind of derived store can be added without touching the application. And the question of whether two stores agree has a definite answer: each is at some position in the same log, and a store is exactly as stale as its position is behind.</p>
+
+<h2 id="choosing">Choosing an approach</h2>
+<table>
+<thead><tr><th>Need</th><th>Use</th></tr></thead>
+<tbody>
+<tr><th>Keep your own search index, cache or read model in step with your database</th><td>Log-based CDC on the tables</td></tr>
+<tr><th>Publish business events to other services reliably</th><td>An outbox table, relayed by CDC or a poller</td></tr>
+<tr><th>Feed a warehouse with near-real-time data</th><td>Log-based CDC into the ingestion layer</td></tr>
+<tr><th>A nightly copy of a small table</th><td>A batch export. Polling is acceptable here.</td></tr>
+<tr><th>Invalidate cache entries when rows change</th><td>CDC, or deleting from the cache in the write path with a short expiry as a backstop (<x-ref to="caching#invalidation"></x-ref>)</td></tr>
+<tr><th>Migrate from one database to another with no downtime</th><td>A snapshot plus CDC to keep the new database current until the switch (<x-ref to="partitioning#migrating"></x-ref>)</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Whenever your design has the same data in two stores, expect the question “how do they stay in sync?”. “The service writes to both” is the answer that loses points. Say “the database is the source of truth, and the index follows it through change data capture, so it is eventually consistent with a lag of about a second, and it can be rebuilt from a snapshot”. That one sentence covers correctness, staleness and recovery.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Writing to the database and a second store from application code</th><td>Silent, permanent divergence after failures or races</td><td>One write, with followers fed from the log</td></tr>
+<tr><th>Polling on <code>updated_at</code> for anything important</th><td>Skipped rows, missed deletes, load on the primary</td><td>Log-based capture</td></tr>
+<tr><th>Unmonitored replication slots</th><td>The primary’s disk fills and writes stop</td><td>Alert on retained log, cap it, drop unused slots</td></tr>
+<tr><th>Consumers that apply changes blindly</th><td>Duplicates and reordering corrupt the derived store</td><td>Upsert by key and compare log positions</td></tr>
+<tr><th>Exposing raw table changes to other teams</th><td>Your schema becomes a public interface you cannot change</td><td>An outbox with designed events</td></tr>
+<tr><th>No plan for the initial load or a rebuild</th><td>A new or corrupted consumer cannot be brought up</td><td>Snapshot, then stream, and practice it</td></tr>
+<tr><th>Letting sensitive columns flow downstream</th><td>Personal data spreads into systems with weaker controls</td><td>Filter and mask at the connector</td></tr>
+<tr><th>Discarding raw data after transforming it</th><td>A transformation bug cannot be corrected after the fact</td><td>Keep a raw layer and make steps rerunnable</td></tr>
+<tr><th>Pipelines with no tests or freshness checks</th><td>Wrong or stale numbers reach decisions unnoticed</td><td>Tests on outputs and alerts on staleness</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="storage-engines"></x-ref> and <x-ref to="replication"></x-ref>: the write-ahead log and the replication stream that CDC reads.</li>
+  <li><x-ref to="distributed-transactions"></x-ref>: the transactional outbox.</li>
+  <li><x-ref to="event-streaming"></x-ref>: the log that carries change events, and compacted topics.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: versions against stale and repeated messages.</li>
+  <li><x-ref to="search-systems"></x-ref> and <x-ref to="caching"></x-ref>: the derived stores most often kept in step this way.</li>
+  <li><x-ref to="schema-design"></x-ref>: migrations that downstream consumers survive.</li>
+  <li><x-ref to="batch-and-stream-processing"></x-ref>: computing over the data once it has been moved.</li>
+  <li><x-ref to="scheduling-and-workflows"></x-ref>: orchestrating pipeline steps.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>One store is the system of record. Everything else is derived data that should follow it and be rebuildable from it.</li>
+  <li>Dual writes diverge silently, through crashes between the writes and through concurrent writes arriving in different orders.</li>
+  <li>Polling on timestamps can skip rows permanently and cannot see deletes.</li>
+  <li>Log-based CDC reads the database’s own replication log, so it captures every committed change in commit order with no code in the write path.</li>
+  <li>Start a new consumer with a snapshot taken at a known log position, then stream from that position.</li>
+  <li>Delivery is at least once and ordered for each key. Consumers upsert by key and use the log position as a version.</li>
+  <li>For other teams, publish designed events through an outbox, not raw table changes.</li>
+  <li>A replication slot that is not consumed will fill the primary’s disk. Monitor and cap it.</li>
+  <li>In analytics pipelines, keep the raw data, make every step rerunnable, and test the outputs.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A service updates PostgreSQL and then Elasticsearch in the same request handler. Describe two different ways they can end up disagreeing with no error reported.</summary><p>The process can crash or lose its connection after the database commit and before the index update, so the index never receives the change. Or two concurrent requests update the same row, and their writes reach the database in one order and the index in the other, leaving each with a different final value while every write succeeded.</p></details>
+<details><summary>A poller selects rows where updated_at is later than its previous run. Why can it miss a row permanently?</summary><p>The timestamp is set when the statement runs, and the row becomes visible only when its transaction commits. If the transaction commits after a poll has already advanced past that timestamp, the next poll asks for later timestamps and never returns the row. Polling also cannot detect deleted rows or values that were overwritten between polls.</p></details>
+<details><summary>Why can log-based CDC capture changes made by a migration script that the application’s code knows nothing about?</summary><p>It reads the database’s write-ahead or binary log, which records every committed change whatever made it. Capture that depends on application code, such as dual writes or an outbox, sees only what that code writes.</p></details>
+<details><summary>A new search index must be built from a table of 500 million rows that is being updated constantly. How do you avoid missing changes made during the copy?</summary><p>Record the log position, read all existing rows as of that position, then start streaming the log from that same position. Any change made during the copy lies after the position and will be delivered by the stream. Rows that are both copied and then delivered again are handled by making the consumer idempotent.</p></details>
+<details><summary>A CDC consumer receives an update for a row and then, late, an older update for the same row. What should it do, and what does it need in order to know?</summary><p>It should ignore the older update. It needs a version for each row that increases with every change, and the log position in each event serves that purpose. The consumer stores the position of the last change it applied to each key and discards anything not newer.</p></details>
+<details><summary>Your PostgreSQL primary runs out of disk although the data has not grown. A logical replication slot exists. What probably happened, and how do you prevent it?</summary><p>The slot’s consumer stopped or was removed, and the database kept every write-ahead log segment since then because the slot had not consumed them. Monitor how much log each slot retains, alert on it, set a maximum so that a lagging slot is invalidated instead of filling the disk, and drop slots that have no active consumer.</p></details>
+<details><summary>Why is exposing raw CDC events from your tables to other teams a design risk, and what is the alternative?</summary><p>Consumers become dependent on your table and column names and on your storage layout, so you can no longer rename, split or restructure tables without breaking them. Write designed business events to an outbox table in the same transaction as the change and publish those. The schema of the events is then a deliberate contract, separate from how you store data.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Debezium, <a href="https://debezium.io/documentation/reference/stable/">Reference documentation</a>, and <a href="https://debezium.io/blog/2026/07/01/debezium-3-6-final-release/">Debezium 3.6 Release Summary</a>, July 2026.</li>
+  <li>PostgreSQL Global Development Group, <a href="https://www.postgresql.org/docs/current/logicaldecoding.html">Logical Decoding</a> and <a href="https://www.postgresql.org/docs/current/view-pg-replication-slots.html">pg_replication_slots</a>.</li>
+  <li>Oracle, <a href="https://dev.mysql.com/doc/refman/8.4/en/binary-log.html">MySQL Reference Manual: The Binary Log</a>.</li>
+  <li>MongoDB, <a href="https://www.mongodb.com/docs/manual/changeStreams/">Change Streams</a>.</li>
+  <li>Andreas Andreakis and Ioannis Papapanagiotou, <a href="https://arxiv.org/abs/2010.12597">DBLog: A Watermark Based Change-Data-Capture Framework</a>, Netflix, 2020. Incremental snapshots interleaved with log events.</li>
+  <li>Martin Kleppmann, <a href="https://martin.kleppmann.com/2015/11/05/database-inside-out-at-oredev.html">Turning the database inside-out</a>, 2015. Derived data as materialized views over a log.</li>
+  <li>Michael Armbrust and others, <a href="https://vldb.org/cidrdb/2021/lakehouse-a-new-generation-of-open-platforms-that-unify-data-warehousing-and-advanced-analytics.html">Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics</a>, CIDR 2021.</li>
+  <li>Apache Software Foundation, <a href="https://iceberg.apache.org/">Apache Iceberg</a>. An open table format for analytic datasets.</li>
+  <li>Martin Kleppmann, <cite>Designing Data-Intensive Applications</cite>, O’Reilly. The chapters on derived data.</li>
+</ol>
+</section>

@@ -1,0 +1,636 @@
+<!--meta
+{ "description": "Threat modeling and common attacks for system design: trust boundaries and STRIDE, SQL injection and parameterized queries, cross-site scripting, cross-site request forgery, server-side request forgery, cache poisoning, software supply chain attacks, denial of service and defense in depth, with the defenses for each.",
+  "lede": "The earlier chapters of this part built controls: who the caller is, what they may do, how data is protected. This one looks from the other side. An attacker does not use a system the way its designers pictured, and does not need to defeat the strongest control, only to find the place where none was built. The chapter gives a method for finding those places before someone else does, and then works through the attacks that account for most real breaches.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Thinking like an attacker</h2>
+<p>Functional requirements say what a system must do. Security is about what it must <em>not</em> do, for anyone, under any input, and that list has no natural end. The designer has to defend every path. The attacker has to find one.</p>
+<p>A few terms make the conversation precise.</p>
+<ul>
+  <li>The <dfn>attack surface</dfn> of a system is everything an attacker can reach and send input to: every endpoint, form, file upload, message consumer, administrative tool and dependency. A smaller surface is the cheapest defense there is.</li>
+  <li>A <dfn>trust boundary</dfn> is a line between two parts of a system that do not trust each other equally, such as the line between the internet and your gateway, or between your service and another company’s.</li>
+  <li>A <dfn>threat model</dfn> is a written account of what a system must protect, from whom, the ways it could be attacked, and what is being done about each.</li>
+</ul>
+<p>How do attackers get in? The 2026 edition of Verizon’s annual breach report, covering the year to October 2025, found that exploiting a software vulnerability was the first step in 31% of breaches, ahead of stolen credentials for the first time, and that another organization, such as a supplier or software vendor, was involved in 48%. Flaws in code and flaws in what the code depends on are the two subjects of this chapter. Stolen credentials were the subject of <x-ref to="authentication"></x-ref>.</p>
+
+<h2 id="modeling">Threat modeling</h2>
+<p>Threat modeling is a design review with one unusual participant: an imagined opponent. It is done on a whiteboard, early, when changing the design is still cheap. The method fits in four questions.</p>
+<ol>
+  <li><b>What are we building?</b> Draw the parts and the data moving between them, and mark the trust boundaries.</li>
+  <li><b>What can go wrong?</b> Walk along each arrow that crosses a boundary and ask how it could be abused.</li>
+  <li><b>What are we going to do about it?</b> For each threat: remove the feature, add a control, pass the risk to someone better placed to carry it, or accept it in writing.</li>
+  <li><b>Did we do a good job?</b> Check that the controls exist and are tested, and repeat when the design changes.</li>
+</ol>
+
+<figure class="fig wide" id="fig-boundaries">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 372" role="img" aria-labelledby="f551t f551d">
+<title id="f551t">The photo app drawn with its trust boundaries</title>
+<desc id="f551d">Boxes grouped into six zones with dashed outlines. The internet, untrusted: Ana’s browser and an attacker. The edge: a content delivery network with a firewall, and an API gateway. The application network: the photos service and background workers. Data: the database and object storage. Other companies: an identity provider and the printing service. The build pipeline: dependencies, the build and the image that is deployed. Five numbered arrows cross from one zone to another, and a list below says what must be checked at each crossing.</desc>
+<rect class="n ghost" x="10" y="10" width="150" height="150" rx="8"/>
+<text class="ts tb" x="20" y="26">The internet: untrusted</text>
+<rect class="n ghost" x="190" y="10" width="140" height="150" rx="8"/>
+<text class="ts tb" x="200" y="26">The edge</text>
+<rect class="n ghost" x="360" y="10" width="160" height="150" rx="8"/>
+<text class="ts tb" x="370" y="26">Application network</text>
+<rect class="n ghost" x="550" y="10" width="160" height="150" rx="8"/>
+<text class="ts tb" x="560" y="26">Data</text>
+<rect class="n ghost" x="10" y="186" width="320" height="74" rx="8"/>
+<text class="ts tb" x="20" y="202">Other companies</text>
+<rect class="n ghost" x="360" y="186" width="350" height="74" rx="8"/>
+<text class="ts tb" x="370" y="202">The build pipeline</text>
+<rect class="n" x="22" y="38" width="126" height="34" rx="6"/>
+<text class="tb mid" x="85" y="59.5">Ana’s browser</text>
+<rect class="n fault" x="22" y="106" width="126" height="34" rx="6"/>
+<text class="tb mid" x="85" y="127.5">An attacker</text>
+<rect class="n sig" x="202" y="38" width="116" height="34" rx="6"/>
+<text class="tb mid" x="260" y="59.5">CDN and firewall</text>
+<rect class="n sig" x="202" y="106" width="116" height="34" rx="6"/>
+<text class="tb mid" x="260" y="127.5">API gateway</text>
+<rect class="n sig" x="372" y="38" width="136" height="34" rx="6"/>
+<text class="tb mid" x="440" y="59.5">Photos service</text>
+<rect class="n sig" x="372" y="106" width="136" height="34" rx="6"/>
+<text class="tb mid" x="440" y="127.5">Workers</text>
+<rect class="n store" x="562" y="38" width="136" height="34" rx="6"/>
+<text class="tb mid" x="630" y="59.5">Database</text>
+<rect class="n store" x="562" y="106" width="136" height="34" rx="6"/>
+<text class="tb mid" x="630" y="127.5">Object storage</text>
+<rect class="n" x="22" y="212" width="136" height="34" rx="6"/>
+<text class="tb mid" x="90" y="233.5">Identity provider</text>
+<rect class="n" x="180" y="212" width="136" height="34" rx="6"/>
+<text class="tb mid" x="248" y="233.5">Printly</text>
+<rect class="n" x="372" y="212" width="100" height="34" rx="6"/>
+<text class="tb mid" x="422" y="233.5">Dependencies</text>
+<rect class="n" x="490" y="212" width="90" height="34" rx="6"/>
+<text class="tb mid" x="535" y="233.5">Build</text>
+<rect class="n" x="598" y="212" width="100" height="34" rx="6"/>
+<text class="tb mid" x="648" y="233.5">Image</text>
+<path class="e sig" d="M149 55H200"/>
+<path class="e fault" d="M149 123H200"/>
+<circle class="n fault" cx="175" cy="89" r="9"/>
+<text class="ts tb mid" x="175" y="93">1</text>
+<path class="e" d="M260 73V104"/>
+<path class="e sig" d="M319 123C340 123 350 55 370 55"/>
+<circle class="n fault" cx="345" cy="89" r="9"/>
+<text class="ts tb mid" x="345" y="93">2</text>
+<path class="e store" d="M509 55H560"/>
+<path class="e store" d="M509 123H560"/>
+<circle class="n fault" cx="535" cy="89" r="9"/>
+<text class="ts tb mid" x="535" y="93">3</text>
+<path class="e" d="M248 211V142"/>
+<circle class="n fault" cx="262" cy="174" r="9"/>
+<text class="ts tb mid" x="262" y="178">4</text>
+<path class="e" d="M473 229H488"/>
+<path class="e" d="M581 229H596"/>
+<path class="e" d="M440 211V142"/>
+<circle class="n fault" cx="454" cy="174" r="9"/>
+<text class="ts tb mid" x="454" y="178">5</text>
+<text class="ts" x="10" y="284">1. Everything from the internet is untrusted: authenticate it, validate it, limit its rate.</text>
+<text class="ts" x="10" y="300">2. Inside the network is not “trusted”: each service identifies its caller and checks the user’s token again.</text>
+<text class="ts" x="10" y="316">3. Before data is read or written: authorize the object, and send input to the database only as parameters.</text>
+<text class="ts" x="10" y="332">4. Other companies’ tokens and callbacks: verify signatures, keep scopes narrow, be able to revoke.</text>
+<text class="ts" x="10" y="348">5. What you build from and deploy: pin and verify dependencies, and give the pipeline the least access that works.</text>
+</svg>
+</div>
+<figcaption>A trust boundary is any line that data crosses between parts that should not trust each other equally. Attacks happen at the crossings, so that is where the checks go.</figcaption>
+</figure>
+
+<p>For the second question, a checklist helps people who do not attack systems for a living. The most used is STRIDE, a name made from six kinds of threat. Each is the violation of a property the system is supposed to have.</p>
+<table>
+<thead><tr><th>Threat</th><th>Property violated</th><th>In the photo app</th><th>Main defenses</th></tr></thead>
+<tbody>
+<tr><th>Spoofing</th><td>Authenticity</td><td>Signing in as Ana with her stolen password</td><td><x-ref to="authentication"></x-ref></td></tr>
+<tr><th>Tampering</th><td>Integrity</td><td>Changing a photo’s owner in a request</td><td>Validation, signatures, <x-ref to="authorization#levels"></x-ref></td></tr>
+<tr><th>Repudiation</th><td>Accountability</td><td>A moderator deletes an account and denies it</td><td>Audit logs that the actor cannot edit</td></tr>
+<tr><th>Information disclosure</th><td>Confidentiality</td><td>Reading Ben’s private album by changing an identifier</td><td>Authorization, encryption (<x-ref to="cryptography-in-practice"></x-ref>)</td></tr>
+<tr><th>Denial of service</th><td>Availability</td><td>Flooding the search endpoint</td><td>Rate limits, an edge network, quotas</td></tr>
+<tr><th>Elevation of privilege</th><td>Authorization</td><td>An ordinary user reaching an administrator’s operation</td><td>Deny by default, least privilege</td></tr>
+</tbody>
+</table>
+<p>Not every threat deserves the same effort. Rank them by how likely each is and how bad it would be, and spend on the top of the list. A threat model that names thirty risks and fixes the five that matter is worth more than one that tries to be complete.</p>
+
+<h2 id="input">Injection: when data becomes a command</h2>
+<p>The oldest family of attacks has one cause. A program builds a command for some interpreter, a database, a shell, a browser, by pasting untrusted input into a string, and the interpreter cannot tell which part the programmer wrote. <dfn>Injection</dfn> is any attack in which input supplied as data is executed as part of a command.</p>
+
+<figure class="fig wide" id="fig-sqli">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 350" role="img" aria-labelledby="f552t f552d">
+<title id="f552t">The same input sent to a database inside the query text and as a parameter</title>
+<desc id="f552d">Two sequences between the photos service and the database. In the first, the service joins the attacker’s input into the text of the query. The quote in the input ends the caption early and the rest is read as part of the command, so the database returns all four rows. In the second, the service sends the query with a placeholder and sends the input separately as a value. The database compares captions with the whole odd string and returns no rows.</desc>
+<text class="tb" x="10" y="16">Input joined into the query text</text>
+<g data-scene="joined">
+<text class="tb mid" x="170" y="36">Photos service</text>
+<line class="axis" x1="170" y1="44" x2="170" y2="170"/>
+<text class="tb mid" x="560" y="36">Database</text>
+<line class="axis" x1="560" y1="44" x2="560" y2="170"/>
+<g data-s="1" data-packet="none">
+<rect class="n fault" x="178" y="58" width="201" height="22" rx="4"/>
+<text class="ts mid" x="278.5" y="73">1. search input:  x' OR '1'='1</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n " x="178" y="86" width="262" height="22" rx="4"/>
+<text class="ts mid" x="309" y="101">2. query = "… caption = '" + input + "'"</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M171 128H559"/>
+<text class="ts mid" x="365.0" y="122">3. WHERE owner = 'ana' AND caption = 'x' OR '1'='1'</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M559 156H171"/>
+<text class="ts mid" x="365.0" y="150">4. 4 rows: every photo in the table</text>
+</g>
+</g>
+<path class="e none dash" d="M10 186H710"/>
+<text class="tb" x="10" y="206">Input sent as a parameter</text>
+<g data-scene="parameter">
+<text class="tb mid" x="170" y="226">Photos service</text>
+<line class="axis" x1="170" y1="234" x2="170" y2="330"/>
+<text class="tb mid" x="560" y="226">Database</text>
+<line class="axis" x1="560" y1="234" x2="560" y2="330"/>
+<g data-s="1">
+<path class="e sig" d="M171 262H559"/>
+<text class="ts mid" x="365.0" y="256">1. WHERE owner = $1 AND caption = $2</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M171 290H559"/>
+<text class="ts mid" x="365.0" y="284">2. $1 is ana,  $2 is x' OR '1'='1</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M559 318H171"/>
+<text class="ts mid" x="365.0" y="312">3. 0 rows</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="joined" data-label="Joined into the text">
+  <li data-msg="none" data-state="The database understood: nothing yet; Rows returned: none">The search box asks for a caption. This “caption” was written by an attacker and contains a quote mark.</li>
+  <li data-msg="none">The code builds the query by joining strings. Nothing marks where the programmer’s text ends and the visitor’s begins.</li>
+  <li data-msg="one string, input inside">The quote in the input closes the caption early. What follows it arrives as part of the command.</li>
+  <li data-msg="4 rows" data-state="The database understood: Ana’s photos captioned x, or everything; Rows returned: 4, three of them private">The database reads “captioned x, or one equals one”. One always equals one, so every row matches, private ones included.</li>
+</ol>
+<ol class="steps" data-scene="parameter" data-label="As a parameter">
+  <li data-msg="the command" data-state="The database understood: find photos with this owner and this caption; Rows returned: none">The query text goes first, with placeholders where values will be. The database works out what the command means before it has seen any input.</li>
+  <li data-msg="the values">The values follow separately. They are data and can no longer change the command, whatever characters they contain.</li>
+  <li data-state="The database understood: find photos with this owner and this caption; Rows returned: 0">The database looks for a photo whose caption is that whole odd string. There is none.</li>
+</ol>
+<figcaption>Injection is possible whenever data and commands travel in one string. The cure is a channel that keeps them apart, not a filter that tries to spot bad input.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="The two queries in the figure">
+// Wrong: the input becomes part of the command.
+db.query(`SELECT id, caption FROM photos WHERE owner = '${user}' AND caption = '${input}'`);
+
+// Right: the command and the values travel separately.
+db.query("SELECT id, caption FROM photos WHERE owner = $1 AND caption = $2", [user, input]);
+</pre>
+<p>Both forms were run against PostgreSQL with four photos, three of them private. With the input <code>x' OR '1'='1</code> the first returned all four rows and the second returned none. A <dfn>parameterized query</dfn> is a query whose text and values are sent to the database separately, so that a value can never be read as part of the command. Every database library supports it, and it is the complete fix: it does not depend on recognizing bad input.</p>
+<p>The same shape appears wherever a string is handed to an interpreter.</p>
+<table>
+<thead><tr><th>Interpreter</th><th>Attack</th><th>Keep data and command apart by</th></tr></thead>
+<tbody>
+<tr><th>Database</th><td>SQL injection</td><td>Parameterized queries, including inside stored procedures and query builders</td></tr>
+<tr><th>Operating system shell</th><td>Command injection</td><td>Calling the program directly with a list of arguments, never through a shell string</td></tr>
+<tr><th>Browser</th><td>Cross-site scripting, in the next section</td><td>Encoding output for the place it is inserted</td></tr>
+<tr><th>File system</th><td>Path traversal: <code>../../etc/passwd</code></td><td>Generating file names yourself, and never building a path from input</td></tr>
+<tr><th>Language model</th><td>Prompt injection: text in a document or web page that the model follows as an instruction</td><td>No complete separation exists yet. Limit what the model is able to do, and require approval for consequential actions</td></tr>
+</tbody>
+</table>
+<p>Input validation still matters, as a second layer and for correctness. Do it at the boundary, by stating what is allowed (a length, a pattern, a set of values) and rejecting everything else. A list of forbidden characters is always one entry short.</p>
+
+<h2 id="browser">Attacks through the browser</h2>
+<p>A web application runs partly on a machine it does not control, beside pages from every other site its users have open. Two attacks exploit that, and they are often confused.</p>
+<h3 id="xss">Cross-site scripting</h3>
+<p><dfn>Cross-site scripting</dfn>, or XSS, is injection into a web page: the attacker gets a script of theirs delivered as part of a page from your site, and it runs in other users’ browsers with all the rights of your own code.</p>
+
+<figure class="fig wide" id="fig-xss">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f553t f553d">
+<title id="f553t">A stored script running in another user’s browser</title>
+<desc id="f553d">A sequence between an attacker, the photo site and Ben’s browser. The attacker posts a comment that contains a script. Ben opens the photo. The site sends the page with the comment inserted as markup. Ben’s browser runs the script as if it were the site’s own, and the script sends requests to the site as Ben.</desc>
+<text class="tb mid" x="90" y="20">An attacker</text>
+<line class="axis" x1="90" y1="28" x2="90" y2="186"/>
+<text class="tb mid" x="350" y="20">The photo site</text>
+<line class="axis" x1="350" y1="28" x2="350" y2="186"/>
+<text class="tb mid" x="610" y="20">Ben’s browser</text>
+<line class="axis" x1="610" y1="28" x2="610" y2="186"/>
+<g data-s="1">
+<path class="e fault" d="M91 54H349"/>
+<text class="ts mid" x="220.0" y="48">1. a comment containing a script</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M609 82H351"/>
+<text class="ts mid" x="480.0" y="76">2. GET /photos/871</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M351 110H609"/>
+<text class="ts mid" x="480.0" y="104">3. the page, comment inserted as markup</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n fault" x="401" y="124" width="201" height="22" rx="4"/>
+<text class="ts mid" x="501.5" y="139">4. the script runs as the site</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M609 166H351"/>
+<text class="ts mid" x="480.0" y="160">5. POST /account/email, as Ben</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="comment + script" data-state="Stored on the site: a comment with a script in it; Running in Ben’s browser: nothing unusual">The attacker posts a comment on a public photo. Part of it is HTML that carries a script.</li>
+  <li>Later Ben, who is signed in, opens the photo.</li>
+  <li data-msg="page with the script">The site puts the comment into the page as it was typed, without encoding it. The script is now part of a page from the real site.</li>
+  <li data-msg="none" data-state="Stored on the site: a comment with a script in it; Running in Ben’s browser: the attacker’s script">The browser cannot tell this script from the site’s own code. It runs with everything the page has: Ben’s session and whatever the page can read.</li>
+  <li data-msg="requests as Ben">The script changes Ben’s email address to the attacker’s, in a request that carries Ben’s cookie. A password reset then gives the attacker the account.</li>
+</ol>
+<figcaption>The attacker never touches Ben’s computer or his password. The site itself delivers the attack, to every visitor who opens that page.</figcaption>
+</figure>
+
+<p>The fix is the same idea as for SQL: do not let data be parsed as code. In a page that means encoding text for the place it is inserted, so that <code>&lt;</code> is shown as a character and never begins a tag.</p>
+<pre data-lang="ts" data-title="The same comment inserted two ways">
+const comment = 'Nice photo <img src=x onerror="…the attacker’s code…">';
+
+element.innerHTML = comment;   // parsed as markup: in a test browser, the code ran
+element.textContent = comment; // inserted as text: nothing ran
+</pre>
+<table>
+<thead><tr><th>Defense</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><th>Encode on output, by default</th><td>Template systems and component frameworks do this unless told otherwise. The danger is in the escape hatches: <code>innerHTML</code>, <code>dangerouslySetInnerHTML</code>, building HTML by hand</td></tr>
+<tr><th>Sanitize where markup is intended</th><td>If users may format comments, pass the HTML through a maintained sanitizer with an allow-list of tags. Do not write one</td></tr>
+<tr><th><dfn>Content Security Policy</dfn></th><td>A response header that tells the browser which sources of script the page may run. A strict policy means an injected script does not execute even if the encoding was missed</td></tr>
+<tr><th><code>HttpOnly</code> cookies</th><td>The script cannot read the session cookie. It can still act as the user while the page is open, so this limits the damage and does not prevent it</td></tr>
+</tbody>
+</table>
+<h3 id="csrf">Cross-site request forgery</h3>
+<p>In <dfn>cross-site request forgery</dfn>, or CSRF, the attacker’s code never runs on your site at all. Another site causes the user’s browser to send your site a request, and the browser attaches the user’s cookie to it.</p>
+
+<figure class="fig wide" id="fig-csrf">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 350" role="img" aria-labelledby="f554t f554d">
+<title id="f554t">A forged cross-site request, with and without a SameSite cookie</title>
+<desc id="f554d">Two sequences between Ben’s browser, a page controlled by an attacker and the photo site. In the first, Ben opens the attacker’s page, which contains a hidden form aimed at the photo site. The browser submits it and attaches Ben’s session cookie, and the site deletes his photo. In the second, the cookie is marked SameSite Lax. The browser sends the forged request without the cookie, and the site refuses it.</desc>
+<text class="tb" x="10" y="16">A session cookie that is sent with every request</text>
+<g data-scene="none">
+<text class="tb mid" x="110" y="36">Ben’s browser</text>
+<line class="axis" x1="110" y1="44" x2="110" y2="170"/>
+<text class="tb mid" x="360" y="36">The attacker’s page</text>
+<line class="axis" x1="360" y1="44" x2="360" y2="170"/>
+<text class="tb mid" x="610" y="36">photos.example</text>
+<line class="axis" x1="610" y1="44" x2="610" y2="170"/>
+<g data-s="1">
+<path class="e sig" d="M111 72H359"/>
+<text class="ts mid" x="235.0" y="66">1. open a link</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M359 100H111"/>
+<text class="ts mid" x="235.0" y="94">2. a page with a hidden form</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M111 128H609"/>
+<text class="ts mid" x="360.0" y="122">3. POST /photos/871/delete</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n fault" x="394.9" y="142" width="207.1" height="22" rx="4"/>
+<text class="ts mid" x="498.45" y="157">4. valid session: photo deleted</text>
+</g>
+</g>
+<path class="e none dash" d="M10 186H710"/>
+<text class="tb" x="10" y="206">A session cookie marked SameSite=Lax</text>
+<g data-scene="lax">
+<text class="tb mid" x="110" y="226">Ben’s browser</text>
+<line class="axis" x1="110" y1="234" x2="110" y2="326"/>
+<text class="tb mid" x="360" y="226">The attacker’s page</text>
+<line class="axis" x1="360" y1="234" x2="360" y2="326"/>
+<text class="tb mid" x="610" y="226">photos.example</text>
+<line class="axis" x1="610" y1="234" x2="610" y2="326"/>
+<g data-s="1">
+<path class="e fault" d="M359 262H111"/>
+<text class="ts mid" x="235.0" y="256">1. the same hidden form</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M111 290H609"/>
+<text class="ts mid" x="360.0" y="284">2. POST /photos/871/delete, no cookie</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n store" x="449.8" y="304" width="152.2" height="22" rx="4"/>
+<text class="ts mid" x="525.9" y="319">3. no session: refused</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="none" data-label="Cookie sent everywhere">
+  <li data-msg="GET cats" data-state="Cookie attached to the forged request: no request yet">Ben is signed in to the photo site in one tab. In another he follows a link to a page of cat pictures.</li>
+  <li data-msg="hidden form">The page contains an invisible form addressed to the photo site, and a script that submits it immediately.</li>
+  <li data-msg="POST + Ben’s cookie" data-state="Cookie attached to the forged request: yes">The browser sends the form. Because the request goes to the photo site, it attaches the photo site’s cookie, as it does for every request there.</li>
+  <li data-msg="none">The site sees a well-formed request with Ben’s session and carries it out. Ben sees cats.</li>
+</ol>
+<ol class="steps" data-scene="lax" data-label="SameSite=Lax">
+  <li data-msg="hidden form" data-state="Cookie attached to the forged request: no request yet">The same page, the same form.</li>
+  <li data-msg="POST, no cookie" data-state="Cookie attached to the forged request: no">The browser still sends the request, and leaves the cookie out, because a different site started it.</li>
+  <li data-msg="none">With no session the site refuses. It can also see where the request came from: the browser states the origin of the page that started it.</li>
+</ol>
+<figcaption>The attacker’s page cannot read the cookie and does not need to. The attack is the browser’s helpfulness in attaching it.</figcaption>
+</figure>
+
+<p>Both halves of that figure were reproduced in a browser with two sites. A form on one site, submitted to the other, arrived with a cookie marked <code>SameSite=None</code> and without one marked <code>SameSite=Lax</code>. The request also carried an <code>Origin</code> header naming the attacking site, and a <code>Sec-Fetch-Site</code> header with the value <code>cross-site</code>.</p>
+<ul>
+  <li><b>Mark session cookies <code>SameSite=Lax</code> or <code>Strict</code>, explicitly.</b> Browsers differ in what they assume when the attribute is missing (<x-ref to="authentication#cookies"></x-ref>).</li>
+  <li><b>Never change state in response to a GET.</b> Lax cookies are still sent when a user follows a link, so a link must not be able to delete anything.</li>
+  <li><b>Check where the request came from.</b> Refuse state-changing requests whose <code>Origin</code> is not your own. Frameworks add a second check, a random token in each form that another site cannot know.</li>
+</ul>
+<table>
+<thead><tr><th></th><th>Cross-site scripting</th><th>Cross-site request forgery</th></tr></thead>
+<tbody>
+<tr><th>Where the attacker’s code runs</th><td>In your page</td><td>On another site</td></tr>
+<tr><th>What it can do</th><td>Anything the user can, and read the results</td><td>Send requests blind. It cannot read the responses</td></tr>
+<tr><th>Root cause</th><td>Output not encoded</td><td>Cookies attached to requests the site did not start</td></tr>
+<tr><th>Does a SameSite cookie stop it?</th><td>No. The script is on the same site</td><td>Yes, for requests other than followed links</td></tr>
+</tbody>
+</table>
+<p>Two more headers close related holes cheaply. <code>Strict-Transport-Security</code> tells browsers to use HTTPS for your site always, and <code>frame-ancestors</code> in the content security policy stops other sites from displaying yours inside an invisible frame and tricking users into clicking on it.</p>
+
+<h2 id="server">Attacks on what the server can reach</h2>
+<p>A server sits inside the network, holds credentials and can call services that are closed to the outside. An attacker who cannot reach those things directly can sometimes get the server to reach them on their behalf.</p>
+<h3 id="ssrf">Server-side request forgery</h3>
+<p><dfn>Server-side request forgery</dfn>, or SSRF, is an attack in which a server is made to send a request to a destination the attacker chooses, usually one that only the server can reach. Any feature that fetches a URL is a candidate: importing an image from a link, generating a preview, calling a webhook the customer configured.</p>
+
+<figure class="fig wide" id="fig-ssrf">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 378" role="img" aria-labelledby="f555t f555d">
+<title id="f555t">A server tricked into fetching an internal address</title>
+<desc id="f555d">Two sequences between an attacker, the photos service, the cloud’s metadata service and object storage. In the first, the attacker asks the service to import a photo from the address of the metadata service. The service fetches it, receives the temporary cloud credentials of its own role, and returns them as the result. The attacker uses them to read object storage directly. In the second, the service resolves the address, finds that it is internal and refuses.</desc>
+<text class="tb" x="10" y="16">“Import a photo from this address”</text>
+<g data-scene="open">
+<text class="tb mid" x="80" y="36">An attacker</text>
+<line class="axis" x1="80" y1="44" x2="80" y2="198"/>
+<text class="tb mid" x="290" y="36">Photos service</text>
+<line class="axis" x1="290" y1="44" x2="290" y2="198"/>
+<text class="tb mid" x="500" y="36">Metadata service</text>
+<line class="axis" x1="500" y1="44" x2="500" y2="198"/>
+<text class="tb mid" x="660" y="36">Object storage</text>
+<line class="axis" x1="660" y1="44" x2="660" y2="198"/>
+<g data-s="1">
+<path class="e fault" d="M81 72H289"/>
+<text class="ts mid" x="185.0" y="66">1. import from 169.254.169.254/…</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M291 100H499"/>
+<text class="ts mid" x="395.0" y="94">2. GET the credentials for my role</text>
+</g>
+<g data-s="3">
+<path class="e" d="M499 128H291"/>
+<text class="ts mid" x="395.0" y="122">3. temporary keys</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M289 156H81"/>
+<text class="ts mid" x="185.0" y="150">4. the “photo” it fetched</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M81 184H659"/>
+<text class="ts mid" x="370.0" y="178">5. read every bucket the role can</text>
+</g>
+</g>
+<path class="e none dash" d="M10 214H710"/>
+<text class="tb" x="10" y="234">With a check on where the address leads</text>
+<g data-scene="checked">
+<text class="tb mid" x="80" y="254">An attacker</text>
+<line class="axis" x1="80" y1="262" x2="80" y2="354"/>
+<text class="tb mid" x="290" y="254">Photos service</text>
+<line class="axis" x1="290" y1="262" x2="290" y2="354"/>
+<text class="tb mid" x="500" y="254">Metadata service</text>
+<line class="axis" x1="500" y1="262" x2="500" y2="354"/>
+<text class="tb mid" x="660" y="254">Object storage</text>
+<line class="axis" x1="660" y1="262" x2="660" y2="354"/>
+<g data-s="1">
+<path class="e fault" d="M81 290H289"/>
+<text class="ts mid" x="185.0" y="284">1. import from 169.254.169.254/…</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n store" x="298" y="304" width="274.2" height="22" rx="4"/>
+<text class="ts mid" x="435.1" y="319">2. resolve it, check the address: internal</text>
+</g>
+<g data-s="3">
+<path class="e" d="M289 346H81"/>
+<text class="ts mid" x="185.0" y="340">3. 400: destination not allowed</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="open" data-label="No check">
+  <li data-msg="an internal address" data-state="The attacker holds: nothing">The app can import a photo from a web address. The attacker supplies an address that exists only inside the cloud network.</li>
+  <li data-msg="GET credentials">The service fetches whatever it was given. This address is the metadata service, which hands every machine its own temporary credentials.</li>
+  <li data-msg="keys">The metadata service answers. The request came from inside, from a machine entitled to ask.</li>
+  <li data-msg="keys" data-state="The attacker holds: the service’s cloud credentials">The service returns what it fetched, or an error message that quotes it. Either way the keys leave the building.</li>
+  <li data-msg="signed with the keys">From their own machine, the attacker uses the keys to read whatever that role may read.</li>
+</ol>
+<ol class="steps" data-scene="checked" data-label="Address checked">
+  <li data-msg="an internal address" data-state="The attacker holds: nothing">The same request arrives, with the same internal address in it.</li>
+  <li data-msg="none">Before connecting, the service resolves the name and compares the address with the ranges it must never fetch from.</li>
+  <li data-state="The attacker holds: nothing">It refuses, and says no more than that.</li>
+</ol>
+<figcaption>Any feature that fetches an address chosen by a user lends that user the server’s position in the network. The server can reach things the user cannot.</figcaption>
+</figure>
+
+<div class="note production"><p><span class="label">In production.</span> This is how the records of about 100 million people who had applied to Capital One were taken in 2019. A misconfigured firewall in front of an application could be made to send requests to the cloud metadata service. The reply contained temporary credentials for a role that was allowed to read storage buckets, and the attacker used them from outside. The role had far more access to storage than the application needed. The bank was fined 80 million dollars, and the cloud provider introduced a stricter version of the metadata service later that year.</p></div>
+<pre data-lang="ts" data-title="Refusing to fetch from internal addresses">
+import { BlockList, isIP } from "node:net";
+import { lookup } from "node:dns/promises";
+
+// Addresses a server must never be talked into fetching from.
+const internal = new BlockList();
+for (const [net, bits] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], // 169.254: cloud metadata
+  ["172.16.0.0", 12], ["192.168.0.0", 16], ["198.18.0.0", 15], ["224.0.0.0", 3],
+] as const) internal.addSubnet(net, bits, "ipv4");
+for (const [net, bits] of [["::", 127], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8]] as const) internal.addSubnet(net, bits, "ipv6");
+
+// The list also matches an IPv4 address written in IPv6 form, such as ::ffff:169.254.169.254.
+const isInternal = (address: string) => internal.check(address, isIP(address) === 6 ? "ipv6" : "ipv4");
+
+// Returns the address to connect to. The caller must connect to that address, not resolve the name again.
+export async function publicAddressFor(input: string): Promise<{ url: URL; address: string }> {
+  const url = new URL(input); // also normalizes forms such as http://2130706433/
+  if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("scheme not allowed");
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  const addresses = isIP(host) ? [host] : (await lookup(host, { all: true })).map((a) => a.address);
+  if (addresses.length === 0 || addresses.some(isInternal)) throw new Error("destination not allowed");
+  return { url, address: addresses[0] };
+}
+</pre>
+<p>Given fourteen addresses, that function refused eleven, among them the metadata address, loopback written as the decimal number <code>2130706433</code> and as <code>0x7f.1</code>, an IPv4 address dressed as IPv6, the name <code>localhost</code>, and the <code>file:</code> scheme. It allowed three public ones. Four points lie behind it.</p>
+<ul>
+  <li><b>Check the address, not the text.</b> An internal address can be written in a dozen ways, or hidden behind a public name that resolves to it. Parse, resolve, then compare.</li>
+  <li><b>Connect to the address you checked.</b> If the code resolves the name again when connecting, an attacker’s name server can answer differently the second time.</li>
+  <li><b>Do not follow redirects blindly.</b> A public address can redirect to an internal one. Check every hop.</li>
+  <li><b>Add layers outside the code.</b> Send such fetches through a proxy that has no route to internal networks, enable the stricter metadata service, and give the server’s role only the access it needs, so that stolen credentials open little.</li>
+</ul>
+<h3 id="other-server">Other classics</h3>
+<table>
+<thead><tr><th>Attack</th><th>How it works</th><th>Defense</th></tr></thead>
+<tbody>
+<tr><th>Malicious upload</th><td>A file named as a photo is a script or an HTML page, and is later served from your domain</td><td>Check content, not the name. Store uploads in object storage on a separate domain, and never execute from there (<x-ref to="object-and-file-storage#uploads"></x-ref>)</td></tr>
+<tr><th>Unsafe deserialization</th><td>A format that can describe objects and code, such as a native serialization format, is parsed from untrusted input</td><td>Accept only data formats such as JSON, validated against a schema</td></tr>
+<tr><th>Resource exhaustion</th><td>A small request causes huge work: a deeply nested query, an archive that expands a thousandfold, an unbounded page size</td><td>Limits on size, depth, time and count for everything a caller controls</td></tr>
+<tr><th>Cache poisoning</th><td>A response that varies with a header the cache ignores is stored and served to everyone</td><td>Include in the cache key everything that changes the response (<x-ref to="cdn-and-edge#cache-key"></x-ref>)</td></tr>
+<tr><th>Cache deception</th><td>A private page is requested under an address that looks like a static file, and the cache stores it for the attacker to fetch</td><td>Cache by what the origin declares, not by what the address looks like, and mark personal responses private</td></tr>
+</tbody>
+</table>
+
+<h2 id="supply">The software supply chain</h2>
+<p>A typical service is a few thousand lines written by its team and a few million written by strangers: libraries, their dependencies, base images, build tools. A <dfn>supply chain attack</dfn> compromises a system through something it depends on, or through the process that builds and delivers it, without touching the system’s own code. The OWASP Top 10 for 2025 lists it third, as a new category.</p>
+<table>
+<thead><tr><th>Case</th><th>What happened</th><th>Lesson</th></tr></thead>
+<tbody>
+<tr><th>xz, March 2024</th><td>A contributor who had worked on a compression library for several years, and had become a maintainer, added a hidden backdoor that would have let its author into servers through SSH. An engineer investigating odd behavior on a test system found it days before it reached the stable releases of the major Linux distributions</td><td>Trust in a project is trust in its people, and patient attackers earn it. A dependency several layers down can reach your login path</td></tr>
+<tr><th>The Shai-Hulud worm, September 2025</th><td>Malicious versions of npm packages ran a script on installation that collected tokens, keys and environment variables. Where it found a publishing token, it published infected versions of that developer’s other packages, and so spread by itself through more than a hundred of them</td><td>Installing a package runs its code on your machine. A developer’s laptop and a build server hold the keys to everything</td></tr>
+</tbody>
+</table>
+<p>No single control answers this. The useful ones each remove one easy path.</p>
+<table>
+<thead><tr><th>Control</th><th>What it prevents</th></tr></thead>
+<tbody>
+<tr><th>A lock file with digests, and builds that install only from it</th><td>A dependency changing between your test and your deployment (<x-ref to="deployment-strategies#artifact"></x-ref>)</td></tr>
+<tr><th>A waiting period before adopting new releases</th><td>Being among the first to install a poisoned version. Many are found and removed within days</td></tr>
+<tr><th>Install scripts disabled by default</th><td>Code running merely because a package was downloaded</td></tr>
+<tr><th>Short-lived, narrowly scoped credentials in the build pipeline</th><td>A compromised build step walking away with long-lived keys (<x-ref to="oauth-and-sso#workload"></x-ref>)</td></tr>
+<tr><th>Signed artifacts and recorded provenance</th><td>Running something that was not built by your pipeline from your source</td></tr>
+<tr><th>An inventory of what is deployed</th><td>Not knowing whether you are affected when the next case is announced. A <dfn>software bill of materials</dfn> is a machine-readable list of every component in a build</td></tr>
+<tr><th>Fewer dependencies</th><td>All of the above, for whatever you did not add</td></tr>
+</tbody>
+</table>
+
+<h2 id="ddos">Denial of service</h2>
+<p>Some attackers do not want your data. They want your service to stop. In a <dfn>distributed denial-of-service attack</dfn>, or DDoS, many machines, usually compromised devices, send traffic at once to exhaust something: bandwidth, connections or processing.</p>
+<table>
+<thead><tr><th>Kind</th><th>What it exhausts</th><th>Looks like</th><th>Stopped by</th></tr></thead>
+<tbody>
+<tr><th>Volumetric</th><td>Network capacity</td><td>Floods of packets, often amplified by bouncing small queries off open servers that send large replies to the victim</td><td>A network with more capacity than the attack, which means a large edge provider</td></tr>
+<tr><th>Protocol</th><td>Connection tables in load balancers and firewalls</td><td>Half-opened connections, or connections held open and fed slowly</td><td>The edge provider, and timeouts on idle connections</td></tr>
+<tr><th>Application</th><td>Your servers’ processing</td><td>Ordinary-looking requests to an expensive endpoint</td><td>You: rate limits, cheap rejection, caching</td></tr>
+</tbody>
+</table>
+<p>The first two are a matter of scale, and no single company’s network wins that contest alone. Cloudflare reported 47.1 million attacks in 2025 and a record of 31.4 terabits a second, which lasted 35 seconds. The practical answer is to put a large edge network in front of everything and make sure the origin cannot be reached around it (<x-ref to="cdn-and-edge#security"></x-ref>).</p>
+<p>The third kind is yours to solve, because the requests are valid. It works by asymmetry: a request that costs the attacker nothing costs you a database scan, a password hash or an export. The calculator starts with an endpoint that takes 200 ms of processor time, on 64 cores.</p>
+
+<div class="widget" data-widget="flood">
+<h4>How little traffic saturates an expensive endpoint</h4>
+<p>The capacity of one endpoint, the share an attack takes, and what a limit for each client changes.</p>
+<div class="controls">
+  <label>Processor cores serving the endpoint<input type="number" name="cores" value="64" min="1" max="100000" step="1"></label>
+  <label>Processor time per request, ms<input type="number" name="ms" value="200" min="0.1" max="60000" step="0.1"></label>
+  <label>Attack, requests per second<input type="number" name="attack" value="500" min="1" max="1000000000" step="1"></label>
+  <label>Limit for each client, requests per second<input type="number" name="limit" value="2" min="0.01" max="100000" step="0.01"></label>
+</div>
+<dl class="results">
+  <div><dt>Capacity, requests per second</dt><dd data-out="capacity">320</dd></div>
+  <div><dt>Share of capacity the attack takes</dt><dd data-out="load">156%</dd></div>
+  <div><dt>Clients needed, with the limit</dt><dd data-out="sources">160</dd></div>
+  <div><dt>Clients needed to send this attack</dt><dd data-out="ratio">250</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Each request costs 200 ms of processor time, so 64 cores handle 320 of them a second. An attacker sending 500 a second uses 156% of that, and ordinary users get nothing. With a limit of 2 a second for each client, checked before the expensive work starts, the same attack needs 160 separate clients to fill the endpoint, and each rejected request costs almost nothing.</p>
+</div>
+
+<p>Five hundred requests a second is within reach of one laptop. The defenses are the ones from <x-ref to="resilience-patterns#rate-limiting"></x-ref>, applied with an attacker in mind: limit each client and each account, reject before doing expensive work, cache what can be cached, put the costly operations behind a queue with a bounded length, and cap what any one request may ask for. Also set a spending limit. A service that scales automatically turns a flood into an invoice.</p>
+
+<h2 id="depth">Defense in depth</h2>
+<p>Every control in this part of the book will fail at some point: a check is forgotten, a library has a flaw, a credential leaks. <dfn>Defense in depth</dfn> is the practice of layering independent controls so that the failure of one is caught or contained by another. Its companion is to assume that a breach will happen and to design for what comes after.</p>
+<table>
+<thead><tr><th>Layer</th><th>Question</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><th>Prevent</th><td>Can the attack be made impossible?</td><td>Parameterized queries, output encoding, authorization in the query, patched dependencies</td></tr>
+<tr><th>Limit</th><td>If one part falls, how far does it spread?</td><td>Least privilege for every service and person, network segments (<x-ref to="ip-and-routing#cloud-networks"></x-ref>), a key for each tenant, cells (<x-ref to="multi-tenancy#cells"></x-ref>)</td></tr>
+<tr><th>Detect</th><td>Would anyone notice?</td><td>Logs of sign-ins, denials and administrative actions, with alerts on unusual patterns (<x-ref to="observability#alerting"></x-ref>)</td></tr>
+<tr><th>Respond</th><td>Does someone know what to do?</td><td>A written plan, the ability to revoke credentials and sessions quickly, practice</td></tr>
+<tr><th>Recover</th><td>Can the system be rebuilt from something the attacker could not reach?</td><td>Backups that cannot be altered, held under separate credentials (<x-ref to="disaster-recovery#ransomware"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>The last row is where attackers and defenders now meet. Someone who intends to demand a ransom looks for the backups first and deletes or encrypts them before touching anything else. A backup that production credentials can delete is not a recovery plan against that opponent.</p>
+<p>A firewall that inspects requests for known attack patterns belongs in the first row as a useful extra. It buys time when a new flaw is announced, and blocks the automated scanning that every public address receives. It is not a substitute for fixing the code, because it sees requests and not meaning: it cannot know that photo 872 is not Ana’s.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Trusting the inside of the network. A design in which services accept any request from an internal address has one layer, the perimeter, and everything is reachable from the first machine that falls: an injection, a poisoned dependency, a stolen laptop on the office network. Each service should authenticate its callers and hold only the access it needs, as if the network were public.</p></div>
+
+<h2 id="design">Choosing for a real system</h2>
+<p>A first threat model for the photo app, cut to the entries that would change the design.</p>
+<table>
+<thead><tr><th>Threat</th><th>Where</th><th>Control</th><th>Chapter</th></tr></thead>
+<tbody>
+<tr><th>Reading another user’s private photos</th><td>Every endpoint that takes an identifier</td><td>The caller in every query, and tests as a second user</td><td><x-num to="authorization"></x-num></td></tr>
+<tr><th>Account takeover with reused passwords</th><td>Sign-in and recovery</td><td>Breached-password checks, a second factor, passkeys, rate limits</td><td><x-num to="authentication"></x-num></td></tr>
+<tr><th>A script in a comment or caption</th><td>Anything users type that others see</td><td>Encoding by default, a strict content security policy</td><td>This one</td></tr>
+<tr><th>Import-from-link reaching internal services</th><td>The photo import feature</td><td>Address checks, an egress proxy, a minimal role</td><td>This one</td></tr>
+<tr><th>A poisoned dependency in the build</th><td>The pipeline</td><td>Locked digests, a waiting period, short-lived pipeline credentials</td><td>This one</td></tr>
+<tr><th>A flood on search or sign-in</th><td>The edge and the expensive endpoints</td><td>An edge network, limits for each client, bounded queues</td><td><x-num to="resilience-patterns"></x-num></td></tr>
+<tr><th>A stolen database copy</th><td>Storage and backups</td><td>Encryption with keys in a key service, sensitive fields sealed</td><td><x-num to="cryptography-in-practice"></x-num></td></tr>
+<tr><th>Ransomware</th><td>Everything</td><td>Unalterable backups under separate credentials, and a rehearsed restore</td><td><x-num to="disaster-recovery"></x-num></td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> You will rarely be asked for a threat model, and you can still show the habit. When you draw a component that accepts input from outside, say what it validates and limits. When you add a feature that fetches a URL, accepts an upload or renders user content, name the attack and the control in one sentence. Two or three such remarks show more than a list of every attack you know.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Building queries or commands by joining strings</th><td>Injection</td><td>Parameters for databases, argument lists for programs</td></tr>
+<tr><th>Filtering “dangerous” characters</th><td>The filter misses a form the interpreter accepts</td><td>Separate data from commands, and validate by what is allowed</td></tr>
+<tr><th>Inserting user content into pages as markup</th><td>Scripts run in other users’ sessions</td><td>Encode by default, sanitize deliberately, add a content security policy</td></tr>
+<tr><th>Cookies sent on every cross-site request, or state changed by GET</th><td>Other sites act for your users</td><td><code>SameSite</code> cookies, origin checks, safe methods kept safe</td></tr>
+<tr><th>Fetching any address a user supplies</th><td>Internal services and cloud credentials exposed</td><td>Resolve, check and pin the address, through a proxy with no internal route</td></tr>
+<tr><th>Installing the newest version of everything, with install scripts on</th><td>A poisoned package runs in the build within hours of release</td><td>Locked digests, a waiting period, scripts off</td></tr>
+<tr><th>Long-lived, powerful credentials in the build pipeline</th><td>One compromised step owns production</td><td>Short-lived credentials scoped to the step</td></tr>
+<tr><th>An origin reachable around the edge network</th><td>The protection is bypassed by addressing the origin directly</td><td>Accept traffic only from the edge</td></tr>
+<tr><th>No limits on what one request may ask for</th><td>One client exhausts the service</td><td>Caps on size, depth, count and time</td></tr>
+<tr><th>One layer of defense, at the perimeter</th><td>The first foothold reaches everything</td><td>Authenticate and limit inside the network too</td></tr>
+<tr><th>Backups that production credentials can delete</th><td>Nothing to restore from after an intrusion</td><td>Unalterable copies in a separate account</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="authentication"></x-ref>, <x-ref to="authorization"></x-ref> and <x-ref to="cryptography-in-practice"></x-ref>: the controls these attacks try to get around.</li>
+  <li><x-ref to="api-styles"></x-ref>: validating input against a contract.</li>
+  <li><x-ref to="cdn-and-edge"></x-ref>: absorbing floods at the edge, and cache keys.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: rate limiting and load shedding, which serve against attackers as well as accidents.</li>
+  <li><x-ref to="deployment-strategies"></x-ref>: the pipeline and its artifacts, which are part of the attack surface.</li>
+  <li><x-ref to="disaster-recovery"></x-ref>: recovering when prevention has failed.</li>
+  <li><x-ref to="observability"></x-ref>: detecting an attack in progress.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Draw the system, mark where data crosses between parts that should not trust each other, and ask at each crossing what could go wrong. Fix the few that matter most.</li>
+  <li>Injection happens when data and commands share one string. Keep them in separate channels: parameters for queries, encoding for pages.</li>
+  <li>Cross-site scripting runs the attacker’s code in your page. Cross-site request forgery makes the browser send your site a request from elsewhere. They need different defenses.</li>
+  <li>A server that fetches addresses for users must check where each address leads, because it can reach what users cannot.</li>
+  <li>Most of what you run was written by others. Lock it, delay it, verify it, and give the build pipeline as little power as possible.</li>
+  <li>Floods on the network are absorbed by a large edge. Floods of valid requests are stopped by limits and by rejecting cheaply.</li>
+  <li>Assume some control will fail. Limit how far a failure spreads, make sure it would be noticed, and keep a way to recover that the attacker cannot reach.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A search endpoint builds its query by joining the search text into a SQL string, after removing every single-quote character from the input. Why is that not a fix, and what is?</summary><p>Removing characters tries to recognize bad input, and the set of inputs an interpreter will accept as syntax is larger than any such list: other quoting forms, encodings, numeric contexts where no quote is needed. It also corrupts legitimate text such as a name with an apostrophe. The fix is a parameterized query, in which the value is sent separately and can never be parsed as part of the command.</p></details>
+<details><summary>A site marks its session cookie <code>HttpOnly</code> and <code>SameSite=Strict</code>. A comment field is inserted into pages without encoding. What can an attacker still do?</summary><p>Nearly everything. A script in a comment runs inside the site’s own page, so its requests are same-site and carry the cookie, and it can read the responses. It cannot read the cookie’s value, so it cannot take the session elsewhere, but while a victim has the page open it can read their data and act as them. The cookie attributes defend against other sites, not against script injected into this one.</p></details>
+<details><summary>Explain why a cross-site request forgery attack can delete a photo but cannot read one.</summary><p>The forged request is sent by the victim’s browser, with their cookie, so the site carries out the action. The response returns to the browser, where the rules that separate sites stop the attacker’s page from reading it. The attacker gets side effects and no data, which is why the defense concentrates on state-changing requests.</p></details>
+<details><summary>A feature fetches a preview of any link a user pastes. The code refuses the text <code>169.254.169.254</code> and <code>localhost</code>. Name three ways an attacker gets past that.</summary><p>Write the address in another form, such as a decimal or hexadecimal number or an IPv4 address in IPv6 notation. Use a public domain name that resolves to the internal address. Supply a public address that redirects to the internal one. A fourth is a name that resolves to a public address when checked and an internal one when fetched. The defense is to resolve first, compare the resulting addresses with the internal ranges, connect to exactly the address that was checked, and check each redirect.</p></details>
+<details><summary>Your build installs the latest matching version of each dependency on every run. A maintainer’s account is compromised and a malicious patch version is published at noon. What happens at your company, and which two controls would have prevented it?</summary><p>The next build after noon installs the malicious version and runs its install script on the build server, with access to whatever credentials the pipeline holds. A lock file with digests would have kept the build on the versions already tested. A waiting period before adopting new releases would have let the wider community find and remove the bad version first. Disabling install scripts and using short-lived pipeline credentials would have limited the damage.</p></details>
+<details><summary>An endpoint takes 200 ms of processor time and runs on 64 cores. How many requests a second saturate it, and why does a limit of two a second for each client help?</summary><p>Each core handles five requests a second, so 320 a second saturates it, which a single machine can send. With a limit of two a second for each client, enforced before the expensive work, an attacker needs at least 160 separate clients to reach the same load, and each rejected request costs almost nothing. The limit turns a trivial attack into one that needs resources.</p></details>
+<details><summary>A company has strong perimeter firewalls and no authentication between internal services. An attacker gains code execution in one low-value service through a dependency. What is exposed, and what would have limited it?</summary><p>Everything that service can reach on the network, which is everything, with whatever data and actions the other services offer to any internal caller. Limiting it needs authentication between services, authorization of each call, credentials for each service scoped to what it needs, and network rules that allow only the connections the design requires. The perimeter was one layer, and it was already behind the attacker.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Adam Shostack, <cite>Threat Modeling: Designing for Security</cite>, Wiley, 2014. The four questions and STRIDE in practice.</li>
+  <li>OWASP, <a href="https://top10.owasp.org/2025/">OWASP Top 10:2025</a>, and the <a href="https://cheatsheetseries.owasp.org/">OWASP Cheat Sheet Series</a>, which has a page for each attack in this chapter.</li>
+  <li>Verizon, 2026 Data Breach Investigations Report, May 2026, as reported in <a href="https://www.securityinfowatch.com/cybersecurity/news/55378754/verizon-dbir-vulnerability-exploitation-surpasses-stolen-credentials-as-top-breach-entry-point">Verizon DBIR: Vulnerability Exploitation Surpasses Stolen Credentials as Top Breach Entry Point</a>, SecurityInfoWatch.</li>
+  <li>TechEarl, <a href="https://techearl.com/capital-one-breach-ssrf">The Capital One Breach: SSRF and the Cloud Metadata Service</a>. A secondary account of the 2019 incident.</li>
+  <li>Rapid7, <a href="https://www.rapid7.com/blog/post/2024/04/01/etr-backdoored-xz-utils-cve-2024-3094/">Backdoored XZ Utils (CVE-2024-3094)</a>, April 2024.</li>
+  <li>Wiz, <a href="https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack">Shai-Hulud: ongoing package supply chain worm delivering data-stealing malware</a>, September 2025.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/ddos-threat-report-2025-q4/">2025 Q4 DDoS threat report: A record-setting 31.4 Tbps attack caps a year of massive DDoS assaults</a>, February 2026.</li>
+  <li>Omer Gil, <a href="https://omergil.blogspot.com/2017/02/web-cache-deception-attack.html">Web Cache Deception Attack</a>, 2017, and James Kettle, <a href="https://portswigger.net/research/practical-web-cache-poisoning">Practical Web Cache Poisoning</a>, PortSwigger, 2018.</li>
+</ol>
+</section>

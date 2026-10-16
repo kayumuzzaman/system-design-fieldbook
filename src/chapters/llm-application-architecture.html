@@ -1,0 +1,877 @@
+<!--meta
+{ "description": "The architecture of applications built on large language models: tokens and the context window, prefill and decode, the KV cache, time to first token, static and continuous batching on an inference server, streaming with server-sent events, cancellation and resumable streams, response, semantic and prefix caching, token budgets and cost, and AI gateways with routing and fallback, with tested TypeScript and a simulated model.",
+  "lede": "A language model is a slow, expensive and unpredictable dependency that answers in pieces. Building an application around one is mostly familiar system design: queues, batching, streaming, caching, rate limits and fallbacks. What changes is the unit. Everything is counted in tokens, and the numbers that matter are how long the first token takes, how fast the rest follow, and what each one costs. This chapter explains how a model server turns a prompt into tokens, why batching decides its capacity, and how the application around it streams, caches and budgets, with a simulated server and stub model whose results you can rerun.",
+  "updated": "2026-10-14" }
+-->
+
+<h2 id="component">A model as a component</h2>
+<p>The photo app adds a help assistant. Users ask questions in their own words (“how do I get back a photo I deleted?”) and get an answer drawn from the app’s help articles. <x-ref to="retrieval-and-vector-search"></x-ref> covers how the right articles are found, and <x-ref to="agent-systems"></x-ref> lets the assistant take actions. This chapter is about the call to the model itself and the system around it.</p>
+<p>A model reads and writes text as tokens. A <dfn>token</dfn> is the unit a language model reads and writes: a common word, a piece of a longer word, or a punctuation mark. In English a token is about four characters, or three quarters of a word, on average. The chapter’s rough tokenizer agrees: a 242-character help paragraph is 60 tokens, 4.0 characters each. Prices, limits and speeds are all stated in tokens.</p>
+<p>The <dfn>context window</dfn> is the most tokens a model can take in one call, the prompt and the answer together. A model keeps nothing between calls. To hold a conversation, the application sends the whole conversation every time, so each turn costs more than the one before it.</p>
+<p>A model call differs from the calls the rest of this book makes in four ways.</p>
+<table>
+<thead><tr><th></th><th>A database query</th><th>A model call</th></tr></thead>
+<tbody>
+<tr><th>Duration</th><td>Milliseconds</td><td>Seconds, growing with the length of the answer</td></tr>
+<tr><th>Cost</th><td>A share of a server you already pay for</td><td>A price for each token in and out</td></tr>
+<tr><th>Result</th><td>The same for the same query and data</td><td>Can differ from call to call, and can be wrong in ways no error code reports</td></tr>
+<tr><th>Input size</th><td>Small</td><td>Thousands of tokens, up to the context window</td></tr>
+</tbody>
+</table>
+<p>So the application does more than forward a question. It assembles the prompt, sends it through a gateway that enforces budgets and picks a provider, and streams the answer back.</p>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 336" role="img" aria-labelledby="f1001t f1001d">
+<title id="f1001t">The parts of an application built around a language model</title>
+<desc id="f1001d">The browser sends a question to the application server, which assembles the prompt from four sources: its fixed instructions, the conversation so far from the conversation store, passages found in the retrieval index, and the new question. The prompt goes to an AI gateway, which checks the user’s token budget, looks in a response cache, picks a model and falls back to another provider if one fails. Behind the gateway are two hosted model APIs and a self-hosted inference server that batches requests on GPUs. Tokens stream back along the same path. Usage records and logs are written asynchronously for billing, monitoring and evaluation.</desc>
+<rect class="n" x="10" y="120" width="100" height="60" rx="6"/>
+<text class="tb mid" x="60" y="146">Browser</text>
+<text class="ts mid" x="60" y="163">streams tokens</text>
+<rect class="n sig" x="160" y="96" width="170" height="108" rx="6"/>
+<text class="tb mid" x="245" y="129">App server</text>
+<text class="ts mid" x="245" y="146">prompt assembly</text>
+<text class="ts mid" x="245" y="163">tools, guardrails</text>
+<text class="ts mid" x="245" y="180">stream relay</text>
+<rect class="n sig" x="380" y="96" width="150" height="108" rx="6"/>
+<text class="tb mid" x="455" y="129">AI gateway</text>
+<text class="ts mid" x="455" y="146">token budgets</text>
+<text class="ts mid" x="455" y="163">cache, routing</text>
+<text class="ts mid" x="455" y="180">fallback</text>
+<rect class="n" x="580" y="20" width="130" height="50" rx="6"/>
+<text class="tb mid" x="645" y="41">Model API A</text>
+<text class="ts mid" x="645" y="58">hosted</text>
+<rect class="n" x="580" y="96" width="130" height="50" rx="6"/>
+<text class="tb mid" x="645" y="117">Model API B</text>
+<text class="ts mid" x="645" y="134">hosted</text>
+<rect class="n" x="580" y="172" width="130" height="74" rx="6"/>
+<text class="tb mid" x="645" y="196.5">Inference server</text>
+<text class="ts mid" x="645" y="213.5">GPUs, batching</text>
+<text class="ts mid" x="645" y="230.5">KV cache</text>
+<path class="e sig" d="M110 142H158"/>
+<path class="e sig" d="M158 160H112"/>
+<text class="ts mid" x="134" y="134">ask</text>
+<text class="ts mid" x="134" y="176">tokens</text>
+<path class="e sig" d="M330 142H378"/>
+<path class="e sig" d="M378 160H332"/>
+<path class="e sig" d="M530 120L578 52"/>
+<path class="e sig" d="M530 140L578 121"/>
+<path class="e sig" d="M530 170L578 200"/>
+<text class="ts end" x="560" y="80">pick one</text>
+<rect class="n store" x="130" y="252" width="110" height="46" rx="6"/>
+<text class="tb mid" x="185" y="271">Conversations</text>
+<text class="ts mid" x="185" y="288">history</text>
+<rect class="n store" x="250" y="252" width="110" height="46" rx="6"/>
+<text class="tb mid" x="305" y="271">Retrieval index</text>
+<text class="ts mid" x="305" y="288">passages</text>
+<path class="e store" d="M200 250V206"/>
+<path class="e store" d="M290 250V206"/>
+<rect class="n store" x="400" y="252" width="110" height="46" rx="6"/>
+<text class="tb mid" x="455" y="271">Response cache</text>
+<text class="ts mid" x="455" y="288">exact repeats</text>
+<path class="e store" d="M455 250V206"/>
+<rect class="n async" x="560" y="268" width="150" height="46" rx="6"/>
+<text class="tb mid" x="635" y="287">Usage and logs</text>
+<text class="ts mid" x="635" y="304">billing, evaluation</text>
+<path class="e async dash" d="M520 204C540 236 560 250 600 266"/>
+<text class="tb" x="10" y="24">Prompt =</text>
+<text class="ts" x="10" y="42">instructions + history</text>
+<text class="ts" x="10" y="58">+ retrieved passages</text>
+<text class="ts" x="10" y="74">+ the new question</text>
+<path class="e none dash" d="M150 50H190V94"/>
+</svg>
+</div>
+<figcaption>The application server decides what goes into the prompt, and the gateway decides where it goes. Both sit on the request path of every call, so both stream.</figcaption>
+</figure>
+
+<h2 id="generation">How a model produces text</h2>
+<p>A model produces its answer one token at a time, and each new token depends on all the tokens before it. A request has two phases with different costs.</p>
+<p><dfn>Prefill</dfn> is the first phase: the model reads the whole prompt in one pass, all its tokens processed in parallel. <dfn>Decode</dfn> is the second: the model produces the answer one token per pass, each pass taking the previous token as new input. A prompt of 1,500 tokens costs one pass. An answer of 200 tokens costs 200 passes.</p>
+<p>Each decode pass must read every weight of the model from the GPU’s memory. A model with 8 billion parameters stored in 2 bytes each is 16 GB. The H100 GPU’s datasheet gives a memory bandwidth of 3.35 TB per second, so a pass takes at least 16 / 3,350 of a second, about 4.8 ms, however fast the arithmetic is. One sequence alone can therefore get at most about 200 tokens a second from this GPU. This estimate explains most of what follows: decode is limited by reading memory, and the same read can serve many sequences at once.</p>
+<p>The past is not recomputed at every pass. The <dfn>KV cache</dfn> holds the intermediate results (the attention keys and values) of every token so far, in GPU memory, for each sequence being served. Its size per token is two (keys and values) × layers × key-value heads × numbers per head × bytes per number. For Llama 3 8B, with 32 layers and 8 key-value heads of 128 numbers in 16 bits, that is 131,072 bytes, about 131 KB per token. For Llama 3 70B, with 80 layers, it is about 328 KB. A 1,500-token conversation on the smaller model holds 197 MB of KV cache, and a hundred such conversations need about 20 GB beside the 16 GB of weights. Memory for the KV cache is what limits how many sequences a server can work on together.</p>
+<p>Two latency numbers describe what a user sees. The <dfn>time to first token</dfn> is the time from sending the request to receiving the first token of the answer: waiting in a queue, plus prefill. The <dfn>time per output token</dfn> is the gap between later tokens, one decode pass as that user experiences it. The time to the last token follows from them.</p>
+<div class="formula">time to last token = time to first token + (answer tokens − 1) × time per output token<br>
+on an idle simulated server: 51.1 ms + 199 × 6.1 ms = 1,265 ms</div>
+
+<figure class="fig wide" id="fig-phases">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f1002t f1002d">
+<title id="f1002t">One request: prefill, then one decode step for each token</title>
+<desc id="f1002d">A timeline of one request, on an idle server, from the chapter’s simulation. The prompt has 1,500 tokens. Prefill reads all of them in one pass, which with the first decode step takes 51.1 milliseconds and produces the first token. Each further token takes one decode step of 6.1 milliseconds, so the 200th token arrives at 1,265 milliseconds. The browser receives each token as soon as it exists. The KV cache grows from 1,500 tokens of keys and values to 1,700, then is freed.</desc>
+<text class="tb" x="10" y="44">GPU</text>
+<text class="tb" x="10" y="104">Browser</text>
+<text class="tb" x="10" y="164">KV cache</text>
+<line class="axis" x1="110" y1="196" x2="700" y2="196"/>
+<line class="grid" x1="110.0" y1="190" x2="110.0" y2="196"/>
+<text class="ts mid" x="110.0" y="212">0 ms</text>
+<line class="grid" x1="226.6" y1="190" x2="226.6" y2="196"/>
+<text class="ts mid" x="226.6" y="212">250 ms</text>
+<line class="grid" x1="343.2" y1="190" x2="343.2" y2="196"/>
+<text class="ts mid" x="343.2" y="212">500 ms</text>
+<line class="grid" x1="459.8" y1="190" x2="459.8" y2="196"/>
+<text class="ts mid" x="459.8" y="212">750 ms</text>
+<line class="grid" x1="576.4" y1="190" x2="576.4" y2="196"/>
+<text class="ts mid" x="576.4" y="212">1000 ms</text>
+<line class="grid" x1="693.0" y1="190" x2="693.0" y2="196"/>
+<text class="ts mid" x="693.0" y="212">1250 ms</text>
+<text class="ts end" x="700" y="228">time since the request arrived</text>
+<g data-s="1" data-packet="none">
+<rect class="n sig" x="110" y="28" width="23.8" height="26" rx="3"/>
+<text class="ts" x="110" y="22">prefill: 1,500 tokens, one pass</text>
+<rect class="n store" x="110" y="150" width="23.8" height="22" rx="3"/>
+</g>
+<g data-s="2" data-packet="none">
+<path class="e sig" d="M133.8 56V88"/>
+<circle class="fill-sig" cx="133.8" cy="98" r="5"/>
+<text class="ts" x="141.8" y="76">first token at 51.1 ms</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n" x="133.8" y="28" width="566.2" height="26" rx="3"/>
+<line class="grid" x1="136.7" y1="30" x2="136.7" y2="52"/>
+<line class="grid" x1="153.7" y1="30" x2="153.7" y2="52"/>
+<line class="grid" x1="170.8" y1="30" x2="170.8" y2="52"/>
+<line class="grid" x1="187.9" y1="30" x2="187.9" y2="52"/>
+<line class="grid" x1="205.0" y1="30" x2="205.0" y2="52"/>
+<line class="grid" x1="222.0" y1="30" x2="222.0" y2="52"/>
+<line class="grid" x1="239.1" y1="30" x2="239.1" y2="52"/>
+<line class="grid" x1="256.2" y1="30" x2="256.2" y2="52"/>
+<line class="grid" x1="273.2" y1="30" x2="273.2" y2="52"/>
+<line class="grid" x1="290.3" y1="30" x2="290.3" y2="52"/>
+<line class="grid" x1="307.4" y1="30" x2="307.4" y2="52"/>
+<line class="grid" x1="324.5" y1="30" x2="324.5" y2="52"/>
+<line class="grid" x1="341.5" y1="30" x2="341.5" y2="52"/>
+<line class="grid" x1="358.6" y1="30" x2="358.6" y2="52"/>
+<line class="grid" x1="375.7" y1="30" x2="375.7" y2="52"/>
+<line class="grid" x1="392.7" y1="30" x2="392.7" y2="52"/>
+<line class="grid" x1="409.8" y1="30" x2="409.8" y2="52"/>
+<line class="grid" x1="426.9" y1="30" x2="426.9" y2="52"/>
+<line class="grid" x1="443.9" y1="30" x2="443.9" y2="52"/>
+<line class="grid" x1="461.0" y1="30" x2="461.0" y2="52"/>
+<line class="grid" x1="478.1" y1="30" x2="478.1" y2="52"/>
+<line class="grid" x1="495.2" y1="30" x2="495.2" y2="52"/>
+<line class="grid" x1="512.2" y1="30" x2="512.2" y2="52"/>
+<line class="grid" x1="529.3" y1="30" x2="529.3" y2="52"/>
+<line class="grid" x1="546.4" y1="30" x2="546.4" y2="52"/>
+<line class="grid" x1="563.4" y1="30" x2="563.4" y2="52"/>
+<line class="grid" x1="580.5" y1="30" x2="580.5" y2="52"/>
+<line class="grid" x1="597.6" y1="30" x2="597.6" y2="52"/>
+<line class="grid" x1="614.6" y1="30" x2="614.6" y2="52"/>
+<line class="grid" x1="631.7" y1="30" x2="631.7" y2="52"/>
+<line class="grid" x1="648.8" y1="30" x2="648.8" y2="52"/>
+<line class="grid" x1="665.9" y1="30" x2="665.9" y2="52"/>
+<line class="grid" x1="682.9" y1="30" x2="682.9" y2="52"/>
+<line class="grid" x1="700.0" y1="30" x2="700.0" y2="52"/>
+<text class="ts end" x="700.0" y="22">decode: 199 more passes, 6.1 ms each, one token per pass</text>
+</g>
+<g data-s="4" data-packet="none">
+<circle class="fill-sig" cx="136.7" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="153.7" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="170.8" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="187.9" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="205.0" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="222.0" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="239.1" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="256.2" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="273.2" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="290.3" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="307.4" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="324.5" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="341.5" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="358.6" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="375.7" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="392.7" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="409.8" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="426.9" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="443.9" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="461.0" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="478.1" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="495.2" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="512.2" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="529.3" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="546.4" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="563.4" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="580.5" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="597.6" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="614.6" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="631.7" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="648.8" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="665.9" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="682.9" cy="98" r="2.5"/>
+<circle class="fill-sig" cx="700.0" cy="98" r="2.5"/>
+<text class="ts mid" x="389.8" y="124">each token is sent the moment it exists</text>
+</g>
+<g data-s="5" data-packet="none">
+<path class="n store" d="M133.8 150H700.0V172H133.8z" style="opacity:.55"/>
+<path class="fill-store" d="M133.8 150L700.0 143V150z"/>
+<text class="ts" x="141.8" y="165">1,500 tokens of keys and values, growing by one each step to 1,700</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Tokens sent: 0; KV cache: 1,500 tokens">Prefill reads all 1,500 prompt tokens in one pass and stores their keys and values in the KV cache. Prompt tokens are cheap because they are processed together.</li>
+  <li data-msg="none" data-state="Tokens sent: 1; KV cache: 1,501 tokens">The pass that ends the prefill produces the first token, 51.1 ms after the request arrived. This is the time to first token.</li>
+  <li data-msg="none" data-state="Tokens sent: 1; KV cache: 1,501 tokens">Every later token needs its own pass over the whole model: 6.1 ms each on this server. Output tokens are produced strictly one after another.</li>
+  <li data-msg="none" data-state="Tokens sent: 200; KV cache: 1,700 tokens">Each token is streamed to the browser as soon as it is produced, so the reader starts reading after 51 ms, not after 1.3 seconds.</li>
+  <li data-msg="none" data-state="Tokens sent: 200; KV cache: freed">The KV cache grew by one token’s keys and values at each step. When the answer ends, at 1,265 ms, its memory is freed for other requests.</li>
+</ol>
+<figcaption>Simulated: an idle server, a 1,500-token prompt and a 200-token answer. Prefill is under a twentieth of the time; producing the answer one token at a time is the rest.</figcaption>
+</figure>
+
+<p>The simulation behind this figure and the rest of the chapter uses a stated cost model, not measurements of real hardware. One pass costs 6 ms (the 4.8 ms of reading weights, plus overhead), 0.1 ms more for each sequence in the batch, and 0.03 ms for each prompt token that joins. These are shaped like a small model on one GPU of the kind above. The shape of every result holds for other numbers; the exact values do not.</p>
+<p>Three consequences matter for design. The length of the answer, not the prompt, sets most of the waiting time: in the example, 1,500 prompt tokens took less time than nine answer tokens. Capping the answer with the request’s maximum output tokens is a latency control as well as a cost control. And streaming the answer as it is produced turns a 1.3 second wait into 51 ms before the reader sees something.</p>
+
+<h2 id="batching">Serving many users: batching</h2>
+<p>A pass that serves one sequence reads 16 GB to produce one token. A pass that serves 64 sequences reads the same 16 GB and produces 64 tokens. This is <x-ref to="latency-and-throughput#trade">batching</x-ref>, and on a model server it decides capacity. The simulation fills a server with a backlog of 1,000 requests and varies the largest batch it may run:</p>
+<table>
+<thead><tr><th>Largest batch</th><th>Tokens a second, whole server</th><th>Tokens a second, each user</th></tr></thead>
+<tbody>
+<tr><th>1</th><td>159</td><td>163.9</td></tr>
+<tr><th>8</th><td>966</td><td>124.7</td></tr>
+<tr><th>64</th><td>2,601</td><td>42.7</td></tr>
+<tr><th>256</th><td>3,139</td><td>13.6</td></tr>
+</tbody>
+</table>
+<p>A larger batch gives the server more tokens a second in total and each user fewer. Somewhere between, the answer still streams faster than people read, and the server earns its cost. Choosing that point is choosing a time per output token, and it is limited from above by memory for the KV cache.</p>
+<p>How requests join a batch matters as much as its size. <dfn>Static batching</dfn> takes a group of waiting requests, runs them together until the longest is finished, and only then takes the next group. <dfn>Continuous batching</dfn> decides at every pass: a sequence that has finished leaves, and a waiting request takes its place in the next pass. It was introduced as iteration-level scheduling in the Orca paper (OSDI 2022), which reported 36.9 times the throughput of NVIDIA’s FasterTransformer at the same latency, on a 175-billion-parameter model.</p>
+
+<figure class="fig wide" id="fig-batching">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 308" role="img" aria-labelledby="f1003t f1003d">
+<title id="f1003t">Eight requests on a server with four slots: static and continuous batching</title>
+<desc id="f1003d">Two grids of four batch slots by model iterations, from the chapter’s simulation. Requests A to H need A 6, B 2, C 4, D 3, E 5, F 2, G 3, H 4 tokens. With static batching, A, B, C and D run together for 6 iterations, the length of A, the longest; B, C and D finish early and their slots are padding until A is done. Then E, F, G and H run for 5 iterations. 11 iterations in all. With continuous batching, a slot is refilled in the iteration after it frees: E takes B’s slot after 2 iterations, F takes D’s after 3, and so on. 9 iterations in all.</desc>
+<text class="tb" x="10" y="30">Static: a batch runs until its longest request is done</text>
+<rect class="n sig" x="120" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="140.0" y="56">A</text>
+<rect class="n sig" x="120" y="66" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="140.0" y="80">B</text>
+<rect class="n sig" x="120" y="90" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="140.0" y="104">C</text>
+<rect class="n sig" x="120" y="114" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="140.0" y="128">D</text>
+<rect class="n sig" x="164" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="184.0" y="56">A</text>
+<rect class="n sig" x="164" y="66" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="184.0" y="80">B</text>
+<rect class="n sig" x="164" y="90" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="184.0" y="104">C</text>
+<rect class="n sig" x="164" y="114" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="184.0" y="128">D</text>
+<rect class="n sig" x="208" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="228.0" y="56">A</text>
+<rect class="n" x="208" y="66" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="228.0" y="80">pad</text>
+<rect class="n sig" x="208" y="90" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="228.0" y="104">C</text>
+<rect class="n sig" x="208" y="114" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="228.0" y="128">D</text>
+<rect class="n sig" x="252" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="272.0" y="56">A</text>
+<rect class="n" x="252" y="66" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="272.0" y="80">pad</text>
+<rect class="n sig" x="252" y="90" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="272.0" y="104">C</text>
+<rect class="n" x="252" y="114" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="272.0" y="128">pad</text>
+<rect class="n sig" x="296" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="316.0" y="56">A</text>
+<rect class="n" x="296" y="66" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="316.0" y="80">pad</text>
+<rect class="n" x="296" y="90" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="316.0" y="104">pad</text>
+<rect class="n" x="296" y="114" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="316.0" y="128">pad</text>
+<rect class="n sig" x="340" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="360.0" y="56">A</text>
+<rect class="n" x="340" y="66" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="360.0" y="80">pad</text>
+<rect class="n" x="340" y="90" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="360.0" y="104">pad</text>
+<rect class="n" x="340" y="114" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="360.0" y="128">pad</text>
+<rect class="n sig" x="384" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="404.0" y="56">E</text>
+<rect class="n sig" x="384" y="66" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="404.0" y="80">F</text>
+<rect class="n sig" x="384" y="90" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="404.0" y="104">G</text>
+<rect class="n sig" x="384" y="114" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="404.0" y="128">H</text>
+<rect class="n sig" x="428" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="448.0" y="56">E</text>
+<rect class="n sig" x="428" y="66" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="448.0" y="80">F</text>
+<rect class="n sig" x="428" y="90" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="448.0" y="104">G</text>
+<rect class="n sig" x="428" y="114" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="448.0" y="128">H</text>
+<rect class="n sig" x="472" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="492.0" y="56">E</text>
+<rect class="n" x="472" y="66" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="492.0" y="80">pad</text>
+<rect class="n sig" x="472" y="90" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="492.0" y="104">G</text>
+<rect class="n sig" x="472" y="114" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="492.0" y="128">H</text>
+<rect class="n sig" x="516" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="536.0" y="56">E</text>
+<rect class="n" x="516" y="66" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="536.0" y="80">pad</text>
+<rect class="n" x="516" y="90" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="536.0" y="104">pad</text>
+<rect class="n sig" x="516" y="114" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="536.0" y="128">H</text>
+<rect class="n sig" x="560" y="42" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="580.0" y="56">E</text>
+<rect class="n" x="560" y="66" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="580.0" y="80">pad</text>
+<rect class="n" x="560" y="90" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="580.0" y="104">pad</text>
+<rect class="n" x="560" y="114" width="40" height="20" rx="3" style="fill:var(--sunk)"/>
+<text class="ts mid" x="580.0" y="128">pad</text>
+<text class="ts end" x="110" y="56">slot 1</text>
+<text class="ts end" x="110" y="80">slot 2</text>
+<text class="ts end" x="110" y="104">slot 3</text>
+<text class="ts end" x="110" y="128">slot 4</text>
+<text class="tb" x="610" y="92">11 iterations</text>
+<text class="tb" x="10" y="168">Continuous: a free slot is refilled at the next iteration</text>
+<rect class="n sig" x="120" y="180" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="140.0" y="194">A</text>
+<rect class="n sig" x="120" y="204" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="140.0" y="218">B</text>
+<rect class="n sig" x="120" y="228" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="140.0" y="242">C</text>
+<rect class="n sig" x="120" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="140.0" y="266">D</text>
+<rect class="n sig" x="164" y="180" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="184.0" y="194">A</text>
+<rect class="n sig" x="164" y="204" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="184.0" y="218">B</text>
+<rect class="n sig" x="164" y="228" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="184.0" y="242">C</text>
+<rect class="n sig" x="164" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="184.0" y="266">D</text>
+<rect class="n sig" x="208" y="180" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="228.0" y="194">A</text>
+<rect class="n sig" x="208" y="204" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="228.0" y="218">E</text>
+<rect class="n sig" x="208" y="228" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="228.0" y="242">C</text>
+<rect class="n sig" x="208" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="228.0" y="266">D</text>
+<rect class="n sig" x="252" y="180" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="272.0" y="194">A</text>
+<rect class="n sig" x="252" y="204" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="272.0" y="218">E</text>
+<rect class="n sig" x="252" y="228" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="272.0" y="242">C</text>
+<rect class="n sig" x="252" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="272.0" y="266">F</text>
+<rect class="n sig" x="296" y="180" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="316.0" y="194">A</text>
+<rect class="n sig" x="296" y="204" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="316.0" y="218">E</text>
+<rect class="n sig" x="296" y="228" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="316.0" y="242">G</text>
+<rect class="n sig" x="296" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="316.0" y="266">F</text>
+<rect class="n sig" x="340" y="180" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="360.0" y="194">A</text>
+<rect class="n sig" x="340" y="204" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="360.0" y="218">E</text>
+<rect class="n sig" x="340" y="228" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="360.0" y="242">G</text>
+<rect class="n sig" x="340" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="360.0" y="266">H</text>
+<rect class="n ghost" x="384" y="180" width="40" height="20" rx="3" style="fill:none;stroke-dasharray:3 3"/>
+<rect class="n sig" x="384" y="204" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="404.0" y="218">E</text>
+<rect class="n sig" x="384" y="228" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="404.0" y="242">G</text>
+<rect class="n sig" x="384" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="404.0" y="266">H</text>
+<rect class="n ghost" x="428" y="180" width="40" height="20" rx="3" style="fill:none;stroke-dasharray:3 3"/>
+<rect class="n ghost" x="428" y="204" width="40" height="20" rx="3" style="fill:none;stroke-dasharray:3 3"/>
+<rect class="n ghost" x="428" y="228" width="40" height="20" rx="3" style="fill:none;stroke-dasharray:3 3"/>
+<rect class="n sig" x="428" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="448.0" y="266">H</text>
+<rect class="n ghost" x="472" y="180" width="40" height="20" rx="3" style="fill:none;stroke-dasharray:3 3"/>
+<rect class="n ghost" x="472" y="204" width="40" height="20" rx="3" style="fill:none;stroke-dasharray:3 3"/>
+<rect class="n ghost" x="472" y="228" width="40" height="20" rx="3" style="fill:none;stroke-dasharray:3 3"/>
+<rect class="n sig" x="472" y="252" width="40" height="20" rx="3"/>
+<text class="ts mid tb" x="492.0" y="266">H</text>
+<text class="ts end" x="110" y="194">slot 1</text>
+<text class="ts end" x="110" y="218">slot 2</text>
+<text class="ts end" x="110" y="242">slot 3</text>
+<text class="ts end" x="110" y="266">slot 4</text>
+<text class="tb" x="522" y="230">9 iterations</text>
+<text class="ts" x="120" y="298">Each column is one pass of the model; each filled cell produces one token.</text>
+</svg>
+</div>
+<figcaption>Static batching pays for padding and makes new requests wait for the whole batch. Continuous batching admits a request as soon as any slot frees, at every iteration.</figcaption>
+</figure>
+
+<p>The chapter’s simulated server (<code>server.ts</code>) runs either policy, one loop iteration per pass. With eight requests and four slots, static batching needs 11 passes, 15 slot-passes of them padding; continuous batching needs 9. Under real load the difference grows, because with static batching a request that arrives soon after a batch starts waits for the batch’s longest answer before it is even read.</p>
+
+<figure class="fig wide" id="fig-load">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f1004t f1004d">
+<title id="f1004t">Tokens delivered as offered load rises, static and continuous batching</title>
+<desc id="f1004d">Output tokens per second delivered by the simulated server, for offered loads from 0.5 to 12 requests a second, with batches of up to 64. Both deliver what is offered at light load. Static batching levels off near 1,111 tokens a second, from about 5 requests a second. Continuous batching keeps up until about 11 requests a second and levels off near 2,630. Median time to first token at 4 requests a second: 6,729 ms static, 60 ms continuous.</desc>
+<line class="grid" x1="70" y1="240.0" x2="670" y2="240.0"/>
+<text class="ts end" x="62" y="244.0">0</text>
+<line class="grid" x1="70" y1="205.0" x2="670" y2="205.0"/>
+<text class="ts end" x="62" y="209.0">500</text>
+<line class="grid" x1="70" y1="170.0" x2="670" y2="170.0"/>
+<text class="ts end" x="62" y="174.0">1,000</text>
+<line class="grid" x1="70" y1="135.0" x2="670" y2="135.0"/>
+<text class="ts end" x="62" y="139.0">1,500</text>
+<line class="grid" x1="70" y1="100.0" x2="670" y2="100.0"/>
+<text class="ts end" x="62" y="104.0">2,000</text>
+<line class="grid" x1="70" y1="65.0" x2="670" y2="65.0"/>
+<text class="ts end" x="62" y="69.0">2,500</text>
+<line class="grid" x1="70" y1="30.0" x2="670" y2="30.0"/>
+<text class="ts end" x="62" y="34.0">3,000</text>
+<text class="ts mid" x="70.0" y="258">0</text>
+<text class="ts mid" x="170.0" y="258">2</text>
+<text class="ts mid" x="270.0" y="258">4</text>
+<text class="ts mid" x="370.0" y="258">6</text>
+<text class="ts mid" x="470.0" y="258">8</text>
+<text class="ts mid" x="570.0" y="258">10</text>
+<text class="ts mid" x="670.0" y="258">12</text>
+<line class="axis" x1="70" y1="240" x2="670" y2="240"/>
+<text class="ts mid" x="370.0" y="278">offered load, requests a second</text>
+<text class="ts" x="70" y="18">output tokens a second delivered</text>
+<path class="line" style="stroke:var(--fault)" d="M95.0 231.2 L120.0 224.1 L170.0 208.1 L220.0 190.9 L270.0 174.8 L320.0 164.0 L370.0 162.9 L470.0 161.5 L570.0 162.6 L620.0 162.2 L670.0 162.2"/>
+<circle class="fill-fault" cx="95.0" cy="231.2" r="3.5"/>
+<circle class="fill-fault" cx="120.0" cy="224.1" r="3.5"/>
+<circle class="fill-fault" cx="170.0" cy="208.1" r="3.5"/>
+<circle class="fill-fault" cx="220.0" cy="190.9" r="3.5"/>
+<circle class="fill-fault" cx="270.0" cy="174.8" r="3.5"/>
+<circle class="fill-fault" cx="320.0" cy="164.0" r="3.5"/>
+<circle class="fill-fault" cx="370.0" cy="162.9" r="3.5"/>
+<circle class="fill-fault" cx="470.0" cy="161.5" r="3.5"/>
+<circle class="fill-fault" cx="570.0" cy="162.6" r="3.5"/>
+<circle class="fill-fault" cx="620.0" cy="162.2" r="3.5"/>
+<circle class="fill-fault" cx="670.0" cy="162.2" r="3.5"/>
+<path class="line" d="M95.0 231.2 L120.0 224.0 L170.0 207.6 L220.0 190.0 L270.0 172.1 L320.0 154.0 L370.0 138.2 L470.0 103.9 L570.0 71.5 L620.0 57.4 L670.0 55.9"/>
+<circle class="dot" cx="95.0" cy="231.2" r="3.5"/>
+<circle class="dot" cx="120.0" cy="224.0" r="3.5"/>
+<circle class="dot" cx="170.0" cy="207.6" r="3.5"/>
+<circle class="dot" cx="220.0" cy="190.0" r="3.5"/>
+<circle class="dot" cx="270.0" cy="172.1" r="3.5"/>
+<circle class="dot" cx="320.0" cy="154.0" r="3.5"/>
+<circle class="dot" cx="370.0" cy="138.2" r="3.5"/>
+<circle class="dot" cx="470.0" cy="103.9" r="3.5"/>
+<circle class="dot" cx="570.0" cy="71.5" r="3.5"/>
+<circle class="dot" cx="620.0" cy="57.4" r="3.5"/>
+<circle class="dot" cx="670.0" cy="55.9" r="3.5"/>
+<text class="ts end tb" x="666.0" y="43.9">continuous batching</text>
+<text class="ts end tb" x="666.0" y="150.2">static batching</text>
+<rect class="hit" x="85" y="30" width="20" height="210" data-tip="0.5 requests a second offered|static: 125 tokens/s, first token p50 399 ms, p95 3,323 ms|continuous: 125 tokens/s, first token p50 50 ms, p95 80 ms"/>
+<rect class="hit" x="110" y="30" width="20" height="210" data-tip="1 requests a second offered|static: 227 tokens/s, first token p50 1,209 ms, p95 4,519 ms|continuous: 229 tokens/s, first token p50 52 ms, p95 82 ms"/>
+<rect class="hit" x="160" y="30" width="20" height="210" data-tip="2 requests a second offered|static: 456 tokens/s, first token p50 2,315 ms, p95 6,381 ms|continuous: 463 tokens/s, first token p50 55 ms, p95 85 ms"/>
+<rect class="hit" x="210" y="30" width="20" height="210" data-tip="3 requests a second offered|static: 701 tokens/s, first token p50 4,437 ms, p95 8,700 ms|continuous: 714 tokens/s, first token p50 57 ms, p95 99 ms"/>
+<rect class="hit" x="260" y="30" width="20" height="210" data-tip="4 requests a second offered|static: 932 tokens/s, first token p50 6,729 ms, p95 13,294 ms|continuous: 970 tokens/s, first token p50 60 ms, p95 116 ms"/>
+<rect class="hit" x="310" y="30" width="20" height="210" data-tip="5 requests a second offered|static: 1,086 tokens/s, first token p50 16,390 ms, p95 32,224 ms|continuous: 1,229 tokens/s, first token p50 64 ms, p95 131 ms"/>
+<rect class="hit" x="360" y="30" width="20" height="210" data-tip="6 requests a second offered|static: 1,101 tokens/s, first token p50 45,089 ms, p95 91,958 ms|continuous: 1,454 tokens/s, first token p50 65 ms, p95 140 ms"/>
+<rect class="hit" x="460" y="30" width="20" height="210" data-tip="8 requests a second offered|static: 1,121 tokens/s, first token p50 111,223 ms, p95 213,551 ms|continuous: 1,944 tokens/s, first token p50 73 ms, p95 176 ms"/>
+<rect class="hit" x="560" y="30" width="20" height="210" data-tip="10 requests a second offered|static: 1,106 tokens/s, first token p50 180,397 ms, p95 340,377 ms|continuous: 2,407 tokens/s, first token p50 92 ms, p95 740 ms"/>
+<rect class="hit" x="610" y="30" width="20" height="210" data-tip="11 requests a second offered|static: 1,111 tokens/s, first token p50 215,120 ms, p95 405,917 ms|continuous: 2,608 tokens/s, first token p50 3,416 ms, p95 6,034 ms"/>
+<rect class="hit" x="660" y="30" width="20" height="210" data-tip="12 requests a second offered|static: 1,111 tokens/s, first token p50 244,328 ms, p95 469,190 ms|continuous: 2,630 tokens/s, first token p50 13,959 ms, p95 28,972 ms"/>
+</svg>
+</div>
+<figcaption>Simulated, batches of up to 64. Where a line levels off, the server is saturated: requests queue without limit and the time to first token grows with the queue.</figcaption>
+</figure>
+
+<p>At 4 requests a second, the median time to first token is 6,729 ms with static batching and 60 ms with continuous. Static batching saturates near 1,100 tokens a second, at about 5 requests a second; continuous batching keeps up until about 11. Past either point the queue grows without limit, the behavior described in <x-ref to="latency-and-throughput#saturation"></x-ref>, and the load test of <x-ref to="capacity-and-cost#knee"></x-ref> is how you find that point for a real server.</p>
+<p>Modern inference servers add two refinements. PagedAttention, from the vLLM project, stores each sequence’s KV cache in small fixed-size blocks, as an operating system stores memory in pages, instead of one reserved region per sequence. Its authors reported in June 2023 that earlier systems wasted 60% to 80% of KV cache memory to fragmentation and over-reservation, and vLLM under 4%, which lets more sequences share a batch. And prefill and decode get in each other’s way: a long prompt joining the batch delays the next token of everyone already in it (the simulation includes this cost). Servers split long prompts into chunks that join over several passes, or run prefill and decode on separate GPUs. DistServe (OSDI 2024), which does the latter, reported serving up to 7.4 times more requests within the same latency targets.</p>
+<aside class="sn"><b>An API or your own GPUs</b>A hosted model API charges per token and batches your requests with other customers’ requests. A GPU you run yourself costs the same per hour whether its batches are full or empty. In the simulation, a full batch of 64 produces 2,601 tokens a second and a batch of one 159: whatever the hourly price, the cost per token differs sixteenfold. Running your own model pays when traffic is steady enough to keep batches full, or when data must not leave your network.</aside>
+
+<h2 id="streaming">Streaming the answer</h2>
+<p>An answer of 400 tokens at 50 tokens a second takes eight seconds. Shown all at once, that is eight seconds of nothing. Shown as it is produced, reading starts within a second. <x-ref to="realtime-communication#sse"></x-ref> explained why server-sent events suit this: one direction, text, over ordinary HTTP. Model APIs use the same format. Anthropic’s Messages API, for example, sends a <code>message_start</code> event, then a <code>content_block_delta</code> for each piece of text, then <code>message_delta</code> with the token counts and <code>message_stop</code>, with occasional <code>ping</code> events to keep the connection alive.</p>
+<p>The application relays the stream to the browser, and three details break it in practice.</p>
+<ul>
+<li><b>Buffering.</b> A proxy that collects a response before forwarding it turns a stream back into one late reply. nginx buffers proxied responses by default; a response header <code>X-Accel-Buffering: no</code> turns that off for one response. Every hop needs checking.</li>
+<li><b>Timeouts.</b> A timeout on the whole response cuts off long answers. Use an idle timeout between chunks, as nginx’s <code>proxy_read_timeout</code> is, and pings to keep a slow stream alive.</li>
+<li><b>Errors after success.</b> The status <code>200</code> was sent with the first byte. A failure halfway through, such as the provider becoming overloaded, arrives as an <code>error</code> event inside the stream, and the browser must handle it as a failure.</li>
+</ul>
+<p>Canceling needs care in the other direction. When the user closes the tab, the application should stop the model call, or the model keeps producing, and billing, tokens nobody will read. Nothing passes the browser’s departure on by itself: the relay must tie the model call to the browser’s connection.</p>
+<pre data-lang="ts" data-title="Relaying tokens, and passing on the cancel">
+// Relays a model's tokens to the browser as they are produced. When the browser goes away, the abort is
+// passed on to the model call, so that the model stops producing (and billing) tokens nobody will read.
+export async function relay(model: StubModel, prompt: string, browser: Connection, passOnCancel: boolean): Promise<Usage> {
+  const upstream = new AbortController();
+  if (passOnCancel) browser.onClose(() => upstream.abort());
+  const tokens = model.generate(prompt, { maxTokens: 1000, signal: upstream.signal });
+  let id = 0;
+  for (;;) {
+    const next = await tokens.next();
+    if (next.done) {
+      browser.write(sseEvent(++id, "done", { usage: next.value }));
+      return next.value;
+    }
+    browser.write(sseEvent(++id, "token", { text: next.value }));
+  }
+}
+</pre>
+<p>In the test, the browser leaves after 20 tokens of an answer that would have been 104 tokens long. Without passing on the cancel, the model produces all 104. With it, it produces 20.</p>
+<p>Not every closed connection means the user has gone, though. A phone that changes from Wi-Fi to a mobile network drops the connection and reconnects a second later, and the answer should continue where it was. The fix is to make the generation belong to the response rather than to the connection: the server numbers each event, keeps the events of a running answer for a few minutes (in a shared store such as Redis, when there are several servers), and on a reconnection with a <code>Last-Event-ID</code> header replays what was missed. Only an explicit Stop cancels the model call.</p>
+
+<figure class="fig wide" id="fig-stream">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 318" role="img" aria-labelledby="f1005t f1005d">
+<title id="f1005t">Streaming an answer: a dropped connection, a resume, and a stop</title>
+<desc id="f1005d">A sequence between the browser, the app server and the model. The browser posts a question. The app server calls the model with streaming on, and relays each token to the browser as a server-sent event with an id. The connection drops after event 30; the generation is not canceled, and the app server keeps storing events. The browser reconnects with Last-Event-ID 30 and receives events 31 onward, then live ones. The user presses Stop at event 80; the app server aborts the model call, and the model stops producing and billing tokens.</desc>
+<text class="tb mid" x="90" y="20">Browser</text>
+<line class="axis" x1="90" y1="28" x2="90" y2="318"/>
+<text class="tb mid" x="360" y="20">App server</text>
+<line class="axis" x1="360" y1="28" x2="360" y2="318"/>
+<text class="tb mid" x="630" y="20">Model</text>
+<line class="axis" x1="630" y1="28" x2="630" y2="318"/>
+<g data-s="1">
+<path class="e sig" d="M91 58H359"/>
+<text class="ts mid" x="225.0" y="52">1. POST /answers</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M361 89H629"/>
+<text class="ts mid" x="495.0" y="83">2. stream: true</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M629 120H361"/>
+<text class="ts mid" x="495.0" y="114">3. token, token, …</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M359 151H91"/>
+<text class="ts mid" x="225.0" y="145">4. id: 1 … id: 30</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M359 182H181.8"/>
+<path class="x" d="M166.8 175l14 14M180.8 175l-14 14"/>
+<text class="ts mid" x="270.9" y="176">5. connection lost</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M91 213H359"/>
+<text class="ts mid" x="225.0" y="207">6. Last-Event-ID: 30</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M359 244H91"/>
+<text class="ts mid" x="225.0" y="238">7. id: 31 … then live</text>
+</g>
+<g data-s="8">
+<path class="e fault" d="M91 275H359"/>
+<text class="ts mid" x="225.0" y="269">8. POST /answers/7/stop</text>
+</g>
+<g data-s="9">
+<path class="e fault" d="M361 306H629"/>
+<text class="ts mid" x="495.0" y="300">9. abort</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="POST /answers" data-state="Model: idle; Events stored: 0; Browser has: 0">The browser sends the question. The response is a stream of type text/event-stream that stays open.</li>
+  <li data-msg="stream: true" data-state="Model: generating; Events stored: 0; Browser has: 0">The app server calls the model with streaming turned on, and with a signal it can use to cancel the call.</li>
+  <li data-msg="token" data-state="Model: generating; Events stored: 30; Browser has: 0">Tokens arrive one at a time. Each is stored with a numbered event id before it is forwarded.</li>
+  <li data-msg="id: 30" data-state="Model: generating; Events stored: 30; Browser has: 30">Each token goes to the browser as one event, a few bytes, as soon as it arrives.</li>
+  <li data-msg="id: 31" data-state="Model: generating; Events stored: 52; Browser has: 30">The phone changes network and the connection drops. The answer belongs to the response, not to the connection, so generation carries on.</li>
+  <li data-msg="Last-Event-ID: 30" data-state="Model: generating; Events stored: 60; Browser has: 30">The browser reconnects and says the last event it saw. EventSource in a browser does this by itself.</li>
+  <li data-msg="id: 31 … 60" data-state="Model: generating; Events stored: 80; Browser has: 80">Stored events 31 to 60 are replayed at once, then new ones follow live. Nothing is missing or repeated.</li>
+  <li data-msg="stop" data-state="Model: generating; Events stored: 80; Browser has: 80">The user presses Stop. An explicit stop, unlike a dropped connection, means nobody wants the rest.</li>
+  <li data-msg="abort" data-state="Model: stopped at 80 tokens; Events stored: 81; Browser has: 81">The app server aborts the model call. The model stops producing tokens, and the provider stops billing them.</li>
+</ol>
+<figcaption>Tie the generation to the response, with stored numbered events, so that a dropped connection costs nothing. Cancel it only when the user asks, and pass the cancel on to the model.</figcaption>
+</figure>
+
+<p>In the test, the browser drops after event 30, reconnects, and receives events 31 to 105: none missing, none repeated, and the model ran once. A Stop pressed after 10 tokens ends the model call with 10 tokens produced and billed.</p>
+
+<h2 id="caching">Three kinds of cache</h2>
+<p>Model calls are slow and priced per token, so caching pays. There are three kinds, at three places, and they cache different things.</p>
+<h3 id="response-cache">Whole responses</h3>
+<p>The simplest stores the answer to a request and returns it when the same request comes again. The key must include everything that affects the answer: the model and its version, the settings, the instructions and the whole conversation. Leaving one out returns an answer made for a different request.</p>
+<pre data-lang="ts" data-title="A cache key that includes everything the answer depends on">
+// Differences that do not change the meaning of a question: case, and spaces at the ends or in a row.
+export function normalize(text: string): string {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+// The key is a hash of everything that affects the answer: the model, its settings and the whole prompt.
+// Leaving any of these out would return an answer produced for a different request.
+export function cacheKey(request: ModelRequest, normalizeText = true): string {
+  const text = (t: string) => (normalizeText ? normalize(t) : t);
+  const canonical = JSON.stringify([request.model, request.temperature, request.maxTokens, text(request.system),
+    request.messages.map((m) => [m.role, text(m.content)])]);
+  return createHash("sha256").update(canonical).digest("hex");
+}
+</pre>
+<p>Cache only requests at temperature 0, the setting that makes the model pick its most likely token each time; above it, the caller asked for variety. Cache only answers that are the same for every user: an answer that mentions the user’s storage plan must not be served to someone else. Give entries an expiry, because the help articles behind an answer change. In the test, 20,000 questions drawn by popularity from 240 kinds, typed with stray capitals and spaces, went through a cache of 100 entries. Exact text gave a hit ratio of 50.5%; normalizing case and spaces first gave 79.4%. <x-ref to="caching#math"></x-ref> shows what such a ratio is worth.</p>
+<h3 id="semantic-cache">Answers to similar questions</h3>
+<p>Users rarely repeat each other word for word. A <dfn>semantic cache</dfn> returns the stored answer of an earlier question whose embedding (<x-ref to="search-systems#vectors"></x-ref>) is similar enough to the new one’s. Its single setting, the similarity threshold, decides how often it answers a question that was not asked. The test caches one phrasing of each of 16 help questions and asks the other 48 phrasings, with a simple stand-in for an embedding model:</p>
+<table>
+<thead><tr><th>Threshold</th><th>Right answer</th><th>Wrong answer</th><th>Not found</th></tr></thead>
+<tbody>
+<tr><th>0.9</th><td>8</td><td>0</td><td>40</td></tr>
+<tr><th>0.8</th><td>18</td><td>0</td><td>30</td></tr>
+<tr><th>0.7</th><td>19</td><td>1</td><td>28</td></tr>
+<tr><th>0.6</th><td>22</td><td>3</td><td>23</td></tr>
+<tr><th>0.5</th><td>27</td><td>5</td><td>16</td></tr>
+<tr><th>0.4</th><td>28</td><td>14</td><td>6</td></tr>
+</tbody>
+</table>
+<p>At 0.6, “Delete an album but keep the photos” is answered with the instructions for deleting a photo, close to the opposite of what was asked. A learned embedding recognizes more paraphrases than the stand-in, but the trade has the same shape: every step down in threshold buys hits with wrong answers, and a wrong answer delivered confidently costs more than a slow one. Use a semantic cache for questions with one shared answer, set the threshold from a labeled set of question pairs, and measure the wrong answers, not only the hits.</p>
+<h3 id="prefix-cache">The beginning of the prompt</h3>
+<p>The third cache works inside the model server. Prefill of an identical beginning gives identical keys and values, so a server can keep the KV cache of prompts it has seen and skip prefill for any new prompt that starts the same way. <dfn>Prefix caching</dfn> is reusing the stored keys and values of a prompt’s beginning for a later prompt that begins with the same tokens. Servers name blocks of tokens by a hash of everything before them, so a block matches only if the whole prompt up to it matches:</p>
+<pre data-lang="ts" data-title="A prefix cache of 16-token blocks">
+// Processes one prompt. Returns how many of its tokens were found in the cache and did not need prefill.
+  prefill(tokens: readonly string[]): number {
+    let name = 0, matched = 0, stillMatching = true;
+    const whole = Math.floor(tokens.length / this.blockTokens);
+    for (let b = 0; b < whole; b += 1) {
+      name = hash32(name + "|" + tokens.slice(b * this.blockTokens, (b + 1) * this.blockTokens).join(""));
+      if (stillMatching && this.blocks.has(name)) matched += this.blockTokens;
+      else stillMatching = false;
+      this.blocks.delete(name); // store or refresh it as the most recently used
+      this.blocks.set(name, true);
+      if (this.blocks.size > this.capacity) this.blocks.delete(this.blocks.keys().next().value as number);
+    }
+    this.reused += matched;
+    this.computed += tokens.length - matched;
+    return matched;
+  }
+</pre>
+<p>That rule makes the order of the prompt a performance decision. The test sends the same 200 conversations of four turns with three layouts of the same content.</p>
+
+<figure class="fig wide" id="fig-prefix">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f1006t f1006d">
+<title id="f1006t">Three layouts of the same prompt, and how much of it the prefix cache can reuse</title>
+<desc id="f1006d">Three ways of ordering the same prompt: fixed instructions of 1,500 tokens, the conversation so far, and the new question. In the first, the instructions come first, so every user’s request starts with the same tokens, and a second turn also reuses its own first question, though not the answer, which was never part of a prompt before: 90.1 percent of prompt tokens were reused in the simulation of 200 users over 4 turns. In the second, the user’s name and plan come first, so only a user’s own earlier turns match: 70.2 percent. In the third, the current time comes first, so no two prompts share a first block: 0 percent.</desc>
+<text class="tb" x="10" y="24">Instructions first, then history, then the question</text>
+<text class="tb end" x="710" y="24">90.1% reused</text>
+<text class="ts" x="10" y="49">Ana, turn 2</text>
+<rect class="n store" x="96" y="34" width="200" height="22" rx="3"/>
+<text class="ts mid" x="196.0" y="49">instructions, 1,500 tokens</text>
+<rect class="n store" x="300" y="34" width="90" height="22" rx="3"/>
+<text class="ts mid" x="345.0" y="49">1st question</text>
+<rect class="n " x="394" y="34" width="80" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="434.0" y="49">1st answer</text>
+<rect class="n " x="478" y="34" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="513.0" y="49">question</text>
+<text class="ts" x="10" y="77">Ben, turn 1</text>
+<rect class="n store" x="96" y="62" width="200" height="22" rx="3"/>
+<text class="ts mid" x="196.0" y="77">instructions, 1,500 tokens</text>
+<rect class="n " x="300" y="62" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="335.0" y="77">question</text>
+<text class="tb" x="10" y="116">The user’s name and plan first</text>
+<text class="tb end" x="710" y="116">70.2% reused</text>
+<text class="ts" x="10" y="141">Ana, turn 2</text>
+<rect class="n store" x="96" y="126" width="70" height="22" rx="3"/>
+<text class="ts mid" x="131.0" y="141">Ana, Pro</text>
+<rect class="n store" x="170" y="126" width="200" height="22" rx="3"/>
+<text class="ts mid" x="270.0" y="141">instructions, 1,500 tokens</text>
+<rect class="n store" x="374" y="126" width="90" height="22" rx="3"/>
+<text class="ts mid" x="419.0" y="141">1st question</text>
+<rect class="n " x="468" y="126" width="80" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="508.0" y="141">1st answer</text>
+<rect class="n " x="552" y="126" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="587.0" y="141">question</text>
+<text class="ts" x="10" y="169">Ben, turn 1</text>
+<rect class="n " x="96" y="154" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="131.0" y="169">Ben, Free</text>
+<rect class="n " x="170" y="154" width="200" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="270.0" y="169">instructions, 1,500 tokens</text>
+<rect class="n " x="374" y="154" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="409.0" y="169">question</text>
+<text class="tb" x="10" y="208">The current time first</text>
+<text class="tb end" x="710" y="208">0% reused</text>
+<text class="ts" x="10" y="233">Ana, turn 2</text>
+<rect class="n " x="96" y="218" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="131.0" y="233">14:03:07</text>
+<rect class="n " x="170" y="218" width="200" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="270.0" y="233">instructions, 1,500 tokens</text>
+<rect class="n " x="374" y="218" width="90" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="419.0" y="233">1st question</text>
+<rect class="n " x="468" y="218" width="80" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="508.0" y="233">1st answer</text>
+<rect class="n " x="552" y="218" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="587.0" y="233">question</text>
+<text class="ts" x="10" y="261">Ben, turn 1</text>
+<rect class="n " x="96" y="246" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="131.0" y="261">14:03:08</text>
+<rect class="n " x="170" y="246" width="200" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="270.0" y="261">instructions, 1,500 tokens</text>
+<rect class="n " x="374" y="246" width="70" height="22" rx="3" style="fill:none"/>
+<text class="ts mid" x="409.0" y="261">question</text>
+<rect class="n store" x="10" y="282" width="14" height="12" rx="2"/>
+<text class="ts" x="30" y="292">found in the cache: no prefill needed</text>
+<rect class="n" x="290" y="282" width="14" height="12" rx="2" style="fill:none"/>
+<text class="ts" x="310" y="292">computed again</text>
+</svg>
+</div>
+<figcaption>A cached block matches only if every token before it matches. Put what never changes first and what changes most last. Percentages are from the chapter’s simulation of 200 users over 4 turns.</figcaption>
+</figure>
+
+<p>Model providers expose this as prompt caching, and price it. As of October 2026, Anthropic’s documentation describes caching of the prompt up to a marked point, requiring an exact match, with a five-minute lifetime that each use renews and an optional one-hour lifetime. Writing to the cache costs 1.25 times the normal input price (twice for one hour), and reading from it a tenth or less. OpenAI caches automatically for prompts of at least 1,024 tokens, bills cached tokens at a tenth of the normal price for its current models, and gives the same advice: stable instructions and shared material first, anything that varies (a timestamp, the user’s details) last.</p>
+
+<h2 id="budgets">Cost and latency budgets</h2>
+<p>The cost of a call is its tokens times their prices, and the two kinds of token are priced differently. As of October 2026, Anthropic’s price list, older models included, runs from $0.10 to $15 per million input tokens and from $0.50 to $75 per million output tokens, depending on the model, with output priced at five times input for every model listed. Prices change often; the arithmetic does not.</p>
+<div class="formula">cost of a call = new input tokens × input price + cached input tokens × cached price + output tokens × output price<br>
+3,000-token prompt, 80% of it cached, 400-token answer, at $2, $0.20 and $10 per million:<br>
+600 × $2 + 2,400 × $0.20 + 400 × $10 = $0.0012 + $0.00048 + $0.004 ≈ $0.0057</div>
+
+<div class="widget" data-widget="llmcost100">
+<h4>Cost and waiting time of a model call</h4>
+<p>What one call and a month of calls cost, and how long the reader waits for the first and the last token.</p>
+<div class="controls">
+  <label>Calls a day<input type="number" name="requests" value="50000" min="0" step="1000"></label>
+  <label>Prompt tokens<input type="number" name="prompt" value="3000" min="0" step="100"></label>
+  <label>Share of the prompt found in the cache, %<input type="number" name="cached" value="80" min="0" max="100" step="5"></label>
+  <label>Answer tokens<input type="number" name="answer" value="400" min="1" step="50"></label>
+  <label>Input price, $ per million<input type="number" name="pin" value="2" min="0" step="0.1"></label>
+  <label>Cached input price, % of input price<input type="number" name="pcache" value="10" min="0" max="100" step="1"></label>
+  <label>Output price, $ per million<input type="number" name="pout" value="10" min="0" step="0.5"></label>
+  <label>Time to first token, ms<input type="number" name="ttft" value="500" min="0" step="50"></label>
+  <label>Output speed, tokens a second<input type="number" name="speed" value="50" min="1" step="5"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 150" role="img" aria-label="Two bars: the cost of one call split into new input, cached input and output, and the waiting time split into the time to the first token and the time to produce the rest."><text x="10" y="34" class="ts">Cost of one call</text><rect x="130" y="20" width="90.8" height="20" rx="2" class="bar"></rect><rect x="130" y="52" width="12" height="12" rx="3" class="bar"></rect><text x="148" y="62" class="ts">new input $0.0012</text><rect x="220.8" y="20" width="36.3" height="20" rx="2" class="bar store"></rect><rect x="280" y="52" width="12" height="12" rx="3" class="bar store"></rect><text x="298" y="62" class="ts">cached input $0.00048</text><rect x="257.2" y="20" width="302.8" height="20" rx="2" class="bar fault"></rect><rect x="430" y="52" width="12" height="12" rx="3" class="bar fault"></rect><text x="448" y="62" class="ts">output $0.004</text><text x="568" y="35" class="ts tb">$0.0057</text><text x="10" y="104" class="ts">Waiting, one call</text><rect x="130" y="90" width="25.4" height="20" rx="2" class="bar"></rect><rect x="155.4" y="90" width="404.6" height="20" rx="2" class="bar mute"></rect><circle cx="155.4" cy="100" r="5" class="dot"></circle><text x="568" y="105" class="ts tb">8.48 s</text><text x="130" y="132" class="ts">first token after 500 ms, then 399 more at 50 a second</text></svg>
+<dl class="results">
+  <div><dt>Cost of one call</dt><dd data-out="per">$0.0057</dd></div>
+  <div><dt>Cost of 30 days</dt><dd data-out="month">$8,520</dd></div>
+  <div><dt>Share of cost from the answer</dt><dd data-out="outshare">70.4%</dd></div>
+  <div><dt>Wait for the last token</dt><dd data-out="wait">8.48 s</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Each call costs $0.0057, so 50 thousand calls a day cost about $8,520 a month. The answer’s 400 tokens are 70.4% of the cost, and the prompt cache saves 43.2% compared with no cache. The reader waits 500 ms for the first word and 8.48 s for the last, which is why the answer is streamed.</p>
+</div>
+
+<p>Two things stand out at the default numbers. The answer is 400 tokens out of 3,400 and 70% of the cost, so a cap on the answer’s length, and instructions that ask for brevity, are the strongest cost controls. And caching 80% of the prompt cuts the cost of each call from $0.010 to $0.0057. For work nobody waits for (summarizing yesterday’s uploads, labeling photos), batch interfaces cost half: both Anthropic and OpenAI offer asynchronous batch processing at a 50% discount, within a 24-hour processing window (Anthropic says most of its batches finish within an hour).</p>
+<p>Costs need limits for each user and each tenant, for the reasons of <x-ref to="multi-tenancy#noisy-neighbors"></x-ref>: one script in a loop can spend a month’s budget in an afternoon. The tool is the <x-ref to="resilience-patterns#token-bucket">token bucket</x-ref>, counted in model tokens instead of requests. One problem is new. The size of a call is not known until it ends, because the answer’s length is not. Charging after the call lets a burst of calls that start together all pass. So a call reserves its largest possible size (the prompt plus its maximum output tokens) and returns the unused part when it ends.</p>
+<pre data-lang="ts" data-title="A token budget that reserves before the call and settles after">
+// Before the call: input tokens plus the largest answer allowed (max_tokens).
+  reserve(user: string, tokens: number, now: number): { ok: true } | { ok: false; retryAfterMs: number } {
+    const b = this.bucket(user, now);
+    if (b.tokens >= tokens) {
+      b.tokens -= tokens;
+      return { ok: true };
+    }
+    return { ok: false, retryAfterMs: Math.ceil((tokens - b.tokens) / this.refillPerMs) };
+  }
+  // After the call: give back what was reserved and not used. (Charging only here, with no reservation,
+  // lets a burst of calls that start together all pass, and the bill arrives after the limit is long gone.)
+  settle(user: string, reserved: number, used: number, now: number): void {
+    const b = this.bucket(user, now);
+    b.tokens = Math.min(this.capacity, b.tokens + reserved - used);
+  }
+</pre>
+<p>In the test, ten calls of 1,500 prompt tokens and up to 1,000 output tokens start at once against a budget of 10,000 tokens. Charging after, all ten pass and use 19,730 tokens, nearly twice the budget. Reserving first, four pass and use 8,130, and the refunds let later calls through.</p>
+<p>Latency needs a budget too, in the terms of <x-ref to="latency-and-throughput#percentiles"></x-ref>: a target for the time to first token at the 95th or 99th percentile, and one for the speed of the stream. The levers are the ones above: a smaller model for easy questions, a shorter prompt (less prefill), a cap on the answer, a prefix cache, and streaming. Retrieval and tool calls before the model call add to the time to first token and belong in the same budget.</p>
+
+<h2 id="gateway">The gateway: limits, routing and fallback</h2>
+<p><x-ref to="proxies-and-load-balancers#api-gateway"></x-ref> described a gateway that handles concerns every API shares. An <dfn>AI gateway</dfn> is an API gateway in front of model providers, applying the same ideas with tokens as the unit. As of October 2026, Cloudflare’s AI Gateway, one example, lists caching, rate limiting, routing rules, fallback to another model when one is unavailable, logging, cost tracking and content filtering.</p>
+<table>
+<thead><tr><th>Concern</th><th>What changes for model calls</th></tr></thead>
+<tbody>
+<tr><th>Rate limits</th><td>Counted in tokens, reserved before and settled after the call</td></tr>
+<tr><th>Credentials</th><td>Provider keys stay in the gateway; applications never hold them</td></tr>
+<tr><th>Routing</th><td>Chooses a model by task, cost or tenant, and can send easy questions to a smaller model</td></tr>
+<tr><th>Fallback</th><td>Another provider or model when one is overloaded or down</td></tr>
+<tr><th>Caching</th><td>Whole responses, and sometimes similar questions</td></tr>
+<tr><th>Logging</th><td>Tokens, cost, time to first token and model version for every call, and the prompts themselves, which contain user data</td></tr>
+</tbody>
+</table>
+<p>Fallback is the circuit breaker of <x-ref to="resilience-patterns#circuit-breaker"></x-ref> with a second destination. It applies only to failures another provider might not share: a rate limit (<code>429</code>), the provider’s own errors (<code>500</code> and above, including the <code>529</code> some use for “overloaded”). A malformed request fails everywhere and is not worth sending twice.</p>
+<pre data-lang="ts" data-title="Trying providers in order, skipping one that keeps failing">
+export class Gateway {
+  private readonly providers: readonly Provider[];
+  private readonly breakers = new Map<string, Breaker>();
+  constructor(providers: readonly Provider[], threshold = 3, coolDownMs = 5_000) {
+    this.providers = providers;
+    for (const p of providers) this.breakers.set(p.name, new Breaker(threshold, coolDownMs));
+  }
+  complete(prompt: string, now: number): { reply: Reply; servedBy?: string; tried: string[] } {
+    const tried: string[] = [];
+    let last: Reply = { ok: false, status: 503 };
+    for (const p of this.providers) {
+      const breaker = this.breakers.get(p.name) as Breaker;
+      if (!breaker.allows(now)) continue;          // known to be failing: do not wait for it to fail again
+      tried.push(p.name);
+      last = p.call(prompt, now);
+      breaker.record(last.ok || !worthFallingBack(last.status), now);
+      if (last.ok) return { reply: last, servedBy: p.name, tried };
+      if (!worthFallingBack(last.status)) break;
+    }
+    return { reply: last, tried };
+  }
+}
+</pre>
+<p>In the test, 600 calls arrive one every 100 ms while provider A is overloaded from 10 to 40 seconds. Without a fallback, 302 calls fail (two more than the outage, while the breaker waits out its cool-down). With provider B behind A, none fail. In both, the breaker keeps A’s share of the outage to 8 calls of 300: three failures open it, and then one test call every five seconds.</p>
+<p>Two cautions. A retried model call repeats its whole cost and its whole wait, so a gateway that retries at every layer multiplies both (<x-ref to="resilience-patterns#retries"></x-ref>). And a fallback model is a different model: it may follow instructions differently, so it needs the same evaluation as the primary (<x-ref to="agent-systems#evaluation"></x-ref>). Record the model that served each call, so that a change in quality can be traced to a change in routing.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> For “design a chat assistant”, say where the time goes before drawing boxes: “the first token comes after queueing and prefill, the rest at the decode speed, so we stream over SSE and cap the answer length”. Then name the controls in the gateway: per-user token budgets with reservation, response and prefix caching with stable content first, fallback across providers behind a breaker, and logs of tokens and cost per call. If the model is self-hosted, say continuous batching and that KV cache memory bounds the batch.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Waiting for the whole answer before showing it</th><td>Seconds of blank screen for every question</td><td>Stream, and measure the time to first token</td></tr>
+<tr><th>A proxy that buffers responses on the path</th><td>The stream arrives in one piece at the end</td><td>Turn off buffering at every hop, and test through the real path</td></tr>
+<tr><th>Not passing on a cancel</th><td>Tokens produced and billed after the user has left</td><td>Abort the model call when the user stops</td></tr>
+<tr><th>Canceling on every dropped connection</th><td>A network change loses the answer</td><td>Numbered events, kept briefly, resumed with <code>Last-Event-ID</code></td></tr>
+<tr><th>A timestamp or user name at the start of the prompt</th><td>The prefix cache never matches</td><td>Stable content first, varying content last</td></tr>
+<tr><th>A semantic cache with a loose threshold</th><td>Confident answers to questions that were not asked</td><td>A high threshold set from labeled pairs, for shared answers only</td></tr>
+<tr><th>Rate limits counted in requests, or charged after the call</th><td>A few large calls, or a burst, exceed the budget</td><td>Token budgets that reserve the maximum and settle after</td></tr>
+<tr><th>No cap on the answer’s length</th><td>Cost and waiting time set by the model’s mood</td><td>Maximum output tokens on every call</td></tr>
+<tr><th>Static batching on a self-hosted server</th><td>Requests wait for the longest answer in the batch</td><td>An inference server with continuous batching</td></tr>
+<tr><th>Logging prompts like any other request</th><td>User data copied into logs and kept indefinitely</td><td>Redaction, access control and a retention limit for prompt logs</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="latency-and-throughput"></x-ref>: batching, saturation and percentiles, the theory behind the model server.</li>
+  <li><x-ref to="realtime-communication"></x-ref>: server-sent events and reconnection.</li>
+  <li><x-ref to="caching"></x-ref>: hit ratios, expiry and what is safe to cache.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: token buckets, circuit breakers and retry budgets.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref>: the API gateway the AI gateway extends.</li>
+  <li><x-ref to="capacity-and-cost"></x-ref>: load tests and cost per unit of business.</li>
+  <li><x-ref to="retrieval-and-vector-search"></x-ref>: finding the passages that go into the prompt.</li>
+  <li><x-ref to="agent-systems"></x-ref>: models that call tools in a loop, and evaluating them.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Everything about a model call is counted in tokens: its price, its limits, its speed. A token is about four characters of English.</li>
+  <li>Prefill reads the prompt in one pass; decode writes the answer one pass per token. The answer’s length sets most of the waiting time and, at five times the price, much of the cost.</li>
+  <li>Each decode pass reads the whole model from memory, so batching many sequences multiplies a server’s output, at the price of a slower stream for each user. KV cache memory limits the batch.</li>
+  <li>Continuous batching admits requests at every pass instead of waiting for a batch to finish. In the simulation it served more than twice the load of static batching, with a first token in tens of milliseconds instead of seconds.</li>
+  <li>Stream with server-sent events, without buffering, with idle timeouts. Pass a user’s Stop on to the model, but let a dropped connection resume.</li>
+  <li>Cache whole responses only for identical, shared, temperature-0 requests; treat semantic caching’s threshold as a dial between hits and wrong answers; put stable content first so prefix caching works.</li>
+  <li>Budget tokens per user by reserving the maximum before a call and settling after it. Route, fall back and log in a gateway.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A prompt of 2,000 tokens gets an answer of 300 tokens. Which part takes longer to process, and why?</summary><p>Usually the answer. The prompt is read in one prefill pass, with all its tokens processed in parallel. The answer is produced one token per decode pass, each pass reading the whole model from memory. 300 passes take far longer than one, even a large one: on the chapter’s simulated server, prefill of 2,000 tokens takes about 66 ms and 300 decode steps about 1.8 s.</p></details>
+<details><summary>Why does batching raise a model server’s throughput so much, and what does it cost each user?</summary><p>Decode is limited by reading the model’s weights from memory, and one read can serve every sequence in the batch. So 64 sequences get 64 tokens for little more than the time of one. Each pass takes a little longer as the batch grows, so each user’s tokens arrive more slowly: in the simulation, 164 tokens a second alone and 43 in a batch of 64.</p></details>
+<details><summary>What limits how large a batch can be, apart from the speed each user needs?</summary><p>Memory for the KV cache. Every sequence in the batch keeps the keys and values of all its tokens in GPU memory, about 131 KB per token for an 8-billion-parameter Llama 3 model in 16 bits. Long conversations fill memory quickly, which is why techniques such as PagedAttention, which waste less of it, let a server batch more sequences.</p></details>
+<details><summary>With static batching, a request arrives a moment after a batch of 64 has started. What decides when its first token arrives?</summary><p>The longest answer in the running batch. The new request is not read until the whole batch is done, so it waits for that answer to finish, then for its own prefill. Continuous batching would admit it at the next pass after any sequence finishes.</p></details>
+<details><summary>A user closes the tab while an answer is streaming. What should happen, and what if the connection dropped because the phone changed networks?</summary><p>If the user meant to leave or pressed Stop, the application should abort the model call so that it stops producing and billing tokens. A dropped connection is different: the browser will reconnect with the id of the last event it received. Tie the generation to the response, keep its numbered events briefly, and replay the missed ones. Cancel only on an explicit stop, or when no one has reconnected after a grace period.</p></details>
+<details><summary>Your system prompt starts with “Today is 14 October 2026, 14:03:07.” and is 2,000 tokens long. Why is the provider’s prompt cache not helping, and what is the fix?</summary><p>A cached block matches only if every token before it matches, and the time changes every second, so no two prompts share even their first block. Move the date to the end of the prompt, after the stable instructions, or round it to the day. In the chapter’s simulation, putting the time first took prefix reuse from 90.1% to 0%.</p></details>
+<details><summary>Why must a per-user token budget reserve tokens before a call instead of charging them after?</summary><p>The answer’s length is unknown until it ends. If the budget is charged only afterward, a burst of calls that start together all see a full budget and all pass. Reserving the largest possible size (prompt plus maximum output tokens) before the call, and returning what was unused after, keeps the total within the budget. In the test, charging after let ten calls use 19,730 tokens of a 10,000-token budget.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Gyeong-In Yu and others, <a href="https://www.usenix.org/conference/osdi22/presentation/yu">Orca: A Distributed Serving System for Transformer-Based Generative Models</a>, OSDI 2022. Iteration-level scheduling, the origin of continuous batching.</li>
+  <li>Woosuk Kwon and others, <a href="https://vllm.ai/blog/2023-06-20-vllm">vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention</a>, vLLM blog, June 2023, and the paper at SOSP 2023. The KV cache in blocks, and the waste it avoids.</li>
+  <li>Yinmin Zhong and others, <a href="https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin">DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</a>, OSDI 2024. Time to first token and time per output token as separate targets.</li>
+  <li>Llama Team, AI at Meta, <a href="https://arxiv.org/abs/2407.21783">The Llama 3 Herd of Models</a>, July 2024. Table 3 gives the layer and head counts used for the KV cache arithmetic.</li>
+  <li>NVIDIA, <a href="https://www.nvidia.com/en-us/data-center/h100/">H100 Tensor Core GPU</a>, specifications consulted October 2026, the same as the February 2023 datasheet: 80 GB of memory at 3.35 TB per second for the SXM version.</li>
+  <li>OpenAI, <a href="https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them">What are tokens and how to count them</a>, help center, consulted October 2026.</li>
+  <li>Anthropic, <a href="https://platform.claude.com/docs/en/build-with-claude/streaming">Streaming messages</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Prompt caching</a> and <a href="https://platform.claude.com/docs/en/about-claude/pricing">Pricing</a>, documentation consulted October 2026.</li>
+  <li>OpenAI, <a href="https://developers.openai.com/api/docs/guides/prompt-caching">Prompt caching</a>, API documentation, and <a href="https://help.openai.com/en/articles/9197833-batch-api-faq">Batch API FAQ</a>, both consulted October 2026.</li>
+  <li>nginx, <a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html">Module ngx_http_proxy_module</a>: <code>proxy_buffering</code>, <code>X-Accel-Buffering</code> and <code>proxy_read_timeout</code>.</li>
+  <li>Cloudflare, <a href="https://developers.cloudflare.com/ai-gateway/features/">AI Gateway features</a>, documentation consulted October 2026.</li>
+</ol>
+</section>

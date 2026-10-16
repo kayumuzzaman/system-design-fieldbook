@@ -1,0 +1,380 @@
+<!--meta
+{ "description": "How content delivery networks work: points of presence, request routing, cache keys, freshness and invalidation, cache hit ratio, origin shielding, dynamic acceleration, edge security against DDoS, and running code at the edge.",
+  "lede": "The speed of light sets a floor on how fast a distant server can answer. A content delivery network gets under that floor by answering from somewhere close. This chapter explains how a CDN decides what it may serve without asking you, how to keep what it serves correct, and what else now happens at the edge: security, routing, and your own code.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Distance is the problem</h2>
+<p><x-ref to="journey-of-a-request"></x-ref> showed that a request to a server on another continent spends most of its time in transit. A round trip between Sydney and Virginia takes about 200 ms, and no amount of server tuning changes that, because it is set by the length of the cable and the speed of light in glass. A new HTTPS connection needs several round trips before the first byte of the response arrives.</p>
+<p>A <dfn>content delivery network</dfn> (CDN) is a fleet of servers placed in hundreds of locations around the world, operated as a service, that sits between your users and your own servers. Each location is called a <dfn>point of presence</dfn> (PoP) or <dfn>edge location</dfn>. Your own servers, where the content really lives, are the <dfn>origin</dfn>. The CDN is a reverse proxy (<x-ref to="proxies-and-load-balancers"></x-ref>) with two unusual properties: it is close to nearly everyone, and it remembers responses.</p>
+
+<figure class="fig wide" id="fig-edge-flow">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f141t f141d">
+<title id="f141t">A request served by an edge location, on a cache hit and on a miss</title>
+<desc id="f141d">A user in Sydney connects to an edge location in Sydney, 10 milliseconds away as a round trip. On a cache hit the edge answers from its cache and the origin in Virginia is not contacted. On a miss the edge fetches the response from the origin, 200 milliseconds away as a round trip, returns it to the user and keeps a copy.</desc>
+<rect class="n" x="10" y="70" width="90" height="60" rx="6"/>
+<text class="tb mid" x="55" y="96">User</text>
+<text class="ts mid" x="55" y="113">Sydney</text>
+<rect class="n sig" x="250" y="50" width="170" height="100" rx="6"/>
+<text class="tb mid" x="335" y="74">Edge location</text>
+<text class="ts mid" x="335" y="91">Sydney</text>
+<rect class="n store" x="295" y="108" width="80" height="30" rx="5"/>
+<text class="ts mid" x="335" y="128">cache</text>
+<rect class="n" x="610" y="70" width="100" height="60" rx="6"/>
+<text class="tb mid" x="660" y="96">Origin</text>
+<text class="ts mid" x="660" y="113">Virginia</text>
+<g data-s="1">
+<path class="e sig both" d="M100 100H250"/>
+<text class="ts mid" x="175" y="91">10 ms round trip</text>
+</g>
+<g data-s="3">
+<path class="e dash both" d="M420 100H610"/>
+<text class="ts mid" x="515" y="91">200 ms round trip</text>
+<text class="ts mid" x="515" y="118">only on a miss</text>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="186"><tspan class="tb">Hit:</tspan> the edge answers from its cache. The origin is never contacted.</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="206"><tspan class="tb">Miss:</tspan> the edge fetches from the origin, answers the user, and keeps a copy for the next request.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="request">A user in Sydney connects to an edge location in the same city, a 10 ms round trip away.</li>
+  <li>On a hit, the edge already holds the response. It answers from its cache and the origin is never contacted.</li>
+  <li data-msg="fetch">On a miss, the edge does not hold it, so it fetches the response from the origin in Virginia. That is a 200 ms round trip.</li>
+  <li>The edge answers the user and keeps a copy. Everyone after that in the region gets a hit, until the copy expires.</li>
+</ol>
+<figcaption>The first user in a region pays for the long trip. Everyone after them, until the copy expires, is served from nearby.</figcaption>
+</figure>
+
+<p>A CDN therefore gives you three things at once:</p>
+<ul>
+  <li><b>Lower latency</b>, because the response travels a short distance.</li>
+  <li><b>Lower origin load</b>, because most requests never reach your servers. This is often the larger benefit. A site that could not survive its own traffic can survive it when the origin sees one request in twenty.</li>
+  <li><b>Absorption</b>, because a network sized for a large share of the world’s traffic can take a flood, accidental or malicious, that would overwhelm any single site.</li>
+</ul>
+<p>The scale is worth knowing. As of October 2026, Cloudflare lists data centers in 348 cities, and Amazon CloudFront lists more than 750 points of presence in over 100 cities. Cloudflare states that 95% of the world’s internet users are within 50 ms of one of its locations.</p>
+
+<h2 id="routing">How a request finds a nearby edge</h2>
+<p>The user types your domain name, and somehow arrives at a server in their own city. Two mechanisms from earlier chapters do this, and CDNs use one or both.</p>
+<ul>
+  <li><b>Anycast.</b> Every edge location announces the same IP address, and the internet’s routing delivers each packet to the nearest one by network distance (<x-ref to="ip-and-routing#anycast"></x-ref>). Failover is automatic: a location that goes down stops announcing, and its traffic flows to the next nearest.</li>
+  <li><b>DNS steering.</b> The CDN’s name servers answer each lookup with the address of an edge location chosen for that user, by geography or by measured latency (<x-ref to="dns#steering"></x-ref>). This allows finer control, such as avoiding a location that is near capacity, and it reacts only as fast as cached DNS answers expire.</li>
+</ul>
+<p>You connect your site to a CDN by pointing your domain’s DNS record at it, and telling the CDN where your origin is. From then on the CDN holds your TLS certificate and terminates your users’ connections (<x-ref to="http-and-tls#termination"></x-ref>). That last point deserves a moment of thought. The CDN sees all of your traffic in the clear, and its availability becomes part of yours.</p>
+
+<h2 id="cache-key">The cache key</h2>
+<p>When a request arrives, the edge must decide whether it already holds a suitable response. It does so by computing a <dfn>cache key</dfn> from the request and looking that up. Two requests with the same key receive the same stored response. Two requests with different keys are cached separately. Everything about a CDN’s efficiency and correctness follows from what goes into that key.</p>
+
+<figure class="fig wide" id="fig-cache-key">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 176" role="img" aria-labelledby="f142t f142d">
+<title id="f142t">Which parts of a request form the cache key</title>
+<desc id="f142d">A request for img.example.com, path /p/871.jpg, with query parameters w=640 and utm_source=mail, and headers Accept-Encoding, Cookie and User-Agent. The host, the path, the width parameter and the normalized Accept-Encoding header are part of the cache key. The tracking parameter, the cookie and the user agent are left out, so requests that differ only in those share one cached copy.</desc>
+<text class="ts" x="10" y="38">URL</text>
+<rect class="n sig" x="76" y="16" width="140" height="34" rx="5"/><text class="mid" x="146" y="38">img.example.com</text>
+<rect class="n sig" x="224" y="16" width="100" height="34" rx="5"/><text class="mid" x="274" y="38">/p/871.jpg</text>
+<rect class="n sig" x="332" y="16" width="80" height="34" rx="5"/><text class="mid" x="372" y="38">?w=640</text>
+<rect class="n ghost" x="420" y="16" width="150" height="34" rx="5"/><text class="mid" x="495" y="38">&amp;utm_source=mail</text>
+<text class="ts" x="10" y="88">Headers</text>
+<rect class="n sig" x="76" y="66" width="170" height="34" rx="5"/><text class="mid" x="161" y="88">Accept-Encoding: br</text>
+<rect class="n ghost" x="254" y="66" width="158" height="34" rx="5"/><text class="mid" x="333" y="88">Cookie: session=…</text>
+<rect class="n ghost" x="420" y="66" width="150" height="34" rx="5"/><text class="mid" x="495" y="88">User-Agent: …</text>
+<rect class="n sig" x="10" y="124" width="22" height="16" rx="3"/><text class="ts" x="40" y="137">In the key. A different value means a separately cached copy.</text>
+<rect class="n ghost" x="10" y="148" width="22" height="16" rx="3"/><text class="ts" x="40" y="161">Left out. Requests that differ only here share one copy.</text>
+</svg>
+</div>
+<figcaption>A sensible key for a resized image. The width changes the bytes, so it belongs in the key. A marketing tag, a session cookie and the browser’s name do not change the image, so including them would only split the cache.</figcaption>
+</figure>
+
+<p>The default key is usually the host and the full URL including the query string. That default goes wrong in both directions.</p>
+<p><b>Too much in the key</b> fragments the cache. If a tracking parameter such as <code>utm_source</code> is part of the key, every email campaign creates a new copy of every page, and each copy starts cold. The same happens when parameters arrive in different orders, or when a response varies on a header with thousands of possible values, as <code>User-Agent</code> has. The hit ratio falls and the origin does the work the CDN was meant to save. The fix is to list the parameters and headers that really change the response and leave everything else out.</p>
+<p><b>Too little in the key</b> is worse, because it serves the wrong content. If the response depends on something that is not in the key, one user receives a response built for another. Leave <code>Accept-Language</code> out when the page is translated, and a visitor in Paris gets the German page cached a moment earlier. Leave out the cookie on a page that shows account details, and you have published one user’s data to the next visitor.</p>
+<p>The <code>Vary</code> response header is the standard way for an origin to declare which request headers matter (<x-ref to="http-and-tls#caching"></x-ref>). CDNs also let you define the key in their own configuration, which gives more control, such as varying on the user’s country as detected by the edge instead of on a raw header.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Caching a personalized response is the most serious error you can make with a CDN. Any response that depends on who is asking must either be marked <code>Cache-Control: private</code> or <code>no-store</code>, or have the distinguishing value in its cache key. Treat responses that set cookies as uncacheable by default. An attack called web cache deception looks for exactly this gap: it tricks the CDN into treating a private page as a static file, for example by requesting <code>/account/x.css</code>, and then reads the victim’s cached page.</p></div>
+
+<h2 id="freshness">Freshness and invalidation</h2>
+<p>A cached copy is a snapshot, and the origin may have changed since it was taken. The rules for how long a copy can be used are the HTTP caching rules from <x-ref to="http-and-tls#caching"></x-ref>, with a few additions aimed at shared caches.</p>
+<table>
+<thead><tr><th>Directive</th><th>Meaning for a CDN</th></tr></thead>
+<tbody>
+<tr><th><code>max-age=60</code></th><td>Any cache, including the browser, may reuse this for 60 seconds</td></tr>
+<tr><th><code>s-maxage=600</code></th><td>Shared caches such as a CDN may reuse it for 600 seconds, overriding <code>max-age</code> for them</td></tr>
+<tr><th><code>private</code></th><td>Only the user’s own browser may store it. A CDN must not.</td></tr>
+<tr><th><code>no-store</code></th><td>Nobody may store it</td></tr>
+<tr><th><code>stale-while-revalidate=30</code></th><td>For 30 seconds after expiry, serve the old copy at once and refresh it in the background</td></tr>
+<tr><th><code>stale-if-error=86400</code></th><td>If the origin is failing, keep serving the old copy for up to a day</td></tr>
+<tr><th><code>immutable</code></th><td>This will never change, so do not even revalidate it</td></tr>
+</tbody>
+</table>
+<p>A useful header for a page that changes occasionally combines several of these:</p>
+<pre data-lang="http">
+Cache-Control: public, max-age=0, s-maxage=600, stale-while-revalidate=30, stale-if-error=86400
+</pre>
+<p>Read it as four instructions. Browsers must check back every time, so a user never sees a copy older than the CDN’s. The CDN may serve its copy for ten minutes. When that expires, the next user is not made to wait, because the CDN serves the old copy and fetches a new one behind the scenes. If the origin is down, the CDN keeps the site up with what it has for a day. That last directive turns the CDN into a cushion against origin outages, and it costs nothing to add.</p>
+<p>The separation of browser lifetime from CDN lifetime matters because of what you can take back. You can purge a CDN. You cannot purge a browser. A long <code>max-age</code> on something you may need to change is a promise you cannot withdraw.</p>
+
+<h3 id="invalidation">Changing content before it expires</h3>
+<p>There are three ways to get new content to users, and they suit different kinds of content.</p>
+<table>
+<thead><tr><th>Method</th><th>How it works</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><th>Versioned URLs</th><td>Put a hash of the content in the file name, such as <code>app.3f9a1c.js</code>. A new version has a new URL, so nothing is ever invalidated. Cache it for a year and mark it <code>immutable</code>.</td><td>Scripts, style sheets, fonts, images: anything referenced from a page you control</td></tr>
+<tr><th>Short lifetimes</th><td>Let copies expire quickly and accept that users may see content up to that old</td><td>HTML pages and API responses where a minute of staleness is acceptable</td></tr>
+<tr><th>Purging</th><td>Tell the CDN to discard copies now, by URL, by prefix, or by a tag you attached to the response</td><td>Content at fixed URLs that must update promptly: a corrected article, a product whose price changed</td></tr>
+</tbody>
+</table>
+<p>Versioned URLs are the best of the three wherever they apply, because they remove the question. Build tools generate the hashed names automatically. The HTML that refers to them is then the only thing with a short lifetime.</p>
+<p>Purging by tag is the practical tool for the rest. The origin labels each response with the things it was built from, for example <code>product-871</code> and <code>category-shoes</code>, in a header the CDN understands. When product 871 changes, one purge of that tag removes every page that included it, without your having to know their URLs. Purges take from under a second to a few minutes to reach every location, depending on the provider, so check that figure before designing around it.</p>
+
+<h2 id="hit-ratio">The number that matters: cache hit ratio</h2>
+<p>The <dfn>cache hit ratio</dfn> is the share of requests answered from the edge without contacting the origin. It is the main measure of whether your CDN is doing its job, and its effect on the origin is not linear in the way people expect.</p>
+
+<div class="widget" data-widget="offload">
+<h4>What the hit ratio does to the origin</h4>
+<p>The origin handles only the misses. Move the slider and watch how much each point matters near the top.</p>
+<div class="controls">
+  <label>Requests per second from users<input type="number" name="rps" value="5000" min="0" step="100"></label>
+  <label>Cache hit ratio <output data-out="hit">90%</output><input type="range" name="hit" min="0" max="100" value="90" step="1"></label>
+  <label>Average response size, in KB<input type="number" name="kb" value="200" min="0" step="10"></label>
+</div>
+<svg viewBox="0 0 100 6" preserveAspectRatio="none" style="height:14px" aria-hidden="true"><rect x="0" y="0" width="100" height="6" style="fill:var(--sunk)"/><rect data-bar x="0" y="0" width="90.0%" height="6" style="fill:var(--store)"/></svg>
+<dl class="results">
+  <div><dt>Served from the edge</dt><dd data-out="edge">4,500 /s</dd></div>
+  <div><dt>Reaching the origin</dt><dd data-out="origin">500 /s</dd></div>
+  <div><dt>Origin bandwidth</dt><dd data-out="bandwidth">800 Mbit/s</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">The origin serves 10% of requests. From here, one more point of hit ratio removes 10% of the origin’s load. That is why the last few points matter most.</p>
+</div>
+
+<p>Going from 90% to 95% sounds like a small improvement, and it halves the traffic your servers see. Going from 95% to 99% cuts it by a further 80%. The origin’s load depends on the miss ratio, and near the top each point of hit ratio is a large fraction of what remains. This is why CDN tuning concentrates on the last few percent.</p>
+<p>The usual causes of a poor hit ratio, in rough order of how often they turn out to be the problem:</p>
+<ol>
+  <li><b>A fragmented cache key</b>: tracking parameters, unordered query strings, or an unnecessary <code>Vary</code>.</li>
+  <li><b>Responses that forbid caching</b>: a framework that adds <code>Cache-Control: private</code> or sets a cookie on every response, including static ones.</li>
+  <li><b>Lifetimes that are too short</b> for how rarely the content changes.</li>
+  <li><b>A long tail of rarely requested objects.</b> An item requested once a day in each of 300 locations is never in cache when it is needed. The next section addresses this.</li>
+</ol>
+<aside class="sn"><b>Two hit ratios</b>CDNs report the ratio by requests and by bytes. They can differ widely. A site whose small files are cached and whose large videos are not may show 95% by requests and 40% by bytes. Requests drive origin CPU, and bytes drive the bandwidth bill, so look at the one that matches the cost you are trying to reduce.</aside>
+
+<h2 id="shield">Tiered caching and origin shields</h2>
+<p>Each edge location has its own cache. With 300 locations, a new or expired object can be requested from the origin 300 times, once by each location, before the whole network holds it. For popular objects that cost is spread over millions of hits. For the long tail it dominates.</p>
+
+<figure class="fig wide" id="fig-shield">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f143t f143d">
+<title id="f143t">Origin fetches with and without an origin shield</title>
+<desc id="f143d">Without a shield, four edge locations that each miss the same object each fetch it from the origin, making four origin requests. With a shield, the four edge locations ask one shield cache, which fetches the object from the origin once and answers all four.</desc>
+<text class="tl" x="10" y="20">Without a shield</text>
+<rect class="n" x="20" y="40" width="84" height="28" rx="5"/><text class="ts mid" x="62" y="59">Tokyo</text>
+<rect class="n" x="20" y="80" width="84" height="28" rx="5"/><text class="ts mid" x="62" y="99">Paris</text>
+<rect class="n" x="20" y="120" width="84" height="28" rx="5"/><text class="ts mid" x="62" y="139">Lagos</text>
+<rect class="n" x="20" y="160" width="84" height="28" rx="5"/><text class="ts mid" x="62" y="179">Lima</text>
+<rect class="n" x="244" y="84" width="90" height="60" rx="6"/><text class="tb mid" x="289" y="119">Origin</text>
+<path class="e fault" d="M104 54 244 98"/><path class="e fault" d="M104 94 244 108"/><path class="e fault" d="M104 134 244 120"/><path class="e fault" d="M104 174 244 130"/>
+<text class="ts" x="10" y="214">Four locations miss. The origin is asked four times.</text>
+<path class="e none dash" d="M360 8V218"/>
+<text class="tl" x="380" y="20">With a shield</text>
+<rect class="n" x="390" y="40" width="84" height="28" rx="5"/><text class="ts mid" x="432" y="59">Tokyo</text>
+<rect class="n" x="390" y="80" width="84" height="28" rx="5"/><text class="ts mid" x="432" y="99">Paris</text>
+<rect class="n" x="390" y="120" width="84" height="28" rx="5"/><text class="ts mid" x="432" y="139">Lagos</text>
+<rect class="n" x="390" y="160" width="84" height="28" rx="5"/><text class="ts mid" x="432" y="179">Lima</text>
+<rect class="n sig" x="522" y="84" width="76" height="60" rx="6"/><text class="tb mid" x="560" y="110">Shield</text><text class="ts mid" x="560" y="127">one cache</text>
+<rect class="n" x="634" y="84" width="76" height="60" rx="6"/><text class="tb mid" x="672" y="119">Origin</text>
+<path class="e sig" d="M474 54 522 98"/><path class="e sig" d="M474 94 522 108"/><path class="e sig" d="M474 134 522 120"/><path class="e sig" d="M474 174 522 130"/>
+<path class="e store" d="M598 114H634"/>
+<text class="ts" x="380" y="214">Four locations miss. The origin is asked once.</text>
+</svg>
+</div>
+<figcaption>A shield is a cache for the caches. It gives the whole network a single shared memory in front of the origin.</figcaption>
+</figure>
+
+<p><dfn>Tiered caching</dfn> adds a second layer. Edge locations that miss ask a regional cache before going to the origin. An <dfn>origin shield</dfn> is the extreme form: one designated location, chosen close to the origin, through which all origin traffic passes. The trade is one extra hop on a miss in exchange for far fewer misses reaching you.</p>
+<p>Two related protections belong here. <dfn>Request collapsing</dfn> means that when a thousand users request the same uncached object in the same instant, the edge sends one request to the origin and gives its response to all of them. Without it, the expiry of a popular object sends a burst to the origin known as a cache stampede. <x-ref to="caching"></x-ref> covers stampedes in application caches, where you have to build the protection yourself.</p>
+
+<h2 id="dynamic">Speeding up what cannot be cached</h2>
+<p>A personalized API response has to come from the origin every time. A CDN still makes it faster, for reasons that have nothing to do with caching.</p>
+<p>The gain comes from where the connection setup happens. Take the user in Sydney and the origin in Virginia again, with a round trip of 200 ms between them and 10 ms from the user to the nearest edge.</p>
+<table>
+<thead><tr><th></th><th>Direct to the origin</th><th>Through the edge</th></tr></thead>
+<tbody>
+<tr><th>TCP and TLS handshakes</th><td>2 round trips of 200 ms: 400 ms</td><td>2 round trips of 10 ms: 20 ms</td></tr>
+<tr><th>Request and response</th><td>1 round trip of 200 ms: 200 ms</td><td>10 ms to the edge, plus 200 ms from edge to origin over a connection that is already open: 210 ms</td></tr>
+<tr><th>Network time to first byte</th><td>600 ms</td><td>230 ms</td></tr>
+</tbody>
+</table>
+<p>The edge keeps warm connections to the origin, so the expensive handshakes are done over the short hop only. The long hop is crossed once instead of three times. On top of that, large CDNs carry the edge-to-origin leg over their own backbone and choose routes by measured performance instead of accepting whatever path BGP offers. They also speak the newest protocols to the user, such as HTTP/3, whatever your origin supports. The figures in the table are for a first request on a new connection. Later requests on the same connection save less, since the handshake is already paid for.</p>
+<p>The edge can also reduce the bytes: compressing text with Brotli or Zstandard, and converting and resizing images to suit each device. Images are usually the heaviest part of a page, and this is often the largest single saving available.</p>
+
+<h2 id="security">Security at the edge</h2>
+<p>Because a CDN stands in front of the origin and has enormous capacity, it has become the standard place to stop attacks.</p>
+<ul>
+  <li><b>DDoS absorption.</b> A distributed denial-of-service attack tries to exhaust a target with traffic from many sources. The attacks are far larger than any single company’s connection. The largest reported so far, mitigated by Cloudflare in late 2025, peaked at 31.4 terabits per second, and Cloudflare counted 805 attacks above 1 terabit per second in the second quarter of 2026, against 130 in the first. Anycast spreads such a flood across hundreds of locations, each of which drops its share.</li>
+  <li><b>A web application firewall</b> (WAF) inspects requests for known attack patterns before they reach your code.</li>
+  <li><b>Rate limiting and bot management</b> at the edge stop abusive clients without spending origin capacity on them.</li>
+  <li><b>TLS</b> is handled with modern settings and automatically renewed certificates.</li>
+</ul>
+<p>All of this protects the origin only if the origin cannot be reached any other way. If an attacker finds your origin’s real IP address, from an old DNS record or a certificate log, they can send traffic to it directly and bypass everything. Close that path: accept connections only from the CDN’s address ranges, or better, require the CDN to present a client certificate or a secret header that the origin verifies.</p>
+<p>The CDN can also serve private content without becoming an open door. A <dfn>signed URL</dfn> contains an expiry time and a signature computed with a key the application shares with the CDN. The application hands a signed URL to a user who is allowed to see a file, and the edge checks the signature on each request without calling the origin. This is how paid video and private downloads are delivered from a cache. <x-ref to="object-and-file-storage"></x-ref> returns to it.</p>
+
+<h2 id="edge-compute">Running code at the edge</h2>
+<p>If the edge can cache and filter, the next step is to let it run your code. <dfn>Edge computing</dfn>, in the sense used by CDNs, means small programs that execute in the edge location on each request, before or instead of the origin.</p>
+
+<figure class="fig wide" id="fig-where-code-runs">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 196" role="img" aria-labelledby="f144t f144d">
+<title id="f144t">Three places code can run, and what each is close to</title>
+<desc id="f144d">Code can run on the user’s device, at the edge or in a cloud region. The device is zero milliseconds from the user, untrusted, and has no direct access to your data. The edge has hundreds of locations about 10 to 50 milliseconds from users, with small fast-starting runtimes, far from your database. A region is one of a few locations, up to 300 milliseconds from users, runs anything, and is next to your database.</desc>
+<rect class="n" x="10" y="14" width="200" height="124" rx="6"/><text class="tb mid" x="110" y="38">User’s device</text>
+<text class="ts mid" x="110" y="62">no network delay</text><text class="ts mid" x="110" y="82">cannot be trusted</text><text class="ts mid" x="110" y="102">no direct access to data</text><text class="ts mid" x="110" y="122">browser or app</text>
+<rect class="n sig" x="260" y="14" width="200" height="124" rx="6"/><text class="tb mid" x="360" y="38">Edge</text>
+<text class="ts mid" x="360" y="62">10 to 50 ms from users</text><text class="ts mid" x="360" y="82">hundreds of locations</text><text class="ts mid" x="360" y="102">far from your database</text><text class="ts mid" x="360" y="122">small, fast-starting runtimes</text>
+<rect class="n" x="510" y="14" width="200" height="124" rx="6"/><text class="tb mid" x="610" y="38">Region</text>
+<text class="ts mid" x="610" y="62">up to 300 ms from users</text><text class="ts mid" x="610" y="82">a few locations</text><text class="ts mid" x="610" y="102">next to your database</text><text class="ts mid" x="610" y="122">any runtime, any size</text>
+<path class="e both" d="M210 76H260"/><path class="e both" d="M460 76H510"/>
+<text class="ts" x="10" y="166">Moving code toward the user saves time only if that code does not have to call back</text><text class="ts" x="10" y="183">to the region for data on every request.</text>
+</svg>
+</div>
+<figcaption>The edge is near users and far from data. That single fact decides what belongs there.</figcaption>
+</figure>
+
+<p>To start in a millisecond in hundreds of locations, edge platforms cannot use ordinary containers. Two designs are common:</p>
+<ul>
+  <li><b>Isolates.</b> Many customers’ code runs inside one process, separated by the same sandbox a browser uses to separate tabs. Start-up takes a few milliseconds or less. The price is a restricted environment: a web-standard JavaScript API instead of the full Node runtime, and tight limits on CPU time and memory. Cloudflare Workers is the best-known example.</li>
+  <li><b>WebAssembly.</b> Code compiled from Rust, Go and other languages runs in a lightweight sandbox with similar start-up times. Fastly Compute works this way.</li>
+</ul>
+<p>Some providers also offer fuller runtimes at fewer, regional locations, such as AWS Lambda@Edge, alongside a very restricted and very fast option for simple header and URL changes, such as CloudFront Functions.</p>
+<p>What suits the edge is work that needs the request and little else:</p>
+<ul>
+  <li><b>Routing and rewriting</b>: redirects, choosing an origin, gradual rollouts, A/B test assignment.</li>
+  <li><b>Checks that reject early</b>: validating a signed token, blocking by country, rate limiting.</li>
+  <li><b>Shaping responses</b>: adding security headers, choosing an image format, assembling a page from cached fragments.</li>
+  <li><b>Personalizing cached content</b>: serving a shared cached page and inserting a small per-user part.</li>
+</ul>
+<pre data-lang="ts" data-title="An edge function: reject early, normalize the cache key, then use the cache">
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    // 1. Reject early. No origin capacity is spent on blocked requests.
+    if (url.pathname.startsWith("/admin")) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    // 2. Normalize, so that links from marketing emails share one cached copy.
+    for (const name of [...url.searchParams.keys()]) {
+      if (name.startsWith("utm_")) url.searchParams.delete(name);
+    }
+    url.searchParams.sort();
+
+    // 3. Fetch through the cache. A hit never reaches the origin.
+    const response = await fetch(new Request(url, request));
+
+    // 4. Shape the response on the way out.
+    const shaped = new Response(response.body, response);
+    shaped.headers.set("Strict-Transport-Security", "max-age=31536000");
+    return shaped;
+  },
+};
+</pre>
+<p>This uses the standard <code>Request</code>, <code>Response</code> and <code>fetch</code> interfaces in the module style that Cloudflare Workers and several other platforms accept. Details differ between providers.</p>
+<p>What does not suit the edge is anything that talks repeatedly to a database in one region. A function in Sydney that makes five queries to a database in Virginia spends five long round trips doing so, and is slower than running the whole request in Virginia, where the queries take a millisecond each. Compute moved to the edge and the data did not.</p>
+<p>Providers have responded with data stores that are themselves distributed: key-value stores replicated to every location, and small replicated databases. Nearly all of them are eventually consistent, meaning a write in one place takes time to appear in others. They suit configuration, feature flags, sessions and other data that is read far more than written. They do not suit an order or a payment. <x-ref to="consistency-models"></x-ref> explains what that trade means, and <x-ref to="serverless"></x-ref> compares edge functions with regional ones.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> When you add a CDN to a design, say three things: what is cached there (static assets, images, video segments, perhaps public API responses), how it stays correct (versioned URLs for assets, short lifetimes or tag purges for the rest), and what the origin’s load becomes as a result. Mentioning the hit ratio and what happens on a miss shows you understand it as a cache and not as a box that makes things fast.</p></div>
+
+<h2 id="operations">Depending on a CDN</h2>
+<p>A CDN is in front of everything. When it fails, your site is down even if every server you own is healthy. CDNs are engineered to a very high standard and their outages are rare. They are also large when they happen, because a CDN applies one configuration to the whole world in seconds.</p>
+<ul>
+  <li><b>Fastly, 8 June 2021.</b> A customer made a valid configuration change that triggered a bug introduced by a software deployment four weeks earlier. Within a minute, 85% of Fastly’s network was returning errors, and a large number of major sites went down together. Fastly detected it within a minute, and 95% of the network was normal again after 49 minutes.</li>
+  <li><b>Cloudflare, 18 November 2025.</b> An automatically generated configuration file grew past a limit in the proxy software and was distributed everywhere. <x-ref to="availability-and-reliability#cloudflare-2025"></x-ref> examines it.</li>
+</ul>
+<p>Both were caused by a change that passed validation and was applied globally at once. The lesson for your own design is to decide in advance what you will do when the CDN is the thing that is broken.</p>
+<ul>
+  <li><b>Keep the ability to bypass it.</b> If your DNS is hosted separately from the CDN, you can point traffic straight at the origin in an emergency. That only helps if the origin can take the full load for a while, which is a capacity decision to make deliberately.</li>
+  <li><b>Use two CDNs</b> if the cost of an outage justifies it. Traffic is split or switched by DNS. The difficulty is that every rule, purge and certificate must then work on both, and features that exist on only one cannot be used. Most teams are better served by one CDN used well.</li>
+  <li><b>Watch it from outside.</b> Monitor from real locations around the world, since a problem in one region is invisible from your office. Track hit ratio, origin error rate and edge error rate separately, so that you can tell at a glance whether a problem is yours or theirs.</li>
+  <li><b>Understand the bill.</b> CDN traffic is usually charged by bytes delivered and by request. Delivering through a CDN is often cheaper than serving the same bytes from a cloud provider’s region directly, and a poor hit ratio means paying for both. <x-ref to="capacity-and-cost"></x-ref> looks at data transfer costs.</li>
+</ul>
+
+<h2 id="what-to-cache">What to put on a CDN</h2>
+<table>
+<thead><tr><th>Content</th><th>Cache it?</th><th>How</th></tr></thead>
+<tbody>
+<tr><th>Scripts, style sheets, fonts</th><td>Always</td><td>Hashed file names, one year, <code>immutable</code></td></tr>
+<tr><th>Images and video segments</th><td>Always</td><td>Long lifetime. Resize and convert at the edge. Sign URLs if private.</td></tr>
+<tr><th>Public HTML pages</th><td>Usually</td><td>Short <code>s-maxage</code> with <code>stale-while-revalidate</code>, and purge by tag on change</td></tr>
+<tr><th>Public API responses, such as a product list</th><td>Often</td><td>Seconds to minutes. Even a 5-second lifetime removes most load from a busy endpoint.</td></tr>
+<tr><th>Personalized pages and API responses</th><td>No</td><td><code>private</code> or <code>no-store</code>. Still route them through the CDN for connection reuse and protection.</td></tr>
+<tr><th>Writes: <code>POST</code>, <code>PUT</code>, <code>DELETE</code></th><td>Never</td><td>Passed through to the origin</td></tr>
+</tbody>
+</table>
+<p>The fourth row is the most underused. An endpoint receiving 2,000 requests per second for the same public data, cached for 5 seconds, sends the origin one request every 5 seconds per edge location. Users see data at most 5 seconds old, which for most listings is indistinguishable from live.</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Caching personalized responses.</b> One user’s data is shown to another. Nothing else on this list is as serious.</li>
+  <li><b>Leaving the origin reachable directly.</b> Attackers bypass the CDN and every protection on it.</li>
+  <li><b>Long browser lifetimes on content at fixed URLs.</b> You can purge the CDN and you cannot purge browsers.</li>
+  <li><b>Never checking the hit ratio.</b> A CDN that is configured and missing most requests adds a hop and saves little.</li>
+  <li><b>Letting tracking parameters into the cache key.</b> Every campaign link is a cold cache.</li>
+  <li><b>Relying on purge for correctness without knowing its delay.</b> A purge is fast and is not instantaneous.</li>
+  <li><b>Running database-heavy code at the edge.</b> It is slower than running it beside the database.</li>
+  <li><b>No plan for a CDN outage.</b> The first time you think about bypassing it should not be during one.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="http-and-tls"></x-ref>: <code>Cache-Control</code>, validators and <code>Vary</code> are the language a CDN obeys.</li>
+  <li><x-ref to="ip-and-routing"></x-ref> and <x-ref to="dns"></x-ref>: anycast and DNS steering are how users reach the nearest edge.</li>
+  <li><x-ref to="caching"></x-ref>: the same ideas inside your own system, including eviction, stampedes and invalidation.</li>
+  <li><x-ref to="object-and-file-storage"></x-ref>: the usual origin for images, video and downloads.</li>
+  <li><x-ref to="threats-and-defenses"></x-ref>: DDoS, WAFs, cache poisoning and cache deception.</li>
+  <li><x-ref to="hld-video-streaming"></x-ref>: a system whose design is mostly about CDN delivery.</li>
+  <li><x-ref to="multi-region"></x-ref>: what to do when the data, and not only the content, must be close to users.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A CDN is a worldwide reverse proxy that caches. It cuts latency by being near users and cuts origin load by answering for you.</li>
+  <li>The cache key decides everything. Too much in it wastes the cache, and too little serves the wrong response to the wrong person.</li>
+  <li>Use versioned URLs for assets, short shared lifetimes with <code>stale-while-revalidate</code> for pages, and purge by tag for the rest.</li>
+  <li>Origin load follows the miss ratio. Moving from 90% to 95% hits halves it.</li>
+  <li>Tiered caches and origin shields stop every edge location from fetching the same object separately.</li>
+  <li>Uncacheable requests still gain from short handshakes, warm origin connections and better routes.</li>
+  <li>The edge is the standard place to absorb DDoS attacks and filter requests, provided the origin accepts traffic only from the CDN.</li>
+  <li>Edge code is close to users and far from data. Use it for routing, checks and response shaping.</li>
+  <li>A CDN is a dependency for your whole site. Decide beforehand what you do when it fails.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Your CDN reports a hit ratio of 96% by requests and 35% by bytes. What is probably happening, and does it matter?</summary><p>Small objects such as scripts and thumbnails are cached well, and a smaller number of large objects, perhaps videos or downloads, are not. It matters if bandwidth is the cost you care about, because most bytes are still coming from the origin. Find out why the large objects miss: they may be marked uncacheable, requested with unique query strings, or too rarely requested per location, in which case tiered caching helps.</p></details>
+<details><summary>After a marketing email goes out, origin load triples although the pages are cached. What would you check first?</summary><p>The cache key. Links in the email probably carry tracking parameters such as <code>utm_campaign</code>, and if the full query string is part of the key, each distinct link is a separate entry that starts cold. Exclude those parameters from the key.</p></details>
+<details><summary>Why is <code>Cache-Control: max-age=31536000</code> safe for <code>app.3f9a1c.js</code> and dangerous for <code>app.js</code>?</summary><p>The hashed name changes whenever the content changes, so the old URL never needs updating and can be cached forever. A fixed name with a one-year lifetime means browsers that have it will not ask again for a year, and you have no means of telling them to.</p></details>
+<details><summary>A page shows “Hello, Ana” to a user who is not Ana. What went wrong?</summary><p>A personalized response was stored in a shared cache under a key that did not include the user’s identity, so it was served to the next visitor. The response should have been marked <code>private</code> or <code>no-store</code>, or the personalized part should be fetched separately from an uncached endpoint.</p></details>
+<details><summary>An API response cannot be cached at all. Give two reasons it may still be faster through a CDN.</summary><p>The TCP and TLS handshakes happen over the short distance to the edge instead of the long distance to the origin, and the edge reuses connections to the origin that are already open. The CDN may also carry the request over a faster route on its own network, and can compress the response.</p></details>
+<details><summary>You move a function that makes four database queries from your region to the edge and it becomes slower. Why?</summary><p>The database is still in the region. Each query now crosses the long distance from the edge to the region, where before it took about a millisecond. Four long round trips cost more than the single one saved by running near the user.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>R. Fielding, M. Nottingham and J. Reschke, <a href="https://www.rfc-editor.org/rfc/rfc9111">RFC 9111: HTTP Caching</a>, 2022. Also <a href="https://www.rfc-editor.org/rfc/rfc5861">RFC 5861</a> for <code>stale-while-revalidate</code> and <code>stale-if-error</code>, and <a href="https://www.rfc-editor.org/rfc/rfc9213">RFC 9213</a> for cache directives aimed only at CDNs.</li>
+  <li>Cloudflare, <a href="https://www.cloudflare.com/network/">Global network</a>. Location count and latency claim, checked October 2026.</li>
+  <li>AWS, <a href="https://aws.amazon.com/cloudfront/features/">Amazon CloudFront features</a>. Points of presence, regional edge caches, Origin Shield, CloudFront Functions and Lambda@Edge. Checked October 2026.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/ddos-threat-report-2025-q4/">2025 Q4 DDoS threat report</a>, February 2026, for the 31.4 Tbps attack, and <a href="https://blog.cloudflare.com/ddos-threat-report-2026-h1/">DDoS threat report for the first half of 2026</a>, August 2026, for the counts of attacks above 1 Tbps.</li>
+  <li>Nick Rockwell, <a href="https://www.fastly.com/blog/summary-of-june-8-outage">Summary of June 8 outage</a>, Fastly, June 2021.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/18-november-2025-outage/">Cloudflare outage on November 18, 2025</a>.</li>
+  <li>Cloudflare documentation, <a href="https://developers.cloudflare.com/workers/reference/how-workers-works/">How Workers works</a>. Isolates compared with containers.</li>
+  <li>Omer Gil, <a href="https://omergil.blogspot.com/2017/02/web-cache-deception-attack.html">Web Cache Deception Attack</a>, 2017. The original description.</li>
+  <li>web.dev, <a href="https://web.dev/articles/http-cache">Prevent unnecessary network requests with the HTTP Cache</a>. Practical guidance on versioned URLs and lifetimes.</li>
+  <li>Erik Nygren, Ramesh Sitaraman and Jennifer Sun, <a href="https://groups.cs.umass.edu/wp-content/uploads/sites/3/2019/12/The-akamai-network-a-platform-for-high-performance-internet-applications.pdf">The Akamai Network: A Platform for High-Performance Internet Applications</a>, ACM SIGOPS Operating Systems Review, 2010. Still the clearest account of how a large CDN is built.</li>
+</ol>
+</section>

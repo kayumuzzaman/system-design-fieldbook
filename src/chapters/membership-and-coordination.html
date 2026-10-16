@@ -1,0 +1,690 @@
+<!--meta
+{ "description": "How distributed systems know which nodes are alive and agree on who does what: heartbeats and timeouts, phi accrual failure detection, gossip and SWIM, coordination services such as ZooKeeper, etcd and Consul, leases, watches, leader election, distributed locks with fencing, the Redlock debate and service discovery.",
+  "lede": "Every distributed system has to keep answering two questions. Which machines are part of this system right now, and which of them is responsible for what? This chapter covers the two families of answers. One lets machines tell each other, cheaply and approximately. The other asks a small, strongly consistent service, slowly and exactly. Most real systems use both, and the craft is in knowing which decisions need which.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="membership">Who is here, and who is in charge?</h2>
+<p>A load balancer needs the list of healthy servers. A database client needs to know which node is the leader. A partitioned store needs to know which node holds which range. A pool of workers needs exactly one of them to run the nightly job. Underneath, these are all two questions.</p>
+<ul>
+  <li><b>Membership:</b> which nodes are currently part of the system and working?</li>
+  <li><b>Coordination:</b> given those nodes, who holds each role, lock or piece of data?</li>
+</ul>
+<p>Both would be simple if failures announced themselves. They do not. <x-ref to="distributed-fundamentals#timeouts"></x-ref> established that the only evidence of a failure is silence, and that silence cannot tell a dead machine from a slow one or a broken network path. Every technique in this chapter is a way of acting sensibly on that weak evidence.</p>
+<p>The techniques fall into two families, and the difference between them is the theme of the chapter.</p>
+<table>
+<thead><tr><th></th><th>Nodes tell each other</th><th>Nodes ask a coordination service</th></tr></thead>
+<tbody>
+<tr><th>Examples</th><td>Gossip in Cassandra, ScyllaDB, Redis Cluster, Consul’s agents</td><td>ZooKeeper, etcd, Consul’s servers, the Kubernetes control plane</td></tr>
+<tr><th>View of the cluster</th><td>Each node has its own, and they converge within seconds</td><td>One view that everyone reads</td></tr>
+<tr><th>Scales to</th><td>Thousands of nodes</td><td>A handful of servers, serving many clients</td></tr>
+<tr><th>Survives</th><td>Almost anything. There is no central part.</td><td>The loss of a minority of its servers</td></tr>
+<tr><th>Good for</th><td>Liveness, routing hints, spreading metadata</td><td>Decisions that must not be made twice: leaders, locks, assignments</td></tr>
+</tbody>
+</table>
+
+<h2 id="heartbeats">Heartbeats and timeouts</h2>
+<p>The basic failure detector is a <dfn>heartbeat</dfn>: a small message a node sends on a fixed schedule to say it is alive. A node whose heartbeats stop for longer than a timeout is treated as failed. The health checks of <x-ref to="proxies-and-load-balancers#health"></x-ref> are the same thing in the other direction, with the checker asking instead of the node telling.</p>
+<p>Two numbers define the detector, the interval and the timeout, and they set a trade that cannot be escaped.</p>
+<ul>
+  <li><b>Detection time.</b> A failure is noticed, at the earliest, one timeout after it happens. With a one-second heartbeat and a ten-second timeout, a dead leader goes unnoticed for up to ten seconds, and replacing it starts only then.</li>
+  <li><b>False alarms.</b> A healthy node that pauses or loses a few packets for longer than the timeout is declared dead. The shorter the timeout, the more often this happens.</li>
+</ul>
+<p>The cost of the first is easy to put a number on. An availability target of 99.99% allows 4.4 minutes of downtime a month (<x-ref to="availability-and-reliability#nines"></x-ref>). If each failover takes 30 seconds from failure to recovery, one failover uses 11% of the month’s allowance. The cost of the second depends on what a false alarm sets off. Removing a server from a load balancer’s list for a few seconds is cheap. Promoting a new database leader while the old one is still running is how data gets lost.</p>
+<p>That gives the first rule of failure detection: <b>match the timeout to the cost of being wrong.</b> Cheap, reversible reactions can use short timeouts. Expensive ones need longer timeouts and, as later sections show, protection for the case where the detector was wrong anyway.</p>
+
+<h3 id="who-watches">Who sends heartbeats to whom?</h3>
+<p>The obvious arrangements both have problems as the cluster grows.</p>
+
+<figure class="fig wide" id="fig-three">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f331t f331d">
+<title id="f331t">Three arrangements for detecting failed nodes</title>
+<desc id="f331d">In the first, every node checks every other node, and the work grows with the square of the cluster size: a thousand nodes send about a million heartbeats every interval. In the second, a single monitor checks all nodes, which is simple, but the monitor can fail and sees only its own view of the network. In the third, gossip, each node tells a few others, so each node does a small fixed amount of work and news reaches everyone within a few rounds.</desc>
+<text class="tb mid" x="120" y="18">Everyone checks everyone</text>
+<text class="tb mid" x="360" y="18">One monitor checks all</text>
+<text class="tb mid" x="600" y="18">Gossip: tell a few others</text>
+<path class="e none" d="M127.8 50.5L162.4 70.5"/>
+<path class="e none" d="M124.5 53.8L165.7 125.2"/>
+<path class="e none" d="M120.0 55.0L120.0 153.0"/>
+<path class="e none" d="M115.5 53.8L74.3 125.2"/>
+<path class="e none" d="M112.2 50.5L77.6 70.5"/>
+<path class="e none" d="M170.2 84.0L170.2 124.0"/>
+<path class="e none" d="M165.7 82.8L124.5 154.2"/>
+<path class="e none" d="M162.4 79.5L77.6 128.5"/>
+<path class="e none" d="M161.2 75.0L78.8 75.0"/>
+<path class="e none" d="M162.4 137.5L127.8 157.5"/>
+<path class="e none" d="M161.2 133.0L78.8 133.0"/>
+<path class="e none" d="M162.4 128.5L77.6 79.5"/>
+<path class="e none" d="M112.2 157.5L77.6 137.5"/>
+<path class="e none" d="M115.5 154.2L74.3 82.8"/>
+<path class="e none" d="M69.8 124.0L69.8 84.0"/>
+<circle class="n" cx="120.0" cy="46.0" r="9"/>
+<circle class="n" cx="170.2" cy="75.0" r="9"/>
+<circle class="n" cx="170.2" cy="133.0" r="9"/>
+<circle class="n" cx="120.0" cy="162.0" r="9"/>
+<circle class="n" cx="69.8" cy="133.0" r="9"/>
+<circle class="n" cx="69.8" cy="75.0" r="9"/>
+<text class="ts mid" x="120" y="196">Work grows with the square of the</text>
+<text class="ts mid" x="120" y="212">cluster: 1,000 nodes send about a</text>
+<text class="ts mid" x="120" y="228">million heartbeats every interval.</text>
+<path class="e sig" d="M360.0 91.0L360.0 59.0"/>
+<path class="e sig" d="M371.3 97.5L399.0 81.5"/>
+<path class="e sig" d="M371.3 110.5L399.0 126.5"/>
+<path class="e sig" d="M360.0 117.0L360.0 149.0"/>
+<path class="e sig" d="M348.7 110.5L321.0 126.5"/>
+<path class="e sig" d="M348.7 97.5L321.0 81.5"/>
+<circle class="n" cx="360.0" cy="46.0" r="9"/>
+<circle class="n" cx="410.2" cy="75.0" r="9"/>
+<circle class="n" cx="410.2" cy="133.0" r="9"/>
+<circle class="n" cx="360.0" cy="162.0" r="9"/>
+<circle class="n" cx="309.8" cy="133.0" r="9"/>
+<circle class="n" cx="309.8" cy="75.0" r="9"/>
+<circle class="n sig" cx="360" cy="104" r="12"/>
+<text class="ts mid" x="360" y="196">Simple. But the monitor can fail,</text>
+<text class="ts mid" x="360" y="212">and it sees only its own view</text>
+<text class="ts mid" x="360" y="228">of the network.</text>
+<path class="e store" d="M606.0 56.4L644.2 122.6"/>
+<path class="e store" d="M639.8 127.0L560.2 81.0"/>
+<path class="e store" d="M555.8 85.4L594.0 151.6"/>
+<path class="e store" d="M606.0 151.6L644.2 85.4"/>
+<path class="e store" d="M639.8 81.0L560.2 127.0"/>
+<path class="e store" d="M555.8 122.6L594.0 56.4"/>
+<circle class="n store" cx="600.0" cy="46.0" r="9"/>
+<circle class="n store" cx="650.2" cy="75.0" r="9"/>
+<circle class="n store" cx="650.2" cy="133.0" r="9"/>
+<circle class="n store" cx="600.0" cy="162.0" r="9"/>
+<circle class="n store" cx="549.8" cy="133.0" r="9"/>
+<circle class="n store" cx="549.8" cy="75.0" r="9"/>
+<text class="ts mid" x="600" y="196">Each node does a small, fixed</text>
+<text class="ts mid" x="600" y="212">amount of work. News reaches</text>
+<text class="ts mid" x="600" y="228">everyone within a few rounds.</text>
+<path class="e none dash" d="M240 8V236"/>
+<path class="e none dash" d="M480 8V236"/>
+
+</svg>
+</div>
+<figcaption>Checking everyone does not scale, and one checker is a single point of failure. Gossip spreads the work evenly.</figcaption>
+</figure>
+
+<p>With every node checking every other, a cluster of 100 sends 9,900 heartbeats each interval and a cluster of 1,000 sends 999,000. With one monitor, the monitor is a single point of failure, and it has a subtler flaw: it reports whether <em>it</em> can reach a node, which is not the same as whether the node’s clients can. A node can be reachable from the monitor and cut off from half its peers, or the reverse. Partial failures of this kind are common, and no single observer sees them correctly.</p>
+
+<h3 id="phi">Suspicion instead of a verdict</h3>
+<p>A fixed timeout is a blunt instrument. On a quiet network, heartbeats arrive like clockwork and three seconds of silence is damning. On a busy one, they arrive irregularly and three seconds may mean nothing. A fixed value is too slow for the first and too jumpy for the second.</p>
+<p>The <dfn>phi accrual failure detector</dfn>, proposed by Naohiro Hayashibara and colleagues in 2004, replaces the yes-or-no answer with a level of suspicion. It records the gaps between recent heartbeats from each node and so learns what normal looks like for that node. At any moment it computes a number, phi, from how unusual the current silence is compared with that history. Each step of one in phi means the silence is ten times less likely to be an ordinary delay. The application chooses the level at which to act.</p>
+
+<figure class="fig wide" id="fig-phi">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f332t f332d">
+<title id="f332t">Suspicion level against time since the last heartbeat, for a steady network and a jittery one</title>
+<desc id="f332d">A line chart. Heartbeats are sent once a second. On a steady network, where arrival times vary by about a tenth of a second, the suspicion level phi passes the threshold of 8 after 1.6 seconds of silence. On a jittery network, where arrival times vary by about half a second, it passes the threshold after 3.8 seconds.</desc>
+<line class="axis" x1="60" y1="196" x2="700" y2="196"/>
+<text class="ts end" x="52" y="200.0">0</text>
+<line class="grid" x1="60" y1="167.333" x2="700" y2="167.333"/>
+<text class="ts end" x="52" y="171.33333333333334">2</text>
+<line class="grid" x1="60" y1="138.667" x2="700" y2="138.667"/>
+<text class="ts end" x="52" y="142.66666666666669">4</text>
+<line class="grid" x1="60" y1="110" x2="700" y2="110"/>
+<text class="ts end" x="52" y="114.0">6</text>
+<line class="grid" x1="60" y1="81.3333" x2="700" y2="81.3333"/>
+<text class="ts end" x="52" y="85.33333333333334">8</text>
+<line class="grid" x1="60" y1="52.6667" x2="700" y2="52.6667"/>
+<text class="ts end" x="52" y="56.66666666666666">10</text>
+<line class="grid" x1="60" y1="24" x2="700" y2="24"/>
+<text class="ts end" x="52" y="28.0">12</text>
+<text class="ts mid" x="60.0" y="214">1 s</text>
+<text class="ts mid" x="220.0" y="214">2 s</text>
+<text class="ts mid" x="380.0" y="214">3 s</text>
+<text class="ts mid" x="540.0" y="214">4 s</text>
+<text class="ts mid" x="700.0" y="214">5 s</text>
+<path class="line" style="stroke:var(--sig)" d="M60.0 191.7 L63.2 190.6 L66.4 189.4 L69.6 187.9 L72.8 186.3 L76.0 184.5 L79.2 182.5 L82.4 180.3 L85.6 177.9 L88.8 175.3 L92.0 172.5 L95.2 169.4 L98.4 166.1 L101.6 162.6 L104.8 158.8 L108.0 154.9 L111.2 150.7 L114.4 146.2 L117.6 141.6 L120.8 136.7 L124.0 131.5 L127.2 126.1 L130.4 120.5 L133.6 114.7 L136.8 108.6 L140.0 102.2 L143.2 95.6 L146.4 88.8 L149.6 81.8 L152.8 74.5 L156.0 66.9 L159.2 59.1 L162.4 51.1 L165.6 42.8 L168.8 34.3 L172.0 25.5 L175.2 24.0"/>
+<path class="line" style="stroke:var(--async)" d="M60.0 191.7 L63.2 191.5 L66.4 191.3 L69.6 191.1 L72.8 190.8 L76.0 190.6 L79.2 190.4 L82.4 190.1 L85.6 189.9 L88.8 189.6 L92.0 189.4 L95.2 189.1 L98.4 188.8 L101.6 188.5 L104.8 188.2 L108.0 187.9 L111.2 187.6 L114.4 187.3 L117.6 187.0 L120.8 186.7 L124.0 186.3 L127.2 186.0 L130.4 185.6 L133.6 185.3 L136.8 184.9 L140.0 184.5 L143.2 184.2 L146.4 183.8 L149.6 183.4 L152.8 183.0 L156.0 182.5 L159.2 182.1 L162.4 181.7 L165.6 181.2 L168.8 180.8 L172.0 180.3 L175.2 179.9 L178.4 179.4 L181.6 178.9 L184.8 178.4 L188.0 177.9 L191.2 177.4 L194.4 176.9 L197.6 176.4 L200.8 175.8 L204.0 175.3 L207.2 174.7 L210.4 174.2 L213.6 173.6 L216.8 173.0 L220.0 172.5 L223.2 171.9 L226.4 171.3 L229.6 170.6 L232.8 170.0 L236.0 169.4 L239.2 168.7 L242.4 168.1 L245.6 167.4 L248.8 166.8 L252.0 166.1 L255.2 165.4 L258.4 164.7 L261.6 164.0 L264.8 163.3 L268.0 162.6 L271.2 161.9 L274.4 161.1 L277.6 160.4 L280.8 159.6 L284.0 158.8 L287.2 158.1 L290.4 157.3 L293.6 156.5 L296.8 155.7 L300.0 154.9 L303.2 154.0 L306.4 153.2 L309.6 152.4 L312.8 151.5 L316.0 150.7 L319.2 149.8 L322.4 148.9 L325.6 148.0 L328.8 147.1 L332.0 146.2 L335.2 145.3 L338.4 144.4 L341.6 143.5 L344.8 142.5 L348.0 141.6 L351.2 140.6 L354.4 139.6 L357.6 138.6 L360.8 137.7 L364.0 136.7 L367.2 135.6 L370.4 134.6 L373.6 133.6 L376.8 132.6 L380.0 131.5 L383.2 130.5 L386.4 129.4 L389.6 128.3 L392.8 127.2 L396.0 126.1 L399.2 125.0 L402.4 123.9 L405.6 122.8 L408.8 121.7 L412.0 120.5 L415.2 119.4 L418.4 118.2 L421.6 117.0 L424.8 115.8 L428.0 114.7 L431.2 113.5 L434.4 112.2 L437.6 111.0 L440.8 109.8 L444.0 108.6 L447.2 107.3 L450.4 106.1 L453.6 104.8 L456.8 103.5 L460.0 102.2 L463.2 100.9 L466.4 99.6 L469.6 98.3 L472.8 97.0 L476.0 95.6 L479.2 94.3 L482.4 92.9 L485.6 91.6 L488.8 90.2 L492.0 88.8 L495.2 87.4 L498.4 86.0 L501.6 84.6 L504.8 83.2 L508.0 81.8 L511.2 80.3 L514.4 78.9 L517.6 77.4 L520.8 75.9 L524.0 74.5 L527.2 73.0 L530.4 71.5 L533.6 70.0 L536.8 68.4 L540.0 66.9 L543.2 65.4 L546.4 63.8 L549.6 62.3 L552.8 60.7 L556.0 59.1 L559.2 57.5 L562.4 55.9 L565.6 54.3 L568.8 52.7 L572.0 51.1 L575.2 49.5 L578.4 47.8 L581.6 46.2 L584.8 44.5 L588.0 42.8 L591.2 41.1 L594.4 39.4 L597.6 37.7 L600.8 36.0 L604.0 34.3 L607.2 32.6 L610.4 30.8 L613.6 29.1 L616.8 27.3 L620.0 25.5 L623.2 24.0"/>
+<path class="e none dash fault" d="M60 81.3333H700"/>
+<text class="ts mid" x="340.0" y="74.33333333333334">threshold 8: declare the node down</text>
+<circle class="dot fill-sig" cx="149.6" cy="81.3" r="5"/>
+<circle class="dot fill-async" cx="509.6" cy="81.3" r="5"/>
+<text class="ts" x="162" y="101.33333333333334">steady network:</text>
+<text class="ts" x="162" y="116.33333333333334">down after 1.6 s</text>
+<text class="ts" x="522" y="101.33333333333334">jittery network:</text>
+<text class="ts" x="522" y="116.33333333333334">down after 3.8 s</text>
+<text class="ts mid" x="380.0" y="236">Time since the last heartbeat. Heartbeats are sent once a second.</text>
+<text class="ts" x="60" y="14">Suspicion level (phi)</text>
+<rect class="hit" x="52" y="24" width="16" height="172" data-tip="1.0 s since the last heartbeat|steady network: phi 0.3|jittery network: phi 0.3"/>
+<rect class="hit" x="68" y="24" width="16" height="172" data-tip="1.1 s since the last heartbeat|steady network: phi 0.8|jittery network: phi 0.4"/>
+<rect class="hit" x="84" y="24" width="16" height="172" data-tip="1.2 s since the last heartbeat|steady network: phi 1.6|jittery network: phi 0.5"/>
+<rect class="hit" x="100" y="24" width="16" height="172" data-tip="1.3 s since the last heartbeat|steady network: phi 2.9|jittery network: phi 0.6"/>
+<rect class="hit" x="116" y="24" width="16" height="172" data-tip="1.4 s since the last heartbeat|steady network: phi 4.5|jittery network: phi 0.7"/>
+<rect class="hit" x="132" y="24" width="16" height="172" data-tip="1.5 s since the last heartbeat|steady network: phi 6.5|jittery network: phi 0.8"/>
+<rect class="hit" x="148" y="24" width="16" height="172" data-tip="1.6 s since the last heartbeat|steady network: phi 9.0, declared down|jittery network: phi 0.9"/>
+<rect class="hit" x="164" y="24" width="16" height="172" data-tip="1.7 s since the last heartbeat|steady network: phi 11.9, declared down|jittery network: phi 1.1"/>
+<rect class="hit" x="180" y="24" width="16" height="172" data-tip="1.8 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 1.3"/>
+<rect class="hit" x="196" y="24" width="16" height="172" data-tip="1.9 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 1.4"/>
+<rect class="hit" x="212" y="24" width="16" height="172" data-tip="2.0 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 1.6"/>
+<rect class="hit" x="228" y="24" width="16" height="172" data-tip="2.1 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 1.9"/>
+<rect class="hit" x="244" y="24" width="16" height="172" data-tip="2.2 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 2.1"/>
+<rect class="hit" x="260" y="24" width="16" height="172" data-tip="2.3 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 2.3"/>
+<rect class="hit" x="276" y="24" width="16" height="172" data-tip="2.4 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 2.6"/>
+<rect class="hit" x="292" y="24" width="16" height="172" data-tip="2.5 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 2.9"/>
+<rect class="hit" x="308" y="24" width="16" height="172" data-tip="2.6 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 3.2"/>
+<rect class="hit" x="324" y="24" width="16" height="172" data-tip="2.7 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 3.5"/>
+<rect class="hit" x="340" y="24" width="16" height="172" data-tip="2.8 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 3.8"/>
+<rect class="hit" x="356" y="24" width="16" height="172" data-tip="2.9 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 4.1"/>
+<rect class="hit" x="372" y="24" width="16" height="172" data-tip="3.0 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 4.5"/>
+<rect class="hit" x="388" y="24" width="16" height="172" data-tip="3.1 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 4.9"/>
+<rect class="hit" x="404" y="24" width="16" height="172" data-tip="3.2 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 5.3"/>
+<rect class="hit" x="420" y="24" width="16" height="172" data-tip="3.3 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 5.7"/>
+<rect class="hit" x="436" y="24" width="16" height="172" data-tip="3.4 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 6.1"/>
+<rect class="hit" x="452" y="24" width="16" height="172" data-tip="3.5 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 6.5"/>
+<rect class="hit" x="468" y="24" width="16" height="172" data-tip="3.6 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 7.0"/>
+<rect class="hit" x="484" y="24" width="16" height="172" data-tip="3.7 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 7.5"/>
+<rect class="hit" x="500" y="24" width="16" height="172" data-tip="3.8 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 8.0, declared down"/>
+<rect class="hit" x="516" y="24" width="16" height="172" data-tip="3.9 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 8.5, declared down"/>
+<rect class="hit" x="532" y="24" width="16" height="172" data-tip="4.0 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 9.0, declared down"/>
+<rect class="hit" x="548" y="24" width="16" height="172" data-tip="4.1 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 9.6, declared down"/>
+<rect class="hit" x="564" y="24" width="16" height="172" data-tip="4.2 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 10.1, declared down"/>
+<rect class="hit" x="580" y="24" width="16" height="172" data-tip="4.3 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 10.7, declared down"/>
+<rect class="hit" x="596" y="24" width="16" height="172" data-tip="4.4 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 11.3, declared down"/>
+<rect class="hit" x="612" y="24" width="16" height="172" data-tip="4.5 s since the last heartbeat|steady network: above 12, declared down|jittery network: phi 11.9, declared down"/>
+<rect class="hit" x="628" y="24" width="16" height="172" data-tip="4.6 s since the last heartbeat|steady network: above 12, declared down|jittery network: above 12, declared down"/>
+<rect class="hit" x="644" y="24" width="16" height="172" data-tip="4.7 s since the last heartbeat|steady network: above 12, declared down|jittery network: above 12, declared down"/>
+<rect class="hit" x="660" y="24" width="16" height="172" data-tip="4.8 s since the last heartbeat|steady network: above 12, declared down|jittery network: above 12, declared down"/>
+<rect class="hit" x="676" y="24" width="16" height="172" data-tip="4.9 s since the last heartbeat|steady network: above 12, declared down|jittery network: above 12, declared down"/>
+<rect class="hit" x="692" y="24" width="16" height="172" data-tip="5.0 s since the last heartbeat|steady network: above 12, declared down|jittery network: above 12, declared down"/>
+</svg>
+</div>
+<figcaption>The same threshold gives different waiting times, because the detector has learned how regular each node’s heartbeats normally are. Curves computed from the model in the original paper.</figcaption>
+</figure>
+
+<p>Cassandra uses this detector, with a default threshold of 8. DataStax’s documentation for it suggests raising the threshold to 10 or 12 on congested networks, and advises against values above 12 or below 5. The practical benefit is that one setting works across quiet and noisy environments, where a fixed timeout would need tuning for each.</p>
+
+<h2 id="gossip">Gossip</h2>
+<p>A <dfn>gossip protocol</dfn> spreads information the way a rumor spreads through a crowd. On a regular schedule, typically once a second, each node picks a few other nodes at random and exchanges what it knows with them. Nobody has the full picture to begin with, nobody is in charge, and within a few rounds everybody knows.</p>
+<p>What makes this work is that spreading is exponential. One node tells three, those four tell twelve more, and so on. The number of rounds needed grows with the logarithm of the cluster size, which means it barely grows at all.</p>
+
+<figure class="fig wide" id="fig-spread">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f333t f333d">
+<title id="f333t">How quickly news spreads by gossip through 1,000 nodes</title>
+<desc id="f333d">A bar chart from a simulation in which each informed node tells three others chosen at random in every round. The number of informed nodes is 1 at the start, then 4, 16, 60, 222, 586, 935, 998 and 1,000 after eight rounds.</desc>
+<line class="axis" x1="60" y1="204" x2="700" y2="204"/>
+<text class="ts end" x="52" y="208.0">0</text>
+<line class="grid" x1="60" y1="165" x2="700" y2="165"/>
+<text class="ts end" x="52" y="169.0">250</text>
+<line class="grid" x1="60" y1="126" x2="700" y2="126"/>
+<text class="ts end" x="52" y="130.0">500</text>
+<line class="grid" x1="60" y1="87" x2="700" y2="87"/>
+<text class="ts end" x="52" y="91.0">750</text>
+<line class="grid" x1="60" y1="48" x2="700" y2="48"/>
+<text class="ts end" x="52" y="52.0">1,000</text>
+<rect class="bar" x="70.0" y="202.5" width="51.1" height="1.5" rx="2"/>
+<text class="ts mid" x="95.55555555555556" y="196.5">1</text>
+<text class="ts mid" x="95.55555555555556" y="222">start</text>
+<rect class="bar" x="141.1" y="202.5" width="51.1" height="1.5" rx="2"/>
+<text class="ts mid" x="166.66666666666669" y="196.5">4</text>
+<text class="ts mid" x="166.66666666666669" y="222">round 1</text>
+<rect class="bar" x="212.2" y="201.5" width="51.1" height="2.5" rx="2"/>
+<text class="ts mid" x="237.77777777777777" y="195.504">16</text>
+<text class="ts mid" x="237.77777777777777" y="222">round 2</text>
+<rect class="bar" x="283.3" y="194.6" width="51.1" height="9.4" rx="2"/>
+<text class="ts mid" x="308.8888888888889" y="188.64">60</text>
+<text class="ts mid" x="308.8888888888889" y="222">round 3</text>
+<rect class="bar" x="354.4" y="169.4" width="51.1" height="34.6" rx="2"/>
+<text class="ts mid" x="380.0" y="163.368">222</text>
+<text class="ts mid" x="380.0" y="222">round 4</text>
+<rect class="bar" x="425.6" y="112.6" width="51.1" height="91.4" rx="2"/>
+<text class="ts mid" x="451.1111111111111" y="106.584">586</text>
+<text class="ts mid" x="451.1111111111111" y="222">round 5</text>
+<rect class="bar" x="496.7" y="58.1" width="51.1" height="145.9" rx="2"/>
+<text class="ts mid" x="522.2222222222223" y="52.139999999999986">935</text>
+<text class="ts mid" x="522.2222222222223" y="222">round 6</text>
+<rect class="bar" x="567.8" y="48.3" width="51.1" height="155.7" rx="2"/>
+<text class="ts mid" x="593.3333333333334" y="42.31200000000001">998</text>
+<text class="ts mid" x="593.3333333333334" y="222">round 7</text>
+<rect class="bar" x="638.9" y="48.0" width="51.1" height="156.0" rx="2"/>
+<text class="ts mid" x="664.4444444444445" y="42.0">1,000</text>
+<text class="ts mid" x="664.4444444444445" y="222">round 8</text>
+<text class="ts" x="60" y="16">Nodes that have heard the news, out of 1,000. Each informed node tells 3 others chosen at random every round.</text>
+<rect class="hit" x="60.0" y="30" width="71.1" height="196" data-tip="At the start|1 of 1,000 nodes have heard|0.1%"/>
+<rect class="hit" x="131.1" y="30" width="71.1" height="196" data-tip="After round 1|4 of 1,000 nodes have heard|0.4%"/>
+<rect class="hit" x="202.2" y="30" width="71.1" height="196" data-tip="After round 2|16 of 1,000 nodes have heard|1.6%"/>
+<rect class="hit" x="273.3" y="30" width="71.1" height="196" data-tip="After round 3|60 of 1,000 nodes have heard|6.0%"/>
+<rect class="hit" x="344.4" y="30" width="71.1" height="196" data-tip="After round 4|222 of 1,000 nodes have heard|22.2%"/>
+<rect class="hit" x="415.5" y="30" width="71.1" height="196" data-tip="After round 5|586 of 1,000 nodes have heard|58.6%"/>
+<rect class="hit" x="486.6" y="30" width="71.1" height="196" data-tip="After round 6|935 of 1,000 nodes have heard|93.5%"/>
+<rect class="hit" x="557.7" y="30" width="71.1" height="196" data-tip="After round 7|998 of 1,000 nodes have heard|99.8%"/>
+<rect class="hit" x="628.8" y="30" width="71.1" height="196" data-tip="After round 8|1,000 of 1,000 nodes have heard|100.0%"/>
+</svg>
+</div>
+<figcaption>A typical run of a simulation. Spreading starts slowly, explodes in the middle, and takes the last rounds to reach the final few nodes.</figcaption>
+</figure>
+
+<p>In the simulation behind <x-fig to="fig-spread"></x-fig>, 100 nodes all heard the news in about 6 rounds, 1,000 in about 8, and 10,000 in about 10. Ten times as many nodes cost two more rounds. At one round a second, a cluster of any practical size converges in well under a minute, and each node’s workload, a few small messages a second, does not change with the size of the cluster.</p>
+<p>Gossip has properties that suit large systems.</p>
+<ul>
+  <li><b>No special nodes.</b> Any node can fail and gossip continues. There is nothing to elect and nothing to fail over.</li>
+  <li><b>Tolerant of loss.</b> A dropped message does not matter. The same news will arrive by another path a moment later.</li>
+  <li><b>Bounded load.</b> Each node sends a fixed number of messages per round, whatever the cluster size.</li>
+</ul>
+<p>And one that limits what it can be used for.</p>
+<ul>
+  <li><b>It is eventually consistent.</b> For some seconds after any change, different nodes hold different views of the cluster. Two nodes can disagree about whether a third is alive. Gossip gives no moment at which everyone is known to agree.</li>
+</ul>
+
+<h3 id="gossip-carries">What is gossiped</h3>
+<p>Cassandra is the standard example. Once a second, each node exchanges state with up to three others. The state is a small table with an entry for every node the sender knows: its address, a heartbeat counter that the node itself increments, and facts such as which data ranges it owns, its schema version and its load. Every entry carries a version number, so when two nodes compare tables, each keeps whichever copy of an entry is newer. A node whose counter stops advancing in everyone’s tables is, by that fact, suspected.</p>
+<p>A new node has to find someone to gossip with. It is given the addresses of a few <dfn>seed nodes</dfn>, contacts them, and learns of everyone else from the first exchange. Seeds have no other role. They are an introduction, not a leader.</p>
+<p>The same exchange-and-reconcile idea repairs data as well as membership. Dynamo-style databases have replicas periodically compare summaries of their data and copy whatever differs, a process called anti-entropy that appeared in <x-ref to="replication#leaderless"></x-ref>.</p>
+
+<h3 id="swim">SWIM: asking for a second opinion</h3>
+<p>Detecting failure through gossiped heartbeat counters has a weakness: it is slow to distinguish “this node is dead” from “I cannot reach this node”. <dfn>SWIM</dfn>, a protocol published in 2002, addresses that directly and is the basis of the membership library used by Consul, Nomad and many other systems.</p>
+<p>In each round, a node picks one member at random and pings it. If the reply comes back, nothing more happens. If it does not, the node does not jump to a conclusion. It asks a few other members to ping the silent node on its behalf.</p>
+
+<figure class="fig wide" id="fig-swim">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f334t f334d">
+<title id="f334t">An indirect probe in the SWIM protocol</title>
+<desc id="f334d">Node A pings node B and receives no reply. A asks nodes C and D to ping B for it. C’s ping reaches B and B replies, while D’s does not. One helper reaching B is enough: C reports back and A keeps B as alive, concluding that only the path between A and B was bad. If no helper had received a reply, A would mark B as suspected and gossip that. B can deny it, and if it stays silent for a set time it is declared dead.</desc>
+<rect class="n sig" x="20" y="84" width="110" height="48" rx="6"/>
+<text class="tb mid" x="75" y="104">Node A</text>
+<text class="ts mid" x="75" y="121">the prober</text>
+<rect class="n" x="590" y="84" width="110" height="48" rx="6"/>
+<text class="tb mid" x="645" y="104">Node B</text>
+<text class="ts mid" x="645" y="121">being checked</text>
+<rect class="n" x="305" y="10" width="110" height="44" rx="6"/>
+<text class="tb mid" x="360" y="36.5">Node C</text>
+<rect class="n" x="305" y="162" width="110" height="44" rx="6"/>
+<text class="tb mid" x="360" y="188.5">Node D</text>
+<g data-s="1">
+<path class="e fault dash" d="M130 108H590"/>
+<path class="x" d="M353 100l14 16M367 100l-14 16"/>
+<text class="ts mid" x="250" y="100">1. ping, no reply</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M100 84C140 40 220 32 305 32"/>
+<path class="e sig" d="M100 132C140 176 220 184 305 184"/>
+<text class="ts mid" x="150" y="36">2. “please ping B”</text>
+<text class="ts mid" x="150" y="190">2. “please ping B”</text>
+</g>
+<g data-s="3">
+<path class="e store both" d="M415 32C500 32 580 40 620 84"/>
+<path class="e fault dash" d="M415 184C500 184 580 176 620 132"/>
+<text class="ts mid" x="566" y="36">3. ping, and B replies</text>
+<text class="ts mid" x="566" y="190">3. ping, no reply</text>
+</g>
+<g data-s="4">
+<text class="ts" x="20" y="236">One helper reaching B is enough: C reports back, and A keeps B as alive. Only the path between A and B was bad.</text>
+<text class="ts" x="20" y="252">If no helper gets a reply, A marks B as suspected and gossips that. B can deny it. If it stays silent for a set time, it is declared dead.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="ping" data-state="What A knows about B: no reply to a direct ping">Node A pings node B directly and gets no reply. B may be dead, or only the path between the two may be broken.</li>
+  <li data-msg="please ping B">So A asks two other nodes, C and D, to ping B on its behalf.</li>
+  <li data-msg="ping" data-state="What A knows about B: C can reach it">C reaches B, and B replies. D gets no answer.</li>
+  <li data-state="What A knows about B: alive">One helper reaching B is enough. C reports back and A keeps B as alive, because only a path had failed. If no helper had got a reply, A would mark B as suspected and spread that by gossip.</li>
+</ol>
+<figcaption>The indirect probe separates a failed node from a failed path. A single observer’s silence is not treated as proof.</figcaption>
+</figure>
+
+<p>If nobody can reach the node, it is still not declared dead. It is marked <dfn>suspected</dfn>, and the suspicion is gossiped. A node that hears it is suspected can refute the claim by announcing a higher version of itself. Only if the suspicion stands for a set time is the node declared dead. All of this news travels piggybacked on the pings themselves, so there are no extra messages.</p>
+<p>HashiCorp’s implementation added a refinement it called Lifeguard, based on an observation from production: most false accusations came from nodes that were themselves overloaded and slow to process replies. A node that notices its own probes timing out more than expected now trusts its own judgment less and waits longer before accusing others.</p>
+
+<h2 id="agreement">When a private opinion is not enough</h2>
+<p>With gossip, each node decides for itself who is alive, and for a while nodes disagree. Whether that matters depends entirely on what is done with the answer.</p>
+<p>If the reaction is to stop sending requests to a node, disagreement is harmless. Some nodes route around it a few seconds before others do, and if the suspicion was wrong, traffic returns. This is why leaderless databases, where any replica can accept any write, are comfortable running on gossip alone.</p>
+<p>If the reaction is to give a role to someone else, disagreement is dangerous. Suppose two nodes each decide, from their own view, that the leader is dead and that they should replace it. Now there are two leaders, or three counting the original, which was only slow. This is split brain, and it cannot be fixed by tuning a detector, since no detector can be certain.</p>
+<p>The decision itself has to be made in one place that cannot contradict itself. That is consensus (<x-ref to="consensus"></x-ref>), and the practical way to get it is a coordination service.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> A useful line to draw out loud: “liveness information can be approximate and spread by gossip, but anything that grants an exclusive role goes through a consensus-backed store”. It shows you know there are two problems and which tool fits each.</p></div>
+
+<h2 id="coordination">Coordination services</h2>
+<p>A <dfn>coordination service</dfn> is a small, strongly consistent data store run as a cluster of three or five servers that agree on every write using a consensus algorithm. The widely used ones are Apache ZooKeeper, etcd and HashiCorp Consul. Their common ancestor is Chubby, a lock service Google described in 2006.</p>
+<p>They store very little: who the leader of each service is, which nodes are registered, which node owns which shard, a few configuration values. etcd, for example, limits a request to 1.5 MiB and its whole data set to 2 GiB by default, with 8 GiB as the suggested maximum. What they offer in return is that every client sees the same data in the same order, and that the service keeps working as long as a majority of its servers can talk to each other.</p>
+<p>A consistent key-value store alone would not be enough to coordinate anything. Three additional features turn it into a coordination tool.</p>
+
+<h3 id="primitives">Three building blocks</h3>
+<p><b>Keys that vanish with their owner.</b> A client opens a session with the service and keeps it alive by sending periodic keep-alive messages. It can create keys that are tied to that session. If the client crashes, or is cut off for longer than the session’s time limit, the service deletes those keys itself. This turns “is that process alive?” into a question with one agreed answer: the key exists or it does not. A time-limited claim of this kind is called a <dfn>lease</dfn>.</p>
+<p><b>Notification of changes.</b> A client can ask to be told when a key, or anything under a prefix, changes. This is a <dfn>watch</dfn>. Without it, every client would have to poll, and would learn of a change late or load the service heavily.</p>
+<p><b>Conditional writes with a global order.</b> A write can be made to succeed only if a condition holds: the key does not exist, or it still has the version the client last read. This is the compare-and-set of <x-ref to="transactions#optimistic"></x-ref>, made available across machines. Every change is also stamped with a number that only increases, which gives all clients one agreed order of events.</p>
+<p>The three services use different names for the same ideas.</p>
+<table>
+<thead><tr><th>Idea</th><th>ZooKeeper</th><th>etcd</th><th>Consul</th></tr></thead>
+<tbody>
+<tr><th>Data layout</th><td>A tree of nodes called znodes, with paths like files</td><td>A flat, sorted set of keys, queried by prefix</td><td>A key-value store, plus a catalog of services</td></tr>
+<tr><th>Vanishes with its owner</th><td>An ephemeral znode, tied to a session</td><td>A key attached to a lease</td><td>A key acquired by a session</td></tr>
+<tr><th>Staying alive</th><td>Session heartbeats</td><td>Lease keep-alives</td><td>Session renewal or health checks</td></tr>
+<tr><th>Hearing of changes</th><td>Watches</td><td>Watch streams</td><td>Blocking queries</td></tr>
+<tr><th>Increasing number</th><td>Transaction ID, and sequential znodes</td><td>Revision</td><td>Index</td></tr>
+<tr><th>Conditional write</th><td>Version check on update</td><td>Transaction: compare, then write</td><td>Check-and-set</td></tr>
+<tr><th>Consensus algorithm</th><td>Zab</td><td>Raft</td><td>Raft</td></tr>
+</tbody>
+</table>
+<pre data-lang="sh" data-title="Leases and watches with etcd’s command-line client (the lease ID is an example)">
+etcdctl lease grant 10
+# lease 694d7c3b1a2f0c15 granted with TTL(10s)
+
+etcdctl put --lease=694d7c3b1a2f0c15 /services/photos/10.0.1.5 '{"port": 8080}'
+etcdctl lease keep-alive 694d7c3b1a2f0c15          # stop this, and the key vanishes 10 s later
+
+etcdctl watch --prefix /services/photos/           # in another terminal: prints every change
+</pre>
+
+<h3 id="election">Leader election</h3>
+<p>Many jobs must be done by exactly one process at a time: running scheduled tasks, assigning shards, being the single writer to some resource. Several copies of the process run for availability, and one of them must be chosen. With the three building blocks, the recipe is short.</p>
+<ol>
+  <li>Every candidate tries to create the same key, for example <code>/photo-app/scheduler/leader</code>, attached to its own lease, on the condition that the key does not exist.</li>
+  <li>The store accepts exactly one of those writes. That candidate is the leader, and it keeps its lease alive.</li>
+  <li>The others watch the key and wait.</li>
+  <li>If the leader crashes or is cut off, its keep-alives stop, the lease expires and the store deletes the key. The watchers are notified and try again from step 1.</li>
+</ol>
+
+<figure class="fig wide" id="fig-election">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f335t f335d">
+<title id="f335t">Leader election with a lease and a watch</title>
+<desc id="f335d">Node A creates the key leader with a 10-second lease and becomes the leader. Node B tries to create the same key, is refused because it exists, and watches it. A sends keep-alives every few seconds. A crashes. After 10 seconds with no keep-alive the coordination service deletes the key and notifies B, which creates the key and becomes the leader.</desc>
+<text class="tb mid" x="110" y="18">Node A</text>
+<text class="tb mid" x="360" y="18">Coordination service</text>
+<text class="tb mid" x="610" y="18">Node B</text>
+<line class="axis" x1="110" y1="26" x2="110" y2="170"/>
+<line class="axis" x1="360" y1="26" x2="360" y2="282"/>
+<line class="axis" x1="610" y1="26" x2="610" y2="282"/>
+<g data-s="1">
+<path class="e sig" d="M111 50H359"/>
+<text class="ts mid" x="235.0" y="44">1. create “leader” with a 10 s lease</text>
+<path class="e" d="M359 74H111"/>
+<text class="ts mid" x="235.0" y="68">created: A is the leader</text>
+</g>
+<g data-s="2">
+<path class="e" d="M609 98H361"/>
+<text class="ts mid" x="485.0" y="92">2. create “leader”: refused, it exists</text>
+</g>
+<g data-s="3">
+<path class="e" d="M609 122H361"/>
+<text class="ts mid" x="485.0" y="116">3. watch “leader”</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M111 150H359"/>
+<text class="ts mid" x="235.0" y="144">4. keep-alive, every few seconds</text>
+</g>
+<g data-s="5">
+<path class="x" d="M103 170l14 14M117 170l-14 14"/>
+<text class="ts end" x="94" y="181">5. A crashes</text>
+</g>
+<g data-s="6">
+<rect class="n fault" x="242" y="192" width="236" height="26" rx="4"/>
+<text class="ts mid" x="360" y="209">6. no keep-alive for 10 s: key deleted</text>
+</g>
+<g data-s="7">
+<path class="e" d="M361 240H609"/>
+<text class="ts mid" x="485.0" y="234">7. event: “leader” was deleted</text>
+</g>
+<g data-s="8">
+<path class="e store" d="M609 268H361"/>
+<text class="ts mid" x="485.0" y="262">8. create “leader”: B is the leader</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="create “leader”|created" data-state="Key “leader”: held by A, on a 10 s lease; Leader: A">Node A asks the coordination service to create the key “leader” with a 10-second lease. The key does not exist yet, so the service creates it. A is the leader.</li>
+  <li data-msg="create “leader”">Node B tries to create the same key. The service refuses, because the key already exists.</li>
+  <li data-state="Key “leader”: held by A, on a 10 s lease; Leader: A; Watching the key: B">So B asks to be told when that key changes, and waits.</li>
+  <li data-msg="keep-alive">A keeps its lease alive by sending a keep-alive every few seconds.</li>
+  <li data-state="Key “leader”: held by A, lease no longer renewed; Leader: A, crashed; Watching the key: B">A crashes. Its keep-alives stop.</li>
+  <li data-state="Key “leader”: deleted; Leader: none; Watching the key: B">Ten seconds pass with no keep-alive. The lease runs out and the service deletes the key.</li>
+  <li>The service tells B, which was watching, that the key is gone.</li>
+  <li data-msg="create “leader”" data-state="Key “leader”: held by B; Leader: B">B creates the key and becomes the leader.</li>
+</ol>
+<figcaption>The store makes the one decision that must not be made twice. The candidates only ask and listen.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Campaigning for leadership">
+// What the code needs from a coordination service. etcd, ZooKeeper and Consul
+// all provide these operations under different names.
+interface Lease {
+  keepAlive(): Promise<boolean>;            // false if the lease has already expired
+  revoke(): Promise<void>;                  // give it up now, deleting its keys
+}
+interface Coordinator {
+  grantLease(ttlSeconds: number): Promise<Lease>;
+  // Create the key only if it does not exist. Returns an ever-increasing
+  // revision number on success, or null if another holder got there first.
+  createIfAbsent(key: string, value: string, lease: Lease): Promise<number | null>;
+  untilDeleted(key: string): Promise<void>; // a watch: resolves when the key goes away
+}
+
+type Work = (token: number, stillLeader: () => boolean) => Promise<void>;
+
+async function campaign(store: Coordinator, key: string, me: string, lead: Work): Promise<never> {
+  for (;;) {
+    const lease = await store.grantLease(10);
+    const token = await store.createIfAbsent(key, me, lease);
+
+    if (token === null) {                   // someone else is the leader
+      await lease.revoke();
+      await store.untilDeleted(key);        // sleep until that changes, then try again
+      continue;
+    }
+
+    let leading = true;
+    const renew = setInterval(async () => {
+      const ok = await lease.keepAlive().catch(() => false);
+      if (!ok) leading = false;             // cannot confirm the lease: stop acting as leader
+    }, 3_000);
+
+    try {
+      await lead(token, () => leading);     // returns when leadership is lost or the work ends
+    } finally {
+      clearInterval(renew);
+      await lease.revoke().catch(() => {}); // let the next candidate start at once
+    }
+  }
+}
+</pre>
+<p>Three details in this code carry the safety of the scheme.</p>
+<ul>
+  <li><b>The leader stops when it cannot renew.</b> A leader cut off from the store cannot know whether its lease is still valid, so it must assume it is not. The renewal interval is shorter than the lease, so a cut-off leader stops before the store gives the role away. In a test of this code, a leader cut off from the store stopped within one renewal interval, about seven seconds before its successor started. For that interval nobody led, which is the intended outcome. A gap is recoverable. Two leaders may not be.</li>
+  <li><b>The work checks <code>stillLeader</code> between steps.</b> Leadership is a claim that expires, and it has to be rechecked, not assumed.</li>
+  <li><b>The token goes with every write.</b> Even this is not airtight. A leader can be paused for longer than its lease between checking and acting, as <x-ref to="distributed-fundamentals#pauses"></x-ref> showed. The revision number returned when the key was created is a fencing token. The resource the leader writes to must reject any token lower than the highest it has seen (<x-ref to="consensus#fencing"></x-ref>).</li>
+</ul>
+<p>Kubernetes provides this recipe as a built-in object called a Lease. Its own control-plane components elect their leaders with it, by default with a 15-second lease, a 10-second deadline for renewing and a retry every 2 seconds. An application running on Kubernetes can use the same mechanism through the client libraries and never run a coordination service of its own.</p>
+
+<h3 id="locks">Distributed locks</h3>
+<p>A <dfn>distributed lock</dfn> is the same idea applied to a resource instead of a role: whoever holds the key may act, and everyone else waits. It deserves a section of its own because it is one of the most misused tools in distributed systems.</p>
+<p>A lock inside one program is trustworthy for a reason that does not carry over. When a thread holds a lock, no other thread can take it, and the lock is released when the thread finishes or the whole process dies. Across machines, the holder can crash while holding the lock, so the lock must expire. And once a lock can expire, it can expire while its holder is still working and only paused or slow. Then a second holder acquires it, and two processes are inside the section that the lock was meant to protect.</p>
+<p>So a distributed lock is always a lease, and a lease is always a promise that depends on timing. The honest question to ask is what the lock is for.</p>
+<table>
+<thead><tr><th>Purpose</th><th>If two holders overlap</th><th>What is sufficient</th></tr></thead>
+<tbody>
+<tr><th>Efficiency: avoid doing the same work twice</th><td>Some wasted work, such as a report generated twice or a duplicate email</td><td>Any lock with an expiry, including a single Redis key. Make the work idempotent as well.</td></tr>
+<tr><th>Correctness: prevent conflicting changes</th><td>Corrupted or lost data</td><td>A lock from a consensus-backed store, plus a fencing token checked by the resource. The lock alone is not enough.</td></tr>
+</tbody>
+</table>
+<p>When many clients wait for the same lock, there is a detail worth knowing. If all of them watch the lock key, all of them are woken when it is released, all rush to acquire it, and all but one fail. This <dfn>herd effect</dfn> can overload the service. The standard recipe gives each waiter a numbered key and has it watch only the one in front.</p>
+
+<figure class="fig wide" id="fig-queue">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 150" role="img" aria-labelledby="f336t f336d">
+<title id="f336t">A fair lock built from numbered keys, each waiter watching its predecessor</title>
+<desc id="f336d">Four clients create numbered keys tied to their sessions: 0001 for client A, which holds the lock, and 0002, 0003 and 0004 for clients B, C and D, which wait. Each waiting client watches only the key just before its own. When A releases the lock or its session ends, key 0001 disappears and only B is notified. If every waiter watched the lock itself, a thousand clients would wake at once and 999 would go back to waiting.</desc>
+<g data-s="1">
+<rect class="n store" x="10" y="30" width="136" height="62" rx="6"/>
+<text class="tb mid" x="78" y="48.5">lock/0001</text>
+<text class="ts mid" x="78" y="65.5">client A</text>
+<text class="ts mid" x="78" y="82.5">holds the lock</text>
+</g>
+<g data-s="2">
+<rect class="n" x="198" y="30" width="136" height="62" rx="6"/>
+<text class="tb mid" x="266" y="48.5">lock/0002</text>
+<text class="ts mid" x="266" y="65.5">client B</text>
+<text class="ts mid" x="266" y="82.5">waiting</text>
+<path class="e sig" d="M198 61H146"/>
+<text class="ts mid" x="172" y="52">watches</text>
+</g>
+<g data-s="3">
+<rect class="n" x="386" y="30" width="136" height="62" rx="6"/>
+<text class="tb mid" x="454" y="48.5">lock/0003</text>
+<text class="ts mid" x="454" y="65.5">client C</text>
+<text class="ts mid" x="454" y="82.5">waiting</text>
+<path class="e sig" d="M386 61H334"/>
+<text class="ts mid" x="360" y="52">watches</text>
+<rect class="n" x="574" y="30" width="136" height="62" rx="6"/>
+<text class="tb mid" x="642" y="48.5">lock/0004</text>
+<text class="ts mid" x="642" y="65.5">client D</text>
+<text class="ts mid" x="642" y="82.5">waiting</text>
+<path class="e sig" d="M574 61H522"/>
+<text class="ts mid" x="548" y="52">watches</text>
+</g>
+<g data-s="1">
+<text class="ts" x="10" y="18">Each client creates a numbered key tied to its session, and watches only the key just before its own.</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="120">When A releases the lock or its session ends, 0001 disappears and only B is told. B now has the lowest number and holds the lock.</text>
+<text class="ts" x="10" y="136">If every waiter watched the lock itself, a thousand clients would wake at once and 999 of them would go back to waiting.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Keys: 0001 (A); Lock held by: A">Each client that wants the lock creates a numbered key tied to its session. Client A created 0001, the lowest number, so A holds the lock.</li>
+  <li data-state="Keys: 0001 (A), 0002 (B); Lock held by: A">Client B created 0002. It does not watch the lock itself. It watches only the key just before its own.</li>
+  <li data-state="Keys: 0001 (A), 0002 (B), 0003 (C), 0004 (D); Lock held by: A">C and D queue up in the same way, each watching its predecessor.</li>
+  <li data-state="Keys: 0002 (B), 0003 (C), 0004 (D); Lock held by: B">When A releases the lock or its session ends, key 0001 disappears and only B is told. B now has the lowest number and holds the lock. Each release wakes exactly one client.</li>
+</ol>
+<figcaption>A queue instead of a scramble. Each release wakes exactly one client, and the lock is granted in order of arrival.</figcaption>
+</figure>
+
+<h3 id="redis-locks">Locks in Redis, and the Redlock debate</h3>
+<p>The most common distributed lock in practice is a single Redis command, because most systems already run Redis.</p>
+<pre data-lang="text" data-title="A lock as one Redis key">
+SET lock:report-2026-10 7f3a9c NX PX 30000
+    NX: only if the key does not exist.  PX 30000: expire after 30 seconds.
+    7f3a9c: a random value that identifies this holder.
+
+To release, delete the key only if it still holds your value, as one atomic script:
+    if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end
+</pre>
+<p>The random value matters. Without it, a holder whose lock has already expired would delete the lock of whoever took it next.</p>
+<p>This lock has two limits. It expires on a timer, with the consequences already described. And Redis replicates asynchronously, so if the primary fails just after granting the lock, the promoted replica may never have heard of it and will grant it again (<x-ref to="replication#sync-async"></x-ref>).</p>
+<p>Redis’s creator proposed an algorithm called Redlock to address the second limit: acquire the lock on a majority of five independent Redis servers within a time bound. In 2016 Martin Kleppmann published a critique arguing that Redlock is unsafe for correctness, because it relies on bounded network delays, bounded process pauses and well-behaved clocks, which real systems do not guarantee, and because it produces no fencing token. Redis’s creator replied in defense of the algorithm’s assumptions. The exchange is worth reading in full, and the practical conclusion most engineers draw from it is the table above. For efficiency, a single-server Redis lock is simpler than Redlock and good enough. For correctness, neither is adequate. Use a consensus-backed store and fencing.</p>
+<p>Before adding any lock service, check whether the database you already have can do the job. A unique constraint makes “only one of these may exist” true without a lock. A row lock or a conditional update makes “only one of these changes at a time” true inside a transaction (<x-ref to="transactions#pessimistic"></x-ref>). PostgreSQL also offers advisory locks, which are application-defined locks held by a database session. If the thing being protected is in that database, these are safer than an external lock, because the lock and the data cannot disagree.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Taking a 30-second lock around work that usually takes two seconds, and assuming that is safe. One slow dependency or one long pause, and the lock expires in the middle of the work while the holder carries on. If overlap would corrupt data, an expiry time is not protection. The write itself must carry something the resource can check: a fencing token, a version number or a unique key.</p></div>
+
+<h3 id="discovery">Service discovery</h3>
+<p>Instances of a service start, stop and move constantly, and their callers need current addresses. <dfn>Service discovery</dfn> is membership offered as a lookup.</p>
+<ol>
+  <li>Each instance registers itself in a registry when it starts, with a key tied to a lease or backed by a health check.</li>
+  <li>When an instance dies, its lease expires or its health check fails, and it is removed.</li>
+  <li>Callers look up the service by name and receive the addresses of the live instances, and they watch for changes so that their list stays current.</li>
+</ol>
+<p>The lookup is frequently offered through DNS, so that existing software needs no changes: in Kubernetes, a service name resolves to a stable address that forwards to healthy instances, and Consul answers DNS queries from its catalog. The caveats of DNS caching apply (<x-ref to="dns#caching"></x-ref>). <x-ref to="service-communication"></x-ref> covers the full picture, including client-side balancing and service meshes.</p>
+
+<h3 id="other-uses">Other uses</h3>
+<ul>
+  <li><b>Shard and partition assignment.</b> The map of which node owns which partition is exactly the small, critical, must-agree data these services are built for (<x-ref to="partitioning#routing"></x-ref>).</li>
+  <li><b>Handing out node numbers.</b> A Snowflake-style ID generator needs a number no other running generator has (<x-ref to="unique-ids#snowflake"></x-ref>). Each instance claims one from a small range by creating a key for it under a lease.</li>
+  <li><b>Configuration and feature flags.</b> Values that every instance must see change at the same time, delivered by watches.</li>
+  <li><b>Group membership for consumers.</b> Kafka tracks the consumers in a group through heartbeats to one of its brokers and reassigns partitions when one stops, by default sending a heartbeat every 3 seconds and declaring a consumer gone after 45 seconds in its classic protocol (<x-ref to="event-streaming"></x-ref>).</li>
+</ul>
+
+<h2 id="depending">Depending on a coordination service safely</h2>
+<p>A coordination service concentrates risk. It is small and reliable, and everything depends on it. When it has trouble, the trouble arrives everywhere at once.</p>
+<p>Roblox’s outage of October 2021 is the clearest public example. The platform was down for 73 hours. Its services used Consul for discovery, health checks, locks and configuration, and its container scheduler and its secrets store depended on Consul as well. Two problems inside Consul, contention in a newly enabled streaming feature under very high load and a performance problem in the storage library that held its log, made the cluster unable to keep up with writes. With Consul unhealthy, services could not find each other, new containers could not be scheduled and secrets could not be read. Diagnosis was slow because the monitoring systems depended on the same Consul cluster. Roblox’s published follow-up actions included removing that circular dependency, splitting workloads across separate Consul clusters, and moving toward more than one data center.</p>
+<p>The lessons apply to any system built on such a service.</p>
+<ul>
+  <li><b>Keep it off the request path.</b> Services should hold the last addresses, configuration and assignments they received and continue with them if the coordination service is unreachable. An outage should stop <em>changes</em>, such as new leaders and new instances, and not stop traffic that was already flowing.</li>
+  <li><b>Keep it small and quiet.</b> Every write goes through consensus. Storing fast-changing or bulky data in it, such as metrics, queues or per-request state, is the usual way it is overloaded.</li>
+  <li><b>Do not let everything share one cluster.</b> Separate critical uses, so that one misbehaving workload cannot starve leader election for all the others.</li>
+  <li><b>Beware mass expiry.</b> If the service itself stalls for longer than the session time limit, every session can expire at once. Every ephemeral key vanishes, every leader steps down and every client reconnects in the same instant. Time limits should be long enough to ride out the service’s own pauses, and clients should reconnect with random delays.</li>
+  <li><b>Monitor it from outside.</b> The tools you need during its outage must not depend on it.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> Run three or five servers, an odd number, spread across failure domains, and never two. Three tolerate one failure and five tolerate two (<x-ref to="consensus#majority"></x-ref>). Put them on fast disks, because every write waits for a disk flush on a majority, and watch that latency. On a managed platform you may never operate one directly: Kubernetes hides its etcd, and managed databases hide the store that runs their failover. It is still there, and its limits still shape what the platform can do.</p></div>
+
+<h2 id="choosing">Choosing an approach</h2>
+<table>
+<thead><tr><th>Need</th><th>Use</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Remove unhealthy servers from a load balancer</th><td>Health checks</td><td>A wrong decision is cheap and quickly reversed</td></tr>
+<tr><th>Track liveness and metadata across hundreds or thousands of equal nodes</th><td>Gossip</td><td>No central part, constant load per node, and approximate views are acceptable</td></tr>
+<tr><th>Exactly one leader, scheduler or writer</th><td>A lease in a coordination service, with fencing</td><td>The decision must be made once, in one place</td></tr>
+<tr><th>Avoid duplicated work, where duplicates are tolerable</th><td>A simple expiring lock, and idempotent work</td><td>Occasional overlap wastes effort and breaks nothing</td></tr>
+<tr><th>Protect data that lives in one database</th><td>That database’s constraints, transactions or advisory locks</td><td>The lock and the data cannot disagree</td></tr>
+<tr><th>Let services find each other</th><td>The platform’s discovery, usually through DNS</td><td>Already present on Kubernetes and the cloud platforms</td></tr>
+<tr><th>Hold the partition map or cluster configuration</th><td>A coordination service</td><td>Small, critical and must be the same for everyone</td></tr>
+</tbody>
+</table>
+<p>Before building any of this, check what your platform already provides. On Kubernetes, discovery, health checking and leader election are built in. Managed databases perform their own failure detection and failover. Message brokers manage their consumers’ membership. Most application teams should consume these mechanisms and need to understand them mainly in order to set timeouts sensibly and to know what happens when they misfire.</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Treating a timeout as proof of death</th><td>A slow node is replaced while still running, and two nodes act in one role</td><td>Assume the old holder may still be active. Fence it at the resource.</td></tr>
+<tr><th>One aggressive timeout for everything</th><td>Expensive failovers set off by brief pauses</td><td>Short timeouts for cheap reactions, longer ones for costly reactions</td></tr>
+<tr><th>Electing a leader from gossip or local opinion</th><td>Two nodes each conclude that they should lead</td><td>Make the decision in a consensus-backed store</td></tr>
+<tr><th>A distributed lock used for correctness without fencing</th><td>The lock expires mid-work, and two holders write</td><td>A fencing token or version check on every write</td></tr>
+<tr><th>A leader that keeps working when it cannot renew its lease</th><td>It overlaps with its successor</td><td>Stop when renewal fails, before the lease runs out</td></tr>
+<tr><th>Releasing a Redis lock with a plain delete</th><td>Deletes a lock that now belongs to someone else</td><td>Store a random value and delete only if it matches</td></tr>
+<tr><th>All waiters watching the same lock key</th><td>Every release wakes everyone at once</td><td>Numbered keys, each watching its predecessor</td></tr>
+<tr><th>Using the coordination service as a database or queue</th><td>Slow writes and an overloaded cluster that everything depends on</td><td>Store only small, slowly changing coordination data</td></tr>
+<tr><th>Looking up the coordination service on every request</th><td>Its outage becomes a full outage</td><td>Cache the last known state and keep serving</td></tr>
+<tr><th>Running two or four coordination servers</th><td>No more failures tolerated than with one or three, and more to go wrong</td><td>Three or five</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: why silence is the only evidence, and how pauses break leases.</li>
+  <li><x-ref to="consensus"></x-ref>: the algorithm inside every coordination service, and fencing tokens.</li>
+  <li><x-ref to="replication"></x-ref>: failover, split brain and anti-entropy.</li>
+  <li><x-ref to="partitioning"></x-ref>: where the partition map is kept.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref>: health checks as failure detection.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: making duplicated work harmless, so that a simple lock is enough.</li>
+  <li><x-ref to="service-communication"></x-ref>: service discovery in depth.</li>
+  <li><x-ref to="containers-and-orchestration"></x-ref>: Kubernetes, built on etcd and leases.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Failure detection is always a guess based on silence. Choose timeouts by what a wrong guess costs.</li>
+  <li>Adaptive detectors such as phi accrual output a level of suspicion learned from each node’s history, in place of a fixed timeout.</li>
+  <li>Gossip spreads membership with no central part and constant load per node, and reaches thousands of nodes in about ten rounds. Its views are approximate and briefly inconsistent.</li>
+  <li>SWIM asks other nodes to confirm before suspecting one, which separates failed nodes from failed paths.</li>
+  <li>Decisions that must not be made twice, such as who leads or who holds a lock, belong in a consensus-backed coordination service.</li>
+  <li>Those services are built from three things: keys that vanish with their owner’s lease, watches, and conditional writes with an increasing number.</li>
+  <li>A distributed lock is a lease that can expire while its holder is still working. For correctness, the resource must check a fencing token.</li>
+  <li>A coordination service is a shared critical dependency. Keep it small, keep it off the request path, and keep serving from cached state when it is down.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A team shortens its database failover timeout from 30 seconds to 2 seconds to improve availability. What new risk have they taken on?</summary><p>False failovers. A leader that pauses or loses packets for more than two seconds is now declared dead while still running. Each unnecessary failover costs downtime of its own and risks two leaders accepting writes. Because promotion is an expensive and dangerous reaction, it calls for a longer timeout and for fencing of the old leader.</p></details>
+<details><summary>Why can Cassandra rely on gossip to decide which nodes are down, while a single-leader database cannot use gossip to choose its leader?</summary><p>In Cassandra any replica can serve any request, so the only reaction to “node down” is to route around it. If nodes briefly disagree, nothing breaks. Choosing a leader grants an exclusive role. If two nodes acted on different views there would be two leaders, so that decision has to be made once by a majority, through consensus.</p></details>
+<details><summary>A gossip cluster grows from 1,000 to 10,000 nodes. Roughly how does the time for news to reach every node change, and how does each node’s workload change?</summary><p>Spreading time grows with the logarithm of the size, so it rises by only a couple of rounds, from about 8 to about 10 when each node tells three others per round. Each node still sends the same few messages per round, so its workload does not change.</p></details>
+<details><summary>In SWIM, node A cannot reach node B. Why does A ask other nodes to ping B before doing anything else?</summary><p>A’s failed ping shows only that the path from A to B is not working, or that A itself is slow. If another node can reach B, then B is alive and should not be reported as failed. Indirect probing removes most false accusations caused by local network problems or an overloaded prober.</p></details>
+<details><summary>A worker takes a lock with a 30-second expiry from a coordination service, then pauses for 40 seconds before writing to storage. What happens, and what prevents damage?</summary><p>The lease expires during the pause and another worker acquires the lock and starts writing. When the first worker resumes, it still believes it holds the lock and writes too. The lock service cannot stop this. The storage system must: each grant of the lock carries a higher fencing token, and storage rejects a write whose token is lower than one it has already seen.</p></details>
+<details><summary>Why must a Redis lock be released with “delete only if the value is mine” and not with a plain delete?</summary><p>If the holder’s lock has already expired and another client has acquired it, a plain delete removes the other client’s lock, and a third client can then enter. Storing a random value unique to each holder and deleting only on a match ensures that a client can release only its own lock.</p></details>
+<details><summary>Your service looks up its dependencies’ addresses in a coordination service on every request. What happens during a five-minute outage of that service, and what would you change?</summary><p>Every request fails for five minutes, although all the dependencies are healthy. The service should look up addresses once, keep them in memory, update them from watches, and continue with the last known list when the coordination service is unreachable. The outage then delays changes of membership without stopping traffic.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>N. Hayashibara, X. Défago, R. Yared and T. Katayama, “The φ Accrual Failure Detector”, IEEE Symposium on Reliable Distributed Systems, 2004.</li>
+  <li>A. Das, I. Gupta and A. Motivala, <a href="https://research.google/pubs/swim-scalable-weakly-consistent-infection-style-process-group-membership-protocol/">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a>, 2002.</li>
+  <li>HashiCorp, <a href="https://www.hashicorp.com/blog/making-gossip-more-robust-with-lifeguard">Making Gossip More Robust with Lifeguard</a>, 2017.</li>
+  <li>DataStax, <a href="https://docs.datastax.com/en/dse/5.1/architecture/database-architecture/gossip-about.html">Internode communications (gossip)</a>. Gossip and the failure detector in Cassandra.</li>
+  <li>M. Burrows, <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a>, OSDI 2006.</li>
+  <li>P. Hunt, M. Konar, F. Junqueira and B. Reed, <a href="https://www.usenix.org/conference/usenix-atc-10/zookeeper-wait-free-coordination-internet-scale-systems">ZooKeeper: Wait-free Coordination for Internet-scale Systems</a>, USENIX ATC 2010.</li>
+  <li>Apache ZooKeeper, <a href="https://zookeeper.apache.org/doc/current/recipes.html">ZooKeeper Recipes and Solutions</a>. Locks, queues and leader election, including the numbered-key lock.</li>
+  <li>etcd, <a href="https://etcd.io/docs/v3.6/dev-guide/limit/">System limits</a>. Request and storage size limits.</li>
+  <li>Kubernetes, <a href="https://kubernetes.io/docs/concepts/architecture/leases/">Leases</a>. Leader election and node heartbeats in Kubernetes.</li>
+  <li>M. Kleppmann, <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">How to do distributed locking</a>, February 2016, and S. Sanfilippo, <a href="https://antirez.com/news/101">Is Redlock safe?</a>, February 2016. The critique of Redlock and the reply.</li>
+  <li>Redis, <a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Distributed Locks with Redis</a>. The single-instance lock and the Redlock algorithm.</li>
+  <li>Roblox, <a href="https://about.roblox.com/newsroom/2022/01/roblox-return-to-service-10-28-10-31-2021">Roblox Return to Service 10/28-10/31 2021</a>, January 2022. The post-incident report on the 73-hour outage.</li>
+</ol>
+</section>

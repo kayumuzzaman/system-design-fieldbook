@@ -1,0 +1,401 @@
+<!--meta
+{ "description": "Object, block and file storage compared: how object stores such as Amazon S3 work, durability and erasure coding, direct uploads with presigned URLs, multipart upload, serving through a CDN, storage tiers and lifecycle rules, key design and cost.",
+  "lede": "Photos, videos, documents, backups and logs are too large and too numerous to keep in a database. They go into object storage, a kind of system that holds almost unlimited data cheaply and very durably by offering far less than a database does. This chapter explains what it offers, how it stays durable, and the handful of patterns for getting files in and out of it.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="three-kinds">Three kinds of storage</h2>
+<p>Everything a system stores ends up on one of three kinds of storage service. They differ in the interface they present, and the interface decides what they are good for.</p>
+
+<figure class="fig wide" id="fig-three-kinds">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 178" role="img" aria-labelledby="f231t f231d">
+<title id="f231t">Block, file and object storage compared by interface</title>
+<desc id="f231d">Block storage presents a numbered array of fixed-size blocks that are read and written by number. It is used by one server at a time, typically for a database’s data files. File storage presents a tree of named files and folders with operations such as open, seek, read, write and rename. It is shared by many servers. Object storage presents a flat set of keys, each naming a whole object that is put and fetched over HTTP. It suits images, video, backups and logs.</desc>
+<rect class="n" x="10" y="10" width="220" height="54" rx="6"/>
+<text class="tb mid" x="120" y="33">Block storage</text>
+<text class="ts mid" x="120" y="50">a numbered array of fixed-size blocks</text>
+<rect class="n sunk" x="10" y="74" width="220" height="50" rx="5"/>
+<text class="ts" x="20" y="94">read block 88,201</text>
+<text class="ts" x="20" y="111">write block 88,202</text>
+<text class="ts tb" x="10" y="146">Used by</text>
+<text class="ts" x="66" y="146">One server at a time.</text>
+<text class="ts tb" x="10" y="166">Typical use</text>
+<text class="ts" x="86" y="166">A database’s data files.</text>
+<rect class="n" x="250" y="10" width="220" height="54" rx="6"/>
+<text class="tb mid" x="360" y="33">File storage</text>
+<text class="ts mid" x="360" y="50">a tree of named files and folders</text>
+<rect class="n sunk" x="250" y="74" width="220" height="50" rx="5"/>
+<text class="ts" x="260" y="94">open /reports/q3.pdf</text>
+<text class="ts" x="260" y="111">seek, read, write, rename</text>
+<text class="ts tb" x="250" y="146">Used by</text>
+<text class="ts" x="306" y="146">Many servers, shared.</text>
+<text class="ts tb" x="250" y="166">Typical use</text>
+<text class="ts" x="326" y="166">Shared folders, legacy apps.</text>
+<rect class="n sig" x="490" y="10" width="220" height="54" rx="6"/>
+<text class="tb mid" x="600" y="33">Object storage</text>
+<text class="ts mid" x="600" y="50">a flat set of keys, each a whole object</text>
+<rect class="n sunk" x="490" y="74" width="220" height="50" rx="5"/>
+<text class="ts" x="500" y="94">PUT photos/871.jpg</text>
+<text class="ts" x="500" y="111">GET photos/871.jpg</text>
+<text class="ts tb" x="490" y="146">Used by</text>
+<text class="ts" x="546" y="146">Anyone, over HTTP.</text>
+<text class="ts tb" x="490" y="166">Typical use</text>
+<text class="ts" x="566" y="166">Images, video, backups, logs.</text>
+
+</svg>
+</div>
+<figcaption>The same bytes behind three interfaces. Each step to the right gives up some ability to modify data in place and gains scale and simplicity.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th></th><th>Block</th><th>File</th><th>Object</th></tr></thead>
+<tbody>
+<tr><th>Unit</th><td>Fixed-size block</td><td>File in a directory tree</td><td>Whole object under a key</td></tr>
+<tr><th>Change part of the data</th><td>Yes, any block</td><td>Yes, any byte range</td><td>No. Replace the whole object.</td></tr>
+<tr><th>Access</th><td>Attached to one machine as a disk</td><td>Mounted by many machines over a network protocol</td><td>HTTP requests from anywhere</td></tr>
+<tr><th>Latency</th><td>Under a millisecond</td><td>Milliseconds</td><td>Tens of milliseconds to the first byte</td></tr>
+<tr><th>Scale</th><td>One volume, sized in advance</td><td>Large, with effort</td><td>Effectively unlimited</td></tr>
+<tr><th>Cost per gigabyte</th><td>Highest</td><td>High</td><td>Lowest</td></tr>
+<tr><th>Cloud examples</th><td>Amazon EBS, Google Persistent Disk</td><td>Amazon EFS, Azure Files</td><td>Amazon S3, Google Cloud Storage, Azure Blob Storage, Cloudflare R2</td></tr>
+</tbody>
+</table>
+<p><dfn>Block storage</dfn> is a virtual disk. The operating system puts a file system on it, and a database puts its pages on that. It is what <x-ref to="storage-engines"></x-ref> was writing to all along. A cloud block volume lives on the network, survives the failure of the machine it is attached to, and has performance you pay for in operations per second. Fast local disks inside the machine are quicker still and are lost when the machine is.</p>
+<p><dfn>File storage</dfn> is a shared folder: many servers see the same directory tree and can read and write the same files. It exists mostly for software that expects a file system. New systems rarely need it, because sharing files between servers is better done with object storage.</p>
+<p><dfn>Object storage</dfn> is the subject of the rest of this chapter. It is where the photo app’s photos go, and where the bulk of the world’s data now lives.</p>
+
+<h2 id="not-in-db">Why files do not belong in the database</h2>
+<p>A database can hold a 4 MB photo in a column, and it is tempting to keep everything in one place. It is a poor trade for anything but small files.</p>
+<ul>
+  <li><b>It crowds out what the database is for.</b> The buffer pool that should hold rows and indexes fills with image bytes.</li>
+  <li><b>Everything operational gets slower.</b> Backups, restores, replication and migrations all scale with size, and the files are almost all of the size.</li>
+  <li><b>It costs more.</b> Database storage is fast block storage, replicated. Object storage costs a small fraction per gigabyte.</li>
+  <li><b>It forces every download through your servers.</b> Object storage and a CDN can serve files directly.</li>
+</ul>
+<p>The standard arrangement is to keep the file in object storage and a row in the database that records its key, size, type, owner and status. The database stays small and answers the questions (“which photos does Ana have?”). The object store holds the bytes.</p>
+
+<h2 id="model">How object storage works, from the outside</h2>
+<p>The model is deliberately minimal.</p>
+<ul>
+  <li>A <dfn>bucket</dfn> is a named container.</li>
+  <li>An <dfn>object</dfn> is a sequence of bytes of any size, plus a little metadata such as its content type.</li>
+  <li>A <dfn>key</dfn> is the object’s name within the bucket, such as <code>photos/42/871.jpg</code>.</li>
+</ul>
+<p>The operations are few: put an object, get it (or a byte range of it), delete it, and list keys that start with a given prefix. All of them are HTTP requests. Three properties follow from this simplicity and shape every design that uses it.</p>
+<p><b>The namespace is flat.</b> There are no real folders. The slashes in a key are ordinary characters, and “folders” in a console are a display convention built on listing by prefix. Renaming a folder therefore means copying every object under it.</p>
+<p><b>Objects are immutable.</b> There is no way to change bytes in the middle or append to the end. To change an object you upload a complete replacement. This rules out using object storage as a database or a log file, and it is what makes the service so easy to replicate and cache.</p>
+<p><b>There are no transactions and no queries.</b> You cannot update two objects atomically or ask for “all objects larger than 1 MB uploaded by Ana”. That is the database’s job, which is the reason for the metadata row.</p>
+<p>One thing has improved in recent years. Amazon S3 originally gave only eventual consistency, where a read just after a write might return the old object. Since late 2020 it has been strongly consistent: a successful write is visible to every read that follows. The other major providers behave the same way. Limits have grown too. The largest single object S3 accepts is about 50 TB (48.8 TiB) since December 2025, ten times the earlier limit.</p>
+
+<h2 id="durability">Durability, and how it is achieved</h2>
+<p>Object stores advertise striking durability figures. Amazon S3 is designed for 99.999999999% durability of objects over a year, eleven nines. Amazon’s own illustration is that if you store ten million objects, you can expect to lose one every ten thousand years. The figure is a design target derived from modeling, and it describes hardware failure. It is achieved with four techniques working together.</p>
+<ol>
+  <li><b>Redundancy across failure domains.</b> Each object is stored on many devices in at least three availability zones, so that losing a disk, a rack or a whole data center loses no data (<x-ref to="availability-and-reliability#failure-domains"></x-ref>).</li>
+  <li><b>Erasure coding</b>, explained below, which provides that redundancy at much lower cost than full copies.</li>
+  <li><b>Checksums.</b> Every piece is stored with a checksum, so silent corruption on a disk is detected when the piece is read.</li>
+  <li><b>Continuous repair.</b> Background processes read everything periodically, verify it, and rebuild any piece that is missing or damaged from the others, before enough pieces are lost to matter.</li>
+</ol>
+
+<h3 id="erasure-coding">Erasure coding</h3>
+<p>The simple way to survive disk failures is to keep three copies of everything, which triples the storage bill. <dfn>Erasure coding</dfn> gets the same or better protection for far less. An object is cut into <i>k</i> data pieces, and <i>m</i> additional parity pieces are computed from them, in such a way that any <i>k</i> of the <i>k</i> + <i>m</i> pieces are enough to rebuild the object.</p>
+
+<figure class="fig wide" id="fig-erasure">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f232t f232d">
+<title id="f232t">Erasure coding with four data pieces and two parity pieces</title>
+<desc id="f232d">An object of 4 megabytes is split into four data pieces, and two parity pieces are computed from them. The six pieces are stored on six different machines. When two machines are lost, taking data piece 2 and parity piece 1 with them, the remaining four pieces are enough to rebuild the object.</desc>
+<rect class="n" x="10" y="50" width="110" height="50" rx="6"/>
+<text class="tb mid" x="65" y="71">Object</text>
+<text class="ts mid" x="65" y="88">4 MB</text>
+<path class="e" d="M120 75H160"/>
+<text class="ts mid" x="140" y="46">split</text>
+<rect class="n sig" x="170" y="58" width="64" height="34" rx="4"/>
+<text class="ts mid" x="202" y="79.5">data 1</text>
+<rect class="n sig" x="244" y="58" width="64" height="34" rx="4"/>
+<text class="ts mid" x="276" y="79.5">data 2</text>
+<rect class="n sig" x="318" y="58" width="64" height="34" rx="4"/>
+<text class="ts mid" x="350" y="79.5">data 3</text>
+<rect class="n sig" x="392" y="58" width="64" height="34" rx="4"/>
+<text class="ts mid" x="424" y="79.5">data 4</text>
+<text class="ts mid" x="480" y="46">compute parity</text>
+<path class="e" d="M456 75H504"/>
+<rect class="n async" x="514" y="58" width="64" height="34" rx="4"/>
+<text class="ts mid" x="546" y="79.5">parity 1</text>
+<rect class="n async" x="588" y="58" width="64" height="34" rx="4"/>
+<text class="ts mid" x="620" y="79.5">parity 2</text>
+<text class="tl" x="10" y="24">Writing: 4 data pieces and 2 parity pieces, each stored on a different machine</text>
+<text class="tl" x="10" y="140">Reading after two machines are lost: any 4 of the 6 pieces rebuild the object</text>
+<rect class="n sig" x="170" y="156" width="64" height="34" rx="4"/>
+<text class="ts mid" x="202" y="177.5">data 1</text>
+<rect class="n ghost" x="244" y="156" width="64" height="34" rx="4"/>
+<text class="ts mid" x="276" y="177.5">lost</text>
+<rect class="n sig" x="318" y="156" width="64" height="34" rx="4"/>
+<text class="ts mid" x="350" y="177.5">data 3</text>
+<rect class="n sig" x="392" y="156" width="64" height="34" rx="4"/>
+<text class="ts mid" x="424" y="177.5">data 4</text>
+<rect class="n ghost" x="514" y="156" width="64" height="34" rx="4"/>
+<text class="ts mid" x="546" y="177.5">lost</text>
+<rect class="n async" x="588" y="156" width="64" height="34" rx="4"/>
+<text class="ts mid" x="620" y="177.5">parity 2</text>
+<text class="ts" x="10" y="216">Storage used: 1.5 times the object’s size. Three full copies would use 3 times and survive the same two losses.</text>
+
+</svg>
+</div>
+<figcaption>A 4 + 2 code. Any two of the six machines can fail. The mathematics is the same family used for error correction on discs and in QR codes.</figcaption>
+</figure>
+
+<figure class="fig wide" id="fig-overhead">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 184" role="img" aria-labelledby="f233t f233d">
+<title id="f233t">Raw storage needed to hold one terabyte of data under four redundancy schemes</title>
+<desc id="f233d">A bar chart. Three full copies need 3 terabytes and survive 2 losses. A 6 plus 3 erasure code needs 1.5 terabytes and survives 3 losses. A 10 plus 4 code needs 1.4 terabytes and survives 4 losses. A 17 plus 3 code needs 1.18 terabytes and survives 3 losses.</desc>
+<line class="grid" x1="190" y1="8" x2="190" y2="150"/>
+<text class="ts mid" x="190" y="168">0 TB</text>
+<line class="grid" x1="308" y1="8" x2="308" y2="150"/>
+<text class="ts mid" x="308" y="168">1 TB</text>
+<line class="grid" x1="426" y1="8" x2="426" y2="150"/>
+<text class="ts mid" x="426" y="168">2 TB</text>
+<line class="grid" x1="544" y1="8" x2="544" y2="150"/>
+<text class="ts mid" x="544" y="168">3 TB</text>
+<text class="ts end" x="178" y="29">3 full copies</text>
+<path class="bar mute" d="M190 14h350.0a4 4 0 0 1 4 4v14a4 4 0 0 1 -4 4h-350.0z"/>
+<text class="ts" x="552" y="29">3 TB, survives 2 losses</text>
+<text class="ts end" x="178" y="63">Erasure code 6 + 3</text>
+<path class="bar" d="M190 48h173.0a4 4 0 0 1 4 4v14a4 4 0 0 1 -4 4h-173.0z"/>
+<text class="ts" x="375" y="63">1.5 TB, survives 3 losses</text>
+<text class="ts end" x="178" y="97">Erasure code 10 + 4</text>
+<path class="bar" d="M190 82h161.2a4 4 0 0 1 4 4v14a4 4 0 0 1 -4 4h-161.2z"/>
+<text class="ts" x="363" y="97">1.4 TB, survives 4 losses</text>
+<text class="ts end" x="178" y="131">Erasure code 17 + 3</text>
+<path class="bar" d="M190 116h135.2a4 4 0 0 1 4 4v14a4 4 0 0 1 -4 4h-135.2z"/>
+<text class="ts" x="337" y="131">1.18 TB, survives 3 losses</text>
+<line class="axis" x1="190" y1="8" x2="190" y2="150"/>
+
+<rect class="hit" x="6" y="10" width="708" height="30" data-tip="3 full copies|3 TB of disk for each TB stored|200% extra|survives 2 losses"/>
+<rect class="hit" x="6" y="44" width="708" height="30" data-tip="Erasure code 6 + 3|1.5 TB of disk for each TB stored|50% extra|survives 3 losses"/>
+<rect class="hit" x="6" y="78" width="708" height="30" data-tip="Erasure code 10 + 4|1.4 TB of disk for each TB stored|40% extra|survives 4 losses"/>
+<rect class="hit" x="6" y="112" width="708" height="30" data-tip="Erasure code 17 + 3|1.18 TB of disk for each TB stored|18% extra|survives 3 losses"/>
+</svg>
+</div>
+<figcaption>Disk space consumed per terabyte stored. The codes shown are ones that large systems have published: 6 + 3 in Hadoop’s file system, 10 + 4 at Facebook, 17 + 3 at Backblaze.</figcaption>
+</figure>
+
+<p>The saving is paid for elsewhere. Writing requires computing the parity. Reading normally needs only the data pieces, and a read that hits a failed machine must fetch several other pieces and reconstruct. Repairing one lost piece means reading <i>k</i> others, which for wide codes is a great deal of network traffic. Systems often keep new, frequently read data as plain replicas and convert it to an erasure code as it cools.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Reading eleven nines as “this data cannot be lost”. The figure covers hardware faults. It does not cover a script that deletes the wrong prefix, a compromised credential, an application bug that overwrites objects with garbage, or a closed account. Those are the realistic ways data in object storage is lost. The defenses are different: object versioning, which keeps old versions when an object is overwritten or deleted, retention locks, tightly scoped permissions, and for critical data a copy in another region or account.</p></div>
+<p>Durability is also not availability. The same service that promises eleven nines of durability is designed for 99.99% availability, which allows about an hour a year in which requests may fail. Your data is safe during that hour, and you cannot reach it.</p>
+
+<h2 id="uploads">Getting files in</h2>
+<p>The obvious upload path sends the file from the browser to your API server, which then sends it to object storage. Every byte crosses your servers twice, uploads tie up request handlers for seconds or minutes, and a large upload on a slow connection can hold a server’s memory or disk for a long time. There is a better way.</p>
+
+<h3 id="presigned">Direct upload with a signed URL</h3>
+<p>A <dfn>presigned URL</dfn> is an object storage URL with a signature attached that grants permission for one specific operation for a limited time. Your server creates it, which needs no network call, and hands it to the client. The client then talks to object storage directly.</p>
+
+<figure class="fig wide" id="fig-presigned">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 268" role="img" aria-labelledby="f234t f234d">
+<title id="f234t">Uploading a file directly to object storage with a presigned URL</title>
+<desc id="f234d">The browser tells your API it wants to upload a 4 megabyte JPEG. The API returns a signed URL valid for five minutes. The browser sends the file with a PUT request straight to object storage, which replies with 200 OK. Object storage then sends an event to your API saying the object was created.</desc>
+<text class="tb mid" x="90" y="20">Browser or app</text>
+<text class="tb mid" x="360" y="20">Your API</text>
+<text class="tb mid" x="630" y="20">Object storage</text>
+<line class="axis" x1="90" y1="28" x2="90" y2="232"/>
+<line class="axis" x1="360" y1="28" x2="360" y2="232"/>
+<line class="axis" x1="630" y1="28" x2="630" y2="232"/>
+<g data-s="1">
+<path class="e sig" d="M91 56H359"/>
+<text class="ts mid" x="225.0" y="50">1. I want to upload a 4 MB JPEG</text>
+</g>
+<g data-s="2">
+<path class="e" d="M359 88H91"/>
+<text class="ts mid" x="225.0" y="82">2. a signed URL, valid for 5 minutes</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M91 128H629"/>
+<text class="ts mid" x="495" y="122">3. PUT the file, straight to storage</text>
+</g>
+<g data-s="4">
+<path class="e" d="M629 160H91"/>
+<text class="ts mid" x="495" y="154">4. 200 OK</text>
+</g>
+<g data-s="5">
+<path class="e async" d="M629 196H361"/>
+<text class="ts mid" x="495.0" y="190">5. event: object created</text>
+<text class="ts" x="10" y="256">The file never passes through your servers. They handle two small requests and then record the upload when storage reports it.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="upload request">The app tells your API what it wants to upload: a 4 MB JPEG.</li>
+  <li data-msg="signed URL">The API checks that this user may upload, and returns a signed URL that is valid for five minutes and for this one object.</li>
+  <li data-msg="PUT the file">The app sends the file straight to object storage, using that URL.</li>
+  <li data-msg="200 OK">Storage checks the signature and accepts the file.</li>
+  <li>Storage tells your API that the object now exists. The file itself never passed through your servers.</li>
+</ol>
+<figcaption>Direct upload. Your servers authorize the upload and learn of its completion, and never carry the bytes.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Creating a presigned upload URL with the AWS SDK">
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+const s3 = new S3Client({ region: "eu-west-1" });
+const ALLOWED = ["image/jpeg", "image/png", "image/webp"];
+
+export async function createUploadUrl(userId: number, contentType: string) {
+  if (!ALLOWED.includes(contentType)) throw new BadRequest("unsupported type");
+
+  const key = `uploads/${userId}/${crypto.randomUUID()}`;     // the server chooses the key, never the client
+  const url = await getSignedUrl(
+    s3,
+    new PutObjectCommand({ Bucket: "photo-app-uploads", Key: key, ContentType: contentType }),
+    { expiresIn: 300 },                                        // seconds
+  );
+
+  await db.query(
+    "INSERT INTO uploads (key, user_id, status) VALUES ($1, $2, 'pending')", [key, userId]);
+  return { key, url };
+}
+</pre>
+<p>The details in that function are the security of the scheme.</p>
+<ul>
+  <li><b>The server picks the key.</b> A client allowed to choose could overwrite someone else’s object.</li>
+  <li><b>The URL is short-lived and for one operation.</b> Anyone who obtains it can use it until it expires.</li>
+  <li><b>The upload is recorded as pending.</b> Nothing treats the file as real until storage confirms it arrived, and pending rows that never complete can be cleaned up.</li>
+  <li><b>Uploads land in a separate bucket</b> that is never served to the public.</li>
+</ul>
+<p>What arrives is untrusted. A client can claim a file is a JPEG and send anything. After the upload, a background job should check the size and the real type, scan it if your product requires that, produce the resized versions you will actually serve, and only then mark the photo as ready. The trigger is an event that object storage emits when an object is created, delivered to a queue (<x-ref to="message-queues"></x-ref>). This “upload, then process asynchronously” pipeline is one of the most common structures in system design.</p>
+
+<h3 id="multipart">Large files: multipart upload</h3>
+<p>A single request is a poor way to send a 2 GB video. If the connection drops at 95% the whole upload starts again. <dfn>Multipart upload</dfn> splits the file into parts that are uploaded separately and assembled by the storage service at the end.</p>
+<ul>
+  <li><b>Parts upload in parallel</b>, using the full bandwidth available.</li>
+  <li><b>A failed part is retried alone.</b></li>
+  <li><b>An upload can be paused and resumed</b>, since the service remembers which parts it has.</li>
+</ul>
+<p>In S3, parts are between 5 MiB and 5 GiB each, with at most 10,000 parts, and AWS suggests multipart once a file passes about 100 MB. One operational detail matters: parts of an upload that is never completed stay in storage, invisible in listings and billed every month, until something removes them. Set a lifecycle rule that aborts incomplete uploads after a few days.</p>
+
+<h2 id="serving">Getting files out</h2>
+<p>Serving follows the same principle as uploading: keep your application servers out of the path.</p>
+<ul>
+  <li><b>Public files go through a CDN</b> with the bucket as its origin (<x-ref to="cdn-and-edge"></x-ref>). The bucket itself stays private and accepts requests only from the CDN.</li>
+  <li><b>Private files use signed URLs or signed cookies.</b> The application checks that the user may see the file and returns a URL that works for a few minutes. The check is done once by your code, and the bytes are delivered by storage or the CDN.</li>
+  <li><b>Large media uses range requests.</b> A video player asks for the bytes it needs, which is how seeking works without downloading the whole file. <x-ref to="hld-video-streaming"></x-ref> builds on this.</li>
+  <li><b>Serve derived versions, not originals.</b> A 12-megapixel original is the wrong thing to send to a phone showing a thumbnail. Generate a few sizes at upload, or transform on demand at the CDN and cache the result.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> Publicly readable buckets are a leading cause of data leaks. Providers now block public access by default, and the setting should stay that way. Serve public content through a CDN that authenticates to a private bucket. Check, as a routine, that no bucket holding user data allows anonymous listing or reads.</p></div>
+
+<h2 id="tiers">Storage classes and lifecycle</h2>
+<p>Most stored data is rarely read. A photo is viewed often in its first week and almost never after a year. Backups and logs may never be read at all. Object stores offer cheaper classes of storage for such data, with a penalty for reading it: a retrieval fee, a delay, or both. The classes of Amazon S3 illustrate the range, and other providers have equivalents.</p>
+<table>
+<thead><tr><th>Class</th><th>Meant for</th><th>Access</th><th>Designed availability</th><th>Minimum storage period</th></tr></thead>
+<tbody>
+<tr><th>Standard</th><td>Data in active use</td><td>Immediate</td><td>99.99%</td><td>None</td></tr>
+<tr><th>Standard, infrequent access</th><td>Read about once a month or less</td><td>Immediate, with a fee per gigabyte read</td><td>99.9%</td><td>30 days</td></tr>
+<tr><th>One zone, infrequent access</th><td>Data you could recreate</td><td>Immediate. Stored in a single zone.</td><td>99.5%</td><td>30 days</td></tr>
+<tr><th>Archive, instant retrieval</th><td>Read a few times a year</td><td>Milliseconds</td><td>99.9%</td><td>90 days</td></tr>
+<tr><th>Archive, flexible retrieval</th><td>Backups, rarely restored</td><td>Minutes to hours, after a restore request</td><td>99.99% once restored</td><td>90 days</td></tr>
+<tr><th>Deep archive</th><td>Records kept for compliance</td><td>Hours, after a restore request</td><td>99.99% once restored</td><td>180 days</td></tr>
+<tr><th>Express, one zone</th><td>Latency-sensitive data</td><td>Single-digit milliseconds. Stored in a single zone.</td><td>99.95%</td><td>None</td></tr>
+</tbody>
+</table>
+<p>A <dfn>lifecycle rule</dfn> moves objects between classes, or deletes them, by age: originals to infrequent access after 30 days, to archive after a year, logs deleted after 90 days. There is also a class that watches access patterns and moves objects automatically.</p>
+<p>The cost of object storage has four parts, and designs go wrong by counting only the first.</p>
+<ol>
+  <li><b>Storage</b>, per gigabyte per month. The headline price.</li>
+  <li><b>Requests.</b> Each put, get and list has a small price. Billions of tiny objects make this the larger part.</li>
+  <li><b>Retrieval</b> from the colder classes, and early deletion before the minimum period.</li>
+  <li><b>Data transfer out</b> to the internet, called egress. For a service that serves media this often exceeds everything else. Serving through a CDN usually reduces it, and some providers, Cloudflare R2 for one, do not charge for egress at all.</li>
+</ol>
+<p>The colder classes suit large objects that are truly cold. Moving millions of small objects into them can cost more than leaving them, because of per-object fees and minimum billable sizes. <x-ref to="capacity-and-cost"></x-ref> returns to cost modeling.</p>
+
+<h2 id="keys">Keys, listing and performance</h2>
+<p>Object storage scales by spreading keys across many internal partitions, in the manner of <x-ref to="partitioning#range"></x-ref>. S3 documents at least 3,500 writes and 5,500 reads per second for each key prefix, scaling further as load spreads over more prefixes. For nearly all applications that is far more than enough. Two habits keep you out of trouble.</p>
+<ul>
+  <li><b>Do not use listing as a query.</b> Listing returns keys in pages of up to a thousand, in key order, and is slow and billed. To find “Ana’s photos”, ask the database, which holds the keys. Treat object storage as something you look up by exact key.</li>
+  <li><b>Avoid billions of tiny objects.</b> Each object carries overhead in requests, metadata and billing. If you have very many small records, such as events or thumbnails by the hundred million, pack them into larger files and keep an index of what is where.</li>
+</ul>
+<p>Remember the latency too. A request to object storage typically takes tens of milliseconds before the first byte arrives. That is excellent for a photo and far too slow for something read on every request, such as a session or a configuration value.</p>
+
+<h2 id="foundation">Object storage as a foundation</h2>
+<p>Because it is cheap, durable and effectively limitless, object storage has become the base layer for other data systems, and the pattern is worth recognizing.</p>
+<ul>
+  <li><b>Data lakes.</b> Analytical data is stored as column-oriented files, usually Parquet, in object storage, and query engines read them in place. Table formats such as Apache Iceberg add what plain files lack: a consistent list of which files make up a table, so that many writers and readers can work safely. <x-ref to="batch-and-stream-processing"></x-ref> covers this.</li>
+  <li><b>Databases and logs with separated storage.</b> Many newer systems keep only recent data on local disks and move older data to object storage, or keep all durable state there and treat their servers as replaceable. Cloud data warehouses work this way, and so do the tiered-storage modes of streaming systems.</li>
+  <li><b>Backups</b> of nearly everything else (<x-ref to="disaster-recovery"></x-ref>).</li>
+</ul>
+<p>The design principle behind all three is to put durable state in the one system built to never lose it, and to make everything else stateless enough to replace.</p>
+<aside class="sn"><b>Running your own</b>Most teams use their cloud provider’s object storage. If you must run one yourself, Ceph is the long-established choice, and smaller S3-compatible servers such as SeaweedFS and Garage exist. MinIO was for years the usual recommendation. Its community edition has been scaled back since 2025, so check its current status before choosing it. Nearly everything speaks the S3 API, which has become the common interface.</aside>
+
+<h2 id="block-file">When you need block or file storage</h2>
+<p>Object storage is the default for files. The other two have their places.</p>
+<ul>
+  <li><b>Block storage for databases and anything that modifies data in place.</b> Choose it by the operations per second and throughput it guarantees. Know which kind you have: a network volume survives the loss of its machine and can be detached and snapshotted, and a local disk is faster and disappears with the machine, which is acceptable only when the data is replicated elsewhere.</li>
+  <li><b>File storage when software requires a shared file system</b>: older applications, some content management and media tools, and shared working directories for computation. It costs more than object storage and scales less well. If the code is yours to change, change it to use object storage.</li>
+</ul>
+<div class="note interview"><p><span class="label">In an interview.</span> Any design with images, video or documents should say: “files go to object storage, with a metadata row in the database, uploaded directly with presigned URLs and served through a CDN”. That one sentence removes a class of follow-up questions. If the files are large, add multipart upload. If they are processed, add the event that triggers a worker.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Storing files in the database</b>, or on an application server’s local disk, where the next deployment or scale-in deletes them.</li>
+  <li><b>Routing uploads and downloads through application servers.</b></li>
+  <li><b>Letting clients choose object keys.</b></li>
+  <li><b>Trusting an uploaded file’s declared type and size.</b></li>
+  <li><b>Public buckets.</b></li>
+  <li><b>No versioning or second copy</b> for data that matters, on the strength of the durability figure.</li>
+  <li><b>Listing a bucket to answer a question</b> the database should answer.</li>
+  <li><b>Forgetting incomplete multipart uploads</b>, which are billed until removed.</li>
+  <li><b>Ignoring egress and request costs</b> when estimating the bill.</li>
+  <li><b>Using object storage for small, hot, frequently changing data.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="cdn-and-edge"></x-ref>: how stored files reach users, and signed URLs at the edge.</li>
+  <li><x-ref to="message-queues"></x-ref>: processing uploads asynchronously.</li>
+  <li><x-ref to="schema-design"></x-ref>: the metadata row that makes objects findable.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: failure domains, and durability as distinct from availability.</li>
+  <li><x-ref to="disaster-recovery"></x-ref>: backups, versioning and copies in other regions.</li>
+  <li><x-ref to="hld-file-sync"></x-ref> and <x-ref to="hld-video-streaming"></x-ref>: designs built on object storage.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Block storage is a disk for one machine, file storage is a shared folder, and object storage holds whole objects under keys, reached over HTTP.</li>
+  <li>Keep files in object storage and their metadata in the database.</li>
+  <li>Objects are immutable and the namespace is flat. There are no queries and no transactions.</li>
+  <li>Durability comes from redundancy across zones, erasure coding, checksums and constant repair. It protects against hardware failure and not against deletion or misuse.</li>
+  <li>Erasure coding gives the protection of several copies for a fraction of the space.</li>
+  <li>Upload directly with presigned URLs, use multipart for large files, and validate and process after the upload.</li>
+  <li>Serve through a CDN from a private bucket, with signed URLs for private content.</li>
+  <li>Use colder storage classes and lifecycle rules for data that is rarely read, and count request, retrieval and egress costs as well as storage.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why can you not append a line to a log file stored as an object?</summary><p>Objects are immutable. The only write operation replaces the whole object. To add a line you would download the object, add the line and upload all of it again. Logs are therefore written as many separate objects, typically one per time interval, or kept elsewhere and moved to object storage in batches.</p></details>
+<details><summary>A 6 + 3 erasure code and three full copies both protect a 900 MB object. How much raw storage does each use, and how many lost machines can each survive?</summary><p>Three copies use 2,700 MB and survive the loss of any two. The 6 + 3 code stores nine pieces of 150 MB each, 1,350 MB in total, and survives the loss of any three.</p></details>
+<details><summary>Your provider promises eleven nines of durability. A developer’s script deletes a production prefix. What does the durability figure do for you, and what would have helped?</summary><p>Nothing. The deletion was a valid request and the service carried it out faithfully. Object versioning would have kept the previous versions recoverable, a retention lock would have refused the deletion, narrower permissions would have prevented the script from having that access, and a copy in another account would have been unaffected.</p></details>
+<details><summary>Why should the server, and not the client, choose the object key for an upload?</summary><p>If the client chooses, it can pick a key that already belongs to another user’s object and overwrite it, or place files where other parts of the system will trust them. A key generated by the server under a prefix tied to the authenticated user removes that possibility.</p></details>
+<details><summary>A 3 GB upload fails at 90% over a mobile connection. How does multipart upload change what happens next?</summary><p>Only the part that was in flight is lost. The parts already uploaded are kept by the storage service, so the client retries that one part and continues, instead of starting from the beginning.</p></details>
+<details><summary>You move 400 million thumbnails of 20 KB each to an archive class to save money, and the bill goes up. Why?</summary><p>Cold classes charge per object for transitions and requests and often bill a minimum size per object that is larger than a thumbnail, so small objects cost more there than in standard storage. Cold classes pay off for large objects that are rarely read.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html">Data protection in Amazon S3</a> and <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html">Understanding and managing Amazon S3 storage classes</a>. Durability, zones, availability and minimum durations. Checked October 2026.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html">Amazon S3 multipart upload limits</a> and <a href="https://aws.amazon.com/about-aws/whats-new/2025/12/amazon-s3-maximum-object-size-50-tb/">Amazon S3 increases the maximum object size to 50 TB</a>, December 2025.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html">Best practices design patterns: optimizing Amazon S3 performance</a>. Request rates per prefix.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html">Download and upload objects with presigned URLs</a>.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html">What is Amazon S3?</a> The data consistency model: strong read-after-write consistency for all requests.</li>
+  <li>Brian Beach, <a href="https://www.backblaze.com/blog/vault-cloud-storage-architecture/">Backblaze Vaults: Zettabyte-Scale Cloud Storage Architecture</a>. The 17 + 3 code.</li>
+  <li>Subramanian Muralidhar and others, <a href="https://www.usenix.org/conference/osdi14/technical-sessions/presentation/muralidhar">f4: Facebook’s Warm BLOB Storage System</a>, OSDI 2014. Replicas for hot data, a 10 + 4 code for warm data.</li>
+  <li>Sanjay Ghemawat, Howard Gobioff and Shun-Tak Leung, <a href="https://research.google/pubs/the-google-file-system/">The Google File System</a>, SOSP 2003. The ancestor of large-scale storage on ordinary hardware.</li>
+  <li><a href="https://iceberg.apache.org/">Apache Iceberg</a> and <a href="https://parquet.apache.org/">Apache Parquet</a> project sites.</li>
+</ol>
+</section>

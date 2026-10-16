@@ -1,0 +1,803 @@
+<!--meta
+{ "description": "Serverless architecture explained for system design: functions as a service, execution environments and cold starts, concurrency and scaling limits, triggers, state, database connections, the cost model and its break-even point, the Prime Video case, serverless containers, edge isolates and durable functions.",
+  "lede": "Serverless means renting computing by the request instead of by the machine. You hand the provider some code, it runs a copy whenever a request or event arrives, and you pay for the time those copies spend working. This chapter explains how that works underneath, what it costs, where the limits are, and how to tell a workload that fits from one that does not.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="idea">What the word means</h2>
+<p>There are still servers. The word describes who looks after them. With a <dfn>serverless</dfn> service you never see a machine, choose its size, patch it, or decide how many to run. Three properties together separate it from ordinary hosting:</p>
+<ul>
+  <li><b>No capacity to manage.</b> You do not pick a number of instances. The provider adds and removes copies as load changes.</li>
+  <li><b>It scales to zero.</b> With no traffic, nothing of yours is running.</li>
+  <li><b>You pay for use.</b> The bill counts requests and running time, so no traffic means no charge for computing.</li>
+</ul>
+<p>The best-known form is <dfn>functions as a service</dfn>, shortened to FaaS: AWS Lambda, Google Cloud Run functions, Azure Functions, Cloudflare Workers. The same three properties describe other services you have already met: object storage in <x-ref to="object-and-file-storage"></x-ref>, managed queues in <x-ref to="message-queues"></x-ref>, and databases billed by the request. A serverless design usually combines several of them, with functions as the glue.</p>
+<p>The figure places functions on a line of options, by how much the provider takes over.</p>
+
+<figure class="fig wide" id="fig-spectrum">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f431t f431d">
+<title id="f431t">Who manages what, from virtual machines to functions</title>
+<desc id="f431d">A table of four hosting options against five responsibilities. With virtual machines you manage your code, the runtime, operating system patches and scaling, and the provider manages only the physical machines. With your own container cluster the split is the same. With serverless containers you manage your code and the runtime inside the container image, and the provider handles patches, scaling and machines. With functions you manage only your code. You pay by the hour for instances and nodes whether busy or idle, for container time while serving requests, and per request and its running time for functions.</desc>
+<text class="ts tb mid" x="242.0" y="20">Virtual machines</text>
+<text class="ts tb mid" x="376.0" y="20">Your own cluster</text>
+<text class="ts tb mid" x="510.0" y="20">Serverless containers</text>
+<text class="ts tb mid" x="644.0" y="20">Functions</text>
+<text class="ts" x="10" y="50">Your code</text>
+<rect class="n sig" x="178" y="32" width="128" height="26" rx="4"/>
+<text class="ts mid" x="242.0" y="49">you</text>
+<rect class="n sig" x="312" y="32" width="128" height="26" rx="4"/>
+<text class="ts mid" x="376.0" y="49">you</text>
+<rect class="n sig" x="446" y="32" width="128" height="26" rx="4"/>
+<text class="ts mid" x="510.0" y="49">you</text>
+<rect class="n sig" x="580" y="32" width="128" height="26" rx="4"/>
+<text class="ts mid" x="644.0" y="49">you</text>
+<text class="ts" x="10" y="82">Runtime and libraries</text>
+<rect class="n sig" x="178" y="64" width="128" height="26" rx="4"/>
+<text class="ts mid" x="242.0" y="81">you</text>
+<rect class="n sig" x="312" y="64" width="128" height="26" rx="4"/>
+<text class="ts mid" x="376.0" y="81">you</text>
+<rect class="n sig" x="446" y="64" width="128" height="26" rx="4"/>
+<text class="ts mid" x="510.0" y="81">you</text>
+<rect class="n sunk" x="580" y="64" width="128" height="26" rx="4"/>
+<text class="ts mid" x="644.0" y="81">provider</text>
+<text class="ts" x="10" y="114">Operating system patches</text>
+<rect class="n sig" x="178" y="96" width="128" height="26" rx="4"/>
+<text class="ts mid" x="242.0" y="113">you</text>
+<rect class="n sig" x="312" y="96" width="128" height="26" rx="4"/>
+<text class="ts mid" x="376.0" y="113">you</text>
+<rect class="n sunk" x="446" y="96" width="128" height="26" rx="4"/>
+<text class="ts mid" x="510.0" y="113">provider</text>
+<rect class="n sunk" x="580" y="96" width="128" height="26" rx="4"/>
+<text class="ts mid" x="644.0" y="113">provider</text>
+<text class="ts" x="10" y="146">Scaling and spare capacity</text>
+<rect class="n sig" x="178" y="128" width="128" height="26" rx="4"/>
+<text class="ts mid" x="242.0" y="145">you</text>
+<rect class="n sig" x="312" y="128" width="128" height="26" rx="4"/>
+<text class="ts mid" x="376.0" y="145">you</text>
+<rect class="n sunk" x="446" y="128" width="128" height="26" rx="4"/>
+<text class="ts mid" x="510.0" y="145">provider</text>
+<rect class="n sunk" x="580" y="128" width="128" height="26" rx="4"/>
+<text class="ts mid" x="644.0" y="145">provider</text>
+<text class="ts" x="10" y="178">Physical machines</text>
+<rect class="n sunk" x="178" y="160" width="128" height="26" rx="4"/>
+<text class="ts mid" x="242.0" y="177">provider</text>
+<rect class="n sunk" x="312" y="160" width="128" height="26" rx="4"/>
+<text class="ts mid" x="376.0" y="177">provider</text>
+<rect class="n sunk" x="446" y="160" width="128" height="26" rx="4"/>
+<text class="ts mid" x="510.0" y="177">provider</text>
+<rect class="n sunk" x="580" y="160" width="128" height="26" rx="4"/>
+<text class="ts mid" x="644.0" y="177">provider</text>
+<text class="ts tb" x="10" y="212">You pay for</text>
+<text class="ts" x="182" y="212">instances, by the</text>
+<text class="ts" x="182" y="227">hour, busy or idle</text>
+<text class="ts" x="316" y="212">nodes, by the hour,</text>
+<text class="ts" x="316" y="227">busy or idle</text>
+<text class="ts" x="450" y="212">container time while</text>
+<text class="ts" x="450" y="227">serving requests</text>
+<text class="ts" x="584" y="212">each request and</text>
+<text class="ts" x="584" y="227">its running time</text>
+</svg>
+</div>
+<figcaption>Each step to the right gives up some control and removes some work. The last row matters as much as the others: the further right, the closer the bill follows actual use.</figcaption>
+</figure>
+
+<p>Every step to the right is a trade. You lose control over the machine, the operating system and how long a process lives, and you gain time not spent on them. Whether that is a good trade depends on the workload, and the rest of this chapter is about telling which is which.</p>
+
+<h2 id="faas">Functions as a service</h2>
+<p>A function is a piece of code with one entry point, called the <dfn>handler</dfn>. The platform calls the handler with an event, and the handler returns a result. The photo app’s smallest function could look like this.</p>
+
+<pre data-lang="ts" data-title="handler.ts">type Db = { query(sql: string): Promise<string[]> };
+
+// Runs once per execution environment, during a cold start.
+const dbReady: Promise<Db> = connect();
+
+export async function handler(event: { userId: string }) {
+  const db = await dbReady;               // reused on every warm invocation
+  const rows = await db.query("select ...");
+  return { statusCode: 200, body: JSON.stringify({ user: event.userId, rows }) };
+}</pre>
+
+<p>There is no server code in it: nothing listens on a port, parses HTTP or manages threads. The platform does all of that and hands the function one event at a time.</p>
+
+<h3 id="lifecycle">The execution environment</h3>
+<p>Your code runs inside an <dfn>execution environment</dfn>: an isolated sandbox with some memory, a share of a processor, the language runtime and a copy of your code. On AWS Lambda each one is a small virtual machine built with Firecracker, a virtual machine monitor written for this purpose. The Firecracker project reports that it starts a virtual machine in as little as 125 ms with under 5 MiB of memory overhead, which is what makes it practical to give every customer’s function its own.</p>
+<p>An environment goes through three stages.</p>
+<ol>
+  <li><b>Init.</b> The platform creates the environment, loads your code, starts the runtime, and runs everything outside the handler: imports, configuration, the <code>connect()</code> call above.</li>
+  <li><b>Invoke.</b> The handler runs for one event. When it returns, the environment is frozen: its memory is kept and it gets no processor time. The next event thaws it and runs the handler again. This repeats, possibly thousands of times.</li>
+  <li><b>Shutdown.</b> After a period with no events, or when the provider wants the capacity back, the environment is destroyed.</li>
+</ol>
+<p>In the classic model one environment handles <em>one request at a time</em>. If a second request arrives while the first is running, the platform uses a second environment. This single fact explains most of how functions behave: their scaling, their cold starts, their trouble with databases, and their bill.</p>
+
+<h2 id="cold-starts">Cold starts</h2>
+<p>A request that finds a frozen environment waiting is a <dfn>warm start</dfn>: only the handler runs. A request that needs a new environment is a <dfn>cold start</dfn>: the whole init stage happens first, while the caller waits.</p>
+
+<figure class="fig wide" id="fig-coldwarm">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f432t f432d">
+<title id="f432t">A cold start compared with a warm start</title>
+<desc id="f432d">Two timelines. The first request to a new environment has four parts: creating the environment, starting the runtime, running your initialization code, and then the handler. The first three together are the cold start. The provider controls the first two and you control the third. Later requests to the same environment run only the handler, because the environment, the runtime and everything the initialization code built are still in memory. Between requests the environment is frozen, and after some idle time it is discarded.</desc>
+<g data-scene="cold">
+<text class="tb" x="10" y="18">First request to a new environment</text>
+<g data-s="1">
+<text class="ts" x="10" y="54">Cold</text>
+<rect class="n sunk" x="120.0" y="36" width="172.0" height="28" rx="4"/>
+<text class="ts mid" x="206.0" y="54">new environment</text>
+</g>
+<g data-s="2">
+<rect class="n sunk" x="292.0" y="36" width="103.2" height="28" rx="4"/>
+<text class="ts mid" x="343.6" y="54">start runtime</text>
+</g>
+<g data-s="3">
+<rect class="n async" x="395.2" y="36" width="172.0" height="28" rx="4"/>
+<text class="ts mid" x="481.2" y="54">your init code</text>
+</g>
+<g data-s="4">
+<rect class="n store" x="567.2" y="36" width="103.2" height="28" rx="4"/>
+<text class="ts mid" x="618.8" y="54">handler</text>
+</g>
+<g data-s="5">
+<path class="e none" d="M120 72v7H567.2v-7"/>
+<text class="ts mid" x="343.6" y="96">the cold start: everything before your handler runs</text>
+<path class="e none" d="M120 106v6H395.2v-6"/>
+<text class="ts mid" x="257.6" y="128">the provider’s part</text>
+<path class="e none" d="M395.2 106v6H567.2v-6"/>
+<text class="ts mid" x="481.2" y="128">your part</text>
+</g>
+</g>
+<g data-scene="warm">
+<text class="tb" x="10" y="166">Later requests to the same environment</text>
+<g data-s="1">
+<text class="ts" x="10" y="202">Warm</text>
+<rect class="n store" x="120.0" y="184" width="103.2" height="28" rx="4"/>
+<text class="ts mid" x="171.6" y="202">handler</text>
+</g>
+<g data-s="2">
+<text class="ts" x="236.95999999999998" y="196">The environment, the runtime and everything your init code</text>
+<text class="ts" x="236.95999999999998" y="212">built are still in memory. Only the handler runs.</text>
+</g>
+</g>
+<text class="ts" x="10" y="244">Between requests the environment is frozen. After some idle time, or when the provider needs</text>
+<text class="ts" x="10" y="260">the capacity, it is discarded, and the next request is cold again. Widths are illustrative.</text>
+
+</svg>
+</div>
+<ol class="steps" data-scene="cold" data-label="Cold start">
+  <li>A request arrives and no environment is free to take it. The provider creates a new one.</li>
+  <li>It starts the language runtime.</li>
+  <li>Your initialization code runs: imports, configuration, opening connections.</li>
+  <li>Only now does your handler run and answer the request.</li>
+  <li>Everything in front of the handler is the cold start. Part of it belongs to the provider, and part of it is yours to shorten.</li>
+</ol>
+<ol class="steps" data-scene="warm" data-label="Warm start">
+  <li>A later request reaches the same environment. Only the handler runs.</li>
+  <li>The environment, the runtime and everything your init code built are still in memory.</li>
+</ol>
+<figcaption>The handler takes the same time in both cases. A cold start adds everything in front of it.</figcaption>
+</figure>
+
+<p>How long a cold start takes depends mostly on things you choose. A small function in a light runtime such as Node.js or Python adds on the order of a hundred milliseconds or a few hundred. A large application on a runtime with a slow start, such as a Java framework that scans its classes at boot, can add several seconds. AWS caps the init stage at 10 seconds.</p>
+<p>How often cold starts happen depends on traffic. To see why, here is a small simulator that follows the rule above: one request per environment, and an environment is discarded after sitting idle for some time.</p>
+
+<pre data-lang="ts" data-title="simulate.ts">type Sim = { coldStarts: number; peakEnvironments: number; requests: number };
+
+/** Each environment serves one request at a time and is discarded after idleMs unused. */
+export function simulate(arrivalsMs: number[], durationMs: number, idleMs: number): Sim {
+  const freeAt: number[] = [];            // for each environment: when it is next free
+  let cold = 0, peak = 0;
+  for (const t of [...arrivalsMs].sort((a, b) => a - b)) {
+    // discard environments idle for too long
+    for (let i = freeAt.length - 1; i >= 0; i--) if (t - freeAt[i] > idleMs) freeAt.splice(i, 1);
+    // pick a warm, free environment: the most recently used one
+    let pick = -1;
+    for (let i = 0; i < freeAt.length; i++) if (freeAt[i] <= t && (pick < 0 || freeAt[i] > freeAt[pick])) pick = i;
+    if (pick < 0) { cold++; freeAt.push(t + durationMs); }
+    else freeAt[pick] = t + durationMs;
+    peak = Math.max(peak, freeAt.length);
+  }
+  return { coldStarts: cold, peakEnvironments: peak, requests: arrivalsMs.length };
+}</pre>
+
+<p>Running it with a five-minute idle limit on four traffic shapes gives these results.</p>
+<table>
+<thead><tr><th>Traffic</th><th>Requests</th><th>Cold starts</th><th>Environments at peak</th></tr></thead>
+<tbody>
+<tr><th>10 a second for a minute, 100 ms each</th><td>600</td><td>1</td><td>1</td></tr>
+<tr><th>10 a second for a minute, 250 ms each</th><td>600</td><td>3</td><td>3</td></tr>
+<tr><th>200 at the same instant</th><td>200</td><td>200</td><td>200</td></tr>
+<tr><th>One every 10 minutes for a day</th><td>144</td><td>144</td><td>1</td></tr>
+</tbody>
+</table>
+<p>Steady traffic almost never starts cold, because a warm environment is always about to become free. Two shapes are different. A sudden burst is cold for every request beyond the environments already warm. Sparse traffic is cold <em>every time</em>, because each environment is discarded before the next request comes. The real idle limit is not published and varies, so do not design around a specific number.</p>
+<p>Across all its customers, AWS said in April 2025 that cold starts typically occur in under 1% of invocations. That average hides the two bad cases: for a rarely used internal tool, the figure is close to 100%.</p>
+
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Judging cold starts by the average. A function with a 2-second cold start on 1% of requests has a fine median and a 99th percentile of two seconds. If a page calls five such functions, about 5% of page loads include at least one cold start. This is the tail arithmetic from <x-ref to="latency-and-throughput#tail-at-scale"></x-ref>.</p></div>
+
+<h3 id="reducing">Reducing them</h3>
+<ul>
+  <li><b>Do less at init.</b> Ship less code, import only what the handler uses, and delay loading rarely used parts until they are needed. This is the cheapest fix and often the largest.</li>
+  <li><b>Do the right things at init.</b> Work that every request needs, such as opening a database connection or reading configuration, belongs outside the handler so that it runs once per environment instead of once per request.</li>
+  <li><b>Keep environments ready.</b> AWS calls this <dfn>provisioned concurrency</dfn>, and Cloud Run calls it minimum instances: you pay for a number of environments to stay initialized. Requests up to that number never start cold. You are now paying for idle capacity again, at a lower rate.</li>
+  <li><b>Start from a snapshot.</b> Lambda SnapStart runs the init stage once when you publish a version, saves the memory and disk of the initialized environment, and starts new environments by restoring that snapshot. As of October 2026 it supports Java 11 and later, Python 3.12 and later, and .NET 8 and later. AWS describes the effect as taking start-up from several seconds to under a second in good cases. Anything unique that init created, such as a random seed or an identifier, is now shared by every environment restored from the snapshot, so it must be generated after the restore.</li>
+  <li><b>Use a lighter sandbox.</b> Cloudflare Workers run code in V8 isolates, the mechanism a browser uses to separate tabs, instead of a virtual machine per function. An isolate starts in a few milliseconds. The price is a narrower environment: JavaScript and WebAssembly, 128 MB of memory, and a limit of one second for start-up code.</li>
+</ul>
+
+<h2 id="scaling">Concurrency and scaling</h2>
+<p>The unit of capacity for functions is <dfn>concurrency</dfn>: the number of requests in progress at the same moment, which is also the number of environments in use. It follows from two numbers you can estimate.</p>
+<div class="formula">concurrency = requests per second × average duration in seconds</div>
+<p>This is Little’s law from <x-ref to="latency-and-throughput#littles-law"></x-ref>. At 400 requests a second and 250 ms each, 100 environments are busy. If a slow dependency stretches the duration to 2.5 seconds, the same traffic needs 1,000. Duration is under your influence and the request rate is not, so a slow downstream call is the usual way a function runs into its limit.</p>
+<p>Scaling is automatic and it is bounded twice. The figures are for AWS Lambda as of October 2026.</p>
+<ul>
+  <li><b>A total.</b> An account may run 1,000 concurrent executions in a region by default, shared by all its functions. The limit can be raised on request. Beyond it, requests are rejected with status <code>429</code>, which is called <dfn>throttling</dfn>.</li>
+  <li><b>A rate.</b> Each function can add at most 1,000 environments every 10 seconds. A burst larger than that is throttled until capacity catches up.</li>
+</ul>
+
+<figure class="fig wide" id="fig-ramp">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f433t f433d">
+<title id="f433t">A burst of traffic outrunning the rate at which a function can scale</title>
+<desc id="f433d">A chart of requests in progress against time in seconds. The number needed is 500 until second 5, then jumps to 4,000 and stays there. The number available is also 500 until second 5, then rises in a straight line by 1,000 every 10 seconds, reaching 4,000 at second 40. The area between the two lines, from second 5 to second 40, is shaded and labeled throttled.</desc>
+<line class="axis" x1="64" y1="214" x2="470" y2="214"/>
+<text class="ts end" x="56" y="218.0">0</text>
+<line class="grid" x1="64" y1="176" x2="470" y2="176"/>
+<text class="ts end" x="56" y="180.0">1,000</text>
+<line class="grid" x1="64" y1="138" x2="470" y2="138"/>
+<text class="ts end" x="56" y="142.0">2,000</text>
+<line class="grid" x1="64" y1="100" x2="470" y2="100"/>
+<text class="ts end" x="56" y="104.0">3,000</text>
+<line class="grid" x1="64" y1="62" x2="470" y2="62"/>
+<text class="ts end" x="56" y="66.0">4,000</text>
+<line class="grid" x1="64" y1="24" x2="470" y2="24"/>
+<text class="ts end" x="56" y="28.0">5,000</text>
+<text class="ts mid" x="64.0" y="232">0</text>
+<text class="ts mid" x="145.2" y="232">10</text>
+<text class="ts mid" x="226.4" y="232">20</text>
+<text class="ts mid" x="307.6" y="232">30</text>
+<text class="ts mid" x="388.8" y="232">40</text>
+<text class="ts mid" x="470.0" y="232">50</text>
+<text class="ts mid" x="267.0" y="252">seconds</text>
+<text class="ts mid" transform="translate(14 119) rotate(-90)">requests in progress</text>
+<path d="M104.6 62.0L388.8 62.0L104.6 195.0Z" fill="var(--fault)" opacity="0.14"/>
+<path class="line" style="stroke:var(--fault)" d="M64.0 195.0H104.6V62.0H470.0"/>
+<path class="line" style="stroke:var(--store)" d="M64.0 197.0H104.6L388.8 64.0H470.0"/>
+<text class="ts" x="120.84" y="54.0">needed</text>
+<text class="ts" x="307.6" y="134.2">available</text>
+<text class="ts" x="137.07999999999998" y="92.39999999999999">throttled</text>
+<text class="ts" x="492" y="40">A burst needs 4,000 requests</text>
+<text class="ts" x="492" y="56">in progress at once.</text>
+<text class="ts" x="492" y="90">A function gains at most 1,000</text>
+<text class="ts" x="492" y="106">environments every 10 seconds,</text>
+<text class="ts" x="492" y="122">so capacity takes 35 seconds to</text>
+<text class="ts" x="492" y="138">catch up.</text>
+<text class="ts" x="492" y="172">Requests in the shaded area</text>
+<text class="ts" x="492" y="188">are rejected, or wait in a queue</text>
+<text class="ts" x="492" y="204">if the trigger has one.</text>
+
+<rect class="hit" x="64" y="24" width="20.3" height="190" data-tip="Second 0|needed: 500|available: 500|nothing throttled"/>
+<rect class="hit" x="84.3" y="24" width="40.6" height="190" data-tip="Second 5|needed: 4,000|available: 500|throttled: 3,500"/>
+<rect class="hit" x="124.9" y="24" width="40.6" height="190" data-tip="Second 10|needed: 4,000|available: 1,000|throttled: 3,000"/>
+<rect class="hit" x="165.5" y="24" width="40.6" height="190" data-tip="Second 15|needed: 4,000|available: 1,500|throttled: 2,500"/>
+<rect class="hit" x="206.1" y="24" width="40.6" height="190" data-tip="Second 20|needed: 4,000|available: 2,000|throttled: 2,000"/>
+<rect class="hit" x="246.7" y="24" width="40.6" height="190" data-tip="Second 25|needed: 4,000|available: 2,500|throttled: 1,500"/>
+<rect class="hit" x="287.3" y="24" width="40.6" height="190" data-tip="Second 30|needed: 4,000|available: 3,000|throttled: 1,000"/>
+<rect class="hit" x="327.9" y="24" width="40.6" height="190" data-tip="Second 35|needed: 4,000|available: 3,500|throttled: 500"/>
+<rect class="hit" x="368.5" y="24" width="40.6" height="190" data-tip="Second 40|needed: 4,000|available: 4,000|nothing throttled"/>
+<rect class="hit" x="409.1" y="24" width="40.6" height="190" data-tip="Second 45|needed: 4,000|available: 4,000|nothing throttled"/>
+<rect class="hit" x="449.7" y="24" width="20.3" height="190" data-tip="Second 50|needed: 4,000|available: 4,000|nothing throttled"/>
+</svg>
+</div>
+<figcaption>Scaling is fast and it is not instant. The example assumes the account’s total limit has been raised above 4,000.</figcaption>
+</figure>
+
+<p>Because the total is shared, one runaway function can use all of it and throttle every other function in the account. Two settings prevent that. <dfn>Reserved concurrency</dfn> sets aside a number of executions for one function and also caps it at that number. It is a bulkhead in the sense of <x-ref to="resilience-patterns#bulkheads"></x-ref>: the function that processes uploads cannot starve the function that serves logins, and the reverse.</p>
+
+<h3 id="connections">The database connection problem</h3>
+<p>Automatic scaling moves the bottleneck to whatever the function calls. The classic case is a relational database. A PostgreSQL or MySQL server accepts a limited number of connections, often a few hundred, because each one costs it memory. A long-running application server opens a small pool and shares it among all its requests, as <x-ref to="indexes-and-queries#connections"></x-ref> described. Functions cannot share: each environment is a separate sandbox with its own connection.</p>
+
+<figure class="fig wide" id="fig-connections">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f434t f434d">
+<title id="f434t">Function environments exhausting database connections, and a pooling proxy that prevents it</title>
+<desc id="f434d">On the left, 300 function environments each open their own connection to a database whose limit is 200. A burst of traffic creates environments, each with a connection, and the database refuses the excess or runs out of memory. On the right, the same 300 environments connect to a pooling proxy, which holds a pool of 40 connections to the database. The proxy lends a database connection to each query and takes it back when the query ends.</desc>
+<text class="tb" x="10" y="18">Every environment opens its own connection</text>
+<rect class="n sig" x="10" y="34" width="32" height="22" rx="4"/>
+<rect class="n sig" x="48" y="34" width="32" height="22" rx="4"/>
+<rect class="n sig" x="86" y="34" width="32" height="22" rx="4"/>
+<rect class="n sig" x="124" y="34" width="32" height="22" rx="4"/>
+<rect class="n sig" x="10" y="64" width="32" height="22" rx="4"/>
+<rect class="n sig" x="48" y="64" width="32" height="22" rx="4"/>
+<rect class="n sig" x="86" y="64" width="32" height="22" rx="4"/>
+<rect class="n sig" x="124" y="64" width="32" height="22" rx="4"/>
+<rect class="n sig" x="10" y="94" width="32" height="22" rx="4"/>
+<rect class="n sig" x="48" y="94" width="32" height="22" rx="4"/>
+<rect class="n sig" x="86" y="94" width="32" height="22" rx="4"/>
+<rect class="n sig" x="124" y="94" width="32" height="22" rx="4"/>
+<text class="ts mid" x="86" y="136">300 environments</text>
+<rect class="n fault" x="240" y="44" width="100" height="62" rx="6"/>
+<text class="tb mid" x="290" y="71">Database</text>
+<text class="ts mid" x="290" y="88">limit: 200</text>
+<path class="e fault" d="M164 51H240"/>
+<path class="e fault" d="M164 63H240"/>
+<path class="e fault" d="M164 75H240"/>
+<path class="e fault" d="M164 87H240"/>
+<path class="e fault" d="M164 99H240"/>
+<text class="ts mid" x="202" y="40">300</text>
+<text class="ts" x="10" y="164">A burst of traffic creates environments, each with</text>
+<text class="ts" x="10" y="179">a connection. The database refuses the excess,</text>
+<text class="ts" x="10" y="194">or runs out of memory.</text>
+<path class="e none dash" d="M360 8V206"/>
+<text class="tb" x="380" y="18">A pooling proxy shares a few connections</text>
+<rect class="n sig" x="380" y="34" width="32" height="18" rx="4"/>
+<rect class="n sig" x="418" y="34" width="32" height="18" rx="4"/>
+<rect class="n sig" x="380" y="58" width="32" height="18" rx="4"/>
+<rect class="n sig" x="418" y="58" width="32" height="18" rx="4"/>
+<rect class="n sig" x="380" y="82" width="32" height="18" rx="4"/>
+<rect class="n sig" x="418" y="82" width="32" height="18" rx="4"/>
+<rect class="n sig" x="380" y="106" width="32" height="18" rx="4"/>
+<rect class="n sig" x="418" y="106" width="32" height="18" rx="4"/>
+<text class="ts" x="380" y="146">300 environments</text>
+<rect class="n async" x="488" y="50" width="84" height="52" rx="6"/>
+<text class="tb mid" x="530" y="72">Proxy</text>
+<text class="ts mid" x="530" y="89">pool of 40</text>
+<path class="e sig" d="M452 58H488"/>
+<path class="e sig" d="M452 70H488"/>
+<path class="e sig" d="M452 82H488"/>
+<path class="e sig" d="M452 94H488"/>
+<rect class="n store" x="620" y="50" width="90" height="52" rx="6"/>
+<text class="tb mid" x="665" y="72">Database</text>
+<text class="ts mid" x="665" y="89">limit: 200</text>
+<path class="e store" d="M572 68H620"/>
+<path class="e store" d="M572 84H620"/>
+<text class="ts mid" x="596" y="46">40</text>
+<text class="ts" x="380" y="172">The proxy lends a database connection to each</text>
+<text class="ts" x="380" y="187">query and takes it back when the query ends.</text>
+</svg>
+</div>
+<figcaption>Three hundred environments rarely run three hundred queries at the same instant. The proxy exploits the difference.</figcaption>
+</figure>
+
+<p>There are three ways out, and they combine.</p>
+<ul>
+  <li><b>A pooling proxy</b> between the functions and the database, such as PgBouncer, or Amazon RDS Proxy as a managed service. Functions connect to the proxy, which is cheap, and the proxy multiplexes their queries over a small pool of real connections.</li>
+  <li><b>A cap on the function.</b> Reserved concurrency below the database’s connection limit guarantees the function alone cannot exhaust it.</li>
+  <li><b>A database reached over HTTP.</b> Stores built for this style, such as DynamoDB, have no connection limit of this kind because every request stands alone.</li>
+</ul>
+<p>The general lesson applies to any downstream system with a fixed capacity: a third-party API with a rate limit, a legacy service, a search cluster. Something that scales without limit should not call something that does not without a limit in between. A queue is the usual buffer, as the next section shows.</p>
+
+<h2 id="triggers">What starts a function</h2>
+<p>A function runs because something invoked it. There are three ways, and they differ in who waits and who retries.</p>
+<table>
+<thead><tr><th>Style</th><th>Typical sources</th><th>Caller waits?</th><th>On failure</th></tr></thead>
+<tbody>
+<tr><th>Synchronous</th><td>An HTTP request through an API gateway or a function URL</td><td>Yes, for the response</td><td>The caller gets the error and decides</td></tr>
+<tr><th>Asynchronous</th><td>An object was stored, a notification was published, a schedule fired</td><td>No. The platform queues the event internally</td><td>The platform retries, then discards or dead-letters</td></tr>
+<tr><th>Polling</th><td>A queue, a stream, a database change stream</td><td>No. The platform reads batches and invokes the function</td><td>The batch returns to the source and is delivered again</td></tr>
+</tbody>
+</table>
+<p>For asynchronous events, Lambda retries a failed invocation twice by default, and events that still fail go to a dead-letter queue or failure destination if you configured one. If you did not, they are dropped. For polling sources the queue’s own rules apply: the visibility timeout and redelivery count from <x-ref to="message-queues#ack"></x-ref>.</p>
+<p>In every non-synchronous style the same event can arrive more than once, so handlers must be idempotent, for the reasons in <x-ref to="idempotency-and-delivery"></x-ref>. With a batch there is a second concern: if one message in ten fails, the other nine should not be processed again. Queue triggers let the handler report which messages failed.</p>
+
+<pre data-lang="ts" data-title="batch.ts">type Message = { messageId: string; body: string };
+type BatchResult = { batchItemFailures: { itemIdentifier: string }[] };
+
+interface ProcessedStore {
+  has(id: string): Promise<boolean>;
+  add(id: string): Promise<void>;
+}
+
+export async function handleBatch(
+  messages: Message[],
+  done: ProcessedStore,
+  work: (body: string) => Promise<void>,
+): Promise<BatchResult> {
+  const failures: { itemIdentifier: string }[] = [];
+  for (const m of messages) {
+    try {
+      if (await done.has(m.messageId)) continue;   // a duplicate delivery: skip it
+      await work(m.body);
+      await done.add(m.messageId);                 // recorded only after success
+    } catch {
+      failures.push({ itemIdentifier: m.messageId });  // only this one is retried
+    }
+  }
+  return { batchItemFailures: failures };
+}</pre>
+
+<p>The order of the three lines inside <code>try</code> matters. Recording the message before doing the work would mean that a failure leaves it marked as done, and the retry would skip it: the message is lost. Recording after the work means a crash between the two lines repeats the work once, which is the safe direction. To close that gap completely, write the record in the same database transaction as the work’s result, as <x-ref to="idempotency-and-delivery#consumers"></x-ref> showed.</p>
+
+<div class="note production"><p><span class="label">In production.</span> A queue between an event source and a function is also a throttle. Set the function’s maximum concurrency for that queue to what the downstream system can take, and a burst waits in the queue instead of arriving all at once. AWS recommends a queue visibility timeout of at least six times the function’s timeout, so that a message being retried inside the function is not handed to a second copy.</p></div>
+
+<h3 id="thumbnails">An example: thumbnails for the photo app</h3>
+<p>When Ana uploads a photo, the app needs three smaller versions of it. This is work with an event that starts it, no user waiting on the result, a few seconds of processing, and a rate that follows uploads: quiet at night, busy in the evening, very busy after a public holiday.</p>
+
+<figure class="fig wide" id="fig-thumbs">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f435t f435d">
+<title id="f435t">An event-driven thumbnail pipeline built from serverless parts</title>
+<desc id="f435d">Ana’s phone uploads a photo to the originals prefix of an object store. The store emits an event for the new object into a queue. The queue invokes a function that makes thumbnails. The function writes three sizes to a separate thumbs prefix of the object store and marks the photo as ready in the database. A message that fails five times moves to a dead-letter queue. Nothing runs between uploads, and a thousand uploads at once become a thousand copies of the function, up to its concurrency limit.</desc>
+<rect class="n" x="10" y="34" width="96" height="50" rx="6"/>
+<text class="ts tb mid" x="58" y="63.5">Ana’s phone</text>
+<rect class="n store" x="160" y="34" width="130" height="50" rx="6"/>
+<text class="ts tb mid" x="225" y="55">Object store</text>
+<text class="ts mid" x="225" y="72">originals/</text>
+<rect class="n async" x="346" y="34" width="110" height="50" rx="6"/>
+<text class="ts tb mid" x="401" y="55">Queue</text>
+<text class="ts mid" x="401" y="72">one event each</text>
+<rect class="n sig" x="512" y="34" width="150" height="50" rx="6"/>
+<text class="ts tb mid" x="587" y="55">Function</text>
+<text class="ts mid" x="587" y="72">make thumbnails</text>
+<g data-s="1">
+<path class="e" d="M106 59H160"/>
+<text class="ts mid" x="133" y="51">1</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M290 59H346"/>
+<text class="ts mid" x="318" y="51">2</text>
+</g>
+<g data-s="3">
+<path class="e async" d="M456 59H512"/>
+<text class="ts mid" x="484" y="51">3</text>
+</g>
+<rect class="n fault" x="336" y="132" width="130" height="44" rx="6"/>
+<text class="ts tb mid" x="401" y="158.5">Dead-letter queue</text>
+<g data-s="6">
+<path class="e fault" d="M401 84V132"/>
+<text class="ts" x="410" y="112">after 5 failures</text>
+</g>
+<rect class="n store" x="480" y="132" width="110" height="44" rx="6"/>
+<text class="ts tb mid" x="535" y="150">Object store</text>
+<text class="ts mid" x="535" y="167">thumbs/</text>
+<g data-s="4">
+<path class="e store" d="M535 84V132"/>
+<text class="ts" x="544" y="112">4</text>
+</g>
+<rect class="n store" x="604" y="132" width="106" height="44" rx="6"/>
+<text class="ts tb mid" x="657" y="150">Database</text>
+<text class="ts mid" x="657" y="167">photo: ready</text>
+<g data-s="5">
+<path class="e store" d="M645 84V132"/>
+<text class="ts" x="654" y="112">5</text>
+</g>
+<text class="ts" x="10" y="206">1 upload   2 the store emits an event for the new object   3 the queue invokes the function   4 write three sizes   5 mark ready</text>
+<text class="ts" x="10" y="222">Nothing runs between uploads. A thousand uploads at once become a thousand copies of the function, up to its concurrency limit.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="photo">Ana’s phone uploads a photo straight to the object store.</li>
+  <li data-msg="object created">The store emits an event for the new object, and the event lands on a queue.</li>
+  <li data-msg="object created">The queue invokes the function with that event.</li>
+  <li data-msg="thumbnails">The function reads the original, makes the thumbnails and writes them back to the object store.</li>
+  <li data-msg="photo: ready">It marks the photo as ready in the database.</li>
+  <li data-msg="after 5 failures">If an event fails five times, it is moved to a dead-letter queue instead of being retried for ever.</li>
+</ol>
+<figcaption>The upload itself goes straight to object storage with a presigned URL, as in <x-ref to="object-and-file-storage#presigned"></x-ref>. No server of the app’s handles the bytes.</figcaption>
+</figure>
+
+<p>Two details in the figure are deliberate. The thumbnails go to a different prefix from the originals, and the trigger listens only to <code>originals/</code>. A function that writes into the location that triggers it invokes itself without end, and the bill grows until someone notices. The queue and its dead-letter queue mean that a corrupt image fails five times and is set aside for a person to look at, instead of failing silently or blocking the photos behind it.</p>
+
+<h2 id="state">State</h2>
+<p>A function must be written as if every invocation ran on a new machine, because some will. The stateless rule from <x-ref to="scalability#stateless"></x-ref> is enforced here by the platform.</p>
+<table>
+<thead><tr><th>Kind of state</th><th>In a function</th></tr></thead>
+<tbody>
+<tr><th>Variables outside the handler</th><td>Survive between invocations in the same environment. Useful as a cache and for connections. Never the only copy of anything, and never shared across environments.</td></tr>
+<tr><th>Local disk</th><td>A temporary directory, private to the environment and lost with it. Use it for scratch files within one invocation.</td></tr>
+<tr><th>Sessions, counters, anything shared</th><td>In an external store: a database, a cache, object storage.</td></tr>
+<tr><th>Long-lived connections from clients</th><td>Held by a gateway, which invokes the function for each message. The function never holds a WebSocket itself.</td></tr>
+<tr><th>Work after the response</th><td>Not reliable. Once the handler returns, the environment may be frozen at once.</td></tr>
+</tbody>
+</table>
+<p>The last row surprises people moving from ordinary servers. Code that sends a response and then, in the background, writes a log line or flushes metrics will sometimes be frozen in the middle and finish minutes later, or never. Finish everything before returning, or hand the follow-up to a queue.</p>
+
+<h2 id="limits">Limits</h2>
+<p>Every function platform publishes hard limits, and a design must fit inside them. These are the ones that most often decide whether a workload fits, as of October 2026.</p>
+<table>
+<thead><tr><th>Limit</th><th>AWS Lambda</th><th>Cloudflare Workers, paid plan</th></tr></thead>
+<tbody>
+<tr><th>Longest single run</th><td>900 seconds (15 minutes)</td><td>No wall-clock limit on HTTP requests. CPU time 30 seconds by default, up to 5 minutes</td></tr>
+<tr><th>Memory</th><td>128 MB to 10,240 MB</td><td>128 MB per isolate</td></tr>
+<tr><th>Request and response size</th><td>6 MB each when synchronous, 1 MB for asynchronous events, 200 MB for a streamed response</td><td>Set by the plan, not the runtime</td></tr>
+<tr><th>Code size</th><td>250 MB unzipped, or a 10 GB container image</td><td>64 MiB uncompressed</td></tr>
+<tr><th>Temporary disk</th><td>512 MB, configurable to 10,240 MB</td><td>None</td></tr>
+<tr><th>Concurrency</th><td>1,000 per region by default, shared by all functions</td><td>No fixed number of this kind</td></tr>
+</tbody>
+</table>
+<p>Lambda gives a function processor power in proportion to its memory setting, reaching one full virtual CPU at 1,769 MB. A function that is slow because it computes, not because it waits, often becomes both faster and cheaper with more memory, since it is billed for memory multiplied by time.</p>
+<p>The size limits shape designs. A 6 MB ceiling on a synchronous response rules out returning a large file through a function, which is one more reason to hand clients a link to object storage instead. The 15-minute ceiling rules out a long batch job as a single invocation, and the section on durable functions below shows the way around it.</p>
+
+<h2 id="cost">What it costs</h2>
+<p>A function’s bill has two parts: a small fee per request, and a fee for <dfn>GB-seconds</dfn>, which is the memory you configured multiplied by the time your code ran.</p>
+<div class="formula">monthly cost = requests × (duration in seconds × memory in GB × price per GB-second + price per request)</div>
+<p>For AWS Lambda on x86 in the us-east-1 region, as of October 2026, the prices are $0.0000166667 per GB-second and $0.20 per million requests. Arm processors are about 20% cheaper per GB-second. Each month the first 1 million requests and 400,000 GB-seconds are free. Since August 2025 the init stage of a cold start is billed like any other running time.</p>
+
+<div class="widget" data-widget="lambdacost">
+<h4>Function cost and break-even</h4>
+<p>The monthly cost of a function, and the traffic at which an always-on server becomes cheaper. Prices default to AWS Lambda on x86.</p>
+<div class="controls">
+  <label>Requests per month<input type="number" name="requests" value="10000000" min="0" step="1000000"></label>
+  <label>Average duration, in ms<input type="number" name="ms" value="120" min="1" step="10"></label>
+  <label>Memory, in MB<input type="number" name="memory" value="512" min="128" max="10240" step="128"></label>
+  <label>Price per GB-second, in $<input type="number" name="gbs" value="0.0000166667" min="0" step="0.000001"></label>
+  <label>Price per million requests, in $<input type="number" name="reqprice" value="0.20" min="0" step="0.05"></label>
+  <label>Always-on alternative, in $ a month<input type="number" name="server" value="60" min="0" step="10"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 220" role="img" aria-label="Monthly cost against requests per month: a rising line for the function, a flat line for the always-on alternative, the break-even point and the current volume marked."><line x1="64" x2="620" y1="20" y2="20" class="grid"></line><line x1="64" x2="620" y1="180" y2="180" class="axis"></line><text x="56" y="24" class="ts end">$97</text><text x="56" y="184" class="ts end">$0</text><text x="64" y="197" class="ts">0</text><text x="620" y="197" class="ts end">75 million</text><text x="342" y="214" class="ts mid">Cost per month against requests per month</text><path d="M64 81.2 L620 81.2" class="line" style="stroke:var(--ink-2)"></path><text x="616" y="74.2" class="ts end">always on: $60</text><path d="M64 180 L620 31.9" class="line" style="stroke:var(--async)"></path><text x="402.7" y="80.1" class="ts end">function</text><line x1="434.7" x2="434.7" y1="81.2" y2="180" class="axis" stroke-dasharray="4 4"></line><text x="434.7" y="197" class="ts mid">break-even</text><circle cx="138.1" cy="160.2" r="5.5" class="dot"></circle><text x="148.1" y="174" class="tb">now: $12.00</text></svg>
+<dl class="results">
+  <div><dt>Compute used</dt><dd data-out="gbs">600 thousand GB-s</dd></div>
+  <div><dt>Function cost per month</dt><dd data-out="cost">$12.00</dd></div>
+  <div><dt>Average copies running</dt><dd data-out="conc">0.463</dd></div>
+  <div><dt>Break-even volume</dt><dd data-out="breakeven">50 million /month</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At these prices the function costs about $12.00 a month before any free allowance: $10.00 for compute and $2.00 for requests. On average 0.463 copies are running at once, so an always-on server would sit idle most of the time. The function stays cheaper than the $60 alternative up to about 50 million requests a month.</p>
+</div>
+
+<p>The third result explains the economics. Ten million requests a month sounds large and is under four a second. At 120 ms each, less than half of one copy of the function is busy on average. A single small server can run dozens of such requests at once, so it would be idle nearly all the time, and you would want two of them for availability. Paying per use wins because most of the capacity you would otherwise rent is unused.</p>
+
+<figure class="fig wide" id="fig-cost">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f436t f436d">
+<title id="f436t">Monthly cost of a function and of an always-on server as traffic grows</title>
+<desc id="f436d">A chart of monthly cost against requests per month. The always-on server is a flat line at 60 dollars. The function is a straight line from zero that rises by 1 dollar 20 for each million requests, crossing the server’s line at 50 million requests and reaching 180 dollars at 150 million. Below the break-even point the function is cheaper, and at zero traffic it costs nothing. Above it each extra million requests adds cost, where the server would have absorbed them for free until it is full. The function is assumed to run for 120 milliseconds at 512 megabytes per request.</desc>
+<line class="axis" x1="64" y1="214" x2="470" y2="214"/>
+<text class="ts end" x="56" y="218.0">$0</text>
+<line class="grid" x1="64" y1="166.5" x2="470" y2="166.5"/>
+<text class="ts end" x="56" y="170.5">$50</text>
+<line class="grid" x1="64" y1="119" x2="470" y2="119"/>
+<text class="ts end" x="56" y="123.0">$100</text>
+<line class="grid" x1="64" y1="71.5" x2="470" y2="71.5"/>
+<text class="ts end" x="56" y="75.5">$150</text>
+<line class="grid" x1="64" y1="24" x2="470" y2="24"/>
+<text class="ts end" x="56" y="28.0">$200</text>
+<text class="ts mid" x="64.0" y="232">0</text>
+<text class="ts mid" x="199.33333333333331" y="232">50M</text>
+<text class="ts mid" x="334.66666666666663" y="232">100M</text>
+<text class="ts mid" x="470.0" y="232">150M</text>
+<text class="ts mid" x="267.0" y="252">requests per month</text>
+<text class="ts mid" transform="translate(14 119) rotate(-90)">cost per month</text>
+<path class="line" style="stroke:var(--sig)" d="M64.0 157.0H470.0"/>
+<path class="line" style="stroke:var(--async)" d="M64.0 214.0L470.0 43.0"/>
+<path class="e none dash" d="M199.3 157.0V214"/>
+<circle class="dot" cx="199.3" cy="157.0" r="4"/>
+<text class="ts" x="345.49333333333334" y="149.0">always-on server: $60</text>
+<text class="ts end" x="329.25333333333333" y="79.1">function</text>
+<text class="ts" x="207.33333333333331" y="193.1">break-even</text>
+<text class="ts" x="492" y="40">Below 50 million requests a</text>
+<text class="ts" x="492" y="56">month the function is cheaper,</text>
+<text class="ts" x="492" y="72">and at zero traffic it costs</text>
+<text class="ts" x="492" y="88">nothing.</text>
+<text class="ts" x="492" y="124">Above that, each extra million</text>
+<text class="ts" x="492" y="140">requests adds $1.20, and the</text>
+<text class="ts" x="492" y="156">server would have absorbed</text>
+<text class="ts" x="492" y="172">them for free until it is full.</text>
+<text class="ts" x="492" y="206">120 ms at 512 MB per request.</text>
+
+<rect class="hit" x="64" y="24" width="13.5" height="190" data-tip="0 million requests a month|function: $0|always-on server: $60|the function is $60 cheaper"/>
+<rect class="hit" x="77.6" y="24" width="27.1" height="190" data-tip="10 million requests a month|function: $12|always-on server: $60|the function is $48 cheaper"/>
+<rect class="hit" x="104.6" y="24" width="27.1" height="190" data-tip="20 million requests a month|function: $24|always-on server: $60|the function is $36 cheaper"/>
+<rect class="hit" x="131.7" y="24" width="27.1" height="190" data-tip="30 million requests a month|function: $36|always-on server: $60|the function is $24 cheaper"/>
+<rect class="hit" x="158.8" y="24" width="27.1" height="190" data-tip="40 million requests a month|function: $48|always-on server: $60|the function is $12 cheaper"/>
+<rect class="hit" x="185.8" y="24" width="27.1" height="190" data-tip="50 million requests a month|function: $60|always-on server: $60|the same cost: break-even"/>
+<rect class="hit" x="212.9" y="24" width="27.1" height="190" data-tip="60 million requests a month|function: $72|always-on server: $60|the server is $12 cheaper"/>
+<rect class="hit" x="240.0" y="24" width="27.1" height="190" data-tip="70 million requests a month|function: $84|always-on server: $60|the server is $24 cheaper"/>
+<rect class="hit" x="267.0" y="24" width="27.1" height="190" data-tip="80 million requests a month|function: $96|always-on server: $60|the server is $36 cheaper"/>
+<rect class="hit" x="294.1" y="24" width="27.1" height="190" data-tip="90 million requests a month|function: $108|always-on server: $60|the server is $48 cheaper"/>
+<rect class="hit" x="321.2" y="24" width="27.1" height="190" data-tip="100 million requests a month|function: $120|always-on server: $60|the server is $60 cheaper"/>
+<rect class="hit" x="348.2" y="24" width="27.1" height="190" data-tip="110 million requests a month|function: $132|always-on server: $60|the server is $72 cheaper"/>
+<rect class="hit" x="375.3" y="24" width="27.1" height="190" data-tip="120 million requests a month|function: $144|always-on server: $60|the server is $84 cheaper"/>
+<rect class="hit" x="402.4" y="24" width="27.1" height="190" data-tip="130 million requests a month|function: $156|always-on server: $60|the server is $96 cheaper"/>
+<rect class="hit" x="429.4" y="24" width="27.1" height="190" data-tip="140 million requests a month|function: $168|always-on server: $60|the server is $108 cheaper"/>
+<rect class="hit" x="456.5" y="24" width="13.5" height="190" data-tip="150 million requests a month|function: $180|always-on server: $60|the server is $120 cheaper"/>
+</svg>
+</div>
+<figcaption>Pay-per-use is a straight line through zero. Rented capacity is flat until it is full. Where they cross depends on how busy the rented capacity would have been.</figcaption>
+</figure>
+
+<p>The crossing point moves with the shape of traffic. Steady load around the clock is the worst case for functions, because a server would be well used. Spiky load is the best case, because a server sized for the peak sits idle the rest of the time and a function does not.</p>
+<p>The function’s own charge is seldom the whole bill. An API gateway in front is priced per request too, and for small, fast functions it can cost more than the function. Logs are billed by volume, and a function that logs every event generously can spend more on logging than on computing. Add data transfer and whatever the function calls. A fair comparison covers the full path of a request, not one line of it.</p>
+<p>The server’s bill is incomplete as well. It leaves out the hours someone spends patching, resizing and being paged for it. For a small team that time is usually worth more than either figure in the chart.</p>
+
+<h2 id="prime-video">A case: Prime Video’s monitoring service</h2>
+<p>In 2023 a team at Amazon Prime Video published an account of rebuilding a service, and it became the most discussed serverless story of the year. The service checks live video streams for defects: frozen frames, corrupted blocks, audio out of step with the picture.</p>
+<p>The first version was assembled from serverless parts. A workflow service, AWS Step Functions, coordinated a chain of Lambda functions: one split the stream into frames and audio, others ran defect detectors on them, another combined the results. Frames passed between functions by way of object storage.</p>
+
+<figure class="fig wide" id="fig-prime">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f437t f437d">
+<title id="f437t">The Prime Video monitoring service before and after its redesign</title>
+<desc id="f437d">Before: a workflow service coordinates three functions, split into frames, detect defects and combine results. The split function writes every frame to object storage and the detect function reads it back. There are several state transitions for every second of every stream, each one billed. After: one service on container instances contains the same three steps. Frames stay in memory and are passed between steps as function calls. There is no per-step charge and no storage round trip, and the service scales by running more copies of itself. The reported saving is about 90 percent of infrastructure cost.</desc>
+<text class="tb" x="10" y="18">Before: a workflow of functions</text>
+<rect class="n async" x="110" y="32" width="140" height="34" rx="6"/>
+<text class="ts tb mid" x="180" y="53.5">Workflow service</text>
+<rect class="n sig" x="10" y="96" width="96" height="40" rx="6"/>
+<text class="ts tb mid" x="58" y="112">Split</text>
+<text class="ts mid" x="58" y="129">into frames</text>
+<rect class="n sig" x="132" y="96" width="96" height="40" rx="6"/>
+<text class="ts tb mid" x="180" y="112">Detect</text>
+<text class="ts mid" x="180" y="129">defects</text>
+<rect class="n sig" x="254" y="96" width="86" height="40" rx="6"/>
+<text class="ts tb mid" x="297" y="112">Combine</text>
+<text class="ts mid" x="297" y="129">results</text>
+<path class="e async" d="M180 66L58 96"/>
+<path class="e async" d="M180 66L180 96"/>
+<path class="e async" d="M180 66L297 96"/>
+<rect class="n store" x="70" y="164" width="220" height="34" rx="6"/>
+<text class="ts tb mid" x="180" y="185.5">Object storage: every frame</text>
+<path class="e store" d="M58 136L120 164"/>
+<path class="e store" d="M180 164V136"/>
+<text class="ts" x="10" y="222">Several state transitions for every second of every</text>
+<text class="ts" x="10" y="237">stream, each one billed. Every frame written to</text>
+<text class="ts" x="10" y="252">storage by one function and read back by the next.</text>
+<path class="e none dash" d="M360 8V264"/>
+<text class="tb" x="380" y="18">After: one process</text>
+<rect class="n" x="380" y="32" width="330" height="166" rx="8"/>
+<text class="ts" x="396" y="52">one service on container instances</text>
+<rect class="n sig" x="396" y="68" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="441" y="94.5">Split</text>
+<rect class="n sig" x="500" y="68" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="545" y="94.5">Detect</text>
+<rect class="n sig" x="604" y="68" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="649" y="94.5">Combine</text>
+<path class="e" d="M486 90H500"/>
+<path class="e" d="M590 90H604"/>
+<rect class="n store" x="396" y="132" width="298" height="50" rx="6"/>
+<text class="ts tb mid" x="545" y="152">frames stay in memory</text>
+<text class="ts mid" x="545" y="170">passed between steps as function calls</text>
+<text class="ts" x="380" y="222">No per-step charge and no storage round trip. Scaled</text>
+<text class="ts" x="380" y="237">by running more copies of the whole service.</text>
+<text class="ts" x="380" y="252">Reported saving: about 90% of infrastructure cost.</text>
+
+</svg>
+</div>
+<figcaption>The steps did not change. What changed is that the boundaries between them stopped being network and storage operations.</figcaption>
+</figure>
+
+<p>According to the team’s account, it stopped scaling at about 5% of the load they expected. Two things were responsible:</p>
+<ul>
+  <li><b>The workflow was too fine-grained.</b> It performed several state transitions for every second of every stream. Step Functions bills per transition and limits how many an account may make, and the service hit that limit.</li>
+  <li><b>The data moved the long way round.</b> Every frame was written to object storage by one function and read back by another. That is a large number of storage requests for data that lived only a moment.</li>
+</ul>
+<p>The rebuilt version runs all the steps in one process on container instances. Frames stay in memory and pass from step to step as ordinary function calls. The team reported that infrastructure cost fell by 90%, and the service could handle the load.</p>
+<p>The story was widely read as “serverless failed” or “microservices failed”. The account supports a narrower conclusion.</p>
+<ul>
+  <li><b>The grain was wrong for this workload.</b> A per-step billed workflow suits steps that happen a few times per business event: an order, a signup, an upload. It does not suit steps that happen many times a second on a continuous stream. That is a steady, high-volume, data-heavy job, which is the profile where pay-per-use loses.</li>
+  <li><b>Passing bulk data between functions is expensive.</b> Functions share nothing, so anything large must travel through storage or the network. Steps that exchange a lot of data belong in one process.</li>
+  <li><b>The first version was not a mistake.</b> By the team’s own description it let them build the service quickly. The cost of that speed appeared only at scale, and by then they knew enough to design the replacement. This is the “start simple, then change what measurement shows” advice from <x-ref to="monoliths-and-microservices#cases"></x-ref>, arriving from the opposite direction.</li>
+</ul>
+
+<h2 id="fits">What fits and what does not</h2>
+<p>The case gives one side of a general pattern. Functions suit work that is driven by events, short, and uneven. They do not suit work that is steady, long, or needs to hold on to something.</p>
+<table>
+<thead><tr><th>Fits well</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Reacting to events: a file arrived, a row changed, a message was queued</th><td>The trigger, the scaling and the retries are provided</td></tr>
+<tr><th>Scheduled jobs that run for seconds or minutes</th><td>Nothing to keep running between runs. See <x-ref to="scheduling-and-workflows#cron"></x-ref></td></tr>
+<tr><th>Webhooks and glue between services</th><td>Small, rarely called, and tedious to host otherwise</td></tr>
+<tr><th>APIs with low or very uneven traffic</th><td>No cost while idle, and bursts are absorbed</td></tr>
+<tr><th>New products with unknown demand</th><td>No capacity to guess, and little to operate</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Fits badly</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Steady, high-volume traffic</th><td>Rented capacity would be well used and cheaper</td></tr>
+<tr><th>Strict latency at the 99th percentile</th><td>Cold starts land in the tail unless you pay to keep environments warm</td></tr>
+<tr><th>Long computations, large memory, GPUs</th><td>Run-time and memory limits, and limited hardware choice</td></tr>
+<tr><th>Long-lived connections and in-memory state</th><td>Environments are frozen and discarded. See <x-ref to="realtime-communication#scaling"></x-ref></td></tr>
+<tr><th>Many steps exchanging bulk data</th><td>The Prime Video problem</td></tr>
+</tbody>
+</table>
+<p>Most systems have work of both kinds, and mixing is normal. The photo app can serve its feed from long-running containers and still make thumbnails, send the weekly digest and receive payment webhooks with functions.</p>
+
+<h3 id="shapes">Shapes to avoid</h3>
+<ul>
+  <li><b>Functions calling functions and waiting.</b> While function A waits for function B, both are billed, both count against concurrency, and both must stay inside A’s timeout. A chain of three is three bills for one piece of work. Put the code in one function, or connect them with a queue so that nobody waits.</li>
+  <li><b>One function per tiny step.</b> Dozens of functions with a few lines each give you a distributed system to debug in exchange for nothing. A function should be a unit you would deploy on its own for a reason.</li>
+  <li><b>One function that does everything.</b> The opposite extreme: a whole web application behind a single handler. It works, and it brings a large package, slow cold starts and one set of permissions for everything. It can be a reasonable way to move an existing application. For new code, group by what changes and scales together.</li>
+  <li><b>A function that triggers itself.</b> Writing to the place you are triggered from, as in the thumbnail example, or publishing to the queue you consume without a stop condition.</li>
+</ul>
+
+<h2 id="containers">Serverless containers and the edge</h2>
+<p>Functions are one point on the line in the first figure. Two neighbors are worth knowing, because they remove some of the limits above.</p>
+<p><b>Serverless containers.</b> Services such as Google Cloud Run, AWS Fargate and Azure Container Apps run a container image of yours and manage the machines under it. On Cloud Run the container is an ordinary web server, and one instance handles many requests at once: up to 80 by default and at most 1,000, as of October 2026. That removes the one-request-per-environment rule and most of what follows from it. An instance can keep a shared connection pool, a burst needs fewer new instances, and cold starts affect fewer requests. It still scales to zero unless you set a minimum. You bring the web server and the image, which is more to maintain than a handler and far less than a cluster. Lambda has moved in the same direction: since late 2025 it can also run functions on instances that serve several requests each.</p>
+<p><b>Edge functions.</b> Platforms such as Cloudflare Workers run your code in the provider’s points of presence, close to users, using the isolates described under cold starts. They suit short work on the request path: authentication checks, redirects, rewriting headers, assembling a page from cached pieces. <x-ref to="cdn-and-edge#edge-compute"></x-ref> covers them. The usual catch is data: code that runs in 300 cities and queries a database in one of them has moved the computation closer to the user and left the slow part where it was.</p>
+
+<h2 id="durable">Long-running work</h2>
+<p>A single invocation is short-lived by design. Work that takes hours or waits on people, such as “resize, then wait for moderation, then publish, and send a reminder after three days”, needs something that remembers where it is. <x-ref to="scheduling-and-workflows#durable-execution"></x-ref> explained the idea: record each completed step, and after any interruption replay the record to get back to the same point.</p>
+<p>Serverless platforms offer this in two forms. A <b>workflow service</b> such as AWS Step Functions holds the state machine outside your code and invokes a function for each step. <b>Durable functions</b> let you write the whole flow as one ordinary function. Azure has offered this for years, and AWS Lambda added it in late 2025. In Lambda’s version the code wraps each unit of work in a <dfn>step</dfn>, whose result is checkpointed, and calls a <dfn>wait</dfn> to pause. During a wait nothing is running and nothing is billed. When it is time to continue, the platform invokes the function again from the top and feeds it the stored results of the steps already done, so those steps are skipped. Each invocation is still limited to 15 minutes, and the whole execution may last up to a year.</p>
+<p>The constraint is the one from that earlier chapter. Because the code is replayed, it must be deterministic outside its steps: no reading the clock, no random numbers, no network calls, except inside a step whose result is recorded.</p>
+<p>The Prime Video case is the caution to keep beside this section. These tools are for flows with a modest number of steps per business event. They are not a way to process a stream.</p>
+
+<h2 id="operating">Operating functions</h2>
+<p><b>Observability.</b> A request that passes through a gateway, a function, a queue and another function leaves its evidence in four places. Give every event a correlation identifier and log it everywhere, as in <x-ref to="event-driven-architecture#tracing"></x-ref>. Watch four numbers for each function: invocations, errors, duration at the 99th percentile, and throttles. For queue-triggered functions add the age of the oldest message, the signal from <x-ref to="message-queues#backpressure"></x-ref> that tells you the function is not keeping up.</p>
+<p><b>Timeouts.</b> Set the function’s timeout deliberately, a little above its measured worst case, and below the timeout of whatever calls it. The default advice from <x-ref to="resilience-patterns#timeouts"></x-ref> applies with extra force, because a function waiting on a dead dependency is billed for every second it waits.</p>
+<p><b>Permissions.</b> Each function runs with its own identity. Give it only what it needs: the thumbnail function may read <code>originals/</code> and write <code>thumbs/</code>, and nothing else. Small, separate permissions are one of the real security gains of the model, and they are lost if every function shares one broad role.</p>
+<p><b>Testing.</b> Keep the handler thin. It should translate the platform’s event into a call to plain code that knows nothing about the platform, and translate the result back. The plain code can then be tested like any other, and the handler has almost nothing in it to get wrong. Test the wiring, meaning triggers, permissions and limits, by deploying to a real test environment, since local emulators reproduce it only partly.</p>
+<p><b>Lock-in.</b> The handler is the easy part to move. The triggers, the permissions, and the queues, stores and gateways around it are specific to one provider. The thin-handler habit keeps your logic portable. The architecture around it is not, and that is usually an acceptable price for not operating it yourself. Decide it knowingly.</p>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Propose functions for the event-driven edges of a design, such as processing uploads, scheduled jobs and webhooks, and say why they fit: uneven load and nobody waiting. Then name the two limits before you are asked. First the concurrency ceiling, with the arithmetic of rate times duration. Second, what protects the database or API behind the function. For a request path with a strict latency target, say that you would use long-running instances or keep a minimum warm, and why.</p></div>
+
+<h2 id="choosing">Choosing</h2>
+<table>
+<thead><tr><th>If the workload is</th><th>Start with</th></tr></thead>
+<tbody>
+<tr><th>Triggered by events, seconds long, uneven</th><td>Functions</td></tr>
+<tr><th>An HTTP service with idle periods or unpredictable bursts</th><td>Serverless containers, scaling to zero</td></tr>
+<tr><th>An HTTP service with steady traffic and a latency target</th><td>Long-running containers or instances, sized for the load</td></tr>
+<tr><th>Short logic that should run near every user</th><td>Edge functions</td></tr>
+<tr><th>A multi-step flow that waits for hours or days</th><td>A workflow service or durable functions</td></tr>
+<tr><th>Continuous, heavy processing of a stream</th><td>Long-running workers, as in <x-ref to="batch-and-stream-processing#stream"></x-ref></td></tr>
+<tr><th>Unknown</th><td>Whichever your team can operate today, with the logic kept apart from the hosting</td></tr>
+</tbody>
+</table>
+<p>Three questions settle most cases. How even is the traffic, and what fraction of rented capacity would sit idle? What is the latency target at the tail, and can a cold start fit inside it? What does the code call, and can that survive the function scaling by a thousand in ten seconds?</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Assuming it scales without limit.</b> There is a regional total and a scaling rate, and both produce throttling. Know your limit and request an increase before the launch, not during it.</li>
+  <li><b>Ignoring what is downstream.</b> A function scales and its database does not. Use a pooling proxy, a concurrency cap, or a queue.</li>
+  <li><b>Heavy initialization.</b> Large dependencies and frameworks loaded on every cold start. Measure init time and trim it.</li>
+  <li><b>Initialization in the wrong place.</b> Opening a connection inside the handler, so every request pays for it.</li>
+  <li><b>Treating memory outside the handler as storage.</b> It is a cache that can vanish, and each environment has its own.</li>
+  <li><b>Work after the response.</b> Background tasks that are frozen halfway.</li>
+  <li><b>Handlers that are not idempotent.</b> Every asynchronous trigger can deliver twice.</li>
+  <li><b>No dead-letter destination.</b> Failed asynchronous events are discarded after the retries unless you say where they go.</li>
+  <li><b>Synchronous chains of functions.</b> Paying several times over for waiting.</li>
+  <li><b>Extrapolating the bill.</b> A cost that is trivial at a thousand requests a day is not trivial at a thousand a second. Recompute the break-even as traffic grows, and include the gateway and the logs.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="scalability"></x-ref>: statelessness and elasticity, which functions enforce.</li>
+  <li><x-ref to="latency-and-throughput"></x-ref>: Little’s law for concurrency, and tail latency for cold starts.</li>
+  <li><x-ref to="message-queues"></x-ref> and <x-ref to="idempotency-and-delivery"></x-ref>: what sits between an event and a function, and why handlers must tolerate repeats.</li>
+  <li><x-ref to="scheduling-and-workflows"></x-ref>: schedules and durable execution, the basis of long-running serverless work.</li>
+  <li><x-ref to="monoliths-and-microservices"></x-ref>: the same questions about grain and boundaries, at a smaller scale.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: timeouts, bulkheads and limits around anything that scales by itself.</li>
+  <li><x-ref to="capacity-and-cost"></x-ref>: the wider cost comparison between rented and metered capacity.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Serverless means no capacity to manage, scaling to zero, and paying for use. Functions are its best-known form.</li>
+  <li>Code runs in execution environments that are created on demand, reused while traffic continues, frozen between requests and discarded when idle. In the classic model each handles one request at a time.</li>
+  <li>A cold start is the cost of creating an environment. Steady traffic rarely sees one. Bursts and sparse traffic see many. Trim init code first, then pay for warm capacity or snapshots if the tail still matters.</li>
+  <li>Concurrency is request rate times duration. It is capped in total and in how fast it can grow, and whatever the function calls needs protecting from it.</li>
+  <li>Asynchronous and polled triggers deliver at least once. Handlers must be idempotent and failures need a dead-letter destination.</li>
+  <li>The bill is a straight line through zero. It beats rented capacity when that capacity would be mostly idle and loses when it would be busy.</li>
+  <li>Functions suit short, uneven, event-driven work. Steady streams, bulk data passed between steps, long computations and held connections belong in long-running processes.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A function receives 600 requests a second and each takes 200 ms. How many execution environments are busy? What happens to that number if a dependency slows each request to 2 seconds?</summary><p>600 × 0.2 = 120 environments. At 2 seconds it becomes 1,200, which is above the default regional limit of 1,000 on AWS Lambda, so some requests are throttled. The traffic did not change. The duration did.</p></details>
+<details><summary>An internal tool is used about once every 20 minutes. Its users complain that it is always slow, while a busy public endpoint built the same way is fast. Why?</summary><p>Environments are discarded after sitting idle, so with one request every 20 minutes almost every request finds no warm environment and pays the full cold start. The busy endpoint always has warm environments becoming free. The fixes are a lighter init stage, a kept-warm environment, or accepting it for an internal tool.</p></details>
+<details><summary>Why does code outside the handler run only sometimes, and what belongs there?</summary><p>It runs during the init stage, once for each new execution environment, and not on warm invocations. Work every request needs and that can be reused belongs there: opening connections, loading configuration, building clients. Per-request data does not, because the environment is reused across requests from different users.</p></details>
+<details><summary>A function with a concurrency of 500 queries a PostgreSQL server that accepts 200 connections. Give three ways to stop it exhausting them.</summary><p>Put a pooling proxy between them so that many environments share a few real connections. Cap the function’s concurrency below the database’s limit. Feed the function from a queue with a maximum concurrency so that bursts wait. A fourth is to use a store reached by independent HTTP requests instead of held connections.</p></details>
+<details><summary>In a batch handler, why record a message as processed after doing the work and not before?</summary><p>If the record is written first and the work then fails, the redelivered message is seen as already processed and skipped, so its work never happens. Writing the record after the work means a crash in between repeats the work, which idempotent work tolerates. Writing both in one transaction removes the gap.</p></details>
+<details><summary>A function runs for 80 ms with 1,024 MB of memory, 30 million times a month. Using $0.0000166667 per GB-second and $0.20 per million requests, what does it cost before the free allowance?</summary><p>Compute: 30,000,000 × 0.08 s × 1 GB = 2,400,000 GB-seconds, which costs $40.00. Requests: 30 × $0.20 = $6.00. Total $46.00 a month. The average concurrency is about 11.6 requests a second × 0.08 s, under one environment.</p></details>
+<details><summary>What two properties of the first Prime Video design made it expensive and unable to scale, and what kind of workload do they point to?</summary><p>A workflow that made several billed, rate-limited state transitions for every second of every stream, and frames passed between functions through object storage. Both point to a steady, high-frequency, data-heavy workload, where per-step billing and share-nothing functions cost the most.</p></details>
+<details><summary>How does one instance of a serverless container differ from one function environment, and what does the difference change?</summary><p>A container instance is a web server that handles many requests at once, where a classic function environment handles one. So an instance can share a connection pool, a burst needs far fewer new instances, and fewer requests meet a cold start. In exchange you maintain the server and its image.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>AWS, <a href="https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html">Lambda quotas</a>. Time, memory, payload, package, concurrency and scaling-rate limits, read in October 2026.</li>
+  <li>AWS, <a href="https://aws.amazon.com/lambda/pricing/">AWS Lambda pricing</a>. Per-request and GB-second prices and the free allowance.</li>
+  <li>AWS Compute Blog, <a href="https://aws.amazon.com/blogs/compute/aws-lambda-standardizes-billing-for-init-phase/">AWS Lambda standardizes billing for INIT phase</a>, April 2025. The source for cold starts in under 1% of invocations and for init billing from August 2025.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html">Improving startup performance with Lambda SnapStart</a>. Supported runtimes and the uniqueness caveat.</li>
+  <li>Alexandru Agache and others, <a href="https://www.usenix.org/conference/nsdi20/presentation/agache">Firecracker: Lightweight Virtualization for Serverless Applications</a>, NSDI 2020. How Lambda isolates functions.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/lambda/latest/dg/durable-basic-concepts.html">Lambda durable functions: basic concepts</a>. Steps, waits, checkpoint and replay.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html">RDS Proxy concepts and terminology</a>. Connection pooling and multiplexing for functions.</li>
+  <li>Cloudflare, <a href="https://developers.cloudflare.com/workers/platform/limits/">Workers limits</a>. CPU time, memory and start-up limits for isolates.</li>
+  <li>Google Cloud, <a href="https://docs.cloud.google.com/run/docs/about-concurrency">Maximum concurrent requests for services</a>, Cloud Run documentation.</li>
+  <li>InfoQ, <a href="https://www.infoq.com/news/2023/05/prime-ec2-ecs-saves-costs">report on Prime Video moving a monitoring service from serverless functions to a single process</a>, May 2023. A summary of Marcin Kolny’s original post on the Prime Video technology blog.</li>
+  <li>Eric Jonas and others, <a href="https://arxiv.org/abs/1902.03383">Cloud Programming Simplified: A Berkeley View on Serverless Computing</a>, 2019. A careful statement of what serverless is and where it falls short.</li>
+  <li>Joseph Hellerstein and others, <a href="https://arxiv.org/abs/1812.03651">Serverless Computing: One Step Forward, Two Steps Back</a>, CIDR 2019. The critical view, especially on data-heavy work.</li>
+</ol>
+</section>

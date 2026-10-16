@@ -1,0 +1,620 @@
+<!--meta
+{ "description": "Message queues and publish-subscribe for system design: why to put a broker between services, queues versus topics, acknowledgments and visibility timeouts, ordering by key, retries and dead-letter queues, delayed delivery, backpressure and backlog arithmetic, durability, message design and the main products.",
+  "lede": "Until now, one service has asked another for something and waited for the answer. This part of the book is about not waiting. A message queue lets a service hand work to another and move on, which makes systems faster to respond, more tolerant of failure and able to absorb bursts. It also introduces delay, duplicates and a new component to run. This chapter explains how queues behave and what they ask of the code on both sides.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Why put a queue in the middle</h2>
+<p>When Ana uploads a photo to the photo app, several things have to happen. The photo must be stored. Thumbnails must be generated in three sizes. The search index must learn about it. Her followers must be notified. Only the first of these has to finish before Ana sees “uploaded”.</p>
+<p>If the upload service calls the other services directly and waits for each, it inherits all of their problems.</p>
+<ul>
+  <li><b>Their latency.</b> The user waits for the sum of every call.</li>
+  <li><b>Their failures.</b> If the notification service is down, uploads fail, although nothing is wrong with storing photos.</li>
+  <li><b>Their capacity.</b> A burst of uploads becomes an equal burst on every downstream service at the same instant.</li>
+  <li><b>Their existence.</b> Adding a fifth thing that should happen on upload means changing and redeploying the upload service.</li>
+</ul>
+
+<figure class="fig wide" id="fig-sync-async">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-labelledby="f341t f341d">
+<title id="f341t">An upload that calls three services directly, compared with one that hands a message to a broker</title>
+<desc id="f341d">On the left, the upload API calls the thumbnail, search index and notification services directly and waits for each. The user waits for all three, and if one is slow or down the upload is slow or fails. On the right, the upload API sends a message to a broker and returns. The broker delivers the message to the three services, each of which works at its own pace and retries on its own.</desc>
+<g data-scene="direct">
+<text class="tb" x="10" y="18">Direct calls: the upload waits for everything</text>
+<rect class="n sig" x="10" y="92" width="100" height="46" rx="6"/>
+<text class="tb mid" x="60" y="119.5">Upload API</text>
+<rect class="n" x="220" y="40" width="120" height="40" rx="6"/>
+<text class="tb mid" x="280" y="64.5">Thumbnails</text>
+<g data-s="1">
+<path class="e both" d="M110 115C160 115 170 60 220 60"/>
+</g>
+<rect class="n" x="220" y="96" width="120" height="40" rx="6"/>
+<text class="tb mid" x="280" y="120.5">Search index</text>
+<g data-s="2">
+<path class="e both" d="M110 115C160 115 170 116 220 116"/>
+</g>
+<rect class="n" x="220" y="152" width="120" height="40" rx="6"/>
+<text class="tb mid" x="280" y="176.5">Notifications</text>
+<g data-s="3">
+<path class="e both" d="M110 115C160 115 170 172 220 172"/>
+<text class="ts" x="10" y="222">The user waits for all three in turn. If one is</text>
+<text class="ts" x="10" y="238">slow or down, the upload is slow or fails.</text>
+</g>
+</g>
+<path class="e none dash" d="M360 8V250"/>
+<g data-scene="broker">
+<text class="tb" x="380" y="18">Through a broker: the upload hands off and returns</text>
+<rect class="n sig" x="378" y="92" width="84" height="46" rx="6"/>
+<text class="ts tb mid" x="420" y="119.5">Upload API</text>
+<rect class="n async" x="486" y="92" width="68" height="46" rx="6"/>
+<text class="tb mid" x="520" y="119.5">Broker</text>
+<g data-s="1">
+<path class="e sig" d="M462 115H486"/>
+</g>
+<rect class="n" x="608" y="40" width="102" height="40" rx="6"/>
+<text class="ts mid" x="659" y="64.5">Thumbnails</text>
+<g data-s="2">
+<path class="e async" d="M554 115C584 115 578 60 608 60"/>
+</g>
+<rect class="n" x="608" y="96" width="102" height="40" rx="6"/>
+<text class="ts mid" x="659" y="120.5">Search index</text>
+<g data-s="2">
+<path class="e async" d="M554 115C584 115 578 116 608 116"/>
+</g>
+<rect class="n" x="608" y="152" width="102" height="40" rx="6"/>
+<text class="ts mid" x="659" y="176.5">Notifications</text>
+<g data-s="2">
+<path class="e async" d="M554 115C584 115 578 172 608 172"/>
+</g>
+<g data-s="3">
+<text class="ts" x="380" y="222">The user waits only for the hand-off. Each consumer</text>
+<text class="ts" x="380" y="238">works at its own pace and retries on its own.</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="direct" data-label="Direct calls">
+  <li data-msg="call" data-state="The user waits for: thumbnails">The upload API calls the thumbnail service and waits for it to finish.</li>
+  <li data-msg="call" data-state="The user waits for: thumbnails, search">Then it calls the search index, and waits again.</li>
+  <li data-msg="call" data-state="The user waits for: thumbnails, search, notifications">Then notifications. The user waits for all three in turn, and if any one of them is slow or down, the upload is slow or fails.</li>
+</ol>
+<ol class="steps" data-scene="broker" data-label="Through a broker">
+  <li data-msg="photo uploaded" data-state="The user waits for: one hand-off to the broker">The upload API hands one message to the broker and returns to the user at once.</li>
+  <li data-msg="photo uploaded">The broker delivers the message to each consumer.</li>
+  <li>Each consumer works at its own pace and retries on its own. A slow thumbnail service no longer slows the upload.</li>
+</ol>
+<figcaption>The same work, with and without waiting. The broker separates “the upload happened” from “everything that follows from it”.</figcaption>
+</figure>
+
+<p>A <dfn>message broker</dfn> is a service that accepts messages from senders, stores them, and delivers them to receivers. With one in the middle, the upload service stores the photo, sends a message saying “photo 871 was uploaded”, and returns. The other services receive the message when they are ready.</p>
+<p>This buys four things.</p>
+<ul>
+  <li><b>Independence in time.</b> The sender and receiver do not need to be running at the same moment. If the thumbnail service is down for five minutes, its messages wait.</li>
+  <li><b>Load leveling.</b> A burst fills the queue instead of overwhelming the receivers, which work through it at a steady rate.</li>
+  <li><b>Independent scaling.</b> If thumbnails fall behind, add thumbnail workers. Nothing else changes.</li>
+  <li><b>Built-in retry.</b> A message that could not be processed is delivered again, with no code in the sender.</li>
+</ul>
+<p>And it costs four things.</p>
+<ul>
+  <li><b>No immediate result.</b> The sender cannot say “and here are your thumbnails”. The work is done later, so the product must be designed around that (<x-ref to="consistency-models#eventual"></x-ref>).</li>
+  <li><b>Duplicates.</b> Retrying means the same message can arrive more than once. Receivers must be written to tolerate that.</li>
+  <li><b>Harder debugging.</b> A request no longer has one stack trace. Its effects are spread over several services and several minutes.</li>
+  <li><b>One more system.</b> The broker must be run, monitored and sized, and it is now on the critical path of everything that uses it.</li>
+</ul>
+<p>The rule of thumb: if the caller needs the answer to continue, call directly. If the caller only needs the work to happen, send a message.</p>
+
+<figure class="fig wide" id="fig-leveling">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f342t f342d">
+<title id="f342t">A queue absorbing a ten-minute burst of messages</title>
+<desc id="f342d">Two charts over 75 minutes. In the first, messages arrive at 600 a minute, jump to 3,000 a minute for ten minutes, and return to 600. The consumers process at most 1,200 a minute. In the second, the queue depth is zero until the burst, climbs to 18,000 at the end of the burst, and drains back to zero thirty minutes later. A message arriving at the peak waits 15 minutes.</desc>
+<text class="ts" x="64" y="16">Messages per minute</text>
+<line class="axis" x1="64" y1="128" x2="700" y2="128"/>
+<text class="ts end" x="56" y="132.0">0</text>
+<line class="grid" x1="64" y1="100" x2="700" y2="100"/>
+<text class="ts end" x="56" y="104.0">1,000</text>
+<line class="grid" x1="64" y1="72" x2="700" y2="72"/>
+<text class="ts end" x="56" y="76.0">2,000</text>
+<line class="grid" x1="64" y1="44" x2="700" y2="44"/>
+<text class="ts end" x="56" y="48.0">3,000</text>
+<path class="line" d="M64.0 111.2H233.6V44.0H318.4V111.2H700.0"/>
+<path class="line" style="stroke:var(--store);stroke-dasharray:6 4" d="M64.0 111.2H233.6V94.4H572.8V111.2H700.0"/>
+<text class="ts" x="326.88" y="37.0">arriving: a burst of 3,000 a minute for ten minutes</text>
+<text class="ts" x="581.28" y="88.4">processed: at most 1,200</text>
+<text class="ts" x="64" y="158">Messages waiting in the queue</text>
+<line class="axis" x1="64" y1="262" x2="700" y2="262"/>
+<text class="ts end" x="56" y="266.0">0</text>
+<line class="grid" x1="64" y1="216" x2="700" y2="216"/>
+<text class="ts end" x="56" y="220.0">10,000</text>
+<line class="grid" x1="64" y1="170" x2="700" y2="170"/>
+<text class="ts end" x="56" y="174.0">20,000</text>
+<path d="M64.0 262.0H233.6L318.4 179.2L572.8 262.0H700.0Z" fill="var(--async-tint)"/>
+<path class="line" style="stroke:var(--async)" d="M64.0 262.0H233.6L318.4 179.2L572.8 262.0H700.0"/>
+<circle class="dot fill-async" cx="318.4" cy="179.2" r="5"/>
+<text class="ts" x="412" y="186">Peak at minute 30: 18,000 waiting.</text>
+<text class="ts" x="412" y="201">A message arriving then waits 15 minutes.</text>
+<text class="ts mid" x="64.0" y="280">0 min</text>
+<text class="ts mid" x="191.2" y="280">15 min</text>
+<text class="ts mid" x="318.4" y="280">30 min</text>
+<text class="ts mid" x="445.59999999999997" y="280">45 min</text>
+<text class="ts mid" x="572.8" y="280">60 min</text>
+<text class="ts mid" x="700.0" y="280">75 min</text>
+<rect class="hit" x="64" y="24" width="21.2" height="238" data-tip="Minute 0|arriving: 600 a minute|processed: 600 a minute|waiting in the queue: 0"/>
+<rect class="hit" x="85.2" y="24" width="42.4" height="238" data-tip="Minute 5|arriving: 600 a minute|processed: 600 a minute|waiting in the queue: 0"/>
+<rect class="hit" x="127.6" y="24" width="42.4" height="238" data-tip="Minute 10|arriving: 600 a minute|processed: 600 a minute|waiting in the queue: 0"/>
+<rect class="hit" x="170.0" y="24" width="42.4" height="238" data-tip="Minute 15|arriving: 600 a minute|processed: 600 a minute|waiting in the queue: 0"/>
+<rect class="hit" x="212.4" y="24" width="42.4" height="238" data-tip="Minute 20|arriving: 3,000 a minute|processed: 1,200 a minute|waiting in the queue: 0|the burst begins"/>
+<rect class="hit" x="254.8" y="24" width="42.4" height="238" data-tip="Minute 25|arriving: 3,000 a minute|processed: 1,200 a minute|waiting in the queue: 9,000|a message arriving now waits 7.5 minutes"/>
+<rect class="hit" x="297.2" y="24" width="42.4" height="238" data-tip="Minute 30|arriving: 600 a minute|processed: 1,200 a minute|waiting in the queue: 18,000|a message arriving now waits 15 minutes|the burst ends: the peak"/>
+<rect class="hit" x="339.6" y="24" width="42.4" height="238" data-tip="Minute 35|arriving: 600 a minute|processed: 1,200 a minute|waiting in the queue: 15,000|a message arriving now waits 12.5 minutes"/>
+<rect class="hit" x="382.0" y="24" width="42.4" height="238" data-tip="Minute 40|arriving: 600 a minute|processed: 1,200 a minute|waiting in the queue: 12,000|a message arriving now waits 10 minutes"/>
+<rect class="hit" x="424.4" y="24" width="42.4" height="238" data-tip="Minute 45|arriving: 600 a minute|processed: 1,200 a minute|waiting in the queue: 9,000|a message arriving now waits 7.5 minutes"/>
+<rect class="hit" x="466.8" y="24" width="42.4" height="238" data-tip="Minute 50|arriving: 600 a minute|processed: 1,200 a minute|waiting in the queue: 6,000|a message arriving now waits 5 minutes"/>
+<rect class="hit" x="509.2" y="24" width="42.4" height="238" data-tip="Minute 55|arriving: 600 a minute|processed: 1,200 a minute|waiting in the queue: 3,000|a message arriving now waits 2.5 minutes"/>
+<rect class="hit" x="551.6" y="24" width="42.4" height="238" data-tip="Minute 60|arriving: 600 a minute|processed: 600 a minute|waiting in the queue: 0|the queue is empty again"/>
+<rect class="hit" x="594.0" y="24" width="42.4" height="238" data-tip="Minute 65|arriving: 600 a minute|processed: 600 a minute|waiting in the queue: 0"/>
+<rect class="hit" x="636.4" y="24" width="42.4" height="238" data-tip="Minute 70|arriving: 600 a minute|processed: 600 a minute|waiting in the queue: 0"/>
+<rect class="hit" x="678.8" y="24" width="21.2" height="238" data-tip="Minute 75|arriving: 600 a minute|processed: 600 a minute|waiting in the queue: 0"/>
+</svg>
+</div>
+<figcaption>Load leveling. The consumers never see more than they can handle. The price is delay: the burst is paid for in waiting time over the next half hour.</figcaption>
+</figure>
+
+<h2 id="models">Queues and topics</h2>
+<p>Brokers offer two basic delivery patterns, and most real systems combine them.</p>
+
+<figure class="fig wide" id="fig-models">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f343t f343d">
+<title id="f343t">A queue shared by competing workers, and a topic that fans out to subscribers</title>
+<desc id="f343d">On the left, a producer puts messages m1, m2 and m3 on a queue, and three identical workers each receive one of them. On the right, a publisher sends messages to a topic, which copies every message into a separate queue for each of three subscribing services, so each service receives all three messages.</desc>
+<text class="tb" x="10" y="18">Queue: each message goes to one consumer</text>
+<rect class="n sig" x="10" y="74" width="90" height="44" rx="6"/>
+<text class="tb mid" x="55" y="100.5">Producer</text>
+<rect class="n async" x="130" y="74" width="110" height="44" rx="6"/>
+<rect class="n" x="138" y="82" width="28" height="28" rx="3"/><text class="ts mid" x="152" y="101">m3</text>
+<rect class="n" x="171" y="82" width="28" height="28" rx="3"/><text class="ts mid" x="185" y="101">m2</text>
+<rect class="n" x="204" y="82" width="28" height="28" rx="3"/><text class="ts mid" x="218" y="101">m1</text>
+<path class="e sig" d="M100 96H130"/>
+<rect class="n" x="270" y="30" width="80" height="40" rx="6"/>
+<text class="ts mid" x="310" y="46">Worker 1</text>
+<text class="ts mid" x="310" y="63">gets m1</text>
+<path class="e async" d="M240 96C256 96 254 50 270 50"/>
+<rect class="n" x="270" y="82" width="80" height="40" rx="6"/>
+<text class="ts mid" x="310" y="98">Worker 2</text>
+<text class="ts mid" x="310" y="115">gets m2</text>
+<path class="e async" d="M240 96C256 96 254 102 270 102"/>
+<rect class="n" x="270" y="134" width="80" height="40" rx="6"/>
+<text class="ts mid" x="310" y="150">Worker 3</text>
+<text class="ts mid" x="310" y="167">gets m3</text>
+<path class="e async" d="M240 96C256 96 254 154 270 154"/>
+<text class="ts" x="10" y="200">Identical workers share the work. Adding workers</text>
+<text class="ts" x="10" y="216">adds throughput. Also called competing consumers.</text>
+<path class="e none dash" d="M360 8V236"/>
+<text class="tb" x="380" y="18">Topic: every subscriber gets every message</text>
+<rect class="n sig" x="380" y="74" width="80" height="44" rx="6"/>
+<text class="tb mid" x="420" y="100.5">Publisher</text>
+<rect class="n async" x="486" y="74" width="64" height="44" rx="6"/>
+<text class="tb mid" x="518" y="100.5">Topic</text>
+<path class="e sig" d="M460 96H486"/>
+<rect class="n async" x="574" y="36" width="34" height="28" rx="3"/>
+<rect class="n" x="622" y="30" width="88" height="40" rx="6"/>
+<text class="ts mid" x="666" y="54.5">Thumbnails</text>
+<path class="e async" d="M550 96C564 96 560 50 574 50"/>
+<path class="e async" d="M608 50H622"/>
+<rect class="n async" x="574" y="88" width="34" height="28" rx="3"/>
+<rect class="n" x="622" y="82" width="88" height="40" rx="6"/>
+<text class="ts mid" x="666" y="106.5">Search index</text>
+<path class="e async" d="M550 96C564 96 560 102 574 102"/>
+<path class="e async" d="M608 102H622"/>
+<rect class="n async" x="574" y="140" width="34" height="28" rx="3"/>
+<rect class="n" x="622" y="134" width="88" height="40" rx="6"/>
+<text class="ts mid" x="666" y="158.5">Notifications</text>
+<path class="e async" d="M550 96C564 96 560 154 574 154"/>
+<path class="e async" d="M608 154H622"/>
+<text class="ts" x="380" y="200">Each subscriber has its own queue and receives its</text>
+<text class="ts" x="380" y="216">own copy of m1, m2 and m3. Also called fan-out.</text>
+
+</svg>
+</div>
+<figcaption>A queue divides work among identical consumers. A topic multiplies each message across different consumers.</figcaption>
+</figure>
+
+<p>A <dfn>queue</dfn> holds messages for one kind of consumer. Each message is delivered to one consumer, and several consumers reading the same queue share the work between them. This is how a pool of thumbnail workers divides up resize jobs.</p>
+<p>A <dfn>topic</dfn>, in the pattern called <dfn>publish-subscribe</dfn> or pub/sub, delivers a copy of each message to every subscriber. The publisher does not know who the subscribers are or how many exist. This is how one “photo uploaded” message reaches thumbnails, search and notifications.</p>
+<p>The standard arrangement puts the two together: publish to a topic, and give each subscribing service its own queue fed by that topic. Each service then gets every message, can run as many workers as it needs on its own queue, and falls behind or fails without affecting the others. On AWS this is an SNS topic delivering to SQS queues. In RabbitMQ it is an exchange bound to queues. In Google Pub/Sub it is a topic with several subscriptions.</p>
+<p>A third model, the <dfn>log</dfn>, keeps messages after they are read and lets each consumer track its own position. It behaves differently enough to need its own chapter, <x-ref to="event-streaming"></x-ref>. The differences in brief:</p>
+<table>
+<thead><tr><th></th><th>Queue</th><th>Log</th></tr></thead>
+<tbody>
+<tr><th>After a message is processed</th><td>It is deleted</td><td>It stays until a retention limit</td></tr>
+<tr><th>Progress is tracked</th><td>Per message, by the broker</td><td>As a position in the log, per consumer group</td></tr>
+<tr><th>Reading old messages again</th><td>Not possible</td><td>Normal: move the position back</td></tr>
+<tr><th>Ordering</th><td>Best effort, or by group</td><td>Strict within a partition</td></tr>
+<tr><th>Typical use</th><td>Jobs and tasks to be done once</td><td>Streams of events that many systems read</td></tr>
+</tbody>
+</table>
+
+<h2 id="ack">The life of a message</h2>
+<p>The central mechanism of a queue is how it decides that a message has been dealt with. The broker cannot see inside the consumer. It only knows what it is told.</p>
+
+<figure class="fig wide" id="fig-lifecycle">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f344t f344d">
+<title id="f344t">The states of a message in a queue</title>
+<desc id="f344d">A message may start as delayed and become ready when due. When a consumer receives it, it is in flight and hidden from other consumers. An acknowledgment deletes it. A timeout or a reported failure makes it ready again with its receive count increased by one. A message received too many times moves to a dead-letter queue, from which it can be sent back to the ready state after a fix.</desc>
+<rect class="n ghost" x="10" y="40" width="100" height="48" rx="6"/>
+<text class="tb mid" x="60" y="60">Delayed</text>
+<text class="ts mid" x="60" y="77">not yet due</text>
+<rect class="n async" x="170" y="40" width="110" height="48" rx="6"/>
+<text class="tb mid" x="225" y="60">Ready</text>
+<text class="ts mid" x="225" y="77">waiting</text>
+<rect class="n sig" x="350" y="40" width="130" height="48" rx="6"/>
+<text class="tb mid" x="415" y="60">In flight</text>
+<text class="ts mid" x="415" y="77">hidden from others</text>
+<rect class="n store" x="580" y="40" width="130" height="48" rx="6"/>
+<text class="tb mid" x="645" y="60">Deleted</text>
+<text class="ts mid" x="645" y="77">work is done</text>
+<rect class="n fault" x="170" y="176" width="110" height="48" rx="6"/>
+<text class="tb mid" x="225" y="196">Dead-letter</text>
+<text class="ts mid" x="225" y="213">needs a human</text>
+<g data-s="1">
+<path class="e" d="M110 64H170"/>
+<text class="ts mid" x="140" y="56">due</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M280 54H350"/>
+<text class="ts mid" x="315" y="46">receive</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M480 64H580"/>
+<text class="ts mid" x="530" y="56">acknowledge</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M350 76H280"/>
+<text class="ts" x="292" y="106">timeout or failure:</text>
+<text class="ts" x="292" y="121">visible again, count + 1</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M225 88V176"/>
+<text class="ts" x="234" y="162">received too many times</text>
+</g>
+<g data-s="6">
+<path class="e dash" d="M170 204C100 204 110 88 176 88"/>
+<text class="ts" x="10" y="150">redrive after a fix</text>
+<text class="ts" x="350" y="186">A message is removed only by an acknowledgment.</text>
+<text class="ts" x="350" y="202">If the consumer crashes, says nothing or takes too long,</text>
+<text class="ts" x="350" y="218">the broker assumes failure and delivers it again.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>A message may be sent with a delay. When it falls due, it becomes ready.</li>
+  <li>A consumer receives it. The message is now in flight: still stored, but hidden from other consumers.</li>
+  <li>If the consumer finishes the work and acknowledges, the message is deleted. This is the only way a message leaves the queue for good.</li>
+  <li data-msg="timeout or failure">If the consumer crashes, fails or takes too long, the message becomes visible again and its receive count goes up by one.</li>
+  <li data-msg="too many receives">A message that has been received too many times is moved to a dead-letter queue. There it stops blocking the others and waits for a person to look at it.</li>
+  <li data-msg="redrive">Once the fault is fixed, the dead-lettered messages can be sent back for another attempt.</li>
+</ol>
+<figcaption>A message leaves the queue only when a consumer says it is done. Every other outcome leads back to another delivery.</figcaption>
+</figure>
+
+<ol>
+  <li>A consumer receives a message. The broker does not delete it. It hides it from other consumers for a period, called the <dfn>visibility timeout</dfn> in SQS and the acknowledgment deadline in Google Pub/Sub.</li>
+  <li>The consumer does the work.</li>
+  <li>The consumer sends an <dfn>acknowledgment</dfn>, or ack. The broker deletes the message.</li>
+  <li>If no acknowledgment arrives before the timeout, because the consumer crashed, hung or was simply slow, the message becomes visible again and is delivered to another consumer.</li>
+</ol>
+<p>This design means a message is never lost because a consumer died halfway. It also means the same message can be processed twice. The consumer may have finished the work and crashed before acknowledging, or may still be working when the timeout expires. The guarantee is <dfn>at-least-once delivery</dfn>, and the consequence, covered in <x-ref to="idempotency-and-delivery#consumers"></x-ref>, is that every consumer must be safe to run twice on the same message.</p>
+<p>A queue fits in a page of code, and reading it makes the behavior concrete.</p>
+<pre data-lang="ts" data-title="A queue in miniature: visibility timeout, receive count and dead letters">
+interface Message<T> {
+  id: string;
+  body: T;
+  receiveCount: number;      // how many times it has been handed out
+  visibleAt: number;         // hidden from consumers until this time
+}
+
+class Queue<T> {
+  private messages: Message<T>[] = [];
+  readonly deadLetters: Message<T>[] = [];
+
+  constructor(private visibilityTimeoutMs = 30_000, private maxReceives = 5) {}
+
+  send(id: string, body: T, delayMs = 0, now = Date.now()): void {
+    this.messages.push({ id, body, receiveCount: 0, visibleAt: now + delayMs });
+  }
+
+  // Hand out the next visible message and hide it until the timeout passes.
+  receive(now = Date.now()): Message<T> | undefined {
+    for (const m of [...this.messages]) {
+      if (m.visibleAt > now) continue;                 // delayed, or in flight with another consumer
+      if (m.receiveCount >= this.maxReceives) {        // tried too often: set it aside
+        this.remove(m.id);
+        this.deadLetters.push(m);
+        continue;
+      }
+      m.receiveCount += 1;
+      m.visibleAt = now + this.visibilityTimeoutMs;
+      return m;
+    }
+    return undefined;
+  }
+
+  // The consumer finished. Only now is the message gone.
+  ack(id: string): void {
+    this.remove(id);
+  }
+
+  private remove(id: string): void {
+    this.messages = this.messages.filter((m) => m.id !== id);
+  }
+}
+</pre>
+<p>Real brokers add durability, replication and scale, but <code>receive</code> and <code>ack</code> behave as they do here. Notice that “delayed” and “in flight” are the same mechanism: a time before which the message is not handed out.</p>
+<p>The timeout has to be chosen with care. SQS defaults to 30 seconds and allows up to 12 hours. Pub/Sub defaults to 10 seconds and allows up to 10 minutes. Both let a consumer extend the deadline while it works.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> A visibility timeout shorter than the work. If resizing a large video takes two minutes and the timeout is 30 seconds, the message reappears while the first worker is still busy. A second worker starts the same job, then a third. The queue appears to have a mysterious duplication problem, and the workers are overloaded with repeated work. Set the timeout well above the slowest normal processing time, and for long jobs have the worker extend it periodically while it is still making progress.</p></div>
+
+<h2 id="routing">Routing and filtering</h2>
+<p>Not every subscriber wants every message. Brokers offer ways to select.</p>
+<table>
+<thead><tr><th>Mechanism</th><th>How it selects</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>A topic per kind of message</th><td>Subscribers choose which topics to subscribe to</td><td><code>photo-uploaded</code>, <code>photo-deleted</code>, <code>comment-added</code></td></tr>
+<tr><th>Routing keys with patterns</th><td>Each message carries a dotted key, and subscriptions match on patterns</td><td>RabbitMQ: a queue bound with <code>photo.*</code> receives <code>photo.uploaded</code> and <code>photo.deleted</code></td></tr>
+<tr><th>Attribute filters</th><td>The message has key-value attributes, and each subscription declares a filter on them</td><td>SNS and Pub/Sub: deliver only where <code>country = "DE"</code></td></tr>
+<tr><th>Filtering in the consumer</th><td>Receive everything and discard what is not wanted</td><td>Simple, and wasteful when most messages are discarded</td></tr>
+</tbody>
+</table>
+<p>Filtering in the broker saves the cost of delivering messages that would be thrown away. Keep the rules simple. Routing logic that lives in broker configuration is invisible to anyone reading the code, and a subscription that silently matches nothing is a hard bug to find.</p>
+
+<h2 id="ordering">Ordering</h2>
+<p>It is natural to assume a queue delivers messages in the order they were sent. With more than one consumer, it does not, and cannot.</p>
+<p>Suppose two messages concern the same photo: “caption changed to Sunset” and then “caption changed to Sunrise”. Two workers each take one. The second worker happens to finish first. The caption ends up as “Sunset”, which is wrong. Retries reorder in the same way: a message that fails and is redelivered arrives after messages that were sent later.</p>
+<p>There are three ways to deal with this, in rising order of cost.</p>
+<ol>
+  <li><b>Make order irrelevant.</b> Put a version number or timestamp from the source in each message, and have the consumer ignore any message older than what it has already applied (<x-ref to="idempotency-and-delivery#versions"></x-ref>). This works with any broker and any number of consumers, and it is the most durable solution.</li>
+  <li><b>Order within a key.</b> Give each message a key, such as the photo ID. The broker guarantees that messages with the same key are delivered in order, to one consumer at a time, while different keys are processed in parallel. SQS FIFO queues call this a message group, and Pub/Sub an ordering key. A log does it with partitions.</li>
+  <li><b>One consumer.</b> A single consumer processing one message at a time sees them in order. Throughput is limited to what that one consumer can do.</li>
+</ol>
+
+<figure class="fig wide" id="fig-groups">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f345t f345d">
+<title id="f345t">Ordered delivery within a key, with different keys processed in parallel</title>
+<desc id="f345d">Six messages arrive interleaved: A1, B1, A2, C1, B2, A3, where the letter is the photo ID. Consumer 1 receives A1, A2 and A3 in order. Consumer 2 receives B1, C1 and B2, with each photo’s messages in order. If A2 keeps failing, A3 has to wait behind it, while B and C are not affected.</desc>
+<text class="tb" x="10" y="18">Messages for three photos arrive interleaved. The key is the photo ID.</text>
+<rect class="n sig" x="10" y="32" width="44" height="30" rx="4"/><text class="ts mid" x="32" y="52">A1</text>
+<rect class="n store" x="62" y="32" width="44" height="30" rx="4"/><text class="ts mid" x="84" y="52">B1</text>
+<rect class="n sig" x="114" y="32" width="44" height="30" rx="4"/><text class="ts mid" x="136" y="52">A2</text>
+<rect class="n async" x="166" y="32" width="44" height="30" rx="4"/><text class="ts mid" x="188" y="52">C1</text>
+<rect class="n store" x="218" y="32" width="44" height="30" rx="4"/><text class="ts mid" x="240" y="52">B2</text>
+<rect class="n sig" x="270" y="32" width="44" height="30" rx="4"/><text class="ts mid" x="292" y="52">A3</text>
+<text class="ts" x="332" y="52">arrival order, left to right</text>
+<rect class="n" x="10" y="88" width="110" height="40" rx="6"/>
+<text class="tb mid" x="65" y="112.5">Consumer 1</text>
+<rect class="n sig" x="150" y="93" width="44" height="30" rx="4"/><text class="ts mid" x="172" y="113">A1</text>
+<rect class="n sig" x="202" y="93" width="44" height="30" rx="4"/><text class="ts mid" x="224" y="113">A2</text>
+<rect class="n sig" x="254" y="93" width="44" height="30" rx="4"/><text class="ts mid" x="276" y="113">A3</text>
+<text class="ts" x="320" y="113">photo A, in order</text>
+<rect class="n" x="10" y="140" width="110" height="40" rx="6"/>
+<text class="tb mid" x="65" y="164.5">Consumer 2</text>
+<rect class="n store" x="150" y="145" width="44" height="30" rx="4"/><text class="ts mid" x="172" y="165">B1</text>
+<rect class="n async" x="202" y="145" width="44" height="30" rx="4"/><text class="ts mid" x="224" y="165">C1</text>
+<rect class="n store" x="254" y="145" width="44" height="30" rx="4"/><text class="ts mid" x="276" y="165">B2</text>
+<text class="ts" x="320" y="165">photos B and C, each in order</text>
+<text class="ts" x="10" y="206">Messages with the same key go to one consumer at a time, in order. Different keys are processed in parallel.</text>
+<text class="ts" x="10" y="222">If A2 keeps failing, A3 has to wait behind it. B and C are not affected.</text>
+
+</svg>
+</div>
+<figcaption>Ordering by key gives order where it matters, between messages about the same thing, without giving up parallelism.</figcaption>
+</figure>
+
+<p>Total order across all messages is almost never needed. What matters is the order of events for one photo, one user or one account. Ask which it is before paying for ordering.</p>
+<p>Ordering has a side effect to plan for. If the message at the head of a group cannot be processed, everything behind it in that group waits. This <dfn>head-of-line blocking</dfn> is the correct behavior, since skipping ahead would break the order, and it means a single bad message can stall one customer’s work indefinitely unless something removes it.</p>
+
+<h2 id="failures">Retries, poison messages and dead-letter queues</h2>
+<p>Consumers fail for two different kinds of reason, and they call for opposite responses.</p>
+<ul>
+  <li><b>Transient failures.</b> A dependency timed out or a database was briefly unavailable. Trying again later will probably work.</li>
+  <li><b>Permanent failures.</b> The message is malformed, refers to something that does not exist, or triggers a bug. Trying again will fail forever. Such a message is called a <dfn>poison message</dfn>.</li>
+</ul>
+<p>Redelivery handles the first kind automatically. Left alone, it turns the second kind into an endless loop: the poison message is delivered, fails, becomes visible, and is delivered again, consuming a worker each time.</p>
+<p>The standard protection is a limit on deliveries. The broker counts how many times each message has been received. Past the limit, it moves the message to a separate <dfn>dead-letter queue</dfn>, where it no longer blocks anything and waits for a person to look at it. Pub/Sub allows between 5 and 100 attempts and defaults to 5. In SQS you choose the number.</p>
+<p>A dead-letter queue is only useful if somebody watches it.</p>
+<ul>
+  <li><b>Alert when it is not empty.</b> Each message in it is work that did not happen.</li>
+  <li><b>Keep the reason.</b> Log the error with the message ID, so that the cause can be found without reproducing it.</li>
+  <li><b>Be able to redrive.</b> After fixing the bug, move the messages back to the main queue. Without this the queue is only a place where failures are stored.</li>
+</ul>
+<p>Between the first failure and the dead-letter queue, retries should be spaced out. Retrying at once hits a struggling dependency again while it is still struggling. Waiting a second, then several, then a minute gives it time to recover. Brokers support this in different ways: Pub/Sub has a retry policy with exponential backoff, SQS lets the consumer set a longer visibility timeout on a failed message, and RabbitMQ 4.3, released in April 2026, added delayed retries inside its quorum queues. <x-ref to="idempotency-and-delivery#retries"></x-ref> covers backoff and jitter.</p>
+<div class="note production"><p><span class="label">In production.</span> Decide in the consumer which errors are worth retrying. A validation error will never succeed, so send that message straight to the dead-letter queue instead of burning five attempts. A timeout should be retried. Treating all errors alike either wastes capacity on hopeless messages or gives up too early on recoverable ones.</p></div>
+
+<h2 id="delayed">Delays, schedules, expiry and priority</h2>
+<p><b>Delayed delivery.</b> A message can be sent now and delivered later: “check in ten minutes whether the payment completed”. SQS supports delays of up to 15 minutes, and other brokers have similar features. Inside the broker a delayed message is stored with its due time and becomes visible when that time arrives, exactly as in the miniature queue above. For delays of hours or days, or for jobs that recur, use a scheduler (<x-ref to="scheduling-and-workflows"></x-ref>).</p>
+<p><b>Expiry.</b> Some messages lose their value with time. A “your driver is two minutes away” notification is worthless after ten minutes. A time-to-live on the message lets the broker discard it instead of delivering it late. Queues also have an overall retention limit: SQS keeps a message for 4 days by default and at most 14.</p>
+<p><b>Priority.</b> It is tempting to give urgent messages a higher priority in one queue. Brokers that support this deliver higher priorities first, and the danger is starvation: under sustained load, low-priority messages never get their turn. The simpler and more predictable design is a separate queue for each priority, each with its own workers, so that the urgent queue has guaranteed capacity and the bulk queue still makes progress.</p>
+
+<h2 id="backpressure">Backlog and backpressure</h2>
+<p>A queue absorbs a burst by letting messages wait. That only works if, averaged over time, consumers process faster than producers send. The arithmetic is the queueing of <x-ref to="latency-and-throughput#saturation"></x-ref> again.</p>
+
+<div class="widget" data-widget="backlog">
+<h4>Will the queue drain?</h4>
+<p>Compare what arrives with what the consumers can process, and see how long a backlog takes to clear.</p>
+<div class="controls">
+  <label>Messages arriving per second<input type="number" name="arrive" value="800" min="0" step="50"></label>
+  <label>Time to process one message, in ms<input type="number" name="each" value="40" min="1" step="5"></label>
+  <label>Consumers<input type="number" name="consumers" value="40" min="1" step="1"></label>
+  <label>Messages already waiting<input type="number" name="backlog" value="500000" min="0" step="10000"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 214" role="img" aria-label="The number of messages waiting in the queue over time, from the present backlog to the moment it is empty, or growing if arrivals exceed capacity."><line x1="40" x2="620" y1="30" y2="30" class="grid"></line><path d="M40 30 L504 174 L620 174 L620 174 L40 174 Z" class="fill-sig" style="opacity:.14"></path><path d="M40 30 L504 174 L620 174" class="line" style=""></path><line x1="40" x2="620" y1="174" y2="174" class="axis"></line><text x="40" y="22" class="ts">500 thousand messages</text><text x="32" y="178" class="ts end">0</text><text x="40" y="191" class="ts">now</text><text x="330" y="191" class="ts mid">26 min</text><text x="620" y="191" class="ts end">52.1 min</text><text x="330" y="208" class="ts mid">Messages waiting in the queue, from now on</text><circle cx="504" cy="174" r="5.5" class="dot"></circle><text x="614" y="50" class="tb end">empty after 41.7 min</text></svg>
+<dl class="results">
+  <div><dt>Processing capacity</dt><dd data-out="capacity">1,000 /s</dd></div>
+  <div><dt>Utilization</dt><dd data-out="util">80%</dd></div>
+  <div><dt>Time to clear the backlog</dt><dd data-out="drain">41.7 min</dd></div>
+  <div><dt>Consumers for 70% utilization</dt><dd data-out="need">46</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">The consumers can process 1,000 messages a second and 800 arrive, so the queue shrinks by 200 a second and the backlog of 500 thousand clears in 41.7 min. At 80% utilization there is little room for a burst: 46 consumers would bring it down to 70%.</p>
+</div>
+
+<p>Two measurements tell you how a queue is doing, and one of them matters more.</p>
+<ul>
+  <li><b>Depth:</b> how many messages are waiting. Easy to measure, hard to interpret. Ten thousand waiting messages is trivial for a queue that processes fifty thousand a second and a disaster for one that processes ten.</li>
+  <li><b>Age of the oldest message:</b> how long the message at the front has waited. This is what users experience, and it is the number to alert on. “Thumbnails are 40 minutes behind” needs no interpretation.</li>
+</ul>
+<p>If arrivals exceed capacity for long enough, something must give. A queue with no limit hides the problem while making it worse: messages wait for hours, the work is stale by the time it is done, and the queue eventually exhausts memory or disk. The honest responses are these.</p>
+<ul>
+  <li><b>Add consumers.</b> Scale them automatically on the age of the oldest message or on backlog per consumer. Check that the next thing down, usually a database, can take the extra load.</li>
+  <li><b>Push back.</b> Give the queue a maximum size and refuse new messages when it is full, so that producers slow down or fail fast. This is <dfn>backpressure</dfn>: the overload is reported upstream, where something can be done about it, instead of accumulating silently.</li>
+  <li><b>Shed load.</b> Drop or sample what matters least. For data that goes stale, drop the oldest first.</li>
+  <li><b>Limit how much each consumer takes.</b> A consumer that pulls a thousand messages into memory and then crashes sends a thousand messages back for redelivery. RabbitMQ’s prefetch count and similar settings cap the number of unacknowledged messages a consumer may hold.</li>
+</ul>
+
+<h3 id="cloudflare-2024">When the buffer is the thing that fails</h3>
+<p>On 14 November 2024 Cloudflare lost about 55% of the logs it would normally have delivered to customers over a period of roughly three and a half hours. The pipeline that delivers those logs keeps a separate buffer for every customer log job, ordinarily more than a million of them.</p>
+<p>A configuration change produced an empty configuration for the service at the front of the pipeline. The change was reverted within five minutes. But that service had an old safety behavior: when its configuration was missing, it failed open and forwarded logs for <em>all</em> customers, not only those with jobs configured. The buffering system downstream began creating a buffer for each of them, about forty times the usual number. It became unresponsive and had to be fully reset.</p>
+<p>The buffering system did have a mechanism to protect itself against this kind of overload. According to Cloudflare’s own account, it had not been configured. Three lessons generalize.</p>
+<ul>
+  <li><b>A buffer needs a limit, and the limit must be switched on and tested.</b> Protection that exists but is not configured is not protection.</li>
+  <li><b>Failing open multiplies load.</b> A fallback that does more work than the normal path will be exercised at the worst moment.</li>
+  <li><b>Test overload on purpose.</b> Cloudflare’s follow-up included regular overload tests, alongside the failure tests it already ran.</li>
+</ul>
+
+<h2 id="durability">Durability, and sending reliably</h2>
+<p>A message accepted by the broker should survive the broker crashing. That depends on settings you choose.</p>
+<ul>
+  <li><b>Persistence.</b> Messages kept only in memory are fast and are lost on restart. Durable queues write them to disk.</li>
+  <li><b>Replication.</b> One broker with a disk is a single point of failure. Managed services replicate across availability zones for you. RabbitMQ’s quorum queues replicate each queue with Raft (<x-ref to="consensus#raft"></x-ref>).</li>
+  <li><b>Confirmation to the sender.</b> A send can fail in transit. Use the acknowledgment the broker returns, called a publisher confirm in RabbitMQ, and retry until it arrives. A sender that does not wait for it will lose messages without knowing.</li>
+</ul>
+<p>Retrying a send can itself create a duplicate, if the first attempt succeeded and only its confirmation was lost. So duplicates enter from both ends, and consumer-side idempotency covers both.</p>
+<p>The hardest reliability problem lies just before the broker. The upload service must save the photo’s row in its database <em>and</em> send the message. If it saves and then crashes, no message is sent and no thumbnails are ever made. If it sends first and the save fails, consumers act on a photo that does not exist. The two systems cannot be updated in one transaction. The solution is the transactional outbox of <x-ref to="distributed-transactions#outbox"></x-ref>: write the message into a table in the same database transaction as the row, and have a separate process forward it to the broker.</p>
+
+<h2 id="payloads">Designing the message</h2>
+<p>A message is an interface, and it outlives the code that first sent it. Messages sent today may be read next week by a consumer deployed tomorrow.</p>
+<ul>
+  <li><b>Identify it.</b> Include a unique message ID for deduplication, the time the thing happened, and the ID of the request that caused it so that the flow can be traced across services (<x-ref to="observability"></x-ref>).</li>
+  <li><b>Name the type and version.</b> A consumer must be able to tell what it is looking at without guessing.</li>
+  <li><b>Evolve compatibly.</b> Add optional fields. Do not remove or rename fields, or change their meaning, while any consumer still reads them. The rules are those of API versioning in <x-ref to="api-styles"></x-ref>, with the difference that you cannot see who the clients are.</li>
+  <li><b>Keep it small.</b> Brokers limit message size: 1 MiB in SQS. Large messages also slow everything down. For a large payload, store it in object storage and send a reference to it. This is called the <dfn>claim check</dfn> pattern, after the ticket you receive for a coat.</li>
+  <li><b>Include what consumers need, and no secrets.</b> A message that only says “photo 871 changed” forces every consumer to call back for details. One that carries the relevant fields does not. <x-ref to="event-driven-architecture#styles"></x-ref> weighs the two.</li>
+</ul>
+<pre data-lang="js" data-title="A message with what a consumer needs to process, deduplicate and trace it">
+{
+  "id": "0199c2f4-7a10-7c3e-9d2b-5f1e8a4b6c70",     // unique: the deduplication key
+  "type": "photo.uploaded",
+  "version": 1,
+  "occurredAt": "2026-10-10T09:14:03.120Z",
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",     // links this work to the original request
+  "data": {
+    "photoId": 871,
+    "ownerId": 42,
+    "storageKey": "originals/42/871.jpg",            // a claim check: the bytes are in object storage
+    "contentType": "image/jpeg",
+    "bytes": 4183022
+  }
+}
+</pre>
+
+<h2 id="landscape">The main products</h2>
+<table>
+<thead><tr><th>Product</th><th>Kind</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Amazon SQS</th><td>Managed queue</td><td>Standard queues: very high throughput, best-effort order, at-least-once. FIFO queues: order within a message group and deduplication on send, at lower throughput.</td></tr>
+<tr><th>Amazon SNS, EventBridge</th><td>Managed pub/sub and event routing</td><td>Fan out to queues, functions and HTTP endpoints, with filtering</td></tr>
+<tr><th>Google Cloud Pub/Sub</th><td>Managed pub/sub</td><td>Topics with subscriptions, ordering keys, dead-letter topics, optional exactly-once delivery within a region</td></tr>
+<tr><th>Azure Service Bus</th><td>Managed queue and pub/sub</td><td>Queues, topics, sessions for ordered groups, scheduled messages</td></tr>
+<tr><th>RabbitMQ</th><td>Open-source broker</td><td>Flexible routing through exchanges. Replicated quorum queues. Version 4.3 is current as of October 2026.</td></tr>
+<tr><th>NATS</th><td>Open-source messaging</td><td>Very light pub/sub, with persistence through its JetStream layer</td></tr>
+<tr><th>Redis</th><td>In-memory store</td><td>Lists and streams used as queues. Simple and fast, with durability limited to what Redis is configured for.</td></tr>
+<tr><th>Apache Kafka</th><td>Log</td><td>Covered in the next chapter. Since version 4.2 it also offers queue-style consumption.</td></tr>
+<tr><th>Your database</th><td>A table of jobs</td><td>Workers claim rows with <code>FOR UPDATE SKIP LOCKED</code> (<x-ref to="transactions#constraints"></x-ref>). Jobs are enqueued in the same transaction as the data they concern, which removes the dual-write problem.</td></tr>
+</tbody>
+</table>
+<p>The last row deserves more respect than it usually gets. A jobs table in PostgreSQL handles thousands of jobs a second, needs no new infrastructure, and makes enqueueing transactional. Many products never need more. A dedicated broker earns its place when volume outgrows that, when many services need to subscribe, or when its routing and delivery features are needed.</p>
+
+<h2 id="choosing">When to use a queue</h2>
+<table>
+<thead><tr><th>Situation</th><th>Use</th></tr></thead>
+<tbody>
+<tr><th>The caller needs the result to continue</th><td>A direct call</td></tr>
+<tr><th>Work that can happen a little later: emails, thumbnails, indexing, exports</th><td>A queue</td></tr>
+<tr><th>Several services must react to one occurrence</th><td>A topic, with a queue per subscriber</td></tr>
+<tr><th>Traffic arrives in bursts that downstream cannot absorb</th><td>A queue, sized and monitored</td></tr>
+<tr><th>Calls to an unreliable or rate-limited external service</th><td>A queue with retries, backoff and a dead-letter queue</td></tr>
+<tr><th>Many consumers need to read the same history, or replay it</th><td>A log (<x-ref to="event-streaming"></x-ref>)</td></tr>
+<tr><th>A multi-step process with waiting and compensation</th><td>A workflow engine (<x-ref to="scheduling-and-workflows"></x-ref>)</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> When you add a queue to a design, say three things without being asked: what the delivery guarantee is (“at least once, so the consumer deduplicates on message ID”), what happens to messages that keep failing (“a dead-letter queue with an alert”), and what you watch (“age of the oldest message”). Those three sentences separate someone who has drawn a queue from someone who has run one.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Consumers that are not idempotent</th><td>Duplicate emails, double charges, counters that drift</td><td>Deduplicate on message ID, or make the operation naturally repeatable</td></tr>
+<tr><th>Acknowledging before doing the work</th><td>A crash loses the message</td><td>Acknowledge after the work has been committed</td></tr>
+<tr><th>Visibility timeout shorter than processing time</th><td>The same job runs several times at once</td><td>A generous timeout, extended while work continues</td></tr>
+<tr><th>No dead-letter queue</th><td>One poison message is retried forever and can block others</td><td>A delivery limit, a dead-letter queue and an alert on it</td></tr>
+<tr><th>Assuming messages arrive in order</th><td>Stale updates overwrite newer ones</td><td>Version numbers in messages, or ordering by key</td></tr>
+<tr><th>Saving to the database and sending as two separate steps</th><td>A crash between them loses or invents a message</td><td>The transactional outbox</td></tr>
+<tr><th>An unbounded queue with no alert on age</th><td>Hours of hidden delay, then memory or disk exhaustion</td><td>Limits, backpressure and an alert on the oldest message</td></tr>
+<tr><th>Large payloads in messages</th><td>Size limits, slow brokers and high cost</td><td>Store the payload and send a reference</td></tr>
+<tr><th>Using a queue where the caller needs an answer</th><td>A slow, fragile imitation of a function call</td><td>Call directly, or redesign so the answer is not needed at once</td></tr>
+<tr><th>Scaling consumers without checking what they call</th><td>The backlog clears and the database falls over</td><td>Size the whole path, not only the workers</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="latency-and-throughput"></x-ref>: the queueing arithmetic behind backlog and utilization.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: delivery guarantees, deduplication and retrying well.</li>
+  <li><x-ref to="distributed-transactions"></x-ref>: the outbox, and sagas built on messages.</li>
+  <li><x-ref to="event-streaming"></x-ref>: the log, the other way to move messages.</li>
+  <li><x-ref to="event-driven-architecture"></x-ref>: designing systems around events.</li>
+  <li><x-ref to="scheduling-and-workflows"></x-ref>: delayed work, recurring work and multi-step processes.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: backpressure and load shedding in the wider system.</li>
+  <li><x-ref to="hld-notifications"></x-ref>: a design built around queues.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A broker lets a service hand off work and move on. It trades an immediate answer for independence from the receiver’s speed, failures and capacity.</li>
+  <li>A queue shares messages among identical workers. A topic copies each message to every subscriber. The usual design is a topic feeding one queue per subscribing service.</li>
+  <li>A message is deleted only when acknowledged. Anything else leads to redelivery, so delivery is at least once and consumers must tolerate duplicates.</li>
+  <li>With several consumers there is no global order. Use versions in messages, or ordering by key.</li>
+  <li>Limit deliveries and send repeated failures to a dead-letter queue that someone is alerted about and can redrive.</li>
+  <li>A queue only absorbs bursts. Sustained overload needs more consumers, backpressure or load shedding. Watch the age of the oldest message.</li>
+  <li>Buffers need limits that are configured and tested.</li>
+  <li>Saving data and sending a message about it cannot be made atomic directly. Use an outbox.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A consumer processes a payment message, charges the card, and crashes before acknowledging. What happens next, and what must the design include?</summary><p>The visibility timeout expires and the broker delivers the message again, to this consumer or another. Without protection the card is charged twice. The consumer must be idempotent: for example it records the message ID in the same transaction as the charge record and skips messages it has already handled, and it passes an idempotency key to the payment provider.</p></details>
+<details><summary>Thumbnails, search indexing and notifications must all react to each upload. Why is one queue read by all three services the wrong design?</summary><p>A queue delivers each message to one consumer, so each upload would reach only one of the three services. Each needs its own copy. Publish to a topic and give every service its own queue subscribed to it. Each service can then scale, fail and fall behind independently.</p></details>
+<details><summary>A queue receives 500 messages a second. Each takes 100 ms to process. How many consumers are needed, and why is the bare minimum a bad choice?</summary><p>One consumer handles 10 a second, so 50 consumers exactly match the arrival rate. At 100% utilization any burst creates a backlog that never clears, and normal variation makes the queue grow without bound. Around 70% utilization, about 72 consumers, leaves room to absorb bursts and drain backlogs.</p></details>
+<details><summary>Two messages about the same order are processed out of order by two workers. Name two ways to prevent the wrong outcome and the cost of each.</summary><p>Carry a version or sequence number in each message and have the consumer ignore anything older than what it has applied. This costs a stored version per entity and works with any broker. Or use ordering by key, so that messages for one order go to one consumer in sequence. This costs some throughput and means a failing message blocks later ones for that order.</p></details>
+<details><summary>What is a poison message, and why does a retry policy alone not handle it?</summary><p>A message that can never be processed successfully, because it is malformed or triggers a bug. Retrying it fails every time, so it is redelivered forever, wasting capacity and, in an ordered group, blocking everything behind it. A limit on deliveries with a dead-letter queue removes it from the flow so that someone can inspect it.</p></details>
+<details><summary>Your alert fires when queue depth exceeds 10,000. Why is that a weak alert, and what is better?</summary><p>Depth has no meaning without the processing rate. Ten thousand messages may be half a second of work or a day of it, and the threshold goes stale as traffic grows. Alert on the age of the oldest message, which measures the delay users experience and stays meaningful at any scale.</p></details>
+<details><summary>In the Cloudflare incident of November 2024, the faulty configuration was reverted within five minutes. Why did the outage last hours?</summary><p>The empty configuration triggered a fail-open behavior that forwarded logs for all customers, and the buffering system tried to create about forty times its normal number of buffers. It became unresponsive and needed a full reset, which took hours. Its overload protection existed but had not been configured. The trigger was brief, and the overloaded buffer was the outage.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Gregor Hohpe and Bobby Woolf, <a href="https://www.enterpriseintegrationpatterns.com/patterns/messaging/">Enterprise Integration Patterns: Messaging Patterns</a>. The catalog that named competing consumers, publish-subscribe, dead-letter channel and claim check.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html">Amazon SQS message quotas</a>. Message size, visibility timeout, retention, delay and FIFO throughput, as read in October 2026.</li>
+  <li>Google Cloud, <a href="https://docs.cloud.google.com/pubsub/docs/subscription-properties">Pub/Sub subscription properties</a>. Acknowledgment deadlines, retention, dead-letter topics and retry policy.</li>
+  <li>RabbitMQ, <a href="https://www.rabbitmq.com/blog/2026/04/23/rabbitmq-4.3-release">RabbitMQ 4.3 Highlights</a>, April 2026. Quorum queue priorities and delayed retries.</li>
+  <li>RabbitMQ, <a href="https://www.rabbitmq.com/docs/quorum-queues">Quorum Queues</a> and <a href="https://www.rabbitmq.com/docs/confirms">Consumer Acknowledgements and Publisher Confirms</a>.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/cloudflare-incident-on-november-14-2024-resulting-in-lost-logs/">Cloudflare incident on November 14, 2024, resulting in lost logs</a>, November 2024.</li>
+  <li>David Yanacek, <a href="https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/">Avoiding insurmountable queue backlogs</a>, Amazon Builders’ Library. How backlogs form and strategies for recovering from them.</li>
+  <li>Chris Richardson, <a href="https://microservices.io/patterns/data/transactional-outbox.html">Pattern: Transactional outbox</a>.</li>
+</ol>
+</section>

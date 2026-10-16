@@ -1,0 +1,380 @@
+<!--meta
+{ "description": "Idempotency and message delivery guarantees: at-most-once, at-least-once and why exactly-once delivery is impossible, idempotency keys, consumer deduplication with an inbox table, version numbers, the end-to-end argument, and retrying safely.",
+  "lede": "A request that gets no reply must be sent again, and the second copy may arrive after the first one already did its work. Every reliable distributed system is built on retries, so every one of them has to cope with the same operation arriving twice. This chapter is about making that harmless.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Duplicates are a certainty</h2>
+<p><x-ref to="distributed-fundamentals#messages"></x-ref> established that a sender who receives no reply cannot tell whether its request was lost or was carried out with the reply lost. The only useful response to silence is to try again. Retrying is therefore built into every layer of a real system:</p>
+<ul>
+  <li>A user taps “Pay” twice because the screen did not change.</li>
+  <li>A mobile app retries after a timeout on a weak connection.</li>
+  <li>A load balancer retries a request on another server.</li>
+  <li>A message queue redelivers a message that was not acknowledged in time.</li>
+  <li>A webhook sender repeats a delivery until it gets a success response.</li>
+  <li>A batch job is run again after failing halfway.</li>
+</ul>
+<p>In each case the same logical operation may reach its destination more than once. If the operation is “charge 42.00”, that is a serious problem. The solution is not to stop retrying, which would mean losing operations. It is to make repetition safe.</p>
+<p>An operation is <dfn>idempotent</dfn> if performing it several times has the same effect as performing it once. Some operations are idempotent by nature and others are not.</p>
+<table>
+<thead><tr><th>Idempotent by nature</th><th>Not idempotent</th></tr></thead>
+<tbody>
+<tr><td>Set the caption to “Sunset”</td><td>Append “!” to the caption</td></tr>
+<tr><td>Delete photo 871</td><td>Delete the newest photo</td></tr>
+<tr><td>Mark order 5512 as shipped</td><td>Create an order</td></tr>
+<tr><td>Set the balance to 100</td><td>Add 10 to the balance</td></tr>
+<tr><td>Add user 42 to the set of likers</td><td>Increase the like count by one</td></tr>
+</tbody>
+</table>
+<p>The left column describes a resulting state. The right column describes a change relative to whatever the state happens to be. That distinction is the key to most of this chapter.</p>
+
+<h2 id="guarantees">Three delivery guarantees</h2>
+<p>When a message is handed from one party to another, with a queue or a network in between, there are three promises a system might make about how many times it is processed.</p>
+
+<figure class="fig wide" id="fig-semantics">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-labelledby="f301t f301d">
+<title id="f301t">At-most-once and at-least-once delivery, distinguished by when the consumer acknowledges</title>
+<desc id="f301d">Left: the queue delivers a message, the consumer acknowledges it at once and then crashes before doing the work. The queue has forgotten the message, so it is lost. Right: the queue delivers a message, the consumer does the work and crashes before acknowledging. No acknowledgment arrives, so the queue delivers the message again and the work is done twice.</desc>
+<g data-scene="amo">
+<text class="tl" x="10" y="18">Acknowledge first: at most once</text>
+<text class="ts mid" x="70" y="42">Queue</text>
+<text class="ts mid" x="280" y="42">Consumer</text>
+<line class="axis" x1="70" y1="50" x2="70" y2="196"/>
+<line class="axis" x1="280" y1="50" x2="280" y2="196"/>
+<g data-s="1">
+<path class="e sig" d="M71 72H279"/>
+<text class="ts mid" x="175.0" y="66">1. deliver</text>
+</g>
+<g data-s="2">
+<path class="e" d="M279 100H71"/>
+<text class="ts mid" x="175.0" y="94">2. acknowledge</text>
+</g>
+<g data-s="3">
+<path class="x" d="M273 123l14 14M287 123l-14 14"/>
+<text class="ts" x="294" y="134">crashes</text>
+<text class="ts" x="10" y="222">The queue has forgotten the message.</text>
+<text class="ts" x="10" y="238">The work was never done: the message is lost.</text>
+</g>
+</g>
+<path class="e none dash" d="M360 8V252"/>
+<g data-scene="alo">
+<text class="tl" x="380" y="18">Process first: at least once</text>
+<text class="ts mid" x="440" y="42">Queue</text>
+<text class="ts mid" x="650" y="42">Consumer</text>
+<line class="axis" x1="440" y1="50" x2="440" y2="196"/>
+<line class="axis" x1="650" y1="50" x2="650" y2="196"/>
+<g data-s="1">
+<path class="e sig" d="M441 72H649"/>
+<text class="ts mid" x="545.0" y="66">1. deliver</text>
+</g>
+<g class="hide" data-s="3">
+<path class="e sig" d="M441 178H649"/>
+<text class="ts mid" x="545.0" y="172">3. deliver again</text>
+</g>
+<g data-s="2">
+<path class="x" d="M643 123l14 14M657 123l-14 14"/>
+<text class="ts end" x="636" y="134">done, then crashes</text>
+</g>
+<g data-s="3">
+<text class="ts" x="380" y="222">The work was done and the queue was not told.</text>
+<text class="ts" x="380" y="238">It delivers again: the work is done twice.</text>
+</g>
+<g data-s="2">
+<text class="ts mid" x="545" y="158">no acknowledgment arrives</text>
+</g>
+</g>
+
+</svg>
+</div>
+<ol class="steps" data-scene="amo" data-label="Acknowledge first">
+  <li data-state="Message in the queue: yes; Work done: no">The queue delivers a message to the consumer.</li>
+  <li data-state="Message in the queue: no, acknowledged; Work done: no">The consumer acknowledges at once, before doing the work. The queue forgets the message.</li>
+  <li data-state="Message in the queue: no, acknowledged; Work done: never">The consumer crashes before the work is done. The message is gone, and the work will never be done.</li>
+</ol>
+<ol class="steps" data-scene="alo" data-label="Process first">
+  <li data-state="Message in the queue: yes; Work done: no">The queue delivers a message to the consumer.</li>
+  <li data-state="Message in the queue: yes, never acknowledged; Work done: once">The consumer does the work first, and crashes before it can acknowledge. No acknowledgment reaches the queue.</li>
+  <li data-state="Message in the queue: yes, never acknowledged; Work done: twice">The queue assumes the message was not handled and delivers it again. The work is done twice.</li>
+</ol>
+<figcaption>The same crash, at the same moment, under the two possible orders of working and acknowledging. One loses the message and the other repeats it.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Guarantee</th><th>How</th><th>Failure it permits</th><th>Acceptable for</th></tr></thead>
+<tbody>
+<tr><th>At most once</th><td>Acknowledge, then process. Never retry.</td><td>Loss</td><td>Data where a gap is harmless: a metrics sample, a “user is typing” signal</td></tr>
+<tr><th>At least once</th><td>Process, then acknowledge. Retry until acknowledged.</td><td>Duplicates</td><td>Nearly everything, provided the receiver handles repeats</td></tr>
+<tr><th>Exactly once</th><td>See below</td><td>Neither</td><td>What everyone wants</td></tr>
+</tbody>
+</table>
+<p><b>Exactly-once delivery does not exist.</b> The reason is the lost acknowledgment. Any scheme needs the receiver to tell the sender “I have it”, and that message can be lost too. The sender must then either resend, risking a duplicate, or not resend, risking loss. No protocol escapes that choice, however many confirmations are layered on.</p>
+<p>What can be achieved is the same result by another route: deliver <em>at least once</em>, and make the processing idempotent, so that duplicates have no further effect. This is properly called <dfn>effectively-once</dfn> processing, and it is what products mean when they advertise exactly-once. The rest of the chapter is the set of techniques for the second half.</p>
+
+<h2 id="natural">Designing operations to be idempotent</h2>
+<p>The cheapest technique is to phrase the operation so that repetition does nothing, following the left column of the earlier table.</p>
+<table>
+<thead><tr><th>Instead of</th><th>Use</th><th>Why it is safe</th></tr></thead>
+<tbody>
+<tr><td>“Increment the like count”</td><td>“Record that user 42 likes photo 871”, with a unique constraint on the pair</td><td>The second insert is rejected or ignored, and the count is derived from the rows</td></tr>
+<tr><td>“Add 10 to the balance”</td><td>“Apply transfer 881, of 10”, where each transfer ID is applied once</td><td>The transfer either exists or does not</td></tr>
+<tr><td>“Create a comment”</td><td>“Create comment 3f9c…”, with the ID chosen by the client</td><td>A repeat hits the primary key</td></tr>
+<tr><td>“Move the order to the next state”</td><td>“Move order 5512 from paid to shipped”</td><td>If it is already shipped, the condition fails and nothing changes</td></tr>
+<tr><td>“Send the welcome email”</td><td>“Send the welcome email for user 42, if not already recorded as sent”</td><td>A record of having done it guards the action</td></tr>
+</tbody>
+</table>
+<p>Three tools recur. A <b>client-supplied identifier</b> for the thing being created turns a create into “make sure this exists”. A <b>unique constraint</b> lets the database reject the repeat, atomically, even under concurrency (<x-ref to="transactions#constraints"></x-ref>). And a <b>conditional update</b> that names the expected current state makes a state change apply once.</p>
+
+<h2 id="keys">Idempotency keys</h2>
+<p>When an operation cannot be rephrased, the general solution is an <dfn>idempotency key</dfn>: a unique value that the client generates once for each logical operation and sends with every attempt. The server remembers which keys it has handled and what it answered. A request with a key it has seen is not executed again. The stored answer is returned.</p>
+
+<figure class="fig wide" id="fig-idem-key">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 276" role="img" aria-labelledby="f302t f302d">
+<title id="f302t">A retried request made safe by an idempotency key</title>
+<desc id="f302d">A client sends POST /orders with key 7f3a. The API saves the key and the new order in the database together. The 201 Created response is lost on the way back. The client retries with the same key. The API finds that the key already exists, reads the saved response and returns the same 201 Created for the same order. Only one order is created.</desc>
+<text class="tb mid" x="90" y="20">Client</text>
+<text class="tb mid" x="360" y="20">API</text>
+<text class="tb mid" x="630" y="20">Database</text>
+<line class="axis" x1="90" y1="28" x2="90" y2="236"/>
+<line class="axis" x1="360" y1="28" x2="360" y2="236"/>
+<line class="axis" x1="630" y1="28" x2="630" y2="236"/>
+<g data-s="1">
+<path class="e sig" d="M91 52H359"/>
+<text class="ts mid" x="225.0" y="46">1. POST /orders, key 7f3a</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M361 78H629"/>
+<text class="ts mid" x="495.0" y="72">2. save key 7f3a and the order, together</text>
+</g>
+<g data-s="3">
+<path class="e" d="M359 108H180"/>
+<path class="x" d="M160 101l14 14M174 101l-14 14"/>
+<text class="ts mid" x="270" y="100">3. 201 Created, lost</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M91 148H359"/>
+<text class="ts mid" x="225.0" y="142">4. retry: POST /orders, key 7f3a</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M361 174H629"/>
+<text class="ts mid" x="495.0" y="168">5. key 7f3a already exists</text>
+</g>
+<g data-s="6">
+<path class="e" d="M629 200H361"/>
+<text class="ts mid" x="495.0" y="194">6. the saved response</text>
+</g>
+<g data-s="7">
+<path class="e" d="M359 226H91"/>
+<text class="ts mid" x="225.0" y="220">7. 201 Created, the same order</text>
+<text class="ts" x="10" y="260">The retry carries the same key, so the server recognizes it and replays its first answer. One order exists.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Keys saved: none; Orders: 0">The client asks the API to create an order, and attaches a key of its own choosing, 7f3a.</li>
+  <li data-msg="save key and order" data-state="Keys saved: 7f3a; Orders: 1">The API saves the key and the order in one transaction.</li>
+  <li>It replies 201 Created, and the reply is lost on the way.</li>
+  <li data-msg="POST /orders, key 7f3a">The client cannot tell whether the order exists, so it retries with the same key.</li>
+  <li data-state="Keys saved: 7f3a; Orders: 1; Second save of 7f3a: refused">The API tries to save the key again and finds that it already exists.</li>
+  <li>So it reads back the response it saved the first time.</li>
+  <li>It returns that same response. One order exists, and the client has its answer.</li>
+</ol>
+<figcaption>An idempotency key. The client decides what counts as “the same operation” by reusing the key, and the server enforces it.</figcaption>
+</figure>
+
+<p>Stripe’s payment API is the best-known implementation and a good model. The client sends an <code>Idempotency-Key</code> header of up to 255 characters, typically a random UUID. Stripe saves the status code and body of the first response for that key, including error responses, and returns them for any repeat. It rejects a repeat whose parameters differ from the original, and it lets keys expire after 24 hours.</p>
+<pre data-lang="ts" data-title="An endpoint that honors idempotency keys">
+async function createOrder(userId: number, key: string, body: OrderInput): Promise<ApiResponse> {
+  const fingerprint = sha256(JSON.stringify(body));
+
+  return db.transaction(async (tx) => {
+    const claimed = await tx.query(
+      `INSERT INTO idempotency_keys (user_id, key, fingerprint)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, key) DO NOTHING`, [userId, key, fingerprint]);
+
+    if (claimed.rowCount === 0) {                       // seen before: replay, do not repeat
+      const prior = await tx.queryOne(
+        "SELECT fingerprint, response FROM idempotency_keys WHERE user_id = $1 AND key = $2",
+        [userId, key]);
+      if (prior.fingerprint !== fingerprint) {
+        return { status: 422, body: { error: "This key was used for a different request." } };
+      }
+      return prior.response;
+    }
+
+    const order = await insertOrder(tx, userId, body);  // the real work, in the same transaction
+    const response = { status: 201, body: order };
+    await tx.query(
+      "UPDATE idempotency_keys SET response = $3 WHERE user_id = $1 AND key = $2",
+      [userId, key, response]);
+    return response;
+  });
+}
+</pre>
+<p>The details carry the correctness.</p>
+<ul>
+  <li><b>The key and the effect commit in one transaction.</b> If they were saved separately, a crash between them would leave either a key with no order, so the retry is wrongly ignored, or an order with no key, so the retry creates a second one. This is the dual-write problem from <x-ref to="distributed-transactions#problem"></x-ref> again.</li>
+  <li><b>A unique constraint decides who is first.</b> Two copies of the request arriving at the same instant both try to insert the key. The database lets one through and makes the other wait, then see the conflict. Checking with a <code>SELECT</code> first and inserting afterward would let both pass.</li>
+  <li><b>Keys are scoped to the caller.</b> Otherwise one client could collide with, or read the stored response of, another.</li>
+  <li><b>The request is fingerprinted.</b> Reusing a key with different contents is a client bug, and it is better to say so than to return an answer to a question that was not asked.</li>
+  <li><b>Keys expire.</b> Keep them longer than any client could plausibly retry, a day is common, and then delete them.</li>
+</ul>
+<p>The key must be created where the operation originates and reused for every retry of it. A key generated afresh on each attempt protects against nothing. For a button in an app, generate the key when the form is shown or the button first pressed, not inside the function that sends the request.</p>
+<aside class="sn"><b>When the effect is outside your database</b>If the work is a call to another system, such as a payment provider, it cannot share your transaction. Record the key as “started” and commit. Call the provider, passing the same key on to it so that it deduplicates too. Then record the outcome. A retry that finds “started” with no outcome knows the call may have happened, and asks the provider what became of that key instead of calling blindly.</aside>
+
+<h2 id="consumers">Deduplicating on the receiving side</h2>
+<p>Messages from a queue arrive at least once, so every consumer needs the same protection. Messages carry a unique ID assigned by the producer, and the consumer records the IDs it has processed. The record must be written in the same transaction as the work, for the same reason as before. This is sometimes called the <dfn>inbox pattern</dfn>, the mirror image of the outbox.</p>
+
+<figure class="fig wide" id="fig-inbox">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 208" role="img" aria-labelledby="f303t f303d">
+<title id="f303t">A consumer recording processed message IDs in the same transaction as its work</title>
+<desc id="f303d">A queue delivers message 4f1c to a consumer. In one database transaction the consumer inserts 4f1c into a processed_messages table that has a unique constraint, and creates a shipment. If the same message is delivered again, the insert fails the unique check, and the consumer skips the work and acknowledges the message.</desc>
+<rect class="n async" x="10" y="56" width="120" height="50" rx="6"/>
+<text class="tb mid" x="70" y="77">Queue</text>
+<text class="ts mid" x="70" y="94">message 4f1c</text>
+<rect class="n" x="190" y="56" width="120" height="50" rx="6"/>
+<text class="tb mid" x="250" y="85.5">Consumer</text>
+<rect class="grp" x="370" y="14" width="340" height="134" rx="8"/>
+<text class="ts" x="380" y="30">one database transaction</text>
+<rect class="n store" x="390" y="40" width="300" height="42" rx="6"/>
+<text class="tb mid" x="540" y="57">processed_messages</text>
+<text class="ts mid" x="540" y="74">insert 4f1c (unique)</text>
+<rect class="n store" x="390" y="92" width="300" height="42" rx="6"/>
+<text class="tb mid" x="540" y="109">shipments</text>
+<text class="ts mid" x="540" y="126">create the shipment</text>
+<g data-s="1">
+<path class="e async" d="M130 81H190"/>
+</g>
+<g data-s="2">
+<path class="e sig" d="M310 74 390 62"/>
+<path class="e sig" d="M310 90 390 112"/>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="176">First delivery: both rows are written and committed together. A redelivery of 4f1c fails the unique check on the first row,</text>
+<text class="ts" x="10" y="192">so the consumer skips the work and simply acknowledges the message.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="message 4f1c" data-state="Processed IDs: none; Shipments: 0">The queue delivers message 4f1c to the consumer.</li>
+  <li data-msg="one transaction" data-state="Processed IDs: 4f1c; Shipments: 1">In one database transaction the consumer records the message ID in a table with a unique constraint, and does its work: it creates the shipment.</li>
+  <li data-state="Processed IDs: 4f1c; Shipments: 1; Second delivery: skipped">If the same message is delivered again, inserting 4f1c fails on the unique constraint. The transaction does nothing, so the consumer skips the work and acknowledges the message.</li>
+</ol>
+<figcaption>Deduplication at the consumer. “Have I done this?” and “do it” are answered in one atomic step.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="A consumer that tolerates redelivery">
+async function handleOrderCreated(msg: Message): Promise<void> {
+  await db.transaction(async (tx) => {
+    const fresh = await tx.query(
+      `INSERT INTO processed_messages (consumer, message_id)
+       VALUES ('shipping', $1) ON CONFLICT DO NOTHING`, [msg.id]);
+    if (fresh.rowCount === 0) return;            // a redelivery: already handled
+
+    await createShipment(tx, msg.payload);       // commits together with the row above
+  });
+  await msg.ack();                               // acknowledge last
+}
+</pre>
+<p>Some queues offer deduplication themselves. Amazon SQS FIFO queues discard a message whose deduplication ID repeats one sent in the previous five minutes. That removes duplicates created by a producer retrying a send. It does not remove redelivery to a consumer that processed a message and failed to acknowledge it, and it does nothing after the five minutes. Treat such features as a reduction in duplicates, and keep the consumer idempotent.</p>
+
+<h3 id="versions">Versions against stale and reordered messages</h3>
+<p>Retries also disturb order. A delayed first attempt can arrive after a later message. If a profile is updated to “Ana B.” and then to “Ana Bell”, and the first update is redelivered late, a consumer that blindly applies each message ends with the older name.</p>
+<p>The defense is a <dfn>version number</dfn> on each entity that increases with every change. Each message carries the version it produces, and the consumer applies a message only if its version is higher than the one it holds:</p>
+<pre data-lang="sql">
+UPDATE profiles SET display_name = 'Ana Bell', version = 7
+WHERE user_id = 42 AND version < 7;
+</pre>
+<p>A duplicate and a late arrival are both discarded by the same condition. This is why change events are best designed to carry the entity’s full new state and a version, in place of an instruction to modify the previous state.</p>
+
+<h2 id="end-to-end">The check must be end to end</h2>
+<p>It is tempting to think a lower layer has already taken care of duplicates. TCP discards duplicate packets. The message queue has a deduplication feature. The database write is transactional. Each of those is true and none of them is sufficient, because a duplicate can be introduced above whichever layer is deduplicating.</p>
+<p>TCP removes duplicate packets within one connection. When the app times out, opens a new connection and sends the request again, TCP sees a new, valid request. A queue that deduplicates sends cannot know that the user pressed the button twice and produced two distinct messages. Only the two ends of the whole operation, the place where the intent originates and the place where the effect is recorded, can decide what “the same operation” means.</p>
+<p>This is an instance of a classic principle of system design, the <dfn>end-to-end argument</dfn>: a guarantee about a whole operation can only be fully implemented at its endpoints, and help from the layers between is an optimization. For idempotency, it means the key is generated at the origin, carried through every hop unchanged, and checked where the effect is committed.</p>
+
+<h2 id="exactly-once-systems">What “exactly once” means in products</h2>
+<p>Stream processing systems such as Apache Kafka advertise exactly-once semantics, and the claim is accurate within limits worth understanding. Kafka gives each producer an ID and numbers its messages, so a broker can discard a resend. It also supports transactions that atomically combine “I consumed these input messages” with “I produced these output messages”, so a processing step that crashes and restarts neither loses nor duplicates its output.</p>
+<p>The guarantee holds as long as everything stays inside the system. The moment a step has an effect outside, such as writing to another database, calling an API or sending an email, that effect is back to at-least-once and needs the techniques of this chapter. <x-ref to="event-streaming"></x-ref> covers the mechanism.</p>
+
+<h2 id="retries">Retrying well</h2>
+<p>Idempotency makes retries safe. They still need to be sensible, and <x-ref to="resilience-patterns"></x-ref> covers the subject fully. The essentials:</p>
+<ul>
+  <li><b>Retry what might succeed.</b> Timeouts, connection failures and responses such as <code>503</code> and <code>429</code> are worth retrying. A <code>400</code> or <code>404</code> will fail the same way again.</li>
+  <li><b>Wait longer each time, with randomness</b>, so that many clients do not retry in step (<x-ref to="realtime-communication#reconnect"></x-ref>).</li>
+  <li><b>Stop eventually.</b> After a bounded number of attempts or a deadline, give up and record the failure where someone or something will deal with it, such as a dead-letter queue (<x-ref to="message-queues"></x-ref>).</li>
+  <li><b>Retry at one layer.</b> Three layers each retrying three times turn one failure into twenty-seven requests.</li>
+  <li><b>Respect HTTP’s rules.</b> <code>GET</code>, <code>PUT</code> and <code>DELETE</code> are defined as idempotent and may be retried by intermediaries. <code>POST</code> is not, which is why it is the method that needs a key (<x-ref to="http-and-tls#methods"></x-ref>).</li>
+</ul>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Checking for a duplicate and then acting, as two separate steps: “look up the order by its reference, and if none exists, create it”. Two retries arriving together both find nothing and both create. The check and the action have to be one atomic operation, which in practice means a unique constraint or a conditional write, never a read followed by a write.</p></div>
+<div class="note production"><p><span class="label">In production.</span> Test for duplicates deliberately, because they will not occur in ordinary testing. Deliver every message twice in a test environment. Replay yesterday’s events against a copy of the system and check that nothing changes. Kill a consumer between its work and its acknowledgment. A system that passes these has earned the word idempotent.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> Any design involving payments, orders or messaging will be probed with “what if the request is retried?” or “what if the consumer crashes after processing?”. The answer has a standard shape: “delivery is at least once, so the operation carries an idempotency key that the server stores with the result in the same transaction, and a retry returns the stored result”. Saying “exactly-once delivery” without that qualification usually draws a follow-up.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Assuming a request is processed once</b> because retries are rare in testing.</li>
+  <li><b>Read-then-write duplicate checks</b> with no unique constraint.</li>
+  <li><b>Storing the idempotency key separately</b> from the effect it guards.</li>
+  <li><b>Generating a new key for every attempt.</b></li>
+  <li><b>Relative operations in messages</b> (“add 1”) where absolute ones (“set to 5, version 12”) would do.</li>
+  <li><b>Acknowledging a message before processing it</b> when losing it matters.</li>
+  <li><b>Relying on a queue’s deduplication window</b> as the only defense.</li>
+  <li><b>Applying messages in arrival order</b> with no version check.</li>
+  <li><b>Retrying non-idempotent calls to third parties</b> without passing a key.</li>
+  <li><b>Unbounded or multi-layer retries.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: the lost-reply ambiguity that makes all this necessary.</li>
+  <li><x-ref to="api-styles#idempotency-keys"></x-ref>: the key as part of an API’s contract.</li>
+  <li><x-ref to="distributed-transactions"></x-ref>: the outbox, whose at-least-once delivery this chapter makes safe.</li>
+  <li><x-ref to="message-queues"></x-ref> and <x-ref to="event-streaming"></x-ref>: acknowledgments, redelivery and transactions in practice.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: retry policy.</li>
+  <li><x-ref to="unique-ids"></x-ref>: generating the identifiers that keys and messages rely on.</li>
+  <li><x-ref to="hld-payments"></x-ref>: where a duplicate costs real money.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Retries are unavoidable, so every operation may arrive more than once.</li>
+  <li>Acknowledging before processing gives at most once and can lose messages. Processing before acknowledging gives at least once and can repeat them.</li>
+  <li>Exactly-once delivery is impossible. At-least-once delivery with idempotent processing gives the same result.</li>
+  <li>Prefer operations that state a result over operations that state a change, and let unique constraints and conditional updates reject repeats.</li>
+  <li>An idempotency key identifies a logical operation. Store it with the result, in the same transaction as the effect, and replay the result on a repeat.</li>
+  <li>Consumers record processed message IDs in the same transaction as their work, and use version numbers to discard stale or reordered messages.</li>
+  <li>Deduplication has to be end to end, from where the intent originates to where the effect is committed.</li>
+  <li>Check and act in one atomic step, never as a read followed by a write.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A consumer takes a message, sends an email and then acknowledges. It crashes between sending and acknowledging. What happens, and which delivery guarantee is this?</summary><p>The queue receives no acknowledgment and delivers the message again, so the email is sent twice. This is at-least-once delivery. To avoid the duplicate, the consumer needs a durable record that this message’s email was sent, checked before sending.</p></details>
+<details><summary>Why is “exactly-once delivery” impossible, and what do systems provide instead?</summary><p>The receiver’s acknowledgment can be lost, leaving the sender unable to tell whether to resend. Resending risks a duplicate and not resending risks loss. Systems instead deliver at least once and make processing idempotent, so that duplicates change nothing. The outcome is as if each message were processed once.</p></details>
+<details><summary>An API stores the idempotency key in a cache and the order in the database. Describe a failure that creates two orders.</summary><p>The order is committed to the database and the process crashes before writing the key to the cache, or the cache loses the entry. The client retries with the same key, the server finds no record of it and creates a second order. The key must be stored in the same transaction as the order.</p></details>
+<details><summary>A client library generates a fresh UUID as the idempotency key inside its <code>send()</code> function, which is called again on each retry. What is wrong?</summary><p>Each attempt carries a different key, so the server sees unrelated requests and executes every one. The key must be created once for the logical operation, before the first attempt, and reused for all retries.</p></details>
+<details><summary>Rewrite “increment the view count of photo 871” so that a redelivered message does no harm.</summary><p>Give each view event its own ID and record it with a unique constraint, deriving the count from the recorded events, so a repeat is ignored. Or, if exact counts do not matter, accept the occasional double count. What does not work is applying “plus one” on every delivery.</p></details>
+<details><summary>TCP already discards duplicate packets. Why does an application still need idempotency keys?</summary><p>TCP deduplicates within a single connection. When a client times out and retries, it sends a new request, often on a new connection, which TCP correctly treats as new data. Only the application knows that the two requests represent the same intended operation.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Stripe documentation, <a href="https://docs.stripe.com/api/idempotent_requests">Idempotent requests</a>. Key length, stored responses, parameter checking and the 24-hour retention. Checked October 2026.</li>
+  <li>Brandur Leach, <a href="https://stripe.com/blog/idempotency">Designing robust and predictable APIs with idempotency</a>, Stripe, 2017.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html">Exactly-once processing in Amazon SQS</a>. The five-minute deduplication interval.</li>
+  <li>J. H. Saltzer, D. P. Reed and D. D. Clark, <a href="https://web.mit.edu/Saltzer/www/publications/endtoend/endtoend.pdf">End-to-End Arguments in System Design</a>, 1984.</li>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapters 8 and 11, on duplicate suppression and end-to-end operation identifiers.</li>
+  <li>Pat Helland, <a href="https://queue.acm.org/detail.cfm?id=2187821">Idempotence Is Not a Medical Condition</a>, ACM Queue, 2012.</li>
+  <li>IETF, <a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/">The Idempotency-Key HTTP Header Field</a>. A draft standard for the header.</li>
+  <li>Apache Kafka documentation, <a href="https://kafka.apache.org/documentation/#semantics">Message delivery semantics</a>. Idempotent producers and transactions.</li>
+</ol>
+</section>

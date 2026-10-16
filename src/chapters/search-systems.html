@@ -1,0 +1,454 @@
+<!--meta
+{ "description": "How full-text search works: inverted indexes, text analysis, BM25 relevance ranking, typo tolerance and autocomplete, Lucene segments, distributed search with shards, keeping a search index in sync with the database, and hybrid search with vectors.",
+  "lede": "A search box looks like a database query and behaves like nothing of the sort. Users type fragments, misspell things, and expect the best match first, not all matches in arbitrary order. This chapter explains the data structure that makes text search fast, how results are ranked, and how to run a search index beside your database without the two drifting apart.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Why a database query is not search</h2>
+<p>Suppose the photo app wants a search box over captions. The first attempt is one line of SQL:</p>
+<pre data-lang="sql">
+SELECT id, caption FROM photos WHERE caption LIKE '%sunset%';
+</pre>
+<p>This fails in three separate ways, and each points to a part of what a search system does.</p>
+<ul>
+  <li><b>It is slow.</b> A pattern that starts with a wildcard cannot use a B-tree index (<x-ref to="indexes-and-queries#when-ignored"></x-ref>), so the database reads every caption. With a hundred million photos that is seconds per query.</li>
+  <li><b>It matches characters, and people search for meanings.</b> It will not find “Sunsets” with a capital letter, or “sun set”, or “sunsett” typed in a hurry, and it will happily match “sunsetter” and other strings that merely contain the letters.</li>
+  <li><b>It has no notion of better and worse.</b> Ten thousand rows come back in whatever order the database finds them. A search user looks at the first five results and nothing else.</li>
+</ul>
+<p>A <dfn>search system</dfn> addresses each: a different index structure for speed, a text processing step for language, and a scoring function for order.</p>
+
+<h2 id="inverted-index">The inverted index</h2>
+<p>A table maps each document to its words. Search needs the reverse: for each word, the documents that contain it. That reversed mapping is the <dfn>inverted index</dfn>, and it is the same structure as the index at the back of a book.</p>
+
+<figure class="fig wide" id="fig-inverted">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f241t f241d">
+<title id="f241t">Three documents and the inverted index built from them</title>
+<desc id="f241d">Three captions: Sunset at the beach, Beach volleyball at sunset, and City lights at night. The inverted index lists each term with the documents containing it: beach in 1 and 2, city in 3, light in 3, night in 3, sunset in 1 and 2, volleyball in 2. A query for beach sunset looks up both terms and intersects their lists, giving documents 1 and 2.</desc>
+<text class="tl" x="10" y="18">Documents</text>
+<rect class="n sunk" x="10" y="30" width="40" height="26" rx="0"/>
+<text class="ts tb" x="17" y="47">id</text>
+<rect class="n sunk" x="50" y="30" width="230" height="26" rx="0"/>
+<text class="ts tb" x="57" y="47">caption</text>
+<rect class="n" x="10" y="56" width="40" height="26" rx="0"/>
+<text class="ts" x="17" y="73">1</text>
+<rect class="n" x="50" y="56" width="230" height="26" rx="0"/>
+<text class="ts" x="57" y="73">Sunset at the beach</text>
+<rect class="n" x="10" y="82" width="40" height="26" rx="0"/>
+<text class="ts" x="17" y="99">2</text>
+<rect class="n" x="50" y="82" width="230" height="26" rx="0"/>
+<text class="ts" x="57" y="99">Beach volleyball at sunset</text>
+<rect class="n" x="10" y="108" width="40" height="26" rx="0"/>
+<text class="ts" x="17" y="125">3</text>
+<rect class="n" x="50" y="108" width="230" height="26" rx="0"/>
+<text class="ts" x="57" y="125">City lights at night</text>
+<text class="tl" x="400" y="18">Inverted index</text>
+<rect class="n sunk" x="400" y="30" width="120" height="24" rx="0"/>
+<text class="ts tb" x="407" y="46">term</text>
+<rect class="n sunk" x="520" y="30" width="180" height="24" rx="0"/>
+<text class="ts tb" x="527" y="46">documents containing it</text>
+<rect class="n sig" x="400" y="54" width="120" height="24" rx="0"/>
+<text class="ts" x="407" y="70">beach</text>
+<rect class="n sig" x="520" y="54" width="180" height="24" rx="0"/>
+<text class="ts" x="527" y="70">1, 2</text>
+<rect class="n" x="400" y="78" width="120" height="24" rx="0"/>
+<text class="ts" x="407" y="94">city</text>
+<rect class="n" x="520" y="78" width="180" height="24" rx="0"/>
+<text class="ts" x="527" y="94">3</text>
+<rect class="n" x="400" y="102" width="120" height="24" rx="0"/>
+<text class="ts" x="407" y="118">light</text>
+<rect class="n" x="520" y="102" width="180" height="24" rx="0"/>
+<text class="ts" x="527" y="118">3</text>
+<rect class="n" x="400" y="126" width="120" height="24" rx="0"/>
+<text class="ts" x="407" y="142">night</text>
+<rect class="n" x="520" y="126" width="180" height="24" rx="0"/>
+<text class="ts" x="527" y="142">3</text>
+<rect class="n sig" x="400" y="150" width="120" height="24" rx="0"/>
+<text class="ts" x="407" y="166">sunset</text>
+<rect class="n sig" x="520" y="150" width="180" height="24" rx="0"/>
+<text class="ts" x="527" y="166">1, 2</text>
+<rect class="n" x="400" y="174" width="120" height="24" rx="0"/>
+<text class="ts" x="407" y="190">volleyball</text>
+<rect class="n" x="520" y="174" width="180" height="24" rx="0"/>
+<text class="ts" x="527" y="190">2</text>
+<path class="e" d="M280 82H400"/>
+<text class="ts mid" x="340" y="74">analyze, then invert</text>
+<text class="ts" x="10" y="150">Query: beach sunset</text>
+<text class="ts" x="10" y="167">Look up both terms and intersect</text>
+<text class="ts" x="10" y="184">their lists: documents 1 and 2.</text>
+<text class="ts" x="10" y="201">No document is scanned.</text>
+
+</svg>
+</div>
+<figcaption>An inverted index. Finding the documents for a word is one lookup, however many documents exist.</figcaption>
+</figure>
+
+<p>Each distinct word is a <dfn>term</dfn>, and the list of documents for a term is its <dfn>postings list</dfn>. The terms are kept in a sorted, compact structure so that any one can be found in a few steps. Postings lists are kept sorted by document ID, which makes combining them cheap: a query for two words walks both lists together and keeps the IDs that appear in both, in a single pass. The same walk handles OR and NOT.</p>
+<p>Real postings hold more than IDs. They record how many times the term occurs in each document, which ranking needs, and at which positions, which makes it possible to search for an exact phrase or for words near each other.</p>
+
+<h2 id="analysis">Analysis: from text to terms</h2>
+<p>The index in the figure contains “light” where the caption said “lights”, and has no entry for “at” or “the”. Text is not indexed as written. It passes through an <dfn>analyzer</dfn>, a small pipeline that turns a string into the terms that will represent it.</p>
+
+<figure class="fig wide" id="fig-analysis">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 208" role="img" aria-labelledby="f242t f242d">
+<title id="f242t">An analyzer turning a phrase into index terms</title>
+<desc id="f242d">The text The Runners’ Cafés is split into three tokens, converted to lower case, has the common word the removed, and finally has accents removed and words reduced to their stems, leaving the two terms runner and cafe.</desc>
+<g data-s="1">
+<text class="ts end" x="230" y="30">Original text</text>
+<rect class="n" x="250" y="10" width="168" height="28" rx="4"/>
+<text class="ts mid" x="334" y="28.5">The Runners’ Cafés</text>
+</g>
+<g data-s="2">
+<path class="e" d="M282 38V50"/>
+<text class="ts end" x="230" y="70">Split into tokens</text>
+<rect class="n" x="250" y="50" width="64" height="28" rx="4"/>
+<text class="ts mid" x="282" y="68.5">The</text>
+<rect class="n" x="324" y="50" width="88" height="28" rx="4"/>
+<text class="ts mid" x="368" y="68.5">Runners’</text>
+<rect class="n" x="422" y="50" width="64" height="28" rx="4"/>
+<text class="ts mid" x="454" y="68.5">Cafés</text>
+</g>
+<g data-s="3">
+<path class="e" d="M282 78V90"/>
+<text class="ts end" x="230" y="110">Lower-case</text>
+<rect class="n" x="250" y="90" width="64" height="28" rx="4"/>
+<text class="ts mid" x="282" y="108.5">the</text>
+<rect class="n" x="324" y="90" width="88" height="28" rx="4"/>
+<text class="ts mid" x="368" y="108.5">runners’</text>
+<rect class="n" x="422" y="90" width="64" height="28" rx="4"/>
+<text class="ts mid" x="454" y="108.5">cafés</text>
+</g>
+<g data-s="4">
+<path class="e" d="M282 118V130"/>
+<text class="ts end" x="230" y="150">Drop common words</text>
+<rect class="n" x="250" y="130" width="88" height="28" rx="4"/>
+<text class="ts mid" x="294" y="148.5">runners’</text>
+<rect class="n" x="348" y="130" width="64" height="28" rx="4"/>
+<text class="ts mid" x="380" y="148.5">cafés</text>
+</g>
+<g data-s="5">
+<path class="e" d="M282 158V170"/>
+<text class="ts end" x="230" y="190">Remove accents, reduce to stems</text>
+<rect class="n sig" x="250" y="170" width="72" height="28" rx="4"/>
+<text class="ts mid" x="286" y="188.5">runner</text>
+<rect class="n sig" x="332" y="170" width="64" height="28" rx="4"/>
+<text class="ts mid" x="364" y="188.5">cafe</text>
+<text class="ts" x="470" y="150">The two final terms are what is</text>
+<text class="ts" x="470" y="166">stored in the index, and what a</text>
+<text class="ts" x="470" y="182">search for “runner cafe” or</text>
+<text class="ts" x="470" y="198">“RUNNERS café” is turned into.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li>The text as it was written: “The Runners’ Cafés”.</li>
+  <li>It is split into tokens at spaces and punctuation.</li>
+  <li>Each token is put into lower case, so that capitals do not affect matching.</li>
+  <li>Very common words such as “the” are dropped.</li>
+  <li>Accents are removed and words are reduced to their stems. These two terms are what the index stores. A search for “RUNNERS café” goes through the same steps and ends up as the same two terms.</li>
+</ol>
+<figcaption>Analysis. Each step throws away a distinction that should not affect matching.</figcaption>
+</figure>
+
+<p>The usual stages are these:</p>
+<ol>
+  <li><b>Tokenizing</b> splits text into words. This is easy for English and hard for languages written without spaces, such as Chinese, Japanese and Thai, which need dictionaries or statistical models.</li>
+  <li><b>Normalizing</b> removes differences that should not matter: case, accents, variant forms of the same character.</li>
+  <li><b>Removing stop words</b> drops extremely common words such as “the” and “at”. Modern systems often keep them, since they are needed for phrases like “to be or not to be”.</li>
+  <li><b>Stemming</b> reduces words to a common root, so that “running”, “runs” and “runner” can match one another. The rules are specific to each language.</li>
+  <li><b>Expanding synonyms</b>, so that “tv” also matches “television”.</li>
+</ol>
+<p>The rule that makes this work is that the same analysis is applied to the query. The user’s “RUNNERS café” becomes <code>runner</code> and <code>cafe</code>, and those are looked up. If documents and queries are analyzed differently, nothing matches, which is the first thing to check when a search mysteriously returns no results.</p>
+<p>Analysis is also where search quality is won or lost. Stem too aggressively and “university” matches “universe”. Too little and “shoes” does not match “shoe”. Each field of a document can have its own analyzer: a product name analyzed for language, a product code indexed exactly as written.</p>
+
+<h2 id="ranking">Ranking: which results come first</h2>
+<p>Finding matching documents is the easy half. Ordering them is the half that users judge. Every match is given a <dfn>relevance score</dfn>, and results are returned in order of score. The standard scoring function for text is <dfn>BM25</dfn>, the default in Lucene, Elasticsearch and OpenSearch. It combines three ideas that are each intuitive.</p>
+<ul>
+  <li><b>Term frequency.</b> A document that mentions “sunset” three times is probably more about sunsets than one that mentions it once. The benefit levels off, so the tenth mention adds almost nothing. That stops a document from winning by repetition.</li>
+  <li><b>Inverse document frequency.</b> A rare term tells you more than a common one. In a query for “blue heron”, a match on “heron” is worth far more than a match on “blue”, because few documents contain it.</li>
+  <li><b>Length normalization.</b> A word appearing once in a five-word caption matters more than once in a five-page article.</li>
+</ul>
+<div class="formula">score(query, doc) = sum over each query term t of
+
+    IDF(t) × tf × (k + 1) ÷ (tf + k × (1 − b + b × length ÷ average length))
+
+tf = times t occurs in doc     k = 1.2 and b = 0.75 by default</div>
+<p>You will rarely compute this by hand. What matters is knowing that the score is built from these three ingredients, so that when a result ranks strangely you can ask which one caused it.</p>
+<p>Text relevance alone is seldom the right order for a product. Two photos matching “sunset” equally well should not be tied if one has ten thousand likes and the other has none. Production ranking blends the text score with other signals:</p>
+<ul>
+  <li><b>Field weights.</b> A match in the title counts for more than a match in the description.</li>
+  <li><b>Quality and popularity</b>: likes, sales, ratings, click-through rate.</li>
+  <li><b>Freshness</b>, for news and social content.</li>
+  <li><b>Personalization</b>: the user’s language, location and history.</li>
+</ul>
+<p>Large systems go further and train a model on what users clicked to combine hundreds of such signals, usually applied only to the top few hundred candidates that the cheap text score has already selected. <x-ref to="retrieval-and-vector-search"></x-ref> returns to this two-stage pattern.</p>
+<aside class="sn"><b>Measuring quality</b>Relevance is judged by people, so it has to be measured. Keep a set of real queries with the results that should appear for each, and score every ranking change against it. Watch live signals too: the share of searches with no results, the share with no click, and how far down the list people click. A change that looks better to its author and worse on these numbers is worse.</aside>
+
+<h2 id="features">The features users expect</h2>
+<table>
+<thead><tr><th>Feature</th><th>How it is done</th></tr></thead>
+<tbody>
+<tr><th>Typo tolerance</th><td><dfn>Fuzzy matching</dfn>: accept terms within a small edit distance of the query word, usually one or two changed, missing or swapped letters</td></tr>
+<tr><th>Autocomplete</th><td>Index the prefixes of each word (“s”, “su”, “sun” and so on) so that a partial word is an exact lookup, or use a dedicated structure built for prefix lookups</td></tr>
+<tr><th>Filters</th><td>Exact conditions such as category, price range or owner. They narrow the result set without affecting scores, and their results can be cached.</td></tr>
+<tr><th>Facets</th><td>Counts of the results in each category (“Shoes 214, Bags 38”), computed alongside the search</td></tr>
+<tr><th>Highlighting</th><td>Using the stored positions to mark the matching words in a snippet</td></tr>
+<tr><th>“Did you mean”</th><td>Suggesting the closest term that has many matches</td></tr>
+</tbody>
+</table>
+<p>The distinction between a filter and a scored query is worth holding on to. “Photos by Ana from this year matching sunset” has two filters and one text query. Only the text part needs scoring. Search engines execute filters first and cheaply, and it is a common inefficiency to express a filter as a scored clause.</p>
+
+<h2 id="segments">How the index is stored</h2>
+<p>Most open-source search engines are built on the Apache Lucene library, and its storage design will be familiar from <x-ref to="storage-engines#lsm"></x-ref>. An inverted index is expensive to modify in place, since adding one document touches the postings of every term in it. So Lucene never modifies. New documents are collected in memory and written out periodically as a small, complete, immutable index called a <dfn>segment</dfn>. A search queries all segments and combines the results. A background process merges small segments into larger ones.</p>
+<p>The consequences mirror those of an LSM tree.</p>
+<ul>
+  <li><b>Search is near real time, not real time.</b> A document becomes searchable when its segment is opened to readers, an operation called a <dfn>refresh</dfn>. In Elasticsearch this happens once a second by default. Something indexed now may not appear in a search for up to a second.</li>
+  <li><b>Deletes are markers.</b> A deleted document is flagged and skipped at query time. Its space is reclaimed when its segment is merged.</li>
+  <li><b>Updates are a delete and an insert.</b> There is no changing one field in place. The whole document is indexed again.</li>
+  <li><b>Indexing fast and searching fast compete.</b> Frequent refreshes create many small segments, which slows searches until they are merged. Bulk loads go faster with refreshes turned down.</li>
+</ul>
+<p>Alongside the inverted index, the engine keeps a column-oriented copy of the fields used for sorting, filtering and facets, since those need “the values for this document” and not “the documents for this value”.</p>
+
+<h2 id="distributed">Search across many machines</h2>
+<p>An index too large for one machine is divided into <dfn>shards</dfn>, each a complete Lucene index holding a subset of the documents, and each shard has replicas. This is the partitioning and replication of the previous two chapters with one notable difference. Documents are assigned to shards by a hash of their ID. A search for a word could match documents on any shard, so nearly every query is a scatter-gather.</p>
+
+<figure class="fig wide" id="fig-scatter">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-labelledby="f243t f243d">
+<title id="f243t">A search query fanned out to three shards and merged</title>
+<desc id="f243d">A client sends a query to a coordinating node. The coordinator sends the query to each of three shards. Each shard searches its own inverted index and returns the IDs and scores of its top ten matches. The coordinator merges the thirty candidates into a final top ten and then fetches those ten documents from the shards that hold them.</desc>
+<rect class="n" x="10" y="84" width="90" height="50" rx="6"/>
+<text class="tb mid" x="55" y="113.5">Client</text>
+<rect class="n sig" x="170" y="74" width="150" height="70" rx="6"/>
+<text class="tb mid" x="245" y="96.5">Coordinating</text>
+<text class="ts mid" x="245" y="113.5">node</text>
+<text class="ts mid" x="245" y="130.5">merges results</text>
+<rect class="n store" x="480" y="20" width="220" height="52" rx="6"/>
+<text class="tb mid" x="590" y="42">Shard 1</text>
+<text class="ts mid" x="590" y="59">its own inverted index</text>
+<g data-s="1">
+<path class="e sig" d="M320 86 480 38"/>
+</g>
+<g data-s="2">
+<path class="e dash" d="M480 54 320 100"/>
+</g>
+<rect class="n store" x="480" y="92" width="220" height="52" rx="6"/>
+<text class="tb mid" x="590" y="114">Shard 2</text>
+<text class="ts mid" x="590" y="131">its own inverted index</text>
+<g data-s="1">
+<path class="e sig" d="M320 100 480 110"/>
+</g>
+<g data-s="2">
+<path class="e dash" d="M480 126 320 114"/>
+</g>
+<rect class="n store" x="480" y="164" width="220" height="52" rx="6"/>
+<text class="tb mid" x="590" y="186">Shard 3</text>
+<text class="ts mid" x="590" y="203">its own inverted index</text>
+<g data-s="1">
+<path class="e sig" d="M320 114 480 182"/>
+</g>
+<g data-s="2">
+<path class="e dash" d="M480 198 320 128"/>
+</g>
+<g data-s="1">
+<path class="e sig" d="M100 100H170"/>
+</g>
+<g data-s="3">
+<path class="e" d="M170 118H100"/>
+</g>
+<g data-s="1">
+<text class="ts mid" x="400" y="22">1. query to every shard</text>
+</g>
+<g data-s="2">
+<text class="ts mid" x="470" y="240">2. each returns its top 10 IDs and scores</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="176">3. The coordinator merges 30</text>
+<text class="ts" x="10" y="192">candidates into a final top 10,</text>
+<text class="ts" x="10" y="208">then fetches those 10 documents</text>
+<text class="ts" x="10" y="224">from the shards that hold them.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="query">The client’s query reaches a coordinating node, which sends it to every shard.</li>
+  <li data-msg="top 10 IDs">Each shard searches its own index and returns only the IDs and scores of its 10 best matches.</li>
+  <li data-msg="top 10 documents">The coordinator merges the 30 candidates into a final top 10, fetches those 10 documents from the shards that hold them, and replies.</li>
+</ol>
+<figcaption>Two phases: first find the best IDs on every shard, then fetch only the winners. Each shard does the full work of the query on its share of the data.</figcaption>
+</figure>
+
+<p>Three practical consequences follow.</p>
+<ul>
+  <li><b>Deep pagination is expensive.</b> To return results 10,001 to 10,010, every shard must produce its top 10,010 and the coordinator must sort all of them. Engines cap how deep ordinary paging can go. The alternative is the same as for databases: continue from the last result’s sort values (<x-ref to="indexes-and-queries#pagination"></x-ref>). Few people read page 500 of search results, so it is reasonable for the product not to offer it.</li>
+  <li><b>Tail latency grows with shard count</b>, since the query waits for the slowest shard (<x-ref to="latency-and-throughput#tail-at-scale"></x-ref>). More shards are not free.</li>
+  <li><b>The number of primary shards is hard to change.</b> As with any hash partitioning, it is fixed when the index is created, and changing it means rebuilding. Elastic’s guidance is to aim for shards of tens of gigabytes, which gives a way to choose the number from the expected data size.</li>
+</ul>
+<p>When queries always concern one tenant or one user, documents can be routed to a shard by that key instead, and a search then visits one shard. For time-based data such as logs, the standard practice is one index per day or week, so that searches over recent data touch only recent indexes and old data is removed by deleting an index.</p>
+
+<h2 id="sync">Keeping the index in step with the database</h2>
+<p>A search index is not where data is first written. The database is the source of truth, and the index is a copy in a different shape, derived data in the sense of <x-ref to="schema-design#denormalization"></x-ref>. Every design must answer how changes get from one to the other.</p>
+<table>
+<thead><tr><th>Approach</th><th>How it works</th><th>Problem</th></tr></thead>
+<tbody>
+<tr><th>Dual write</th><td>The application writes to the database and then to the search index</td><td>No transaction spans the two. If the second write fails, or two requests’ writes arrive in different orders, the index is wrong and stays wrong.</td></tr>
+<tr><th>Periodic rebuild</th><td>A job reindexes everything, or everything changed since the last run</td><td>Simple and robust, and the index is stale between runs. Deletes are easy to miss.</td></tr>
+<tr><th>Queue of changes</th><td>The application records each change in an outbox table within the same transaction, and a worker indexes from it</td><td>Reliable. Requires discipline in every code path that writes.</td></tr>
+<tr><th>Change data capture</th><td>A process reads the database’s own log and feeds every committed change to an indexer</td><td>Reliable and needs no application changes. More infrastructure to run.</td></tr>
+</tbody>
+</table>
+
+<figure class="fig wide" id="fig-sync">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f244t f244d">
+<title id="f244t">A search index kept up to date from the database’s change stream</title>
+<desc id="f244d">The application writes only to the database, which is the source of truth. Committed changes flow from the database through a change stream to an indexer, which builds documents and writes them to the search index. The application sends search queries to the search index.</desc>
+<rect class="n" x="10" y="20" width="110" height="50" rx="6"/>
+<text class="tb mid" x="65" y="49.5">Application</text>
+<rect class="n store" x="200" y="20" width="130" height="50" rx="6"/>
+<text class="tb mid" x="265" y="41">Database</text>
+<text class="ts mid" x="265" y="58">source of truth</text>
+<rect class="n async" x="400" y="20" width="120" height="50" rx="6"/>
+<text class="tb mid" x="460" y="41">Change stream</text>
+<text class="ts mid" x="460" y="58">log or queue</text>
+<rect class="n" x="580" y="20" width="130" height="50" rx="6"/>
+<text class="tb mid" x="645" y="41">Indexer</text>
+<text class="ts mid" x="645" y="58">builds documents</text>
+<rect class="n sig" x="580" y="120" width="130" height="50" rx="6"/>
+<text class="tb mid" x="645" y="141">Search index</text>
+<text class="ts mid" x="645" y="158">derived copy</text>
+<g data-s="1">
+<path class="e sig" d="M120 36H200"/>
+<text class="ts mid" x="160" y="28">writes</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M330 45H400"/>
+</g>
+<g data-s="3">
+<path class="e async" d="M520 45H580"/>
+<path class="e sig" d="M645 70V120"/>
+</g>
+<g data-s="4">
+<path class="e dash" d="M65 70V145H580"/>
+<text class="ts mid" x="300" y="137">search queries</text>
+<text class="ts" x="10" y="196">The application writes only to the database. Every committed change flows to the index a moment later,</text>
+<text class="ts" x="10" y="212">so the index is a copy that can be rebuilt at any time: slightly behind, and never the authority.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li>The application writes only to the database, which is the source of truth.</li>
+  <li data-msg="change">Every committed change appears in the change stream, in commit order.</li>
+  <li data-msg="change|document">An indexer reads the stream, builds search documents and writes them to the search index.</li>
+  <li>Search queries go to the index. It is a derived copy: slightly behind, never the authority, and it can be rebuilt at any time.</li>
+</ol>
+<figcaption>The dependable arrangement. Changes reach the index through one path, in commit order.</figcaption>
+</figure>
+
+<p>The last two rows are the ones to use for anything that matters, and <x-ref to="change-data-capture"></x-ref> covers the mechanics. Whichever you pick, four details need attention.</p>
+<ul>
+  <li><b>The index lags.</b> A user who creates something and immediately searches for it may not find it. Either show the user’s own new item from the database, or accept and explain the delay.</li>
+  <li><b>Deletes and permission changes must propagate</b>, and faster than anything else. A document that still appears in search after being deleted or made private is a privacy incident.</li>
+  <li><b>Plan to rebuild.</b> Changing an analyzer or a field’s type requires reindexing every document. Build the new index beside the old one, switch a name that points to the current index (an alias), and delete the old one. If you cannot rebuild the index from the database at will, the index has quietly become a second source of truth.</li>
+  <li><b>Return IDs, then load.</b> A common pattern has the search engine return only matching IDs in order, and the application load the current rows from the database. Results then reflect current data and current permissions, at the cost of a second lookup.</li>
+</ul>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Using the search engine as the primary database because it can store documents and is already there. It gives up what a database is for: there are no multi-document transactions, writes are not visible until the next refresh, and replicas have historically been able to lose acknowledged writes under some failures. Keep the authoritative copy in a database and treat the index as disposable.</p></div>
+
+<h2 id="vectors">Searching by meaning</h2>
+<p>Everything so far matches words. A search for “dog on a beach” will not find a photo captioned “golden retriever by the sea”, because no words are shared. <dfn>Semantic search</dfn> closes that gap. A machine learning model turns each text, or image, into an <dfn>embedding</dfn>, a list of a few hundred to a few thousand numbers, arranged so that items with similar meaning have nearby values. The query is embedded the same way, and the search returns the items whose embeddings are closest.</p>
+<p>Finding the nearest among millions of such vectors exactly would mean comparing against all of them, so vector indexes find approximate nearest neighbors, trading a little accuracy for a great deal of speed. <x-ref to="specialized-databases#vector"></x-ref> describes how.</p>
+<p>Each method has blind spots the other covers.</p>
+<table>
+<thead><tr><th></th><th>Keyword search (BM25)</th><th>Vector search</th></tr></thead>
+<tbody>
+<tr><th>Finds</th><td>The exact words</td><td>Similar meanings, with no words in common</td></tr>
+<tr><th>Strong on</th><td>Names, codes, part numbers, rare terms, exact phrases</td><td>Natural-language questions, synonyms, other languages</td></tr>
+<tr><th>Weak on</th><td>Paraphrase and vocabulary mismatch</td><td>Exact identifiers, and terms the model never saw</td></tr>
+<tr><th>Explaining a result</th><td>Easy: these words matched</td><td>Hard</td></tr>
+<tr><th>Cost</th><td>Low</td><td>Embedding every document and query, and a memory-heavy index</td></tr>
+</tbody>
+</table>
+<p>The current standard practice is <dfn>hybrid search</dfn>: run both, and merge the two ranked lists. A simple and effective way to merge is reciprocal rank fusion, which scores each document by its positions in the two lists, without needing the two kinds of score to be comparable. A stronger model then often re-ranks the top few dozen. Elasticsearch, OpenSearch and PostgreSQL with the pgvector extension all support storing vectors beside text, so hybrid search does not require a separate system.</p>
+
+<h2 id="choosing">Choosing a search technology</h2>
+<table>
+<thead><tr><th>Option</th><th>Good for</th><th>Limits</th></tr></thead>
+<tbody>
+<tr><th>Your relational database’s full-text search</th><td>Small and medium data sets. No second system and no synchronization, since the index is updated in the same transaction as the data.</td><td>Ranking and language features are basic. Search load competes with transactions.</td></tr>
+<tr><th>Elasticsearch or OpenSearch</th><td>Large data, rich ranking, facets and aggregations, log and event search</td><td>A distributed system to run and tune</td></tr>
+<tr><th>Typesense or Meilisearch</th><td>Fast, typo-tolerant search for sites and apps, with little configuration</td><td>Fewer features and less flexibility at very large scale</td></tr>
+<tr><th>A hosted search service, such as Algolia</th><td>Excellent results with no operations work</td><td>Cost grows with records and queries. Your data lives with a vendor.</td></tr>
+</tbody>
+</table>
+<p>The advice from <x-ref to="data-models#choosing"></x-ref> applies again. If the data is already in PostgreSQL and the need is a search box over a few million rows, its built-in full-text search with the right index is a sound first step and avoids the whole synchronization problem. Move to a dedicated engine when you need ranking you cannot express, features it lacks, or scale it cannot serve.</p>
+<p>A note on the two largest open-source engines, as of October 2026. OpenSearch began in 2021 as a fork of Elasticsearch after a license change, and has been governed under the Linux Foundation since 2024. Elasticsearch added an open-source license option again in 2024. Both are actively developed, at versions 3.9 and 9.5 respectively, and their APIs have drifted apart enough that moving between them is a migration.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> When a design needs search, say that it is a separate index derived from the primary database, name how it is kept current (“change data capture into a queue, an indexer consuming it”), and acknowledge the lag. For autocomplete, mention prefix indexing and that it must answer in tens of milliseconds, so it is usually a separate, smaller index. <x-ref to="hld-search-autocomplete"></x-ref> designs one in full.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b><code>LIKE '%term%'</code> on a large table.</b></li>
+  <li><b>Writing to the database and the index from application code</b> with nothing to reconcile them.</li>
+  <li><b>Treating the search index as the source of truth.</b></li>
+  <li><b>Analyzing queries differently from documents.</b></li>
+  <li><b>Judging relevance by a handful of queries the developer thought of</b>, with no measurements.</li>
+  <li><b>Offering unlimited deep pagination.</b></li>
+  <li><b>Too many small shards</b>, or a shard count chosen without estimating data size.</li>
+  <li><b>Forgetting deletes and permission changes</b> in the indexing pipeline.</li>
+  <li><b>Exposing the search cluster to the internet</b>, or letting users send arbitrary query syntax to it.</li>
+  <li><b>Vector search alone</b> for a catalog full of product codes and names.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="indexes-and-queries"></x-ref>: why ordinary indexes cannot do this job.</li>
+  <li><x-ref to="storage-engines"></x-ref>: segments and merging are the LSM idea applied to an inverted index.</li>
+  <li><x-ref to="partitioning"></x-ref> and <x-ref to="replication"></x-ref>: shards and replicas.</li>
+  <li><x-ref to="change-data-capture"></x-ref>: the reliable way to feed an index.</li>
+  <li><x-ref to="specialized-databases"></x-ref> and <x-ref to="retrieval-and-vector-search"></x-ref>: vector indexes, and search as the retrieval step for language models.</li>
+  <li><x-ref to="hld-search-autocomplete"></x-ref> and <x-ref to="hld-metrics-and-logging"></x-ref>: two systems built on search engines.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Search needs speed, an understanding of language and an ordering by relevance. A database’s pattern matching provides none of them.</li>
+  <li>An inverted index maps each term to the documents containing it. Queries look up terms and combine sorted lists.</li>
+  <li>Analysis turns text into terms by tokenizing, normalizing and stemming. The same analysis must be applied to queries.</li>
+  <li>BM25 scores a match from term frequency, term rarity and document length. Products blend it with popularity, freshness and other signals, and measure the result.</li>
+  <li>Indexes are stored as immutable segments that are merged in the background, which makes search near real time.</li>
+  <li>A distributed search fans out to every shard and merges. Deep pagination and many shards are costly.</li>
+  <li>The index is derived data. Feed it from the database’s committed changes, expect lag, and be able to rebuild it.</li>
+  <li>Keyword search and vector search fail in different ways. Hybrid search combines them.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A user searches for “Running Shoes” and a product titled “running shoe” is not found. Where would you look first?</summary><p>At the analyzers. The query and the document must be reduced to the same terms. If the document field is stemmed and lower-cased and the query is not, or the reverse, “shoes” and “shoe” or “Running” and “running” do not match. Check that both sides use the same analysis.</p></details>
+<details><summary>In a query for “vintage camera”, a document matches only “vintage” and another matches only “camera”. The index has 200 documents containing “vintage” and 50,000 containing “camera”. Which is likely to score higher, and why?</summary><p>The one matching “vintage”. Rare terms carry more weight because they discriminate better between documents. That is the inverse document frequency part of the score.</p></details>
+<details><summary>A user publishes a post and searches for it at once. It is missing. Thirty seconds later it appears. Name two contributing causes.</summary><p>The pipeline from the database to the index is asynchronous, so the change takes time to arrive at the indexer. And once indexed, a document becomes searchable only at the next refresh. Both add delay. The usual remedy is to show the user’s own new content from the database.</p></details>
+<details><summary>Why is requesting page 2,000 of search results across 20 shards so much more expensive than page 1?</summary><p>For page 1, each shard returns its top 10 and the coordinator sorts 200 entries. For page 2,000, each shard must return its top 20,000, and the coordinator must sort 400,000 entries to find ten. The cost grows with the depth multiplied by the number of shards.</p></details>
+<details><summary>Your code writes to the database and then to the search index. Describe a sequence that leaves them permanently inconsistent.</summary><p>The database write commits and the index write fails because of a timeout or a crash in between, so the index never learns of the change. Or two updates to the same record commit in one order and reach the index in the other, leaving the older version indexed. Feeding the index from the database’s ordered change stream avoids both.</p></details>
+<details><summary>A catalog search must handle “waterproof jacket for hiking” and also “SKU-88213-B”. Which kind of search suits each, and what do you build?</summary><p>The descriptive phrase benefits from vector search, which matches meaning. The product code needs exact keyword matching, which vector search handles poorly. Build hybrid search that runs both and merges the rankings.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Christopher Manning, Prabhakar Raghavan and Hinrich Schütze, <a href="https://nlp.stanford.edu/IR-book/information-retrieval-book.html">Introduction to Information Retrieval</a>, Cambridge University Press. Free online. The standard textbook on inverted indexes, analysis and ranking.</li>
+  <li>Stephen Robertson and Hugo Zaragoza, <a href="https://staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf">The Probabilistic Relevance Framework: BM25 and Beyond</a>, 2009.</li>
+  <li>Elastic documentation, <a href="https://www.elastic.co/docs/manage-data/data-store/near-real-time-search">Near real-time search</a>. Segments and the one-second refresh.</li>
+  <li>Elastic documentation, <a href="https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/size-shards">Size your shards</a>.</li>
+  <li><a href="https://lucene.apache.org/core/">Apache Lucene</a>. The library underneath Elasticsearch, OpenSearch and Solr.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/textsearch.html">Full Text Search</a>.</li>
+  <li>Gordon Cormack, Charles Clarke and Stefan Büttcher, <a href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf">Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods</a>, SIGIR 2009.</li>
+  <li>endoflife.date, <a href="https://endoflife.date/elasticsearch">Elasticsearch</a> and <a href="https://endoflife.date/opensearch">OpenSearch</a> release tables. Versions checked October 2026.</li>
+  <li><a href="https://github.com/pgvector/pgvector">pgvector</a>. Vector similarity search for PostgreSQL.</li>
+</ol>
+</section>

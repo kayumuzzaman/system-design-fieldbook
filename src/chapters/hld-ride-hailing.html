@@ -1,0 +1,653 @@
+<!--meta
+{ "description": "A high-level design of a ride-hailing service: requirements and estimates, the rider and driver APIs, location reports every few seconds into an in-memory grid, nearest-driver search by rings of cells, greedy against batched matching measured in a simulated city, claiming a driver with compare-and-set, the trip as a state machine with idempotent events, failures and scale.",
+  "lede": "A rider taps a button and, a few seconds later, a particular car is on its way. Behind that tap are a quarter of a million location reports a second that are worthless a minute later, a search for nearby cars that must take microseconds, a choice between drivers that affects everyone else waiting, and a promise that no car is ever sent to two riders. This chapter designs that system and measures, in a simulated city, how much each choice is worth.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a ride-hailing service. Drivers go online and their apps report where they are. A rider requests a ride from a pickup point to a destination; the service finds a driver, the driver accepts, the rider watches the car approach, and the trip is recorded from pickup to drop-off.</p></div>
+<p>Three things make it hard, and they pull in different directions. The positions of drivers change constantly, so the index of where cars are is mostly writes. Choosing a driver for one rider changes the choice for the next, so matching is an optimization over everyone waiting, not a lookup. And a driver is a resource that two parts of the system may try to hand out at the same moment, which is a concurrency problem with real cars in it. <x-ref to="lld-elevator"></x-ref> met the same dispatching question inside one building; here it spans a city. In the terms of <x-ref to="hld-method"></x-ref>, it is a real-time matching problem over fast-changing state.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Drivers go online and offline; their apps report position every few seconds</th><td>Yes</td></tr>
+<tr><th>Riders request a ride and see an estimated time to pickup</th><td>Yes</td></tr>
+<tr><th>Match each request to a driver, who accepts or declines within seconds</th><td>Yes</td></tr>
+<tr><th>The rider watches the driver approach; both see the trip’s state</th><td>Yes</td></tr>
+<tr><th>Either side cancels before the ride starts</th><td>Yes</td></tr>
+<tr><th>Prices, surge pricing, payment</th><td>No: payment is <x-ref to="hld-payments"></x-ref></td></tr>
+<tr><th>Maps, routes and travel-time estimates</th><td>No: used as a service, designed in <x-ref to="hld-maps"></x-ref></td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>1 million drivers online at the peak worldwide; 30 million trips a day</td></tr>
+<tr><th>Latency</th><td>A driver found or “no driver” within a few seconds; a driver’s position on the rider’s map within seconds</td></tr>
+<tr><th>Availability</th><td>99.99% for requesting and matching: an outage strands people</td></tr>
+<tr><th>Consistency</th><td>A driver is never assigned to two trips; a trip’s state never goes backward</td></tr>
+<tr><th>Durability</th><td>Trips are never lost; positions may be, since the next report replaces them</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<p>Uber described driver apps reporting a position every four seconds in 2015, which is a good starting assumption (<x-ref to="estimation#method"></x-ref>):</p>
+<div class="formula">location reports: 1 million drivers ÷ 4 s = 250,000 a second at the peak<br>
+ingest: 250,000 × about 100 bytes = 25 MB a second ≈ 200 Mbit/s<br>
+current positions: 1 million × about 100 bytes = 100 MB, which fits in memory many times over<br>
+trips: 30 million ÷ 86,400 s ≈ 350 requests a second on average, about 1,000 at the peak; about 10 state changes each<br>
+history: averaging half the peak, 125,000 reports a second × 100 bytes × 86,400 s ≈ 1.1 TB a day</div>
+<p>The numbers sort the design into two parts. Positions are a high write rate on a small data set that may be lost, so they live in memory, partitioned by area, and are never written to a database on the request path; the history is streamed off to cheap storage. Trips are a modest write rate on data that must be durable and consistent, so they live in a sharded database with transactions. Matching sits between them, a thousand searches a second that each read a few dozen nearby drivers.</p>
+
+<div class="widget" data-widget="dispatch90">
+<h4>Driver location reports</h4>
+<p>The write load of driver positions, and how much of it changes the index of which cell each driver is in.</p>
+<div class="controls">
+  <label>Drivers online, thousands<input type="number" name="drivers" value="1000" min="1" max="100000" step="10"></label>
+  <label>Seconds between reports<input type="number" name="interval" value="4" min="1" max="120" step="1"></label>
+  <label>Bytes per report<input type="number" name="bytes" value="100" min="10" max="10000" step="10"></label>
+  <label>Speed, km/h<input type="number" name="speed" value="25" min="1" max="150" step="1"></label>
+  <label>Cell size, meters<input type="number" name="cell" value="500" min="10" max="10000" step="10"></label>
+</div>
+<dl class="results">
+  <div><dt>Reports a second</dt><dd data-out="reports">250 thousand</dd></div>
+  <div><dt>Ingest</dt><dd data-out="ingest">200 Mbit/s</dd></div>
+  <div><dt>Reports that change cell</dt><dd data-out="share">7.07%</dd></div>
+  <div><dt>Index moves a second</dt><dd data-out="moves">17.7 thousand</dd></div>
+  <div><dt>Current positions in memory</dt><dd data-out="memory">100 MB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Each driver moves about 27.8 m between reports. About 7.07% of reports move a driver into another cell; the other 92.9% only overwrite a position in memory. Positions for all drivers take 100 MB, small enough for memory.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="The rider’s side">
+POST /v1/trips
+Idempotency-Key: r-77-1760260445
+{ "pickup": { "lat": 40.012, "lon": 10.021 }, "destination": { "lat": 40.081, "lon": 10.102 } }
+
+201 Created   { "trip": "t-981", "state": "requested", "pickup_estimate_s": 240 }
+
+GET  /v1/trips/t-981            → state, driver, positions while the trip is active
+POST /v1/trips/t-981/cancel     → 200, or 409 if the ride has started
+</pre>
+<pre data-lang="http" data-title="The driver’s side, over one WebSocket">
+driver → { "type": "status", "available": true }
+driver → { "type": "location", "lat": 40.0153, "lon": 10.0198, "heading": 82, "speed": 7.1,
+           "at": "2026-10-12T09:14:05Z", "seq": 18233 }                       ← every 4 s
+server → { "type": "offer", "trip": "t-981", "pickup": { … }, "expires_in": 10 }
+driver → { "type": "accept", "trip": "t-981", "event": "e-5512" }
+</pre>
+<p>The rider’s request carries an idempotency key, so a request retried after a dropped connection returns the same trip instead of booking two cars (<x-ref to="api-styles#idempotency-keys"></x-ref>). The driver’s messages carry a sequence number, so a report that arrives late, behind a newer one, is ignored rather than moving the car backward on the map. Every trip event carries an id, so an acceptance delivered twice is applied once (<x-ref to="idempotency-and-delivery"></x-ref>). An offer expires: a driver who does not answer in ten seconds is treated as having declined.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>Driver position</th><td>driver id</td><td>Position, heading, speed, time, sequence number, status</td><td>Memory of the location service for the driver’s area</td></tr>
+<tr><th>Cell index</th><td>cell</td><td>Ids of free drivers in the cell</td><td>The same memory, next to the positions</td></tr>
+<tr><th>Driver claim</th><td>driver id</td><td>The trip holding the driver, if any</td><td>The matching service of the area, or a store with compare-and-set</td></tr>
+<tr><th>Trip</th><td>trip id</td><td>Rider, driver, pickup, destination, state, times</td><td>Relational, sharded by trip id (<x-ref to="partitioning#shard-key"></x-ref>)</td></tr>
+<tr><th>Trip events</th><td>trip id, then event id</td><td>Every state change, in order</td><td>Append only, with the trip row, in one transaction</td></tr>
+<tr><th>Location history</th><td>driver id, then time</td><td>Every report</td><td>A log (<x-ref to="event-streaming"></x-ref>), then object storage</td></tr>
+</tbody>
+</table>
+<p>Everything about free drivers is partitioned by geography: one city, or one part of a large city, belongs to one set of location and matching servers. Matching rarely needs a driver from another area, so each area can be matched by a single owner, which makes claiming a driver a local operation. Trips are partitioned differently, by trip id, because they are looked up by id from anywhere.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f901t f901d">
+<title id="f901t">The parts of a ride-hailing service</title>
+<desc id="f901d">Driver and rider apps connect through a gateway that holds their WebSocket connections. Driver location reports go to a location service, which keeps current positions of drivers in an in-memory grid. A ride request goes to the trip service, which records the trip in a sharded trips database and asks the matching service for a driver; matching reads nearby free drivers from the location store, asks the routing service for travel times, claims a driver, and sends an offer through the gateway.</desc>
+<rect class="n " x="10" y="30" width="100" height="52" rx="6"/>
+<text class="tb mid" x="60.0" y="53.0">Driver app</text>
+<text class="ts mid" x="60.0" y="70.0">reports, accepts</text>
+<rect class="n " x="10" y="190" width="100" height="52" rx="6"/>
+<text class="tb mid" x="60.0" y="213.0">Rider app</text>
+<text class="ts mid" x="60.0" y="230.0">requests, watches</text>
+<rect class="n sig" x="150" y="30" width="120" height="212" rx="6"/>
+<text class="tb mid" x="210.0" y="133.0">Gateway</text>
+<text class="ts mid" x="210.0" y="150.0">WebSockets, auth</text>
+<rect class="n sig" x="330" y="30" width="150" height="52" rx="6"/>
+<text class="tb mid" x="405.0" y="53.0">Location service</text>
+<text class="ts mid" x="405.0" y="70.0">every 4 s</text>
+<rect class="n sig" x="330" y="110" width="150" height="52" rx="6"/>
+<text class="tb mid" x="405.0" y="133.0">Matching</text>
+<text class="ts mid" x="405.0" y="150.0">per city</text>
+<rect class="n sig" x="330" y="190" width="150" height="52" rx="6"/>
+<text class="tb mid" x="405.0" y="213.0">Trip service</text>
+<text class="ts mid" x="405.0" y="230.0">state machine</text>
+<rect class="n store" x="540" y="30" width="170" height="52" rx="6"/>
+<text class="tb mid" x="625.0" y="53.0">Driver locations</text>
+<text class="ts mid" x="625.0" y="70.0">in-memory grid</text>
+<rect class="n sig" x="540" y="110" width="170" height="52" rx="6"/>
+<text class="tb mid" x="625.0" y="133.0">Routing and ETA</text>
+<text class="ts mid" x="625.0" y="150.0">road network</text>
+<rect class="n store" x="540" y="190" width="170" height="52" rx="6"/>
+<text class="tb mid" x="625.0" y="213.0">Trips database</text>
+<text class="ts mid" x="625.0" y="230.0">sharded by trip</text>
+<path class="e sig both" d="M110 56H150"/>
+<path class="e sig both" d="M110 216H150"/>
+<path class="e sig" d="M270 56H330"/>
+<text class="ts mid" x="300" y="50">report</text>
+<path class="e sig both" d="M270 216H330"/>
+<text class="ts mid" x="300" y="210">request</text>
+<path class="e store" d="M480 56H540"/>
+<text class="ts mid" x="510" y="50">position</text>
+<path class="e sig" d="M405 190V162"/>
+<text class="ts" x="413" y="180">find a driver</text>
+<path class="e sig" d="M480 120 548 82"/>
+<text class="ts" x="556" y="100">nearby</text>
+<path class="e sig both" d="M480 146H540"/>
+<text class="ts mid" x="510" y="140">ETAs</text>
+<path class="e sig" d="M330 136H270"/>
+<text class="ts mid" x="300" y="130">offer</text>
+<path class="e store" d="M480 216H540"/>
+<text class="ts mid" x="510" y="210">trip rows</text>
+<text class="ts" x="10" y="264">Positions are in memory and short-lived; trips are durable records. Each city is matched on its own.</text>
+</svg>
+</div>
+<figcaption>Two kinds of state with opposite needs: positions, a quarter of a million writes a second that are worthless a minute later, and trips, a few thousand writes a second that must never be lost or double-booked.</figcaption>
+</figure>
+
+<p>Driver apps keep a WebSocket to a gateway (<x-ref to="realtime-communication#gateway"></x-ref>), which routes each report to the location service owning the driver’s area. That service overwrites the driver’s position in memory and, if the driver crossed into another cell, moves the id between cells. A request goes to the trip service, which writes the trip and asks the area’s matching service for a driver.</p>
+
+<figure class="fig wide" id="fig-request">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 298" role="img" aria-labelledby="f902t f902d">
+<title id="f902t">From request to an accepted offer</title>
+<desc id="f902d">A sequence between the rider app, the trip service, the matching service, the driver location store and a driver app. The rider requests a ride; the trip service records the trip and asks matching for a driver; matching reads the nearest free drivers, claims one with a compare-and-set, and offers the trip to that driver, who has ten seconds to accept. The driver accepts, the trip service records it, the rider is told who is coming and when, and the driver’s location reports are relayed to the rider.</desc>
+<text class="tb mid" x="50" y="20">Rider</text>
+<line class="axis" x1="50" y1="28" x2="50" y2="284"/>
+<text class="tb mid" x="200" y="20">Trip service</text>
+<line class="axis" x1="200" y1="28" x2="200" y2="284"/>
+<text class="tb mid" x="350" y="20">Matching</text>
+<line class="axis" x1="350" y1="28" x2="350" y2="284"/>
+<text class="tb mid" x="500" y="20">Locations</text>
+<line class="axis" x1="500" y1="28" x2="500" y2="284"/>
+<text class="tb mid" x="665" y="20">Driver</text>
+<line class="axis" x1="665" y1="28" x2="665" y2="284"/>
+<g data-s="1">
+<path class="e sig" d="M51 56H199"/>
+<text class="ts mid" x="125.0" y="50">1. request, key r-77</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M201 83H349"/>
+<text class="ts mid" x="275.0" y="77">2. find a driver for t-981</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M351 110H499"/>
+<text class="ts mid" x="425.0" y="104">3. free drivers near pickup</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M499 137H351"/>
+<text class="ts mid" x="425.0" y="131">4. 5 nearest</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n store" x="358" y="150" width="158.3" height="22" rx="4"/>
+<text class="ts mid" x="437.15" y="165">5. claim d235 for t-981</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M351 191H664"/>
+<text class="ts mid" x="507.5" y="185">6. offer, 10 s to accept</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M664 218H201"/>
+<text class="ts mid" x="432.5" y="212">7. accept</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M199 245H51"/>
+<text class="ts mid" x="125.0" y="239">8. d235, 4 min away</text>
+</g>
+<g data-s="9">
+<path class="e async" d="M664 272H51"/>
+<text class="ts mid" x="357.5" y="266">9. location every 4 s</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="request" data-state="Trip t-981: requested; driver d235: free">The rider asks for a ride. The idempotency key makes a retried request return the same trip, not a second one.</li>
+  <li data-msg="t-981">The trip is stored first, then matching is asked for a driver.</li>
+  <li data-msg="nearby?">The location store answers from its in-memory grid, in microseconds.</li>
+  <li data-msg="5 drivers">Matching asks routing for the travel time from each, and picks the best.</li>
+  <li data-msg="none" data-state="Trip t-981: offered; driver d235: held by t-981">The claim is a compare-and-set: it succeeds only if the driver is still free, so no other trip can take the same driver.</li>
+  <li data-msg="offer">The offer goes to the driver’s app through the gateway. If it is declined or expires, the claim is released and the next driver is tried.</li>
+  <li data-msg="accept" data-state="Trip t-981: accepted; driver d235: held by t-981">The driver accepts. The trip service records it; a repeated accept is recognized and ignored.</li>
+  <li data-msg="driver">The rider learns who is coming and the estimated time to pickup.</li>
+  <li data-msg="location">From now on the driver’s reports are relayed to the rider, so the car can be watched on the map.</li>
+</ol>
+<figcaption>Matching is a search followed by a claim. The claim, not the search, is what prevents two riders from being promised the same car.</figcaption>
+</figure>
+
+<h2 id="locations">Step 6a: A quarter of a million positions a second</h2>
+<p>Most of the 250,000 reports a second change almost nothing. A car at 25 km/h moves about 28 m in four seconds, and the index only changes when a car crosses into another cell. For a car moving in a straight line, the chance of crossing a boundary between two reports is about (4/π) × distance ÷ cell size. The chapter’s code drove 2,000 simulated cars around a city for half an hour and measured it:</p>
+<table>
+<thead><tr><th>Cell size</th><th>Reports that change cell, measured</th><th>By the formula</th></tr></thead>
+<tbody>
+<tr><th>100 m</th><td>32.9%</td><td>35.4%</td></tr>
+<tr><th>250 m</th><td>13.8%</td><td>14.1%</td></tr>
+<tr><th>500 m</th><td>7.0%</td><td>7.1%</td></tr>
+<tr><th>1 km</th><td>3.5%</td><td>3.5%</td></tr>
+</tbody>
+</table>
+<p>With 500 m cells, 93% of reports are a single overwrite in memory, and the rest move an id between two sets. That is why positions live in an in-memory grid, or in a store such as Redis with its geospatial commands, and never in a database that would write each report to disk (<x-ref to="specialized-databases#geospatial"></x-ref>). The cell size is a trade-off: smaller cells make the index change more often, larger ones make each search read more drivers.</p>
+<pre data-lang="ts" data-title="A report touches the index only when the driver changes cell">
+// A location report. Returns true when the driver moved into another cell, the only case
+  // that touches the index; otherwise only the stored position changes.
+  report(id: string, p: Point): boolean {
+    const cell = this.cellOf(p);
+    const old = this.where.get(id);
+    this.where.set(id, { x: p.x, y: p.y, cell });
+    if (old && old.cell === cell) return false;
+    if (old) this.cells.get(old.cell)?.delete(id);
+    let set = this.cells.get(cell);
+    if (!set) this.cells.set(cell, (set = new Set()));
+    set.add(id);
+    return true;
+  }
+</pre>
+<p>Finding nearby drivers is a search outward in rings of cells: the request’s own cell, then the eight around it, and so on, stopping when the drivers found are closer than any cell not yet searched could be.</p>
+<pre data-lang="ts" data-title="The nearest drivers, ring by ring">
+// The k nearest drivers in straight-line distance: search rings of cells outward until the
+  // nearest k found are closer than any cell not yet searched could be.
+  nearest(p: Point, k: number, maxMeters = 10_000): { ids: string[]; examined: number; cells: number } {
+    const cx = Math.floor(p.x / this.size), cy = Math.floor(p.y / this.size);
+    const found: Array<{ id: string; d: number }> = [];
+    let examined = 0, cells = 0;
+    for (let ring = 0; ring * this.size <= maxMeters + this.size; ring += 1) {
+      for (let dx = -ring; dx <= ring; dx += 1) {
+        for (let dy = -ring; dy <= ring; dy += 1) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue; // only the ring's edge
+          cells += 1;
+          for (const id of this.cells.get(this.key(cx + dx, cy + dy)) ?? []) {
+            const w = this.where.get(id) as { x: number; y: number };
+            examined += 1;
+            found.push({ id, d: Math.hypot(w.x - p.x, w.y - p.y) });
+          }
+        }
+      }
+      found.sort((a, b) => a.d - b.d);
+      // Anything in a ring not yet searched is at least `ring * size` away from p.
+      if (found.length >= k && (found[k - 1] as { d: number }).d <= ring * this.size) break;
+    }
+    return { ids: found.slice(0, k).filter((f) => f.d <= maxMeters).map((f) => f.id), examined, cells };
+  }
+</pre>
+
+<figure class="fig wide" id="fig-grid">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f904t f904d">
+<title id="f904t">Finding the five nearest free drivers by searching rings of cells</title>
+<desc id="f904d">A 3 by 3 km area of the simulated city, divided into cells of 500 m, with the free drivers in it and a ride request near the middle. The search reads the request’s own cell, then the ring of eight cells around it, and stops when the five nearest drivers found are closer than any unsearched cell could be. It examined 18 drivers in 9 cells; a full scan would examine all 1,000.</desc>
+<rect class="n sunk" x="20" y="20" width="260" height="260" rx="2"/>
+<rect class="n sig" x="86.7" y="165.6" width="43.3" height="43.3" style="fill-opacity:0.2"/>
+<rect class="n sig" x="86.7" y="122.3" width="43.3" height="43.3" style="fill-opacity:0.2"/>
+<rect class="n sig" x="86.7" y="78.9" width="43.3" height="43.3" style="fill-opacity:0.2"/>
+<rect class="n sig" x="130.1" y="165.6" width="43.3" height="43.3" style="fill-opacity:0.2"/>
+<rect class="n sig" x="130.1" y="122.3" width="43.3" height="43.3" style="fill-opacity:0.45"/>
+<rect class="n sig" x="130.1" y="78.9" width="43.3" height="43.3" style="fill-opacity:0.2"/>
+<rect class="n sig" x="173.4" y="165.6" width="43.3" height="43.3" style="fill-opacity:0.2"/>
+<rect class="n sig" x="173.4" y="122.3" width="43.3" height="43.3" style="fill-opacity:0.2"/>
+<rect class="n sig" x="173.4" y="78.9" width="43.3" height="43.3" style="fill-opacity:0.2"/>
+<line class="grid" x1="43.4" y1="20" x2="43.4" y2="280"/>
+<line class="grid" x1="20" y1="252.3" x2="280" y2="252.3"/>
+<line class="grid" x1="86.7" y1="20" x2="86.7" y2="280"/>
+<line class="grid" x1="20" y1="208.9" x2="280" y2="208.9"/>
+<line class="grid" x1="130.1" y1="20" x2="130.1" y2="280"/>
+<line class="grid" x1="20" y1="165.6" x2="280" y2="165.6"/>
+<line class="grid" x1="173.4" y1="20" x2="173.4" y2="280"/>
+<line class="grid" x1="20" y1="122.3" x2="280" y2="122.3"/>
+<line class="grid" x1="216.7" y1="20" x2="216.7" y2="280"/>
+<line class="grid" x1="20" y1="78.9" x2="280" y2="78.9"/>
+<line class="grid" x1="260.1" y1="20" x2="260.1" y2="280"/>
+<line class="grid" x1="20" y1="35.6" x2="280" y2="35.6"/>
+<circle class="fill-ink" cx="107.2" cy="121.6" r="3"/>
+<circle class="fill-ink" cx="258.5" cy="45.6" r="3"/>
+<circle class="fill-ink" cx="76.8" cy="69.4" r="3"/>
+<circle class="fill-ink" cx="109.7" cy="138.8" r="3"/>
+<circle class="fill-ink" cx="253.5" cy="166.2" r="3"/>
+<circle class="fill-ink" cx="188.9" cy="51.4" r="3"/>
+<circle class="fill-ink" cx="158.9" cy="74.8" r="3"/>
+<circle class="fill-ink" cx="251.9" cy="161.6" r="3"/>
+<circle class="fill-ink" cx="256.1" cy="194.3" r="3"/>
+<circle class="fill-ink" cx="67.9" cy="120.7" r="3"/>
+<circle class="fill-ink" cx="236.3" cy="179.0" r="3"/>
+<circle class="fill-ink" cx="229.8" cy="200.8" r="3"/>
+<circle class="fill-ink" cx="266.9" cy="215.7" r="3"/>
+<circle class="fill-ink" cx="108.8" cy="178.7" r="3"/>
+<circle class="fill-ink" cx="53.6" cy="104.6" r="3"/>
+<circle class="fill-ink" cx="105.1" cy="146.3" r="3"/>
+<circle class="fill-ink" cx="97.3" cy="201.7" r="3"/>
+<circle class="fill-ink" cx="182.4" cy="194.4" r="3"/>
+<circle class="fill-ink" cx="187.1" cy="24.8" r="3"/>
+<circle class="fill-ink" cx="65.4" cy="130.8" r="3"/>
+<circle class="fill-ink" cx="155.5" cy="222.6" r="3"/>
+<circle class="fill-ink" cx="247.2" cy="86.1" r="3"/>
+<circle class="fill-ink" cx="31.2" cy="198.5" r="3"/>
+<circle class="fill-ink" cx="66.0" cy="156.7" r="3"/>
+<circle class="fill-ink" cx="97.6" cy="192.5" r="3"/>
+<circle class="fill-ink" cx="234.1" cy="180.4" r="3"/>
+<circle class="fill-ink" cx="193.0" cy="264.9" r="3"/>
+<circle class="fill-ink" cx="70.3" cy="173.6" r="3"/>
+<circle class="fill-ink" cx="65.6" cy="135.1" r="3"/>
+<circle class="fill-ink" cx="35.6" cy="119.5" r="3"/>
+<circle class="fill-ink" cx="217.2" cy="166.1" r="3"/>
+<circle class="fill-ink" cx="278.2" cy="59.5" r="3"/>
+<circle class="fill-ink" cx="30.7" cy="115.1" r="3"/>
+<circle class="fill-ink" cx="218.8" cy="278.5" r="3"/>
+<circle class="fill-ink" cx="60.2" cy="237.1" r="3"/>
+<circle class="fill-ink" cx="221.8" cy="154.9" r="3"/>
+<circle class="fill-ink" cx="170.2" cy="99.1" r="3"/>
+<circle class="fill-ink" cx="191.3" cy="136.7" r="3"/>
+<circle class="fill-ink" cx="211.6" cy="222.9" r="3"/>
+<circle class="fill-ink" cx="208.1" cy="104.5" r="3"/>
+<circle class="fill-ink" cx="49.6" cy="258.2" r="3"/>
+<circle class="fill-ink" cx="73.2" cy="80.6" r="3"/>
+<circle class="fill-ink" cx="75.6" cy="192.5" r="3"/>
+<circle class="fill-ink" cx="140.1" cy="55.6" r="3"/>
+<circle class="fill-ink" cx="264.8" cy="89.3" r="3"/>
+<circle class="fill-ink" cx="101.2" cy="202.1" r="3"/>
+<circle class="fill-ink" cx="123.6" cy="232.4" r="3"/>
+<circle class="fill-ink" cx="35.4" cy="133.4" r="3"/>
+<circle class="fill-ink" cx="111.9" cy="141.2" r="3"/>
+<circle class="fill-ink" cx="84.4" cy="116.9" r="3"/>
+<circle class="fill-ink" cx="168.4" cy="61.2" r="3"/>
+<circle class="fill-ink" cx="113.3" cy="155.3" r="3"/>
+<circle class="fill-ink" cx="195.2" cy="248.5" r="3"/>
+<circle class="fill-ink" cx="198.5" cy="73.1" r="3"/>
+<circle class="fill-ink" cx="150.4" cy="233.4" r="3"/>
+<circle class="n store" cx="160.2" cy="163.7" r="6"/>
+<circle class="n store" cx="130.5" cy="157.1" r="6"/>
+<circle class="n store" cx="133.4" cy="128.7" r="6"/>
+<circle class="n store" cx="114.8" cy="139.3" r="6"/>
+<circle class="n store" cx="146.7" cy="127.7" r="6"/>
+<rect class="fill-fault" x="145.0" y="145.0" width="10" height="10"/>
+<rect class="fill-fault" x="310" y="30" width="10" height="10"/>
+<text class="ts" x="328" y="40">the ride request</text>
+<circle class="n store" cx="315" cy="60" r="6"/>
+<text class="ts" x="328" y="64">the five nearest free drivers</text>
+<circle class="fill-ink" cx="315" cy="84" r="3"/>
+<text class="ts" x="328" y="88">other free drivers</text>
+<rect class="n sig" x="310" y="102" width="10" height="10" style="fill-opacity:0.45"/>
+<text class="ts" x="328" y="112">the request’s cell, then the ring around it</text>
+<text class="tb" x="310" y="148">Cells searched: 9</text>
+<text class="tb" x="310" y="168">Drivers examined: 18 of 1,000</text>
+<text class="ts" x="310" y="196">Stop rule: the fifth nearest found is closer</text>
+<text class="ts" x="310" y="212">than the inner edge of the next ring, so no</text>
+<text class="ts" x="310" y="228">unsearched driver can be nearer.</text>
+<text class="ts" x="310" y="262">Cells are 500 m; the area shown is 3 by 3 km.</text>
+</svg>
+</div>
+<figcaption>Drawn from the chapter’s code. Straight-line distance only shortlists drivers; travel times from the routing service decide among them.</figcaption>
+</figure>
+
+<p>In the test, with 20,000 drivers in a 20 km city and 500 m cells, finding the five nearest examined 109 drivers on average and always agreed with a full scan of all 20,000. Straight-line distance only makes the shortlist: a driver 300 m away across a river may be ten minutes away by road, so the shortlist goes to the routing service for travel times, and those decide.</p>
+<div class="note production"><p><span class="label">In production.</span> Reports cost the driver’s battery and data plan as well as the servers. Apps commonly report less often when the car is parked or the driver is offline, and more often during a pickup, when the rider is watching. Each report carries its own time and sequence number, because a phone that loses signal sends a burst of old positions when it reconnects, and only the newest should move the car.</p></div>
+
+<h2 id="matching">Step 6b: Matching one at a time, or together</h2>
+<p>The obvious rule is to give each rider, as they arrive, the nearest free driver. It is fast and fair to that rider, and it can be poor for the next. If rider A is 1 minute from driver X and 2 minutes from driver Y, while rider B is 1 minute from X and 9 minutes from Y, serving A first with X costs 1 + 9 = 10 minutes of pickup, where the other pairing costs 3. <dfn>Batched matching</dfn> waits a few seconds, collects everyone waiting and every free driver nearby, and chooses the pairs that minimize the total time to pickup. That choice is the assignment problem, solved exactly by the Hungarian method.</p>
+<pre data-lang="ts" data-title="One batch: candidates for each rider, then the assignment with the least total pickup time">
+const cols = new Map<string, Driver>();
+      const cand = waiting.map((rd) => grid.nearest(rd.from, k, 5_000).ids);
+      for (const ids of cand) for (const id of ids) cols.set(id, byId.get(id) as Driver);
+      const ds = [...cols.values()];
+      const rows = waiting.slice(0, ds.length); // more riders than candidate drivers: match the earliest
+      const big = 1e7;
+      const cost = rows.map((rd, i) => ds.map((d) => (cand[i]?.includes(d.id) ? eta(d.pos, rd.from) : big)));
+      const pick = assign(cost);
+</pre>
+<p>The chapter’s code simulated a city of 20 by 20 km with 1,000 drivers and riders arriving at random, half of them around five busy districts, with trips across town. It compared matching every second, oldest rider first, each to the nearest free driver, against matching everyone waiting every 5 seconds, for six levels of demand.</p>
+
+<figure class="fig wide" id="fig-batching">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f905t f905d">
+<title id="f905t">Mean time from request to pickup, matching each rider at once or in batches</title>
+<desc id="f905d">Simulated city of 1,000 drivers. For each demand level, the mean wait from request to pickup when riders are matched every second, oldest first, each to the nearest free driver, and when everyone waiting is matched together every 5 seconds to minimize total pickup time. 0.3 requests a second, drivers busy about 48%: one at a time 108 s, batched 110 s. 0.4 requests a second, drivers busy about 64%: one at a time 148 s, batched 150 s. 0.45 requests a second, drivers busy about 73%: one at a time 201 s, batched 202 s. 0.48 requests a second, drivers busy about 82%: one at a time 349 s, batched 309 s. 0.5 requests a second, drivers busy about 86%: one at a time 646 s, batched 526 s. 0.52 requests a second, drivers busy about 87%: one at a time 802 s, batched 695 s.</desc>
+<line class="grid" x1="90" y1="240.0" x2="650" y2="240.0"/>
+<text class="ts end" x="82" y="244.0">0</text>
+<line class="grid" x1="90" y1="206.7" x2="650" y2="206.7"/>
+<text class="ts end" x="82" y="210.7">150</text>
+<line class="grid" x1="90" y1="173.3" x2="650" y2="173.3"/>
+<text class="ts end" x="82" y="177.3">300</text>
+<line class="grid" x1="90" y1="140.0" x2="650" y2="140.0"/>
+<text class="ts end" x="82" y="144.0">450</text>
+<line class="grid" x1="90" y1="106.7" x2="650" y2="106.7"/>
+<text class="ts end" x="82" y="110.7">600</text>
+<line class="grid" x1="90" y1="73.3" x2="650" y2="73.3"/>
+<text class="ts end" x="82" y="77.3">750</text>
+<line class="grid" x1="90" y1="40.0" x2="650" y2="40.0"/>
+<text class="ts end" x="82" y="44.0">900</text>
+<text class="ts" x="10" y="24">seconds from request to pickup</text>
+<text class="ts mid" x="133.1" y="258">0.3</text>
+<text class="ts mid" x="133.1" y="274">48%</text>
+<text class="ts mid" x="348.5" y="258">0.4</text>
+<text class="ts mid" x="348.5" y="274">64%</text>
+<text class="ts mid" x="456.2" y="258">0.45</text>
+<text class="ts mid" x="456.2" y="274">73%</text>
+<text class="ts mid" x="520.8" y="258">0.48</text>
+<text class="ts mid" x="520.8" y="274">82%</text>
+<text class="ts mid" x="563.8" y="258">0.5</text>
+<text class="ts mid" x="563.8" y="274">86%</text>
+<text class="ts mid" x="606.9" y="258">0.52</text>
+<text class="ts mid" x="606.9" y="274">87%</text>
+<text class="ts end" x="82" y="258">requests/s</text>
+<text class="ts end" x="82" y="274">busy</text>
+<path class="line" style="stroke:var(--ink-3)" d="M133.1 216.0 L348.5 207.1 L456.2 195.3 L520.8 162.4 L563.8 96.4 L606.9 61.8"/>
+<circle class="dot" cx="133.1" cy="216.0" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="348.5" cy="207.1" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="456.2" cy="195.3" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="520.8" cy="162.4" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="563.8" cy="96.4" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="606.9" cy="61.8" r="3" style="fill:var(--ink-3)"/>
+<path class="line" style="stroke:var(--sig)" d="M133.1 215.6 L348.5 206.7 L456.2 195.1 L520.8 171.3 L563.8 123.1 L606.9 85.6"/>
+<circle class="dot" cx="133.1" cy="215.6" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="348.5" cy="206.7" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="456.2" cy="195.1" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="520.8" cy="171.3" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="563.8" cy="123.1" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="606.9" cy="85.6" r="3" style="fill:var(--sig)"/>
+<text class="ts" x="614.9" y="65.8">one at a time</text>
+<text class="ts" x="614.9" y="89.6">batched, 5 s</text>
+<rect class="hit" x="109.077" y="30" width="48" height="210" data-tip="0.3 requests a second, drivers busy about 48%|one at a time: 108 s (107 s driving to pickup), 0 gave up|batched: 110 s (107 s driving to pickup), 0 gave up"/>
+<rect class="hit" x="324.462" y="30" width="48" height="210" data-tip="0.4 requests a second, drivers busy about 64%|one at a time: 148 s (147 s driving to pickup), 0 gave up|batched: 150 s (148 s driving to pickup), 0 gave up"/>
+<rect class="hit" x="432.154" y="30" width="48" height="210" data-tip="0.45 requests a second, drivers busy about 73%|one at a time: 201 s (200 s driving to pickup), 0 gave up|batched: 202 s (199 s driving to pickup), 0 gave up"/>
+<rect class="hit" x="496.769" y="30" width="48" height="210" data-tip="0.48 requests a second, drivers busy about 82%|one at a time: 349 s (346 s driving to pickup), 0 gave up|batched: 309 s (305 s driving to pickup), 0 gave up"/>
+<rect class="hit" x="539.846" y="30" width="48" height="210" data-tip="0.5 requests a second, drivers busy about 86%|one at a time: 646 s (486 s driving to pickup), 3 gave up|batched: 526 s (413 s driving to pickup), 3 gave up"/>
+<rect class="hit" x="582.923" y="30" width="48" height="210" data-tip="0.52 requests a second, drivers busy about 87%|one at a time: 802 s (524 s driving to pickup), 195 gave up|batched: 695 s (442 s driving to pickup), 84 gave up"/>
+</svg>
+</div>
+<figcaption>Measured by the chapter’s simulation. With free drivers everywhere, batching only adds its few seconds of delay; when drivers are scarce, matching everyone together cut the wait by 12 to 19%.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Requests a second</th><th>Drivers busy</th><th>One at a time: mean wait</th><th>Batched: mean wait</th><th>Batched: change</th></tr></thead>
+<tbody>
+<tr><th>0.30</th><td>48%</td><td>108 s</td><td>110 s</td><td>2 s longer</td></tr>
+<tr><th>0.40</th><td>64%</td><td>148 s</td><td>150 s</td><td>2 s longer</td></tr>
+<tr><th>0.45</th><td>73%</td><td>201 s</td><td>202 s</td><td>1 s longer</td></tr>
+<tr><th>0.48</th><td>82%</td><td>349 s</td><td>309 s</td><td>11.5% shorter</td></tr>
+<tr><th>0.50</th><td>86%</td><td>646 s</td><td>526 s</td><td>18.6% shorter</td></tr>
+<tr><th>0.52</th><td>87%</td><td>802 s</td><td>695 s</td><td>13.3% shorter, and 84 instead of 195 riders gave up</td></tr>
+</tbody>
+</table>
+<p>When free drivers are plentiful, the nearest one is nearly always the best one, and batching only adds its few seconds of delay. As drivers become scarce, each match takes a driver someone else needed, and choosing pairs together shortened the wait by 12 to 19%. The near-capacity rows show something else as well: waits grew much faster than demand, because a driver sent across town to a pickup is a driver not carrying anyone, which leaves fewer free drivers and makes the next pickup longer still. Uber describes its matching in the same terms: in the seconds after a request, nearby riders and drivers are evaluated in one batch, to reduce the average wait for everyone rather than to give each rider the closest car.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Matching by straight-line distance. It is the right way to shortlist and the wrong way to choose: rivers, one-way streets and motorways make the nearest car a slow one surprisingly often. Shortlist by distance, then rank by travel time from the routing service.</p></div>
+
+<h2 id="trips">Step 6c: Never sending one car to two riders</h2>
+<p>The same driver can look free to two matching decisions at once: two batches in overlapping areas, a retry of a request, or a driver who is still being offered one trip when another needs them. If each decision reads “free” and then writes “taken”, both succeed. In the chapter’s test, two dispatchers that did exactly that against a store with a delay between the read and the write both got the driver. The fix is a single compare-and-set: take the driver only if they are still free, as one operation, the atomic update of <x-ref to="transactions#atomic-ops"></x-ref>. The same test with a claim assigned the driver once.</p>
+<pre data-lang="ts" data-title="Claiming a driver, and the trip as a state machine">
+// Each driver is either free or held by one trip. Claiming is a compare-and-set, so two
+// dispatchers that pick the same driver at the same moment cannot both get them.
+export class Drivers {
+  private readonly holder = new Map<string, string | null>();
+  add(driver: string): void {
+    this.holder.set(driver, null);
+  }
+  claim(driver: string, trip: string): boolean {
+    if (this.holder.get(driver) !== null) return false; // unknown, or already held
+    this.holder.set(driver, trip);
+    return true;
+  }
+  release(driver: string, trip: string): boolean {
+    if (this.holder.get(driver) !== trip) return false; // only the holder may release
+    this.holder.set(driver, null);
+    return true;
+  }
+  heldBy(driver: string): string | null | undefined {
+    return this.holder.get(driver);
+  }
+}
+apply(e: TripEvent): "applied" | "duplicate" | "refused" {
+    if (this.seen.has(e.id)) return "duplicate";
+    const rule = allowed[e.type];
+    if (!rule.from.includes(this.state)) return "refused";
+    this.seen.add(e.id);
+    this.state = rule.to;
+    if (e.type === "offer") this.driver = e.driver;
+    if (e.type === "decline" || e.type === "expire") this.driver = null;
+    this.history.push(this.state);
+    return "applied";
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-states">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 212" role="img" aria-labelledby="f903t f903d">
+<title id="f903t">The states of a trip</title>
+<desc id="f903d">A state diagram. A trip starts requested. An offer to a driver makes it offered; a decline or an expired offer returns it to requested; an acceptance makes it accepted. Then arrived when the driver reaches the pickup, in progress when the ride starts, and completed at the destination. From requested, offered, accepted or arrived, if the rider or the driver cancels, the trip ends as canceled.</desc>
+<rect class="n sig" x="10" y="60" width="100" height="40" rx="20"/>
+<text class="tb mid" x="60" y="85">requested</text>
+<rect class="n sig" x="152" y="60" width="100" height="40" rx="20"/>
+<text class="tb mid" x="202" y="85">offered</text>
+<rect class="n sig" x="294" y="60" width="100" height="40" rx="20"/>
+<text class="tb mid" x="344" y="85">accepted</text>
+<rect class="n sig" x="436" y="60" width="100" height="40" rx="20"/>
+<text class="tb mid" x="486" y="85">arrived</text>
+<rect class="n sig" x="578" y="60" width="100" height="40" rx="20"/>
+<text class="tb mid" x="628" y="85">in progress</text>
+<rect class="n store" x="578" y="150" width="100" height="40" rx="20"/>
+<text class="tb mid" x="628" y="175">completed</text>
+<rect class="n fault" x="220" y="150" width="140" height="40" rx="20"/>
+<text class="tb mid" x="290" y="175">canceled</text>
+<path class="e sig" d="M110 80H152"/>
+<text class="ts mid" x="131.0" y="74">offer</text>
+<path class="e sig" d="M252 80H294"/>
+<text class="ts mid" x="273.0" y="74">accept</text>
+<path class="e sig" d="M394 80H436"/>
+<text class="ts mid" x="415.0" y="74">arrive</text>
+<path class="e sig" d="M536 80H578"/>
+<text class="ts mid" x="557.0" y="74">start</text>
+<path class="e sig" d="M202 60C202 26 60 26 60 58"/>
+<text class="ts mid" x="131" y="22">decline or no answer in 10 s</text>
+<path class="e store" d="M628 100V150"/>
+<text class="ts" x="636" y="130">complete</text>
+<path class="e fault" d="M60 100L236 150"/>
+<path class="e fault" d="M202 100L236 150"/>
+<path class="e fault" d="M344 100L344 150"/>
+<path class="e fault" d="M486 100L344 150"/>
+<text class="ts" x="380" y="175">cancel: rider or driver,</text>
+<text class="ts" x="380" y="191">before the ride starts</text>
+</svg>
+</div>
+<figcaption>Every change is an event with an id, applied only if the trip is in a state that allows it. A repeated event is ignored; an impossible one, such as completing a trip that never started, is refused.</figcaption>
+</figure>
+
+<p>A trip is a small state machine (<x-ref to="scheduling-and-workflows#state-machines"></x-ref>). Every change arrives as an event with an id, is applied only if the current state allows it, and is recorded with the trip in one transaction. That makes the messy parts of mobile networks harmless: an acceptance delivered twice is recognized as a duplicate, and an event that makes no sense in the current state, such as completing a trip that never started, is refused rather than corrupting the record. An offer that expires returns the trip to requested and releases the driver, and matching tries the next candidate.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A location server for an area crashes</th><td>Cars freeze on the map for a few seconds</td><td>A replacement takes the area; every driver reports again within 4 s, so the positions rebuild themselves</td></tr>
+<tr><th>A matching server for an area crashes</th><td>Requests in that area wait</td><td>A standby takes over; claims and open offers are recovered from the trips database, where every claim is recorded with its trip</td></tr>
+<tr><th>A driver’s phone loses signal during an offer</th><td>The rider waits a little longer</td><td>The offer expires after 10 s; the driver is released and the next one is offered</td></tr>
+<tr><th>The rider’s request is retried after a timeout</th><td>Nothing</td><td>The idempotency key returns the existing trip</td></tr>
+<tr><th>The trips database primary fails</th><td>New requests fail for seconds</td><td>Failover (<x-ref to="replication#failover"></x-ref>); apps retry with the same keys</td></tr>
+<tr><th>The routing service is slow</th><td>Slightly worse matches</td><td>Fall back to straight-line estimates with a road factor, flagged so the estimate shown is rough</td></tr>
+<tr><th>Demand spikes after a concert</th><td>Long waits</td><td>Batched matching, wider search areas, and prices that rise to bring more drivers, out of scope here</td></tr>
+</tbody>
+</table>
+<p><b>At ten times the scale</b>, 10 million drivers online, reports reach 2.5 million a second and positions 1 GB. Since areas are independent, that is more areas and more servers, and busy cities are split into several areas, with matching near a boundary allowed to consider drivers from the neighbor. The trips database grows to 3,500 requests a second on average, still modest for a sharded database. <b>At a hundred times</b> the limit is not throughput but the size of each area’s matching problem: the densest areas at peak can hold thousands of riders and drivers in one batch, and the matcher must split them into smaller regions or settle for faster approximate assignments.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Uber’s dispatch system</b>, as described in March 2015, received driver locations “every four seconds”, indexed them with Google’s S2 cells, spread its state over servers with Ringpop, a consistent hash ring with SWIM gossip for membership (<x-ref to="membership-and-coordination#swim"></x-ref>), and was mostly written in Node.js. Instead of replicating dispatch state between data centers, the server returned an encrypted digest of a driver’s state with each location update, so that after a data center failure another one could resume from the digest the driver’s phone sent back.</li>
+  <li><b>H3</b>, Uber’s hexagonal grid, described in June 2018 and open-sourced that year, has 16 resolutions, each cell one seventh the area of its parent, built from 122 base cells. Uber used it for pricing by supply and demand within hexagons, and for dispatch and marketplace analysis.</li>
+  <li><b>Batched matching</b> is how Uber describes its current matching, as of October 2026: nearby drivers and riders are evaluated together in the seconds after a request, to reduce the average wait for everyone. Its earlier approach matched each rider immediately to the closest available driver.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Shared rides</th><td>A driver holds several trips; matching inserts a pickup into an existing route if the detour for the riders already on board stays small</td><td>Claims and the trip state machine, now one per rider</td></tr>
+<tr><th>Drivers about to finish a trip can be matched</th><td>Candidates include busy drivers whose drop-off is near the pickup, with their remaining time added</td><td>The assignment step</td></tr>
+<tr><th>Scheduled rides</th><td>A timer starts matching shortly before the time (<x-ref to="scheduling-and-workflows#timers"></x-ref>)</td><td>Everything after the request</td></tr>
+<tr><th>Show nearby cars before a request</th><td>A read of the cell index, rate-limited and with positions slightly blurred</td><td>The location store</td></tr>
+<tr><th>Detect a trip that went wrong</th><td>A stream job compares the route with the expected one and flags long stops or detours</td><td>The trip records</td></tr>
+<tr><th>Several products: cars, vans, scooters</th><td>Drivers carry a product, and cells hold a set per product</td><td>The grid and the matcher</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Estimate the location reports first: 250,000 writes a second of data nobody needs a minute later is what puts positions in memory. Draw the two kinds of state, positions by area and trips by id. Use the deep dives for the nearest-driver search, the choice between greedy and batched matching, and the claim that prevents double booking, and say the word “idempotent” for requests and events. Leave pricing and payment as follow-ups unless asked.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Writing every location report to a database</th><td>250,000 durable writes a second for data that expires in seconds</td><td>Overwrite in memory; stream history to cheap storage</td></tr>
+<tr><th>Scanning all drivers for each request</th><td>20,000 examined instead of about 100 in the test</td><td>A grid or geohash index, searched outward in rings</td></tr>
+<tr><th>Choosing by straight-line distance</th><td>Cars across rivers and motorways sent to riders they cannot reach quickly</td><td>Shortlist by distance, decide by travel time</td></tr>
+<tr><th>Always matching each rider to the nearest car</th><td>Waits 12 to 19% longer than necessary near capacity, in the simulation</td><td>Batch the riders waiting in an area and solve the assignment</td></tr>
+<tr><th>Read “free”, then write “taken”</th><td>One car promised to two riders</td><td>A compare-and-set claim, owned by one matcher per area</td></tr>
+<tr><th>Applying trip events without checking state or ids</th><td>Duplicates and impossible transitions corrupt the trip</td><td>A state machine with event ids</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="specialized-databases#geospatial"></x-ref>: spatial indexes, and why moving things live in memory.</li>
+  <li><x-ref to="hld-proximity"></x-ref>: the same cells for places that do not move, and live positions shared between friends.</li>
+  <li><x-ref to="lld-elevator"></x-ref>: dispatching in one building, with the same greedy choices.</li>
+  <li><x-ref to="transactions#atomic-ops"></x-ref>: the atomic update behind a claim.</li>
+  <li><x-ref to="hld-payments"></x-ref> and <x-ref to="hld-maps"></x-ref>: what happens after the trip, and the travel times before it.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Two kinds of state: positions, a high write rate that may be lost, in memory by area; trips, durable and consistent, in a sharded database by id.</li>
+  <li>Most location reports do not change cell: 7% with 500 m cells at city speeds, matching (4/π) × distance ÷ cell size. The rest are overwrites.</li>
+  <li>Search nearby drivers outward in rings of cells; in the test that read about 100 drivers instead of 20,000. Then rank the shortlist by travel time.</li>
+  <li>Greedy matching is fine when cars are plentiful. Near capacity, batching everyone waiting and solving the assignment cut waits by 12 to 19% in the simulation.</li>
+  <li>Claim a driver with one compare-and-set; reading “free” and then writing “taken” double-booked in the test.</li>
+  <li>Model the trip as a state machine whose events carry ids, and make requests idempotent, so retries and duplicates change nothing.</li>
+  <li>Partition by area so each city is matched by one owner, and let positions rebuild themselves from the next reports after a failure.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why are driver positions kept in memory rather than in a database?</summary><p>There are hundreds of thousands of reports a second, each replacing the last, and a position is worthless a minute later. Losing them costs nothing, since every driver reports again within seconds. A database would spend durable writes on data that does not need durability.</p></details>
+<details><summary>A car moves 28 m between reports. About what share of reports moves it into another cell of 500 m, and why does that matter?</summary><p>About (4/π) × 28 ÷ 500 ≈ 7%, which the simulation confirmed. Only those reports change the cell index; the other 93% overwrite a position, so the index costs almost nothing to keep current.</p></details>
+<details><summary>When does the ring search stop, and why is that correct?</summary><p>When it has found at least k drivers and the k-th nearest is closer than the inner edge of the next ring. Any driver in an unsearched ring is at least that far away, so none can be nearer than those already found.</p></details>
+<details><summary>Riders A and B and drivers X and Y: A is 1 min from X and 2 from Y; B is 1 min from X and 9 from Y. Compare greedy and batched matching.</summary><p>Greedy, serving A first, gives A the nearest, X, and leaves B with Y: 1 + 9 = 10 minutes of pickup. Batched matching considers both and gives A Y and B X: 2 + 1 = 3 minutes.</p></details>
+<details><summary>Why did batching help little when drivers were plentiful in the simulation?</summary><p>With many free drivers spread around, the nearest driver for each rider is rarely the one another rider needs, so the greedy choice is already close to the best, and batching only adds its few seconds of waiting.</p></details>
+<details><summary>Two matchers both see driver d235 as free. What goes wrong without a compare-and-set, and what does the claim guarantee?</summary><p>Each reads “free”, then writes “taken”, and both offer the driver a trip, so one rider is promised a car that will not come. A claim is one atomic operation that succeeds only if the driver is still free, so exactly one matcher gets the driver and the other moves on to its next candidate.</p></details>
+<details><summary>A driver’s “accept” arrives twice because the app retried. What does the trip do with the second one?</summary><p>Nothing. The event carries an id that the trip has already applied, so it is recognized as a duplicate and ignored, and the trip’s state and history are unchanged.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>João Miranda, <a href="https://www.infoq.com/news/2015/03/uber-realtime-market-platform">Uber Unveils its Realtime Market Platform</a>, InfoQ, 15 March 2015. Location reports every four seconds, S2 cells, Ringpop, and failover from a digest held by the driver’s phone.</li>
+  <li>Isaac Brodsky, <a href="https://www.uber.com/en-US/blog/h3/">H3: Uber’s Hexagonal Hierarchical Spatial Index</a>, Uber Engineering, 27 June 2018. Why hexagons, and what the grid is used for.</li>
+  <li>Uber, <a href="https://www.uber.com/us/en/marketplace/matching/">Matching</a>, Uber Marketplace, accessed October 2026. Batched matching, and the earlier first-to-request approach.</li>
+</ol>
+</section>

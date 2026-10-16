@@ -1,0 +1,733 @@
+<!--meta
+{ "description": "A high-level design of a file storage and sync service like Dropbox or Google Drive: requirements and estimates, a block API that uploads only what the server lacks, metadata in a sharded database with a journal per namespace, content-defined chunking measured against fixed-size chunks, deduplication and version history, conflicts with a revision check against last write wins, notifications, failures and growth.",
+  "lede": "Save a file on a laptop and it appears on a phone a few seconds later, on a train, after a week offline, or in a folder shared with forty colleagues. Behind that sit two systems with opposite shapes: a stream of small, ordered metadata changes that must never be lost or reordered, and an ocean of immutable chunks of bytes. This chapter designs both, and measures the three ideas that make sync cheap and safe: chunking by content, storing each chunk once, and refusing to let one edit silently overwrite another.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a file storage and sync service. Users keep files in a folder on each of their devices. A change on one device appears on the others. Users can share folders, recover earlier versions of a file, and keep working offline.</p></div>
+<p>What makes it hard is that files are large and edits are small. A one-line change to a 32 MiB file must not upload 32 MiB, over a phone connection that drops every few minutes. The same file is often edited in two places at once, by one person with two devices or by colleagues in a shared folder, and nothing may be lost when that happens. And hundreds of millions of devices sit idle almost all the time, yet each must hear about a change within seconds. In the terms of <x-ref to="hld-method"></x-ref>, it is a storage problem whose difficulty is the cost of change: what moves over the network when one byte changes, and what happens when two changes collide.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Upload, download and delete files of any size, in a folder tree</th><td>Yes</td></tr>
+<tr><th>Sync changes to every device of the user, including after long offline periods</th><td>Yes</td></tr>
+<tr><th>Share a folder with other users, who see the same contents</th><td>Yes</td></tr>
+<tr><th>Version history: restore any version from the last 30 days</th><td>Yes</td></tr>
+<tr><th>Concurrent edits to one file never lose either edit</th><td>Yes</td></tr>
+<tr><th>Several people editing one document live, letter by letter</th><td>No: that is <x-ref to="hld-collaborative-editing"></x-ref></td></tr>
+<tr><th>Search inside files, previews, comments</th><td>No: separate services that read the stored files</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>100 million daily active users, each saving about 10 changed files a day; individual files up to 50 GB</td></tr>
+<tr><th>Sync delay</th><td>A small change reaches the user’s other online devices within 5 seconds</td></tr>
+<tr><th>Durability</th><td>A committed file is never lost: at least the eleven nines of the underlying object storage</td></tr>
+<tr><th>Availability</th><td>99.9% for sync; the local folder always works, offline included</td></tr>
+<tr><th>Consistency</th><td>Every device sees the changes in a namespace in the same order, and ends up with the same files</td></tr>
+<tr><th>Efficiency</th><td>Upload and store only bytes the service has never seen</td></tr>
+</tbody>
+</table>
+<p>The last row is unusual for a requirement and drives most of the design. It is what separates a sync service from a web form that accepts uploads.</p>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<p>Following <x-ref to="estimation#method"></x-ref>, start from the users and their behavior. Assume 60% of saves change an existing file and 40% add a new one, and that a changed file averages 2 MB.</p>
+<div class="formula">commits: 100 million users × 10 a day ÷ 86,400 s ≈ 11,600 a second on average, about 35,000 at a peak of three times that<br>
+uploading whole files: 1 billion × 2 MB = 2 PB a day ≈ 185 Gbit/s on average<br>
+uploading only new chunks: new files 0.4 billion × 2 MB = 0.8 PB, edits 0.6 billion × 79 KiB ≈ 0.05 PB: 0.85 PB a day ≈ 79 Gbit/s<br>
+new storage: about 0.85 PB a day before cross-user deduplication, about 1.3 PB of disk with erasure coding at 1.5 times, close to 500 PB a year<br>
+metadata: 1 billion new versions a day, each a row of about 200 bytes plus 32 bytes per chunk</div>
+<p>Four conclusions follow. Upload bandwidth is dominated by new files once edits send only changed chunks; the 79 KiB per edit is measured later in this chapter. Storage grows by hundreds of petabytes a year, which only object storage handles at a sensible cost (<x-ref to="object-and-file-storage"></x-ref>). Metadata is small per row but arrives at tens of thousands of transactions a second and is never deleted while history lasts, so it must be sharded. And the devices waiting for changes are mostly idle connections, tens of millions of them, which is a memory problem, not a CPU one (<x-ref to="realtime-communication#per-server"></x-ref>).</p>
+
+<div class="widget" data-widget="syncload86">
+<h4>Upload and storage for a sync service</h4>
+<p>How much the service receives a day, sending whole files or only the chunks the server lacks.</p>
+<div class="controls">
+  <label>Daily active users, millions<input type="number" name="users" value="100" min="0.01" max="5000" step="1"></label>
+  <label>Saves per user per day<input type="number" name="saves" value="10" min="0" max="1000" step="1"></label>
+  <label>Average file size, MB<input type="number" name="size" value="2" min="0.001" max="10000" step="0.1"></label>
+  <label>Saves that edit an existing file, %<input type="number" name="edits" value="60" min="0" max="100" step="1"></label>
+  <label>Uploaded per edit, KiB<input type="number" name="perEdit" value="79" min="0" max="1000000" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 128" role="img" aria-label="Two bars comparing the bytes uploaded a day when whole files are sent and when only new chunks are sent, each split into new files and edits."><text x="124" y="29" class="ts end">Whole files</text><rect x="132" y="14" width="152" height="22" rx="3" class="bar"></rect><rect x="284" y="14" width="228" height="22" rx="3" class="bar store"></rect><text x="520" y="29" class="ts tb">185 Gbit/s</text><text x="124" y="69" class="ts end">New chunks only</text><rect x="132" y="54" width="152" height="22" rx="3" class="bar"></rect><rect x="284" y="54" width="9.2" height="22" rx="3" class="bar store"></rect><text x="301.2" y="69" class="ts tb">78.6 Gbit/s</text><rect x="132" y="104" width="14" height="12" rx="2" class="bar"></rect><text x="152" y="114" class="ts">new files</text><rect x="240" y="104" width="14" height="12" rx="2" class="bar store"></rect><text x="260" y="114" class="ts">edits to existing files</text></svg>
+<dl class="results">
+  <div><dt>Commits a second, average</dt><dd data-out="commits">11.6 thousand</dd></div>
+  <div><dt>Upload, whole files</dt><dd data-out="whole">185 Gbit/s</dd></div>
+  <div><dt>Upload, new chunks only</dt><dd data-out="chunked">78.6 Gbit/s</dd></div>
+  <div><dt>New data a day</dt><dd data-out="daily">849 TB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Sending only new chunks cuts the upload from 185 Gbit/s to 78.6 Gbit/s on average, 57.6% less. 94.3% of what remains is new files, which no chunking can avoid. A year at this rate adds about 310 PB before erasure coding and before any deduplication across users.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<p>The client never uploads a file. It uploads blocks the server lacks, then commits a list of hashes as the new version. Each block is named by the SHA-256 hash of its bytes (<x-ref to="cryptography-in-practice"></x-ref>), and the ordered list of a file’s block hashes, its <dfn>blocklist</dfn>, is the file’s content as far as the metadata is concerned.</p>
+<pre data-lang="http" data-title="Commit a new version of a file">
+POST /v1/namespaces/51/commit
+Idempotency-Key: 7d1e0c52-laptop-311
+{ "path": "/Reports/q3.pdf", "parent_rev": 7, "size": 4194319,
+  "blocks": ["9f2c…", "41ab…", "07de…", …] }
+
+400 Bad Request         { "error": "missing_blocks", "missing": ["41ab…"] }
+200 OK                  { "rev": 8 }
+409 Conflict            { "error": "conflict", "current": { "rev": 8, "device": "Phone", … } }
+</pre>
+<pre data-lang="http" data-title="Blocks, changes, and waiting for changes">
+PUT /v1/blocks/41ab…            (the bytes)  → 201 Created, or 422 if they do not hash to 41ab…
+GET /v1/blocks/41ab…                         → the bytes, or a redirect to a signed URL
+GET /v1/namespaces/51/changes?cursor=7&limit=500
+                                             → { "entries": [ { "rev": 8, "path": …, "blocks": […] } ],
+                                                 "cursor": 8, "has_more": false }
+GET /v1/notify?cursors=51:8,77:1203&timeout=60
+                                             → held open until something changes: { "changed": [51] }
+</pre>
+<p>Three properties make this safe to retry over a bad network. A block upload is idempotent by construction: the same bytes always have the same name, and storing them twice changes nothing. A commit names the revision it started from, so a commit that arrives after someone else’s fails with 409 instead of overwriting it. And the commit carries an idempotency key, so a retry after a lost response returns the same revision instead of creating a duplicate (<x-ref to="api-styles#idempotency-keys"></x-ref>). The changes list is paged by a cursor that is a position in the namespace’s journal, which is what lets a device that was offline for a week catch up exactly (<x-ref to="api-styles#pagination"></x-ref>).</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<p>Files are grouped into namespaces. A user’s own files are one namespace; each shared folder is another, mounted into the tree of every member. A namespace is the unit of ordering and the shard key: every change to it gets the next number in its journal, and one database shard owns it.</p>
+<table>
+<thead><tr><th>Entity</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>Block</th><td>SHA-256 of its bytes</td><td>Up to a few MiB of file content, never changed</td><td>Object storage</td></tr>
+<tr><th>Journal entry (a version)</th><td>(namespace, rev)</td><td>Path, file id, size, blocklist, device, time, deleted flag</td><td>Sharded relational database</td></tr>
+<tr><th>Current file</th><td>(namespace, file id)</td><td>Path and latest rev: what the folder looks like now</td><td>Same shard, same transaction</td></tr>
+<tr><th>Mount</th><td>(user, namespace)</td><td>Where a shared folder appears in this user’s tree, and the user’s rights</td><td>Sharded by user</td></tr>
+<tr><th>Device</th><td>device id</td><td>Owner, and the cursor it has reached in each namespace</td><td>Sharded by user</td></tr>
+<tr><th>Block references</th><td>block hash</td><td>How many versions list the block</td><td>A separate table, updated in batches</td></tr>
+</tbody>
+</table>
+<p>A relational database fits the metadata because a commit is a small transaction with a condition: check that the parent revision is still current, insert the journal entry, update the current file. That is optimistic concurrency control on a row (<x-ref to="transactions#optimistic"></x-ref>), and putting a whole namespace on one shard keeps it a single-shard transaction (<x-ref to="partitioning#shard-key"></x-ref>). The blocks need nothing a database offers: they are immutable, large and addressed by key, which is object storage’s job.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f861t f861d">
+<title id="f861t">The parts of a file sync service</title>
+<desc id="f861d">Desktop and mobile clients talk to three services. The metadata service commits new versions and lists changes, and writes them to a metadata database sharded by namespace. The block service checks and stores chunks of files in object storage, keyed by the SHA-256 hash of their contents. Every commit adds a row to the journal, and change events derived from it reach a notification service, which answers the long polls that idle clients hold open. A garbage collector later reads the block references from the metadata and deletes blocks that no version uses.</desc>
+<rect class="n" x="10" y="30" width="110" height="250" rx="8"/>
+<text class="tb mid" x="65" y="58">Clients</text>
+<text class="ts mid" x="65" y="76">laptop, phone</text>
+<text class="ts mid" x="65" y="120">watch the folder</text>
+<text class="ts mid" x="65" y="137">chunk and hash</text>
+<text class="ts mid" x="65" y="154">keep a local</text>
+<text class="ts mid" x="65" y="171">database of</text>
+<text class="ts mid" x="65" y="188">what is synced</text>
+<rect class="n sig" x="200" y="30" width="150" height="52" rx="6"/>
+<text class="tb mid" x="275.0" y="53.0">Metadata service</text>
+<text class="ts mid" x="275.0" y="70.0">commits and changes</text>
+<rect class="n sig" x="200" y="130" width="150" height="52" rx="6"/>
+<text class="tb mid" x="275.0" y="153.0">Notification</text>
+<text class="ts mid" x="275.0" y="170.0">holds idle long polls</text>
+<rect class="n sig" x="200" y="228" width="150" height="52" rx="6"/>
+<text class="tb mid" x="275.0" y="251.0">Block service</text>
+<text class="ts mid" x="275.0" y="268.0">checks and stores</text>
+<rect class="n store" x="430" y="30" width="150" height="52" rx="6"/>
+<text class="tb mid" x="505.0" y="53.0">Metadata database</text>
+<text class="ts mid" x="505.0" y="70.0">sharded by namespace</text>
+<rect class="n async" x="430" y="130" width="150" height="52" rx="6"/>
+<text class="tb mid" x="505.0" y="153.0">Change events</text>
+<text class="ts mid" x="505.0" y="170.0">one per commit</text>
+<rect class="n store" x="430" y="228" width="150" height="52" rx="6"/>
+<text class="tb mid" x="505.0" y="251.0">Object storage</text>
+<text class="ts mid" x="505.0" y="268.0">key: SHA-256 of a block</text>
+<rect class="n async" x="610" y="130" width="100" height="52" rx="6"/>
+<text class="tb mid" x="660.0" y="153.0">Garbage</text>
+<text class="ts mid" x="660.0" y="170.0">collector</text>
+<path class="e sig both" d="M120 56H200"/>
+<text class="ts mid" x="160" y="50">commits</text>
+<path class="e sig" d="M200 156H120"/>
+<text class="ts mid" x="160" y="150">long poll</text>
+<path class="e sig both" d="M120 254H200"/>
+<text class="ts mid" x="160" y="248">blocks</text>
+<path class="e store" d="M350 56H430"/>
+<text class="ts mid" x="390" y="50">versions</text>
+<path class="e store" d="M350 254H430"/>
+<text class="ts mid" x="390" y="248">put, get</text>
+<path class="e async" d="M505 82V130"/>
+<text class="ts" x="513" y="111">journal</text>
+<path class="e async" d="M430 156H350"/>
+<text class="ts mid" x="390" y="150">changed</text>
+<path class="e async" d="M580 62 642 130"/>
+<text class="ts" x="622" y="84">refs</text>
+<path class="e async" d="M642 182 580 244"/>
+<text class="ts" x="622" y="232">delete</text>
+</svg>
+</div>
+<figcaption>Two paths that scale separately: small, frequent metadata commits in a sharded database, and large, immutable blocks in object storage. Notifications only say that something changed.</figcaption>
+</figure>
+
+<p>The client does more work than in most designs. It watches the folder for changes, splits each changed file into chunks, hashes them, and keeps a local database of what it believes is synced. Dropbox describes its client as holding three trees: the remote state, the local disk, and the last state known to be the same on both. The third works like the merge base in version control, telling a file deleted locally apart from a file added remotely.</p>
+
+<figure class="fig wide" id="fig-sync">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 306" role="img" aria-labelledby="f862t f862d">
+<title id="f862t">An edit on the laptop reaches the phone</title>
+<desc id="f862d">A sequence between the laptop, the metadata service, the block service, the notification service and the phone. The laptop splits the edited 4 MiB file into 68 chunks and asks to commit them on top of revision 7. The metadata service answers that one block is missing. The laptop uploads that block, 72 KiB, and commits again, creating revision 8. The metadata service signals a change, the notification service answers the phone’s long poll, the phone lists the changes since revision 7, and downloads the one block it does not have.</desc>
+<text class="tb mid" x="50" y="20">Laptop</text>
+<line class="axis" x1="50" y1="28" x2="50" y2="294"/>
+<text class="tb mid" x="205" y="20">Metadata</text>
+<line class="axis" x1="205" y1="28" x2="205" y2="294"/>
+<text class="tb mid" x="360" y="20">Blocks</text>
+<line class="axis" x1="360" y1="28" x2="360" y2="294"/>
+<text class="tb mid" x="515" y="20">Notification</text>
+<line class="axis" x1="515" y1="28" x2="515" y2="294"/>
+<text class="tb mid" x="670" y="20">Phone</text>
+<line class="axis" x1="670" y1="28" x2="670" y2="294"/>
+<g data-s="1" data-packet="none">
+<rect class="n " x="58" y="44" width="133.9" height="22" rx="4"/>
+<text class="ts mid" x="124.95" y="59">1. 68 chunks hashed</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M51 86H204"/>
+<text class="ts mid" x="127.5" y="80">2. commit: parent 7</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M204 114H51"/>
+<text class="ts mid" x="127.5" y="108">3. need 1 block</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M51 142H359"/>
+<text class="ts mid" x="205.0" y="136">4. PUT 1 block, 72 KiB</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M51 170H204"/>
+<text class="ts mid" x="127.5" y="164">5. commit again: rev 8</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M206 198H514"/>
+<text class="ts mid" x="360.0" y="192">6. namespace changed</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M516 226H669"/>
+<text class="ts mid" x="592.5" y="220">7. long poll returns</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M669 254H206"/>
+<text class="ts mid" x="437.5" y="248">8. changes since 7: rev 8</text>
+</g>
+<g data-s="9">
+<path class="e store" d="M669 282H361"/>
+<text class="ts mid" x="515.0" y="276">9. GET the 1 block it lacks</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Server: rev 7; Phone: rev 7; Blocks stored: 67 of 68">The watcher sees report.pdf saved. The client splits it into content-defined chunks and computes the SHA-256 hash of each.</li>
+  <li data-msg="commit">The laptop asks to commit the new list of hashes as the next version of the file it last saw, revision 7.</li>
+  <li data-msg="need 1">The metadata service will not commit a version that names a block nobody has stored. One hash is new.</li>
+  <li data-msg="PUT" data-state="Server: rev 7; Phone: rev 7; Blocks stored: 68 of 68">The laptop uploads only that chunk. The block service checks that its bytes hash to its name.</li>
+  <li data-msg="commit" data-state="Server: rev 8; Phone: rev 7; Blocks stored: 68 of 68">The same commit now succeeds. The version and its journal entry are written in one transaction.</li>
+  <li data-msg="changed">A change event leaves the journal. It carries no content, only the fact that something changed.</li>
+  <li data-msg="changes">The phone had a request held open. It now returns, saying there are changes.</li>
+  <li data-msg="list">The phone asks for everything after its cursor and gets revision 8 with its list of hashes.</li>
+  <li data-msg="GET" data-state="Server: rev 8; Phone: rev 8; Blocks stored: 68 of 68">It already holds the other chunks, so it downloads one and rebuilds the file.</li>
+</ol>
+<figcaption>The chapter’s test makes this edit, 15 bytes inserted near the start of a 4 MiB file: one chunk of 72 KiB goes up and the same one comes down.</figcaption>
+</figure>
+
+<p>Notifications carry no content. A device holds one long poll (<x-ref to="realtime-communication#long-polling"></x-ref>) listing its cursor in each namespace, and the reply says only which namespaces changed. The device then fetches the changes through the ordinary API. A lost notification costs nothing but delay, since the next poll or a periodic check catches up from the cursor, so the notification service can be simple, stateless and lossy.</p>
+<p>Downloads of popular shared files can come from a CDN or through signed URLs straight from object storage (<x-ref to="object-and-file-storage#presigned"></x-ref>). Uploads go through the block service, which checks every block’s hash before storing it, because a client with a memory error can produce a block whose bytes do not match its name.</p>
+
+<h2 id="chunking">Step 6a: Chunking by content</h2>
+<p>Sending only what changed needs a way to name the parts of a file that did not change. The obvious way is to cut the file every 4 MiB, or every 64 KiB, and compare the hashes of the pieces. That works for an edit that overwrites bytes in place, and fails for one that inserts or deletes them, which is most edits to documents.</p>
+
+<figure class="fig wide" id="fig-boundaries">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f863t f863d">
+<title id="f863t">Where the boundaries fall after inserting 100 bytes</title>
+<desc id="f863d">The first 1.5 MiB of a 2 MiB file, cut into chunks of 64 KiB on average, before and after 100 bytes are inserted at 200 KiB. With fixed-size chunks, every chunk from the insertion onward starts 100 bytes later than before, so all of them are new: 30 chunks for the whole file. With content-defined chunks, the boundaries are found again right after the insertion, and only 1 chunk is new.</desc>
+<path class="e none dash" d="M222.4 24V196"/>
+<text class="ts mid" x="222.4" y="16">100 bytes inserted at 200 KiB</text>
+<text class="tb" x="10" y="45">Fixed size</text>
+<text class="ts" x="10" y="60">before</text>
+<rect class="n store" x="150.0" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="173.2" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="196.3" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="219.5" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="242.7" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="265.8" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="289.0" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="312.2" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="335.3" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="358.5" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="381.7" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="404.8" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="428.0" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="451.2" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="474.3" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="497.5" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="520.7" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="543.8" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="567.0" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="590.2" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="613.3" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="636.5" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="659.7" y="30" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="682.8" y="30" width="23.2" height="24" rx="2"/>
+<text class="tb" x="10" y="77"></text>
+<text class="ts" x="10" y="92">after</text>
+<rect class="n store" x="150.0" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="173.2" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="196.3" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="219.5" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="242.7" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="265.8" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="289.0" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="312.2" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="335.3" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="358.5" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="381.7" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="404.8" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="428.0" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="451.2" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="474.3" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="497.5" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="520.7" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="543.8" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="567.0" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="590.2" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="613.3" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="636.5" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="659.7" y="62" width="23.2" height="24" rx="2"/>
+<rect class="n fault" x="682.8" y="62" width="23.2" height="24" rx="2"/>
+<text class="tb" x="10" y="131">Content-defined</text>
+<text class="ts" x="10" y="146">before</text>
+<rect class="n store" x="150.0" y="116" width="31.5" height="24" rx="2"/>
+<rect class="n store" x="181.5" y="116" width="16.1" height="24" rx="2"/>
+<rect class="n store" x="197.6" y="116" width="9.7" height="24" rx="2"/>
+<rect class="n store" x="207.3" y="116" width="8.7" height="24" rx="2"/>
+<rect class="n store" x="216.0" y="116" width="22.6" height="24" rx="2"/>
+<rect class="n store" x="238.7" y="116" width="15.3" height="24" rx="2"/>
+<rect class="n store" x="254.0" y="116" width="8.1" height="24" rx="2"/>
+<rect class="n store" x="262.1" y="116" width="12.1" height="24" rx="2"/>
+<rect class="n store" x="274.2" y="116" width="13.3" height="24" rx="2"/>
+<rect class="n store" x="287.4" y="116" width="9.5" height="24" rx="2"/>
+<rect class="n store" x="296.9" y="116" width="44.9" height="24" rx="2"/>
+<rect class="n store" x="341.8" y="116" width="31.6" height="24" rx="2"/>
+<rect class="n store" x="373.4" y="116" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="396.6" y="116" width="15.1" height="24" rx="2"/>
+<rect class="n store" x="411.7" y="116" width="46.9" height="24" rx="2"/>
+<rect class="n store" x="458.6" y="116" width="54.2" height="24" rx="2"/>
+<rect class="n store" x="512.8" y="116" width="9.8" height="24" rx="2"/>
+<rect class="n store" x="522.5" y="116" width="65.7" height="24" rx="2"/>
+<rect class="n store" x="588.2" y="116" width="7.8" height="24" rx="2"/>
+<rect class="n store" x="596.0" y="116" width="14.8" height="24" rx="2"/>
+<rect class="n store" x="610.8" y="116" width="7.5" height="24" rx="2"/>
+<rect class="n store" x="618.3" y="116" width="13.5" height="24" rx="2"/>
+<rect class="n store" x="631.8" y="116" width="34.8" height="24" rx="2"/>
+<rect class="n store" x="666.6" y="116" width="39.4" height="24" rx="2"/>
+<text class="tb" x="10" y="163"></text>
+<text class="ts" x="10" y="178">after</text>
+<rect class="n store" x="150.0" y="148" width="31.5" height="24" rx="2"/>
+<rect class="n store" x="181.5" y="148" width="16.1" height="24" rx="2"/>
+<rect class="n store" x="197.6" y="148" width="9.7" height="24" rx="2"/>
+<rect class="n store" x="207.3" y="148" width="8.7" height="24" rx="2"/>
+<rect class="n fault" x="216.0" y="148" width="22.7" height="24" rx="2"/>
+<rect class="n store" x="238.7" y="148" width="15.3" height="24" rx="2"/>
+<rect class="n store" x="254.0" y="148" width="8.1" height="24" rx="2"/>
+<rect class="n store" x="262.1" y="148" width="12.1" height="24" rx="2"/>
+<rect class="n store" x="274.2" y="148" width="13.3" height="24" rx="2"/>
+<rect class="n store" x="287.5" y="148" width="9.5" height="24" rx="2"/>
+<rect class="n store" x="297.0" y="148" width="44.9" height="24" rx="2"/>
+<rect class="n store" x="341.9" y="148" width="31.6" height="24" rx="2"/>
+<rect class="n store" x="373.4" y="148" width="23.2" height="24" rx="2"/>
+<rect class="n store" x="396.6" y="148" width="15.1" height="24" rx="2"/>
+<rect class="n store" x="411.7" y="148" width="46.9" height="24" rx="2"/>
+<rect class="n store" x="458.6" y="148" width="54.2" height="24" rx="2"/>
+<rect class="n store" x="512.8" y="148" width="9.8" height="24" rx="2"/>
+<rect class="n store" x="522.6" y="148" width="65.7" height="24" rx="2"/>
+<rect class="n store" x="588.2" y="148" width="7.8" height="24" rx="2"/>
+<rect class="n store" x="596.1" y="148" width="14.8" height="24" rx="2"/>
+<rect class="n store" x="610.8" y="148" width="7.5" height="24" rx="2"/>
+<rect class="n store" x="618.3" y="148" width="13.5" height="24" rx="2"/>
+<rect class="n store" x="631.8" y="148" width="34.8" height="24" rx="2"/>
+<rect class="n store" x="666.7" y="148" width="39.3" height="24" rx="2"/>
+<text class="ts" x="150.0" y="194">0</text>
+<text class="ts mid" x="335.3" y="194">512 KiB</text>
+<text class="ts mid" x="520.7" y="194">1 MiB</text>
+<text class="ts end" x="706.0" y="194">1.5 MiB</text>
+<rect class="n store" x="150" y="210" width="16" height="12" rx="2"/>
+<text class="ts" x="172" y="220">chunk the server already has</text>
+<rect class="n fault" x="400" y="210" width="16" height="12" rx="2"/>
+<text class="ts" x="422" y="220">new chunk: must be uploaded</text>
+</svg>
+</div>
+<figcaption>Drawn from the chapter’s code. Fixed boundaries are positions, so everything after an insertion moves. Content-defined boundaries are patterns in the bytes, so they move with the content.</figcaption>
+</figure>
+
+<p>Inserting 100 bytes shifts every later byte by 100 positions. A fixed boundary is a position, so every piece after the insertion now holds different bytes and a different hash. <dfn>Content-defined chunking</dfn> places boundaries where the content itself has some rare property, so a boundary moves with the bytes around it. The usual property is that a hash of the last few dozen bytes, updated one byte at a time, falls below a threshold. The LBFS file system introduced the idea in 2001, with boundaries roughly every 8 KB; FastCDC (2016) is a faster version of the same idea, and the chapter’s chunker is a simplified form of it.</p>
+<pre data-lang="ts" data-title="Content-defined chunk boundaries">
+// Content-defined chunks: a boundary wherever a rolling hash of the last 32 bytes is small
+// enough. The boundaries depend on the content near them, not on their distance from the start,
+// so an insertion moves only the boundaries next to it.
+export class ContentDefinedChunker implements Chunker {
+  readonly name: string;
+  private readonly min: number;
+  private readonly max: number;
+  private readonly threshold: number; // a hash below this ends a chunk
+  private readonly gear: Uint32Array;
+  constructor(average: number, seed = 86) {
+    this.min = Math.floor(average / 4);
+    this.max = average * 4;
+    // After the minimum, each byte ends the chunk with probability 1 / (average − min).
+    this.threshold = Math.floor(2 ** 32 / (average - this.min));
+    this.gear = gearTable(seed);
+    this.name = `content-defined ${average}`;
+  }
+  ends(data: Uint8Array): number[] {
+    const out: number[] = [];
+    const gear = this.gear;
+    let start = 0;
+    while (start < data.length) {
+      const limit = Math.min(start + this.max, data.length);
+      let end = limit;
+      let h = 0;
+      for (let i = start; i < limit; i += 1) {
+        h = ((h << 1) + (gear[data[i] as number] as number)) >>> 0; // the oldest byte shifts out after 32 steps
+        if (i + 1 - start >= this.min && h < this.threshold) {
+          end = i + 1;
+          break;
+        }
+      }
+      out.push(end);
+      start = end;
+    }
+    return out;
+  }
+}
+</pre>
+<p>The minimum and maximum keep chunks from being tiny or unbounded: without a maximum, a long run of identical bytes would never produce a boundary. Each boundary depends only on the 32 bytes before it, so after an insertion the chunker finds the old boundaries again within one chunk. The figure below measures what that is worth on a 32 MiB file of random bytes.</p>
+
+<figure class="fig wide" id="fig-edits">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 380" role="img" aria-labelledby="f864t f864d">
+<title id="f864t">Bytes uploaded after one edit to a 32 MiB file</title>
+<desc id="f864d">For five edits to a 32 MiB file, the bytes a client must upload with three ways of chunking. Change 100 bytes in the middle: fixed 4 MiB 4 MiB, fixed 64 KiB 64 KiB, content-defined 64 KiB 96 KiB. Insert 100 bytes in the middle: fixed 4 MiB 16 MiB, fixed 64 KiB 16 MiB, content-defined 64 KiB 96 KiB. Insert 100 bytes at the start: fixed 4 MiB 32 MiB, fixed 64 KiB 32 MiB, content-defined 64 KiB 33 KiB. Delete 1 KiB in the middle: fixed 4 MiB 16 MiB, fixed 64 KiB 16 MiB, content-defined 64 KiB 95 KiB. Append 1 MiB: fixed 4 MiB 1 MiB, fixed 64 KiB 1 MiB, content-defined 64 KiB 1.0 MiB.</desc>
+<rect class="bar mute" x="10" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="30" y="20">fixed 4 MiB</text>
+<rect class="bar" x="130" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="150" y="20">fixed 64 KiB</text>
+<rect class="bar store" x="255" y="10" width="14" height="12" rx="2"/>
+<text class="ts" x="275" y="20">content-defined, 64 KiB on average</text>
+<line class="grid" x1="228.0" y1="44" x2="228.0" y2="354"/>
+<text class="ts mid" x="228.0" y="40">16 KiB</text>
+<line class="grid" x1="364.7" y1="44" x2="364.7" y2="354"/>
+<text class="ts mid" x="364.7" y="40">256 KiB</text>
+<line class="grid" x1="501.3" y1="44" x2="501.3" y2="354"/>
+<text class="ts mid" x="501.3" y="40">4 MiB</text>
+<line class="grid" x1="638.0" y1="44" x2="638.0" y2="354"/>
+<text class="ts mid" x="638.0" y="40">64 MiB</text>
+<text class="ts" x="10" y="82">Change 100 bytes in the middle</text>
+<rect class="bar mute" x="228" y="56" width="273.3" height="12" rx="2"/>
+<text class="ts" x="507.3" y="66">4 MiB</text>
+<rect class="bar " x="228" y="71" width="68.3" height="12" rx="2"/>
+<text class="ts" x="302.3" y="81">64 KiB</text>
+<rect class="bar store" x="228" y="86" width="88.4" height="12" rx="2"/>
+<text class="ts" x="322.4" y="96">96 KiB</text>
+<rect class="hit" x="8" y="52" width="704" height="52" data-tip="Change 100 bytes in the middle|fixed 4 MiB: 4 MiB in 1 chunk|fixed 64 KiB: 64 KiB in 1 chunk|content-defined 64 KiB: 96 KiB in 1 chunk"/>
+<text class="ts" x="10" y="144">Insert 100 bytes in the middle</text>
+<rect class="bar mute" x="228" y="118" width="341.7" height="12" rx="2"/>
+<text class="ts" x="575.7" y="128">16 MiB</text>
+<rect class="bar " x="228" y="133" width="341.7" height="12" rx="2"/>
+<text class="ts" x="575.7" y="143">16 MiB</text>
+<rect class="bar store" x="228" y="148" width="88.4" height="12" rx="2"/>
+<text class="ts" x="322.4" y="158">96 KiB</text>
+<rect class="hit" x="8" y="114" width="704" height="52" data-tip="Insert 100 bytes in the middle|fixed 4 MiB: 16 MiB in 5 chunks|fixed 64 KiB: 16 MiB in 257 chunks|content-defined 64 KiB: 96 KiB in 1 chunk"/>
+<text class="ts" x="10" y="206">Insert 100 bytes at the start</text>
+<rect class="bar mute" x="228" y="180" width="375.8" height="12" rx="2"/>
+<text class="ts" x="609.8" y="190">32 MiB</text>
+<rect class="bar " x="228" y="195" width="375.8" height="12" rx="2"/>
+<text class="ts" x="609.8" y="205">32 MiB</text>
+<rect class="bar store" x="228" y="210" width="35.8" height="12" rx="2"/>
+<text class="ts" x="269.8" y="220">33 KiB</text>
+<rect class="hit" x="8" y="176" width="704" height="52" data-tip="Insert 100 bytes at the start|fixed 4 MiB: 32 MiB in 9 chunks|fixed 64 KiB: 32 MiB in 513 chunks|content-defined 64 KiB: 33 KiB in 1 chunk"/>
+<text class="ts" x="10" y="268">Delete 1 KiB in the middle</text>
+<rect class="bar mute" x="228" y="242" width="341.7" height="12" rx="2"/>
+<text class="ts" x="575.7" y="252">16 MiB</text>
+<rect class="bar " x="228" y="257" width="341.7" height="12" rx="2"/>
+<text class="ts" x="575.7" y="267">16 MiB</text>
+<rect class="bar store" x="228" y="272" width="87.9" height="12" rx="2"/>
+<text class="ts" x="321.9" y="282">95 KiB</text>
+<rect class="hit" x="8" y="238" width="704" height="52" data-tip="Delete 1 KiB in the middle|fixed 4 MiB: 16 MiB in 4 chunks|fixed 64 KiB: 16 MiB in 256 chunks|content-defined 64 KiB: 95 KiB in 1 chunk"/>
+<text class="ts" x="10" y="330">Append 1 MiB</text>
+<rect class="bar mute" x="228" y="304" width="205.0" height="12" rx="2"/>
+<text class="ts" x="439.0" y="314">1 MiB</text>
+<rect class="bar " x="228" y="319" width="205.0" height="12" rx="2"/>
+<text class="ts" x="439.0" y="329">1 MiB</text>
+<rect class="bar store" x="228" y="334" width="206.5" height="12" rx="2"/>
+<text class="ts" x="440.5" y="344">1.0 MiB</text>
+<rect class="hit" x="8" y="300" width="704" height="52" data-tip="Append 1 MiB|fixed 4 MiB: 1 MiB in 1 chunk|fixed 64 KiB: 1 MiB in 16 chunks|content-defined 64 KiB: 1.0 MiB in 18 chunks"/>
+<text class="ts" x="10" y="370">Logarithmic scale: each gridline is 16 times the one before it.</text>
+</svg>
+</div>
+<figcaption>Measured by the chapter’s code on random bytes. Fixed chunks are cheap only when an edit leaves every later byte where it was; an insertion or deletion re-uploads the rest of the file.</figcaption>
+</figure>
+
+<p>Fixed chunks of 4 MiB re-upload a whole chunk for a 100-byte change, and fixed chunks of 64 KiB do better there. But both re-upload half the file for an insertion in the middle and all of it for an insertion at the start, while content-defined chunks send one chunk of 33 to 96 KiB for each of these edits. Appending is cheap for all three, which is why logs and video recordings sync well with any chunking.</p>
+<p>The average chunk size is a trade-off between bytes uploaded and metadata kept. Each chunk costs a 32-byte hash in every version that lists it, a reference to count, and an entry in the block store. The chapter’s code measured both sides on a 16 MiB file, inserting 100 bytes at twelve random places:</p>
+<table>
+<thead><tr><th>Target average</th><th>Measured average</th><th>Chunks per GiB</th><th>Hashes per GiB</th><th>Uploaded per small edit</th></tr></thead>
+<tbody>
+<tr><th>4 KiB</th><td>3.9 KiB</td><td>267,904</td><td>8.6 MB</td><td>6.8 KiB</td></tr>
+<tr><th>16 KiB</th><td>16 KiB</td><td>66,624</td><td>2.1 MB</td><td>28 KiB</td></tr>
+<tr><th>64 KiB</th><td>60 KiB</td><td>17,472</td><td>0.56 MB</td><td>79 KiB</td></tr>
+<tr><th>256 KiB</th><td>231 KiB</td><td>4,544</td><td>0.15 MB</td><td>351 KiB</td></tr>
+<tr><th>1 MiB</th><td>819 KiB</td><td>1,280</td><td>41 KB</td><td>1,109 KiB</td></tr>
+</tbody>
+</table>
+<p>Upload per edit grows in step with the chunk size, and metadata falls in step with it. Somewhere between 16 KiB and 1 MiB is the usual choice. Small chunks are never stored as separate objects: a block store packs many of them into large files, as <x-ref to="hld-object-storage"></x-ref> describes. Dropbox’s protocol, as described in 2014, uses fixed blocks of 4 MB, and the company later reported cutting the bytes it sends by compressing blocks before transfer.</p>
+
+<h2 id="dedup">Step 6b: Storing each block once</h2>
+<p>Naming a block by the hash of its bytes is <dfn>content addressing</dfn>: the name is derived from the content, so equal content has equal names. It gives <dfn>deduplication</dfn>, storing identical data once however many times it is uploaded, with no extra machinery: before uploading, the client asks which hashes the server lacks. In the chapter’s test, a second user saving the same 4 MiB file uploaded 0 bytes.</p>
+<p>Within one user, the large saving is version history. Every save creates a version, and versions share most of their blocks. The test saved a 16 MiB file twenty times, each save a small random insertion, deletion or overwrite:</p>
+<table>
+<thead><tr><th>Storing 20 versions of a 16 MiB file</th><th>Stored</th><th>Share of 320 MiB</th></tr></thead>
+<tbody>
+<tr><th>Every version whole</th><td>320 MiB</td><td>100%</td></tr>
+<tr><th>Fixed 4 MiB blocks</th><td>188 MiB</td><td>58.7%</td></tr>
+<tr><th>Fixed 64 KiB blocks</th><td>147 MiB</td><td>45.9%</td></tr>
+<tr><th>Content-defined, 64 KiB on average</th><td>17.9 MiB</td><td>5.6%</td></tr>
+</tbody>
+</table>
+<p>Two consequences need care.</p>
+<p><b>Deleting is garbage collection.</b> A block may be listed by versions of many files and many users, so deleting a file cannot delete its blocks. Each version that lists a block holds a reference to it. When versions leave the history, their references are released, and a collector later deletes blocks with none left. It runs in the background and waits a grace period, often days, because a client may have uploaded a block a moment ago and be about to commit a version that lists it. Deleting from inside the commit path, or without that wait, is how such systems lose data.</p>
+<p><b>Deduplication across users leaks information.</b> If uploading a file takes no time, the file was already stored by someone. An attacker can test whether a particular document, or a form with a guessed salary filled in, exists anywhere in the service. Research on cloud storage has described this side channel since 2010. Services that care deduplicate only within a user or an organization, or always transfer the bytes and deduplicate silently on the server side, giving up the bandwidth saving to keep the storage one.</p>
+
+<h2 id="conflicts">Step 6c: Ordering changes and resolving conflicts</h2>
+<p>Every commit to a namespace gets the next number in its journal. That number is the revision, and the journal is the namespace’s history in one order that every device replays. A device stores the last position it has applied, its cursor, and asks for everything after it. Because positions are assigned by the one shard that owns the namespace, every device sees the same changes in the same order, and catching up after a week offline is the same request as catching up after a second.</p>
+<p>The commit itself is a compare-and-set on the parent revision:</p>
+<pre data-lang="ts" data-title="Namespace.commit: refuse an edit that did not start from the current version">
+commit(req: CommitRequest): CommitResult {
+    // A version may only refer to blocks that are already stored.
+    const missing = this.blocks.missing(req.blocks);
+    if (missing.length > 0) return { kind: "need-blocks", missing };
+    const cur = this.current.get(req.path) ?? null;
+    if (this.policy === "revision") {
+      // Compare and set: the edit must start from the version that is current now.
+      if ((cur?.rev ?? null) !== req.parentRev) return { kind: "conflict", current: cur };
+    } else if (cur !== null && req.time <= cur.time) {
+      return { kind: "committed", version: cur }; // last write wins: the older save is dropped
+    }
+    // In a real store, these lines are one transaction: the version, the journal entry, the references.
+    const version: Version = { ...req, rev: this.journal.length + 1 };
+    this.journal.push(version);
+    this.current.set(req.path, version);
+    this.blocks.addRefs(version.blocks);
+    return { kind: "committed", version };
+  }
+</pre>
+
+<figure class="fig wide" id="fig-conflict">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 380" role="img" aria-labelledby="f866t f866d">
+<title id="f866t">Two offline edits to one file, with a revision check and with last write wins</title>
+<desc id="f866d">Two sequences between a laptop, the server and a phone. Both devices edit revision 7 of notes.txt while offline. With a revision check, the laptop commits first and creates revision 8; the phone’s commit names revision 7 as its parent, so the server refuses it with a conflict; the phone downloads revision 8 and uploads its own edit as a new file, a conflicted copy. With last write wins, the server keeps whichever save carries the later clock time, the phone’s, and the laptop’s edit disappears without anyone being told.</desc>
+<text class="tb" x="10" y="16">Revision check: compare and set</text>
+<g data-scene="revision">
+<text class="tb mid" x="90" y="36">Laptop</text>
+<line class="axis" x1="90" y1="44" x2="90" y2="232"/>
+<text class="tb mid" x="360" y="36">Server</text>
+<line class="axis" x1="360" y1="44" x2="360" y2="232"/>
+<text class="tb mid" x="630" y="36">Phone</text>
+<line class="axis" x1="630" y1="44" x2="630" y2="232"/>
+<g data-s="1" data-packet="none">
+<rect class="n " x="238.15" y="56" width="243.7" height="22" rx="4"/>
+<text class="ts mid" x="360" y="71">1. both edit revision 7 while offline</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M91 96H359"/>
+<text class="ts mid" x="225.0" y="90">2. commit, parent 7</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M359 122H91"/>
+<text class="ts mid" x="225.0" y="116">3. ok: rev 8</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M629 148H361"/>
+<text class="ts mid" x="495.0" y="142">4. commit, parent 7</text>
+</g>
+<g data-s="5">
+<path class="e fault" d="M361 174H629"/>
+<text class="ts mid" x="495.0" y="168">5. 409: current is rev 8</text>
+</g>
+<g data-s="6" data-packet="none">
+<rect class="n store" x="524.7" y="186" width="97.3" height="22" rx="4"/>
+<text class="ts mid" x="573.35" y="201">6. keeps both</text>
+</g>
+</g>
+<path class="e none dash" d="M10 248H710"/>
+<text class="tb" x="10" y="270">Last write wins: the later clock time replaces the file</text>
+<g data-scene="lww">
+<text class="tb mid" x="90" y="290">Laptop</text>
+<line class="axis" x1="90" y1="298" x2="90" y2="376"/>
+<text class="tb mid" x="360" y="290">Server</text>
+<line class="axis" x1="360" y1="298" x2="360" y2="376"/>
+<text class="tb mid" x="630" y="290">Phone</text>
+<line class="axis" x1="630" y1="298" x2="630" y2="376"/>
+<g data-s="1">
+<path class="e sig" d="M91 322H359"/>
+<text class="ts mid" x="225.0" y="316">1. save, clock 10:05</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M629 348H361"/>
+<text class="ts mid" x="495.0" y="342">2. save, clock 10:20</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M359 374H91"/>
+<text class="ts mid" x="225.0" y="368">3. notes.txt changed</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="revision" data-label="Revision check">
+  <li data-msg="none" data-state="Server: rev 7; Laptop: edited; Phone: edited">The laptop and the phone each change notes.txt, starting from revision 7, with no network.</li>
+  <li data-msg="commit">The laptop reconnects first and commits its edit on top of revision 7.</li>
+  <li data-msg="rev 8" data-state="Server: rev 8 (laptop); Laptop: rev 8; Phone: edited">Revision 7 is still current, so the commit succeeds.</li>
+  <li data-msg="commit">The phone reconnects and commits its edit, also on top of revision 7.</li>
+  <li data-msg="409">Revision 7 is no longer current. The server refuses, and says what is.</li>
+  <li data-msg="none" data-state="Server: notes.txt rev 8, conflicted copy rev 9; Laptop: both; Phone: both">The phone renames its edit “notes (Phone’s conflicted copy).txt”, downloads revision 8 to notes.txt, and uploads the copy as a new file.</li>
+</ol>
+<ol class="steps" data-scene="lww" data-label="Last write wins">
+  <li data-msg="10:05" data-state="Server: laptop’s edit; Laptop: own edit; Phone: own edit">The laptop reconnects and saves its edit, stamped with its own clock.</li>
+  <li data-msg="10:20" data-state="Server: phone’s edit; Laptop: own edit; Phone: own edit">The phone’s save carries a later time, so it replaces the laptop’s version.</li>
+  <li data-msg="changed" data-state="Server: phone’s edit; Laptop: phone’s edit; Phone: phone’s edit; lost: laptop’s edit">The laptop downloads the phone’s version over its own. Its edit is gone, and nothing told anyone.</li>
+</ol>
+<figcaption>A revision check turns a lost update into a visible conflict and keeps both edits. Last write wins is simpler and silently discards one of them.</figcaption>
+</figure>
+
+<p>When the check fails, the client keeps both versions. The current one takes the file’s name, and the device’s own edit is saved beside it as a <dfn>conflicted copy</dfn>, a new file whose name records whose edit it was. Dropbox names them with the editor, the words “conflicted copy” and the date. It is not elegant, but nothing is lost and the person who can merge the two edits is told.</p>
+<pre data-lang="ts" data-title="The client keeps both edits">
+if (r.kind === "conflict") {
+      // Someone else changed the file first. Keep both: ours under a new name, theirs at the path.
+      this.conflicts += 1;
+      const dot = path.lastIndexOf(".");
+      const copy = `${path.slice(0, dot)} (${this.name}’s conflicted copy)${path.slice(dot)}`;
+      this.files.set(this.uniqueName(copy), { bytes: f.bytes, baseRev: null, dirty: true });
+      if (r.current) this.install(r.current);
+      else this.files.delete(path);
+      return false;
+    }
+</pre>
+<p>The alternative, last write wins (<x-ref to="replication#multi-leader"></x-ref>), keeps the save with the later timestamp. The chapter’s code simulated a month of a shared folder: four devices, forty files of which a few are edited most, one edit per device per hour, and spells offline of varying length between four-hour spells online. Each file’s content records which edits it includes, so a lost edit can be counted at the end.</p>
+<table>
+<thead><tr><th>Average offline spell</th><th>Edits</th><th>Revision check: conflicted copies</th><th>Revision check: edits lost</th><th>Last write wins: edits lost</th></tr></thead>
+<tbody>
+<tr><th>Never offline</th><td>2,971</td><td>0</td><td>0</td><td>9</td></tr>
+<tr><th>10 minutes</th><td>2,986</td><td>8</td><td>0</td><td>17</td></tr>
+<tr><th>1 hour</th><td>2,974</td><td>131</td><td>0</td><td>196</td></tr>
+<tr><th>4 hours</th><td>2,915</td><td>524</td><td>0</td><td>938</td></tr>
+</tbody>
+</table>
+<p>Offline time is what creates concurrent edits, and their number grows quickly with it. The revision check turns each into a conflicted copy, which can hold several edits made in one offline spell, and loses none. Last write wins loses them silently, and loses some even when every device is always online: the devices’ clocks differed by up to two minutes, so a save made shortly after another could carry an earlier time and be discarded. With clocks that agreed exactly and no offline time, it lost nothing, which is the case that tests usually cover (<x-ref to="distributed-fundamentals#skew"></x-ref>).</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Identifying files by path. A rename then looks like a delete and an add, history is cut, and a rename on one device racing an edit on another loses the edit. Give every file a permanent id, and make the path an attribute of it; a move of a folder with 100,000 files is then one change to one row, not 100,000.</p></div>
+<p>Folders bring harder cases than files. One device moves folder A into B while another moves B into A, and each move is valid alone. The server must refuse the second, because it would create a cycle, and the client must recover. Dropbox’s 2020 rewrite of its sync engine made moves atomic for subtrees of any size, and the team reported running tens of millions of randomized test runs of the engine every night, which says something about how many such cases exist.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A client loses its connection halfway through a large upload</th><td>Sync pauses, then continues where it stopped</td><td>Blocks already uploaded stay stored. The client asks again which are missing and sends only those. Uncommitted blocks are collected after the grace period</td></tr>
+<tr><th>A metadata shard’s leader fails</th><td>Commits in some namespaces pause for seconds</td><td>Failover to a replica (<x-ref to="replication#failover"></x-ref>); clients retry with the same idempotency key, so no commit is applied twice</td></tr>
+<tr><th>The notification service is down</th><td>Changes arrive later</td><td>Clients fall back to checking for changes every minute or so. Nothing is lost, because changes come from the journal, not from notifications</td></tr>
+<tr><th>A client with faulty memory sends a corrupt block</th><td>Nothing</td><td>The block service rejects bytes that do not hash to their name</td></tr>
+<tr><th>A device returns after the journal entries it needs were compacted</th><td>A longer first sync</td><td>The device lists the current files and their hashes, and compares them with its local state, instead of replaying</td></tr>
+<tr><th>The garbage collector deletes a block that a commit is about to list</th><td>A file that cannot be downloaded</td><td>Prevented by design: a long grace period before deleting, and a check of references at deletion time</td></tr>
+<tr><th>A user deletes or overwrites files by mistake, or ransomware encrypts them</th><td>Wrong files everywhere, quickly</td><td>Version history: the old blocklists and their blocks are still stored and can be restored</td></tr>
+</tbody>
+</table>
+<p><b>At ten times the scale</b>, a billion daily users, every number in the estimate grows tenfold: about 116,000 commits a second on average, and several exabytes of new storage a year. The design holds, with more metadata shards and more notification servers. Two things start to hurt. Huge shared namespaces, a company folder with tens of thousands of members, become hot shards and fan their notifications out to every member’s devices, so they are split by subfolder. And storage cost dominates the bill, which favors moving old versions and rarely read files to colder tiers (<x-ref to="object-and-file-storage#tiers"></x-ref>) and erasure coding over replication (<x-ref to="object-and-file-storage#erasure-coding"></x-ref>).</p>
+<p><b>At a hundred times</b>, the service is one of the largest storage systems in the world, and a dedicated block store, built for immutable chunks and nothing else, becomes worth its cost. Dropbox’s Magic Pocket, below, is one.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Dropbox’s protocol</b>, as described in 2014: every file is split into 4 MB blocks, the blocks are hashed with SHA-256, and the list of hashes, which Dropbox also calls a blocklist, identifies the file. A commit to the metadata server answers that blocks are needed if any are missing; the client uploads them to the block server and commits again, and a new row is added to the server file journal.</li>
+  <li><b>Dropbox’s block store</b>, Magic Pocket, described in 2016: an immutable store of blocks up to 4 MB, usually keyed by their SHA-256 hash, grouped into 1 GB buckets that are later erasure coded, with every block in at least two zones. The post calls it “a multi-exabyte behemoth”.</li>
+  <li><b>Dropbox’s sync engine</b> was rewritten in Rust and shipped to all users by 2020, with a protocol giving files and shared folders globally unique ids and atomic moves. The client keeps the remote, local and synced trees described above, and the team runs tens of millions of seeded random tests of it every night.</li>
+  <li><b>Compression on the wire.</b> Dropbox reported in 2020 that compressing blocks before transfer cut the data sent for uploads by about a third and median sync latency by more than 30%.</li>
+  <li><b>Version history and conflicts</b>, as of Dropbox’s help pages in 2025: 30 days of versions on its Basic, Plus and Family plans, 180 or 365 days on business plans, and a conflicted copy named with the editor, “conflicted copy” and the date.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Files of 50 GB</th><td>Blocks upload in parallel and resume after failures; the commit comes after the last block. Hashing and chunking happen as the file is read, not in memory</td><td>The commit of one blocklist</td></tr>
+<tr><th>End-to-end encryption</th><td>The server sees only encrypted blocks, so it cannot deduplicate across users. Chunk hashes are keyed per user so they reveal nothing</td><td>The journal, revisions and conflicts</td></tr>
+<tr><th>Phones with little storage</th><td>Files on demand: the client keeps placeholders with metadata only and downloads blocks when a file is opened</td><td>The server side entirely</td></tr>
+<tr><th>Moving a folder of 100,000 files</th><td>One change to the folder’s row, because files are identified by id and paths are derived</td><td>Blocks, which never move</td></tr>
+<tr><th>Edits live, letter by letter</th><td>A different design, with operations merged as they happen (<x-ref to="hld-collaborative-editing"></x-ref>)</td><td>File storage and history below it</td></tr>
+<tr><th>An administrator must see who accessed what</th><td>An audit log written with each commit and download, kept apart from the journal</td><td>The sync protocol</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Spend five minutes on requirements and say early that edits are small and files are large. Five on estimates, ending at the split between metadata and blocks. Ten on the API and the design: blocks named by hash, the commit with a parent revision, the journal and its cursor, notifications that carry no content. Then use the remaining twenty for two deep dives, usually content-defined chunking and conflicts, and finish with deduplication, garbage collection and failures. Draw the sequence of one edit from laptop to phone; it shows every part.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Uploading the whole file on every save</th><td>Bandwidth and time grow with file size, not with the change</td><td>Upload only the blocks the server lacks</td></tr>
+<tr><th>Fixed-size blocks, assumed to make edits cheap</th><td>An insertion re-uploads everything after it: 32 MiB for 100 bytes in the test</td><td>Content-defined chunking, or accept the cost knowingly</td></tr>
+<tr><th>Last write wins by device clock</th><td>Edits disappear silently, even with every device online</td><td>Commit with the parent revision, and keep both on conflict</td></tr>
+<tr><th>File content in notifications</th><td>A lost or duplicated notification corrupts a device’s copy</td><td>Notifications say only “changed”; content comes from the journal by cursor</td></tr>
+<tr><th>Deleting a file’s blocks when the file is deleted</th><td>Other files, versions or users lose data</td><td>Reference counts and a delayed collector</td></tr>
+<tr><th>Trusting the hash the client sends</th><td>Corrupt blocks stored under a valid name, or someone else’s block claimed</td><td>Hash the bytes on the server before storing</td></tr>
+<tr><th>Metadata and blocks in one database</th><td>Petabytes in a database built for small rows</td><td>Metadata in a sharded database, blocks in object storage</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="object-and-file-storage"></x-ref>: where the blocks live, and how they are kept durable.</li>
+  <li><x-ref to="hld-object-storage"></x-ref>: how a block store packs small immutable objects into large files.</li>
+  <li><x-ref to="transactions#optimistic"></x-ref>: the version check behind every commit.</li>
+  <li><x-ref to="distributed-fundamentals#skew"></x-ref>: why “the later timestamp” is not a safe rule.</li>
+  <li><x-ref to="realtime-communication#long-polling"></x-ref>: how idle devices hear about changes.</li>
+  <li><x-ref to="hld-collaborative-editing"></x-ref>: when merging whole files is not enough.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Split the service into metadata, small ordered transactions in a sharded database, and blocks, large immutable objects in object storage.</li>
+  <li>Name blocks by the hash of their bytes. Uploads become “send what the server lacks”, retries are harmless, and identical data is stored once.</li>
+  <li>Chunk by content, not by position. In the test, 100 bytes inserted at the start of a 32 MiB file re-uploaded the whole file with fixed chunks and 33 KiB with content-defined ones.</li>
+  <li>The average chunk size trades bytes uploaded per edit against hashes kept per GiB, in equal measure.</li>
+  <li>Give each namespace a journal. Its positions are revisions, a device’s cursor is a position, and catching up is reading from there.</li>
+  <li>Commit with the parent revision, and keep both edits on conflict. Last write wins lost edits in the simulation even with every device online.</li>
+  <li>Deleting is garbage collection with a grace period, and cross-user deduplication is a privacy decision as well as a cost one.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does inserting one byte at the start of a file re-upload the whole file with fixed-size chunks, and not with content-defined ones?</summary><p>Fixed boundaries are positions. After the insertion every byte sits one position later, so every chunk holds different bytes and gets a new hash. Content-defined boundaries are where a hash of the preceding bytes is small, so they move with the bytes; after the first chunk the old boundaries are found again and every later chunk is unchanged.</p></details>
+<details><summary>A client uploads three blocks and loses its connection before committing. What happens to them?</summary><p>They stay in the block store with no version referring to them. When the client reconnects, it asks which blocks are missing, the three are not, and it commits. If it never returns, the garbage collector deletes them after the grace period.</p></details>
+<details><summary>Why must the garbage collector wait days before deleting a block with no references?</summary><p>Because uploading blocks and committing the version that lists them are separate steps. A block can be uploaded, or found to exist already, a moment before the commit that refers to it. Deleting it in between would let the commit succeed with a block that is gone.</p></details>
+<details><summary>Two devices edit revision 7 of a file offline. Describe what the server and the second device do.</summary><p>The first to reconnect commits with parent 7 and creates revision 8. The second commits with parent 7, and the server refuses with a conflict naming revision 8. The second device saves its own edit under a new name as a conflicted copy, downloads revision 8 to the original name, and uploads the copy as a new file. Both edits survive.</p></details>
+<details><summary>In the simulation, last write wins lost 9 edits although no device was ever offline. How?</summary><p>The devices’ clocks differed by up to two minutes. When one device saved shortly after another, its timestamp could still be earlier, so the server kept the older save and discarded the newer one. With clocks that agreed exactly, it lost none.</p></details>
+<details><summary>Why do notifications carry only “this namespace changed” and not the change itself?</summary><p>So that a lost, delayed or duplicated notification cannot corrupt anything. The device fetches changes from the journal after its cursor, which gives every change exactly once and in order. The notification only decides when it asks.</p></details>
+<details><summary>What can an attacker learn from cross-user deduplication, and what are the options?</summary><p>Whether a given file is already stored anywhere in the service, by uploading it and seeing that nothing was transferred. The options are to deduplicate only within one user or organization, or to always transfer the bytes and deduplicate on the server, keeping the storage saving and losing the bandwidth one.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Nipunn Koorapati, <a href="https://dropbox.tech/infrastructure/streaming-file-synchronization">Streaming File Synchronization</a>, Dropbox Tech Blog, 10 July 2014. Blocks, blocklists, the commit that asks for missing blocks, and the server file journal.</li>
+  <li>James Cowling, <a href="https://dropbox.tech/infrastructure/inside-the-magic-pocket">Inside the Magic Pocket</a>, Dropbox Tech Blog, 6 May 2016. The immutable block store behind Dropbox.</li>
+  <li>Sujay Jayakar, <a href="https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine">Rewriting the heart of our sync engine</a>, Dropbox Tech Blog, 9 March 2020. Why the sync engine was rebuilt, in Rust.</li>
+  <li>Isaac Goldberg, <a href="https://dropbox.tech/infrastructure/-testing-our-new-sync-engine">Testing sync at Dropbox</a>, Dropbox Tech Blog, 20 April 2020. The three trees, and randomized testing of the planner.</li>
+  <li>Rishabh Jain and Daniel Reiter Horn, <a href="https://dropbox.tech/infrastructure/-broccoli--syncing-faster-by-syncing-less">Broccoli: Syncing faster by syncing less</a>, Dropbox Tech Blog, 4 August 2020. Compressing blocks before transfer, with measured savings.</li>
+  <li>Dropbox Help Center, <a href="https://help.dropbox.com/organize/conflicted-copy">What’s a conflicted copy?</a> (updated 15 May 2025) and <a href="https://help.dropbox.com/security/version-history-overview">Version history overview</a> (updated 20 February 2025).</li>
+  <li>Athicha Muthitacharoen, Benjie Chen and David Mazières, <a href="https://pdos.csail.mit.edu/archive/lbfs/papers/sosp01/lbfs.pdf">A Low-bandwidth Network File System</a>, SOSP 2001. Content-defined chunking with Rabin fingerprints.</li>
+  <li>Wen Xia and others, <a href="https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia">FastCDC: A Fast and Efficient Content-Defined Chunking Approach for Data Deduplication</a>, USENIX ATC 2016. A faster rolling hash for chunk boundaries.</li>
+  <li>Andrew Tridgell and Paul Mackerras, <a href="https://rsync.samba.org/tech_report/">The rsync algorithm</a>, Australian National University technical report TR-CS-96-05, 1996. Matching fixed blocks at any offset with a rolling checksum, the other answer to shifted content.</li>
+  <li>Frederik Armknecht, Colin Boyd, Gareth T. Davies, Kristian Gjøsteen and Mohsen Toorani, <a href="https://eprint.iacr.org/2016/977">Side channels in deduplication: trade-offs between leakage and efficiency</a>, AsiaCCS 2017. What cross-user deduplication reveals, and what it costs to hide it.</li>
+</ol>
+</section>

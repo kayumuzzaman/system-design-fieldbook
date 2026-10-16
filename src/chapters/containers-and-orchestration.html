@@ -1,0 +1,751 @@
+<!--meta
+{ "description": "Containers and Kubernetes explained for system design: what a container is, images and layers, containers versus virtual machines, the Kubernetes control plane, desired state and reconciliation, pods and deployments, health probes, resource requests and limits, scheduling, autoscaling and graceful shutdown.",
+  "lede": "A container packages a program with everything it needs to run, so that it behaves the same on a laptop, a test server and a thousand production machines. An orchestrator decides which machines run which containers, and keeps them running. Together they are the standard way to operate services today. This chapter explains what both do underneath, enough to design for them and to know what they will and will not do for you.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">The problem: running software on machines you did not set up</h2>
+<p>The photo app is now about a dozen services. Each needs a particular version of a language runtime, a set of libraries, some configuration, and a machine to run on. Installing these by hand on every server leads to two familiar failures. A service works on the developer’s laptop and fails in production because a library differs. Two services on one server need different versions of the same thing.</p>
+<p>Operating the services raises more questions. Which of forty servers should run the new copy of the feed service? What restarts it when it crashes at night? How do the other services find it after it moves? How does a new version replace the old one without dropping requests?</p>
+<p>Containers answer the packaging problem. Orchestrators answer the operating problem. Kubernetes is the orchestrator most systems use, and it is the one described here, though the ideas carry over to the others.</p>
+
+<h2 id="containers">What a container is</h2>
+<p>A <dfn>container</dfn> is an ordinary process, running on an ordinary Linux kernel, that has been given a restricted view of the machine. Two kernel features do the restricting.</p>
+<ul>
+  <li><b>Namespaces</b> limit what the process can see. Inside its own namespaces a process has its own list of processes, its own network interfaces and IP address, its own hostname, and its own filesystem root.</li>
+  <li><b>Control groups</b>, usually written cgroups, limit what it can use: how much CPU time, how much memory, how much disk and network throughput.</li>
+</ul>
+<p>There is no “container” object in the kernel. The word names the combination. You can make one by hand, and doing so removes much of the mystery. This command starts a shell in a new process namespace on a machine that is running about 70 processes.</p>
+
+<pre data-lang="sh" data-title="a process namespace by hand">$ unshare --pid --fork --mount-proc sh -c 'echo "my pid is $$"; ps -e -o pid,comm'
+my pid is 1
+    PID COMMAND
+      1 sh
+      2 ps</pre>
+
+<p>The shell believes it is process 1 and can see nothing but itself and its child. It is still an ordinary process on the host, visible there under its real number. A container runtime does the same for the network, the filesystem and the rest, applies cgroup limits, and starts your program.</p>
+
+<figure class="fig wide" id="fig-vm-container">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f461t f461d">
+<title id="f461t">Virtual machines compared with containers</title>
+<desc id="f461d">Two stacks. With virtual machines, a physical machine runs a hypervisor, and each of three applications runs on its own guest operating system. Each has its own kernel, which gives strong isolation, and each is gigabytes in size and takes tens of seconds to boot. With containers, a physical or virtual machine runs one shared Linux kernel, and three applications with their libraries run directly on it. They are processes the kernel keeps apart, megabytes each, and they start in about a second.</desc>
+<text class="tb" x="10" y="18">Virtual machines</text>
+<rect class="n" x="10" y="150" width="320" height="28" rx="6"/>
+<text class="ts mid" x="170" y="168.5">Physical machine</text>
+<rect class="n sunk" x="10" y="118" width="320" height="28" rx="6"/>
+<text class="ts mid" x="170" y="136.5">Hypervisor</text>
+<rect class="n sig" x="10" y="52" width="100" height="28" rx="6"/>
+<text class="ts tb mid" x="60" y="70.5">App A</text>
+<rect class="n sunk" x="10" y="86" width="100" height="28" rx="6"/>
+<text class="ts mid" x="60" y="104.5">guest OS</text>
+<rect class="n sig" x="120" y="52" width="100" height="28" rx="6"/>
+<text class="ts tb mid" x="170" y="70.5">App B</text>
+<rect class="n sunk" x="120" y="86" width="100" height="28" rx="6"/>
+<text class="ts mid" x="170" y="104.5">guest OS</text>
+<rect class="n sig" x="230" y="52" width="100" height="28" rx="6"/>
+<text class="ts tb mid" x="280" y="70.5">App C</text>
+<rect class="n sunk" x="230" y="86" width="100" height="28" rx="6"/>
+<text class="ts mid" x="280" y="104.5">guest OS</text>
+<text class="ts" x="10" y="200">Each has its own kernel. Strong isolation.</text>
+<text class="ts" x="10" y="215">Gigabytes each, and tens of seconds to boot.</text>
+<path class="e none dash" d="M360 8V224"/>
+<text class="tb" x="380" y="18">Containers</text>
+<rect class="n" x="380" y="150" width="320" height="28" rx="6"/>
+<text class="ts mid" x="540" y="168.5">Physical or virtual machine</text>
+<rect class="n sunk" x="380" y="118" width="320" height="28" rx="6"/>
+<text class="ts mid" x="540" y="136.5">One shared Linux kernel</text>
+<rect class="n store" x="380" y="52" width="100" height="62" rx="6"/>
+<text class="ts mid" x="430" y="79">App A</text>
+<text class="ts mid" x="430" y="96">and libraries</text>
+<rect class="n store" x="490" y="52" width="100" height="62" rx="6"/>
+<text class="ts mid" x="540" y="79">App B</text>
+<text class="ts mid" x="540" y="96">and libraries</text>
+<rect class="n store" x="600" y="52" width="100" height="62" rx="6"/>
+<text class="ts mid" x="650" y="79">App C</text>
+<text class="ts mid" x="650" y="96">and libraries</text>
+<text class="ts" x="380" y="200">Processes the kernel keeps apart. Megabytes</text>
+<text class="ts" x="380" y="215">each, and they start in about a second.</text>
+
+</svg>
+</div>
+<figcaption>A virtual machine imitates a computer. A container is a fenced-off process. In the cloud the two are combined: containers run inside virtual machines.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th></th><th>Virtual machine</th><th>Container</th></tr></thead>
+<tbody>
+<tr><th>Isolated by</th><td>A hypervisor and virtual hardware</td><td>Kernel namespaces and cgroups</td></tr>
+<tr><th>Kernel</th><td>One for each machine</td><td>Shared with the host and with other containers</td></tr>
+<tr><th>Typical size</th><td>Gigabytes</td><td>Tens to hundreds of megabytes</td></tr>
+<tr><th>Start time</th><td>Tens of seconds</td><td>About a second</td></tr>
+<tr><th>Strength of isolation</th><td>High</td><td>Lower: a kernel bug can cross the boundary</td></tr>
+</tbody>
+</table>
+<p>The last row matters when the code is not yours. A provider that runs strangers’ code does not rely on plain containers. It wraps each one in a small virtual machine or a kernel that intercepts system calls, as the function platforms in <x-ref to="serverless#lifecycle"></x-ref> do. For your own services on your own machines, plain containers are the normal choice.</p>
+
+<h2 id="images">Images</h2>
+<p>A container needs a filesystem to start from: the program, its libraries, the runtime, and enough of an operating system’s files for them to work. That bundle is an <dfn>image</dfn>. An image is built once and can then be run any number of times, on any machine with a container runtime, and it is the same bytes everywhere. This is what ends “works on my machine”.</p>
+<p>An image is made of <dfn>layers</dfn>. Each layer records a set of file changes, and each is named by a hash of its contents.</p>
+
+<figure class="fig wide" id="fig-layers">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-labelledby="f462t f462d">
+<title id="f462t">Two container images sharing their lower layers</title>
+<desc id="f462d">Two images, feed and thumbnails, each drawn as a stack of layers. Both share the two bottom layers: base system files of 75 megabytes and the Node.js runtime of 120 megabytes, which are stored and downloaded once. Above them the feed image has feed dependencies of 60 megabytes and feed code of 4 megabytes. The thumbnails image has an image library of 35 megabytes and thumbnail code of 2 megabytes. Each layer is a set of file changes named by the hash of its contents. Changing one line of code rebuilds and ships only the top layer, 4 megabytes and not 259. A running container adds a thin writable layer that is lost when the container is removed.</desc>
+<text class="tb" x="10" y="18">Image: feed</text>
+<text class="tb" x="250" y="18">Image: thumbnails</text>
+<rect class="n sig" x="10" y="30" width="200" height="26" rx="6"/>
+<text class="ts mid" x="110" y="47.5">feed code: 4 MB</text>
+<rect class="n async" x="250" y="30" width="200" height="26" rx="6"/>
+<text class="ts mid" x="350" y="47.5">thumbnail code: 2 MB</text>
+<rect class="n sig" x="10" y="60" width="200" height="26" rx="6"/>
+<text class="ts mid" x="110" y="77.5">feed dependencies: 60 MB</text>
+<rect class="n async" x="250" y="60" width="200" height="26" rx="6"/>
+<text class="ts mid" x="350" y="77.5">image library: 35 MB</text>
+<rect class="n store" x="10" y="90" width="440" height="26" rx="6"/>
+<text class="ts mid" x="230" y="107.5">Node.js runtime: 120 MB</text>
+<rect class="n store" x="10" y="120" width="440" height="26" rx="6"/>
+<text class="ts mid" x="230" y="137.5">Base system files: 75 MB</text>
+<text class="ts mid" x="230" y="166">shared layers: stored and downloaded once</text>
+<path class="e none" d="M10 150v6H450v-6"/>
+<text class="ts" x="480" y="44">Each layer is a set of file</text>
+<text class="ts" x="480" y="59">changes, named by the hash</text>
+<text class="ts" x="480" y="74">of its contents.</text>
+<text class="ts" x="480" y="106">Change one line of code and</text>
+<text class="ts" x="480" y="121">only the top layer is rebuilt</text>
+<text class="ts" x="480" y="136">and shipped: 4 MB, not 259.</text>
+<text class="ts" x="480" y="168">A running container adds a thin</text>
+<text class="ts" x="480" y="183">writable layer that is lost</text>
+<text class="ts" x="480" y="198">when the container is removed.</text>
+
+</svg>
+</div>
+<figcaption>Layers make images cheap to rebuild, store and move, because whatever did not change is reused.</figcaption>
+</figure>
+
+<p>An image is described by a build file. This one builds a TypeScript service in two stages, so that compilers and development dependencies do not end up in what is shipped.</p>
+
+<pre data-lang="text" data-title="Dockerfile"># Stage 1: build. This stage is thrown away.
+FROM node:24-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build && npm prune --omit=dev
+
+# Stage 2: what actually ships.
+FROM node:24-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+USER node
+EXPOSE 8080
+CMD ["node", "dist/server.js"]</pre>
+
+<p>Three habits in this file are worth copying.</p>
+<ul>
+  <li><b>Order instructions from least to most often changed.</b> Each instruction makes a layer, and a changed layer forces every later one to be rebuilt. Copying the dependency list and installing before copying the source means a code change does not reinstall dependencies.</li>
+  <li><b>Ship only what runs.</b> A smaller image downloads faster, starts sooner on a new machine, and contains fewer programs for an attacker to use.</li>
+  <li><b>Do not run as root.</b> The <code>USER</code> line means that a flaw in the service gives an intruder an unprivileged account inside the container, which is a much weaker starting point.</li>
+</ul>
+<p>Images live in a <dfn>registry</dfn>, a server that stores and serves them. An image is referred to by a name and either a <dfn>tag</dfn>, such as <code>feed:2026-10-10.3</code>, or a <dfn>digest</dfn>, the hash of its contents. A tag is a label that can be moved to a different image. A digest cannot. The tag <code>latest</code> in particular means “whatever was pushed most recently”, so two machines that pull it an hour apart can end up running different code. Give every build a unique tag and deploy that.</p>
+<p>Configuration and secrets stay out of the image. The same image should run in test and in production, differing only in what it is told at start-up through environment variables or mounted files. <x-ref to="deployment-strategies#artifact"></x-ref> builds on this.</p>
+
+<h2 id="orchestration">What an orchestrator does</h2>
+<p>With images, running one container on one machine is a single command. Running three hundred containers of twelve services on forty machines, and keeping them running, is a different problem. An <dfn>orchestrator</dfn> takes a description of what should be running and makes it so:</p>
+<ul>
+  <li><b>Placement.</b> It chooses a machine for each container that has room for it.</li>
+  <li><b>Healing.</b> It restarts containers that crash and replaces those on machines that die.</li>
+  <li><b>Scaling.</b> It adds and removes copies as load changes.</li>
+  <li><b>Discovery and load balancing.</b> It gives each service a stable name and spreads requests over its copies, as <x-ref to="service-communication#kubernetes"></x-ref> described.</li>
+  <li><b>Rollout.</b> It replaces an old version with a new one gradually, and can go back.</li>
+</ul>
+<p>Kubernetes was released by Google in 2014, drawing on a decade of running its internal systems Borg and Omega, and is now maintained by a foundation with contributors from most of the industry. As of October 2026 the current release is 1.37. There are about three releases a year, and each is supported for a little over a year, so running Kubernetes includes upgrading it regularly.</p>
+
+<h2 id="architecture">How a cluster is put together</h2>
+<p>A Kubernetes <dfn>cluster</dfn> has two kinds of machine. <dfn>Nodes</dfn> run your containers. The <dfn>control plane</dfn> decides what the nodes should run.</p>
+
+<figure class="fig wide" id="fig-cluster">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 266" role="img" aria-labelledby="f463t f463d">
+<title id="f463t">The parts of a Kubernetes cluster</title>
+<desc id="f463d">The control plane contains four parts. The API server is the only way in. It reads and writes etcd, which holds the cluster’s state. The scheduler picks a node for each pod. Controllers close the gaps between desired and actual state. Below are three nodes. Each runs a kubelet, a container runtime, and one or two pods. Each kubelet watches the API server for pods assigned to its node.</desc>
+<rect class="n ghost" x="10" y="10" width="700" height="92" rx="8"/>
+<text class="ts tb" x="22" y="28">Control plane</text>
+<rect class="n store" x="22" y="40" width="150" height="50" rx="6"/>
+<text class="ts tb mid" x="97" y="61">etcd</text>
+<text class="ts mid" x="97" y="78">the cluster’s state</text>
+<rect class="n sig" x="192" y="40" width="150" height="50" rx="6"/>
+<text class="ts tb mid" x="267" y="61">API server</text>
+<text class="ts mid" x="267" y="78">the only way in</text>
+<rect class="n async" x="362" y="40" width="160" height="50" rx="6"/>
+<text class="ts tb mid" x="442" y="61">Scheduler</text>
+<text class="ts mid" x="442" y="78">picks a node per pod</text>
+<rect class="n async" x="542" y="40" width="156" height="50" rx="6"/>
+<text class="ts tb mid" x="620" y="61">Controllers</text>
+<text class="ts mid" x="620" y="78">close the gaps</text>
+<path class="e store both" d="M192 65H172"/>
+<path class="e async" d="M362 65H342"/>
+<path class="e async" d="M620 40C620 20 300 20 290 40"/>
+<path class="e none sig" d="M68 162V118H548V162M308 118V162"/>
+<path class="e sig" d="M267 118V90"/>
+<rect class="n ghost" x="10" y="132" width="220" height="100" rx="8"/>
+<text class="ts tb end" x="218" y="150">Node 1</text>
+<rect class="n" x="22" y="162" width="92" height="28" rx="6"/>
+<text class="ts mid" x="68" y="180.5">kubelet</text>
+<rect class="n sunk" x="22" y="196" width="92" height="28" rx="6"/>
+<text class="ts mid" x="68" y="214.5">runtime</text>
+<rect class="n store" x="126" y="162" width="44" height="62" rx="6"/>
+<text class="ts mid" x="148" y="197.5">pod</text>
+<rect class="n store" x="176" y="162" width="44" height="62" rx="6"/>
+<text class="ts mid" x="198" y="197.5">pod</text>
+<rect class="n ghost" x="250" y="132" width="220" height="100" rx="8"/>
+<text class="ts tb end" x="458" y="150">Node 2</text>
+<rect class="n" x="262" y="162" width="92" height="28" rx="6"/>
+<text class="ts mid" x="308" y="180.5">kubelet</text>
+<rect class="n sunk" x="262" y="196" width="92" height="28" rx="6"/>
+<text class="ts mid" x="308" y="214.5">runtime</text>
+<rect class="n store" x="366" y="162" width="44" height="62" rx="6"/>
+<text class="ts mid" x="388" y="197.5">pod</text>
+<rect class="n store" x="416" y="162" width="44" height="62" rx="6"/>
+<text class="ts mid" x="438" y="197.5">pod</text>
+<rect class="n ghost" x="490" y="132" width="220" height="100" rx="8"/>
+<text class="ts tb end" x="698" y="150">Node 3</text>
+<rect class="n" x="502" y="162" width="92" height="28" rx="6"/>
+<text class="ts mid" x="548" y="180.5">kubelet</text>
+<rect class="n sunk" x="502" y="196" width="92" height="28" rx="6"/>
+<text class="ts mid" x="548" y="214.5">runtime</text>
+<rect class="n store" x="606" y="162" width="44" height="62" rx="6"/>
+<text class="ts mid" x="628" y="197.5">pod</text>
+<text class="ts" x="10" y="254">Each kubelet watches the API server for pods assigned to its node, starts them through the runtime, and reports back.</text>
+</svg>
+</div>
+<figcaption>Every component talks only to the API server. None of them talk to each other directly.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Part</th><th>Job</th></tr></thead>
+<tbody>
+<tr><th>API server</th><td>The front door. Every read and change of cluster state goes through it, from people and from the cluster’s own components.</td></tr>
+<tr><th>etcd</th><td>A small, consistent key-value store that holds all cluster state, replicated with the Raft protocol from <x-ref to="consensus#raft"></x-ref>. Usually three or five copies.</td></tr>
+<tr><th>Scheduler</th><td>Watches for pods with no node and assigns each one.</td></tr>
+<tr><th>Controllers</th><td>A set of loops, each responsible for one kind of object, that make reality match what is recorded.</td></tr>
+<tr><th>kubelet</th><td>An agent on every node. It starts and stops the containers assigned to its node and reports their health.</td></tr>
+<tr><th>Container runtime</th><td>The program that actually pulls images and runs containers, such as containerd.</td></tr>
+</tbody>
+</table>
+<p>One property of this design deserves attention. If the whole control plane goes down, containers that are already running keep running and keep serving. Nothing new can be scheduled and nothing that fails will be replaced, but the service stays up. This is the separation of control plane from data plane discussed in <x-ref to="multi-region#planes"></x-ref>, and it is why a control plane outage is serious without being an immediate outage of everything on the cluster.</p>
+<p>Most teams do not run the control plane themselves. Every large cloud offers it as a managed service, and you supply the nodes or let the provider manage those too. The published scale limits are generous: as of version 1.37 a cluster is supported up to 5,000 nodes and, by long-standing guidance, 150,000 pods with no more than 110 on a node.</p>
+
+<h2 id="desired-state">Desired state and reconciliation</h2>
+<p>The central idea of Kubernetes is how you tell it what to do. You do not issue commands such as “start three copies of the feed service”. You record a fact: “there should be three copies of the feed service, running this image”. The system’s job is to make the fact true and keep it true.</p>
+<p>The recorded fact is the <dfn>desired state</dfn>. What is really running is the <dfn>actual state</dfn>. A <dfn>controller</dfn> is a loop that compares them and acts on the difference. This is called <dfn>reconciliation</dfn>.</p>
+
+<figure class="fig wide" id="fig-reconcile">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 274" role="img" aria-labelledby="f464t f464d">
+<title id="f464t">The reconciliation loop</title>
+<desc id="f464d">A controller compares the desired state, three replicas of image version 2, with the actual state, two healthy pods on version 2. It acts on the difference by creating one pod. The action changes the actual state, and the loop runs again. The loop never finishes. It runs whenever something changes and periodically in between, so a pod that dies at 3 a.m. is replaced by the same code that created it, with nobody awake.</desc>
+<rect class="n store" x="10" y="30" width="170" height="56" rx="6"/>
+<text class="ts tb mid" x="95" y="54">Desired state</text>
+<text class="ts mid" x="95" y="71">replicas: 3, image: v2</text>
+<rect class="n" x="10" y="130" width="170" height="56" rx="6"/>
+<text class="ts tb mid" x="95" y="154">Actual state</text>
+<text class="ts mid" x="95" y="171">2 healthy pods on v2</text>
+<rect class="n async" x="270" y="80" width="150" height="56" rx="6"/>
+<text class="ts tb mid" x="345" y="104">Controller</text>
+<text class="ts mid" x="345" y="121">compare</text>
+<rect class="n sig" x="510" y="80" width="200" height="56" rx="6"/>
+<text class="ts tb mid" x="610" y="104">Act</text>
+<text class="ts mid" x="610" y="121">create 1 pod</text>
+<g data-s="1">
+<path class="e store" d="M180 58C230 58 230 96 270 96"/>
+<path class="e" d="M180 158C230 158 230 120 270 120"/>
+</g>
+<g data-s="2">
+<path class="e async" d="M420 108H510"/>
+</g>
+<g data-s="3">
+<path class="e sig dash" d="M610 136C610 210 300 210 180 170"/>
+<text class="ts mid" x="400" y="216">the action changes the actual state, and the loop runs again</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="246">The loop never finishes. It runs whenever something changes and periodically in between, so a pod that</text>
+<text class="ts" x="10" y="262">dies at 3 a.m. is replaced by the same code that created it, with nobody awake.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="desired: 3 pods|actual: 2 pods" data-state="Desired: 3 pods; Actual: 2 pods">A controller reads two things: the desired state you declared, three replicas of version 2, and the actual state, two healthy pods.</li>
+  <li data-msg="create 1 pod">It compares them, finds one pod missing, and acts by creating a pod.</li>
+  <li data-msg="actual: 3 pods" data-state="Desired: 3 pods; Actual: 3 pods">The action changes the actual state, and the loop runs again. This time nothing differs, so nothing is done.</li>
+  <li>The loop never finishes. A pod that dies at 3 a.m. is replaced by the same code that created it, with nobody awake.</li>
+</ol>
+<figcaption>Deploying, scaling and recovering from failure are the same operation: the desired and actual states differ, and a controller closes the gap.</figcaption>
+</figure>
+
+<p>Reduced to its core, a controller for a set of identical pods is a short function.</p>
+
+<pre data-lang="ts" data-title="reconcile.ts">type Pod = { name: string; image: string; healthy: boolean };
+type Desired = { replicas: number; image: string };
+type Action = { kind: "create"; image: string } | { kind: "delete"; name: string };
+
+/** Compares what should exist with what does, and returns the steps that close the gap. */
+export function reconcile(desired: Desired, actual: Pod[]): Action[] {
+  const actions: Action[] = [];
+  // 1. anything broken or running the wrong image is removed
+  const good = actual.filter((p) => p.healthy && p.image === desired.image);
+  for (const p of actual) if (!good.includes(p)) actions.push({ kind: "delete", name: p.name });
+  // 2. too few: create the difference. Too many: delete the surplus.
+  for (let i = good.length; i < desired.replicas; i++) actions.push({ kind: "create", image: desired.image });
+  for (const p of good.slice(desired.replicas)) actions.push({ kind: "delete", name: p.name });
+  return actions;
+}</pre>
+
+<p>Given a desired state of three pods on version 2, and an actual state of one healthy pod on version 2, one unhealthy pod, and one healthy pod still on version 1, the function returns two deletions and two creations. Run again after those are applied, it returns nothing. Real controllers are more careful, especially about replacing versions gradually, but the shape is this.</p>
+<p>The function looks only at the current state. It does not need to know what happened: whether a pod crashed, a node died, or someone changed the number. A system built on events can miss one and stay wrong. A system that repeatedly compares states corrects itself the next time it looks, whatever it missed. The same reasoning made state-based repair attractive in <x-ref to="replication#repair"></x-ref>.</p>
+
+<h2 id="objects">The objects you work with</h2>
+<p>Desired state is written as <dfn>objects</dfn>, each a small document with a kind, a name and a specification. A handful cover most needs.</p>
+<table>
+<thead><tr><th>Object</th><th>What it describes</th></tr></thead>
+<tbody>
+<tr><th>Pod</th><td>The smallest unit that is scheduled: one container, or a few that must run together and share a network address. Pods are disposable. Each gets a new IP address, and nothing should depend on a particular one.</td></tr>
+<tr><th>Deployment</th><td>“Run <i>n</i> identical pods from this template.” It replaces pods gradually when the template changes. This is what most services use.</td></tr>
+<tr><th>Service</th><td>A stable name and virtual address for a changing set of pods.</td></tr>
+<tr><th>ConfigMap and Secret</th><td>Configuration and credentials, handed to pods as environment variables or files.</td></tr>
+<tr><th>Job and CronJob</th><td>Work that runs to completion, once or on a schedule, as in <x-ref to="scheduling-and-workflows#distributed-cron"></x-ref>.</td></tr>
+<tr><th>StatefulSet</th><td>Pods with stable identities and their own storage, for databases and similar software.</td></tr>
+<tr><th>DaemonSet</th><td>One pod on every node, for agents such as log collectors.</td></tr>
+<tr><th>Namespace</th><td>A named partition of a cluster, for separating teams or environments.</td></tr>
+</tbody>
+</table>
+<p>Here is the feed service as a Deployment. The later sections explain each part of it.</p>
+
+<pre data-lang="text" data-title="deployment.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feed
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: feed
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: feed
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: feed
+          image: registry.example/photos/feed:2026-10-10.3
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 512Mi
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]</pre>
+
+<p>Objects are connected by <dfn>labels</dfn>, not by pointers. The Deployment manages every pod labeled <code>app: feed</code>, and a Service selects pods the same way. These files are kept in version control and applied by an automated pipeline, so the repository is a record of what the cluster should be running.</p>
+
+<h2 id="health">Health probes</h2>
+<p>The orchestrator needs to know two different things about a container: whether it is broken, and whether it can take traffic right now. Kubernetes asks them with separate <dfn>probes</dfn>, each a small request it sends on a timer.</p>
+
+<figure class="fig wide" id="fig-probes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 160" role="img" aria-labelledby="f465t f465d">
+<title id="f465t">One pod’s life and the probes that govern each stage</title>
+<desc id="f465d">A timeline of one pod. It is pending while it is scheduled and its image is pulled. While it is starting, the startup probe holds the other probes off. It is then running but not ready: the readiness probe is failing, so it is kept out of the Service. When readiness passes it is ready and receives traffic, and this is the only time users reach this pod. Later it hangs, the liveness probe fails three times, and the container is restarted.</desc>
+<g data-s="1">
+<rect class="n sunk" x="10" y="30" width="86" height="34" rx="5"/>
+<text class="ts tb mid" x="53.0" y="51">Pending</text>
+</g>
+<g data-s="2">
+<rect class="n async" x="100" y="30" width="116" height="34" rx="5"/>
+<text class="ts tb mid" x="158.0" y="51">Starting</text>
+</g>
+<g data-s="3">
+<rect class="n " x="220" y="30" width="146" height="34" rx="5"/>
+<text class="ts tb mid" x="293.0" y="51">Running, not ready</text>
+</g>
+<g data-s="4">
+<rect class="n store" x="370" y="30" width="186" height="34" rx="5"/>
+<text class="ts tb mid" x="463.0" y="51">Ready</text>
+</g>
+<g data-s="5">
+<rect class="n fault" x="560" y="30" width="66" height="34" rx="5"/>
+<text class="ts tb mid" x="593.0" y="51">Hung</text>
+</g>
+<g data-s="6">
+<rect class="n async" x="630" y="30" width="76" height="34" rx="5"/>
+<text class="ts tb mid" x="668.0" y="51">Restart</text>
+</g>
+<text class="tb" x="10" y="18">One pod’s life</text>
+<g data-s="1">
+<text class="ts" x="10" y="84">scheduled,</text>
+<text class="ts" x="10" y="98">image pulled</text>
+</g>
+<g data-s="2">
+<text class="ts" x="100" y="84">startup probe</text>
+<text class="ts" x="100" y="98">holds the others off</text>
+</g>
+<g data-s="3">
+<text class="ts" x="220" y="84">readiness probe failing:</text>
+<text class="ts" x="220" y="98">kept out of the Service</text>
+</g>
+<g data-s="4">
+<text class="ts" x="370" y="84">readiness passing:</text>
+<text class="ts" x="370" y="98">receives traffic</text>
+</g>
+<g data-s="5">
+<text class="ts" x="560" y="84">liveness probe fails 3 times:</text>
+<text class="ts" x="560" y="98">the container is restarted</text>
+</g>
+<g data-s="4">
+<path class="e none" d="M370 124v6H556v-6"/>
+<text class="ts mid" x="463" y="146">the only time users reach this pod</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Users can reach this pod: no">The pod is scheduled to a node and its image is pulled.</li>
+  <li>The container starts. A startup probe gives it time, and holds the other probes off until it passes.</li>
+  <li>The process is running but not ready, perhaps still loading data. While the readiness probe fails, the pod is kept out of the Service and receives no traffic.</li>
+  <li data-state="Users can reach this pod: yes">The readiness probe passes and traffic arrives. This is the only time users reach this pod.</li>
+  <li data-state="Users can reach this pod: no, it is hung">Later the process hangs. The liveness probe fails three times in a row.</li>
+  <li data-state="Users can reach this pod: no, it is restarting">The container is restarted, and the cycle begins again.</li>
+</ol>
+<figcaption>Readiness controls traffic. Liveness controls restarts. Keeping them separate is what lets a pod be alive, busy and temporarily out of rotation.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Probe</th><th>Question</th><th>If it fails</th></tr></thead>
+<tbody>
+<tr><th>Startup</th><td>Has the program finished starting?</td><td>Keep waiting, up to a limit. The other probes do not run yet</td></tr>
+<tr><th>Readiness</th><td>Can it serve requests now?</td><td>Remove it from the Service until it passes again</td></tr>
+<tr><th>Liveness</th><td>Is it stuck beyond recovery?</td><td>Restart the container</td></tr>
+</tbody>
+</table>
+<p>The advice from <x-ref to="proxies-and-load-balancers#health-design"></x-ref> applies with more force here, because a liveness probe can restart things.</p>
+
+<div class="note pitfall"><p><span class="label">Common mistake.</span> A liveness probe that checks dependencies. If <code>/healthz</code> queries the database and the database slows down, every pod fails its liveness probe at once and every pod is restarted, which adds a wave of cold starts and reconnections to a database that was already struggling. A liveness probe should answer one question: is this process itself stuck? It should touch nothing outside the process. Dependency checks, used with care, belong in readiness.</p></div>
+
+<h2 id="resources">Requests and limits</h2>
+<p>Each container declares how much CPU and memory it needs. There are two numbers for each resource, and they do different jobs.</p>
+
+<figure class="fig wide" id="fig-resources">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-labelledby="f466t f466d">
+<title id="f466t">Resource requests and limits for one container</title>
+<desc id="f466d">Two meters for one container on a node with 4 CPUs and 16 gibibytes. The CPU meter shows a request of 500 millicores and a limit of 1000 millicores, with current usage between them. Above the limit the container is slowed down. The memory meter shows a request of 512 mebibytes and a limit of 1 gibibyte, with usage between them. Above the limit the container is killed. The request is what the scheduler reserves on the node. The limit is what the kernel enforces. Usage between the two is allowed while the node has room, and is the first to suffer when it does not.</desc>
+<text class="tb" x="10" y="18">One container on a node with 4 CPUs and 16 GiB</text>
+<text class="ts tb" x="10" y="75">CPU</text>
+<rect class="n sunk" x="150" y="58" width="360" height="26" rx="4"/>
+<rect class="bar store" x="150" y="61" width="148" height="20" rx="3"/>
+<path class="e none" d="M240 52V90"/>
+<text class="ts mid" x="240.0" y="48">request: 500m</text>
+<path class="e none fault" d="M330 52V90"/>
+<text class="ts mid" x="330.0" y="48">limit: 1000m</text>
+<text class="ts" x="522" y="75">above the limit: slowed down</text>
+<text class="ts tb" x="10" y="149">Memory</text>
+<rect class="n sunk" x="150" y="132" width="360" height="26" rx="4"/>
+<rect class="bar store" x="150" y="135" width="123" height="20" rx="3"/>
+<path class="e none" d="M240 126V164"/>
+<text class="ts mid" x="240.0" y="122">request: 512 Mi</text>
+<path class="e none fault" d="M330 126V164"/>
+<text class="ts mid" x="330.0" y="122">limit: 1 GiB</text>
+<text class="ts" x="522" y="149">above the limit: killed</text>
+<text class="ts" x="10" y="192">The request is what the scheduler reserves on the node. The limit is what the kernel enforces.</text>
+<text class="ts" x="10" y="208">Usage between the two is allowed while the node has room, and is the first to suffer when it does not.</text>
+
+</svg>
+</div>
+<figcaption>CPU is measured in thousandths of a core: 500m is half of one. The two resources fail differently, which is why they are configured differently.</figcaption>
+</figure>
+
+<ul>
+  <li>The <dfn>request</dfn> is a reservation. The scheduler adds up the requests of the pods on a node and will not place a pod where its request does not fit. Requests that are too low pack nodes too tightly. Requests that are too high leave paid-for capacity idle.</li>
+  <li>The <dfn>limit</dfn> is a ceiling enforced by the kernel through cgroups. What happens at the ceiling depends on the resource. CPU can be taken away and given back, so a container at its CPU limit is <em>throttled</em>: paused for the rest of each short accounting period. Memory cannot be taken back, so a container that exceeds its memory limit is <em>killed</em> and restarted.</li>
+</ul>
+<p>Two practical rules follow, and the Deployment above uses both.</p>
+<p><b>Set the memory limit equal to the memory request.</b> Then a container can never be using memory it was not guaranteed, and a node cannot run out because several containers burst at once.</p>
+<p><b>Be cautious with CPU limits.</b> Throttling shows up as latency: a request that needed 20 ms of CPU waits for the next accounting period and takes 100 ms, while the node has idle cores. Many teams set a CPU request, which guarantees a share under contention, and no CPU limit. Others need limits for predictability. Either way, measure throttling before trusting a latency number.</p>
+<p>When a node itself runs short, the kubelet evicts pods to protect it, starting with those using more than they requested. Honest requests are therefore protection as well as bookkeeping.</p>
+
+<h2 id="scheduling">Scheduling</h2>
+<p>The scheduler assigns each new pod to a node in two steps. It first <em>filters</em> out the nodes that cannot run the pod, then <em>scores</em> the rest and picks the best.</p>
+
+<pre data-lang="ts" data-title="schedule.ts">type Resources = { cpu: number; memory: number };            // CPU in millicores, memory in MiB
+type Node = { name: string; capacity: Resources; requested: Resources };
+
+function fits(node: Node, pod: Resources): boolean {
+  return node.requested.cpu + pod.cpu <= node.capacity.cpu &&
+         node.requested.memory + pod.memory <= node.capacity.memory;
+}
+
+/** Fraction of the node that would be in use after placing the pod, averaged over CPU and memory. */
+function fullness(node: Node, pod: Resources): number {
+  return ((node.requested.cpu + pod.cpu) / node.capacity.cpu +
+          (node.requested.memory + pod.memory) / node.capacity.memory) / 2;
+}
+
+export function schedule(nodes: Node[], pod: Resources, strategy: "spread" | "pack"): Node | undefined {
+  const candidates = nodes.filter((n) => fits(n, pod));       // filter
+  if (candidates.length === 0) return undefined;              // the pod stays Pending
+  const score = (n: Node) => (strategy === "pack" ? fullness(n, pod) : 1 - fullness(n, pod));
+  const chosen = candidates.reduce((best, n) => (score(n) > score(best) ? n : best));
+  chosen.requested.cpu += pod.cpu;                            // bind
+  chosen.requested.memory += pod.memory;
+  return chosen;
+}</pre>
+
+<p>The two strategies pull in opposite directions. <em>Spreading</em> puts each pod on the emptiest node, which leaves room everywhere for bursts and limits the damage when a node dies. <em>Packing</em> fills nodes one at a time, which leaves whole nodes empty so that they can be removed and not paid for. The default leans toward spreading, and cost-conscious clusters lean toward packing.</p>
+<p>The function also shows a common source of waste. Place pods that request 500m of CPU and 1 GiB of memory on an empty node with 4 CPUs and 16 GiB, and it holds eight. The CPU is then fully reserved and half the memory, 8 GiB, can never be used. Node shapes should match the shape of what runs on them.</p>
+<p>Real scheduling takes more into account, and you can state most of it as rules:</p>
+<ul>
+  <li><b>Spread across failure domains.</b> A rule can require the copies of a service to be divided evenly among availability zones, or forbid two copies on one node. Without one, the scheduler may place all three copies on the same machine, and a single failure takes the service down.</li>
+  <li><b>Attract or repel.</b> Pods can ask to be near certain others or away from them, and nodes can be marked so that only pods which explicitly accept the mark land there, which is how GPU nodes are kept for workloads that need a GPU.</li>
+</ul>
+<p>A pod that fits nowhere stays in the state <code>Pending</code>. It is one of the most common things to debug, and the cause is nearly always that no node has enough unreserved CPU or memory, or that a rule excludes every node.</p>
+
+<h2 id="autoscaling">Autoscaling</h2>
+<p>Three separate mechanisms adjust capacity, at three levels.</p>
+<table>
+<thead><tr><th>Mechanism</th><th>Changes</th><th>Reacts in</th></tr></thead>
+<tbody>
+<tr><th>Horizontal pod autoscaler</th><td>The number of pods of a service</td><td>Tens of seconds, plus pod start time</td></tr>
+<tr><th>Vertical autoscaling</th><td>The requests of each pod</td><td>Slowly, from days of observed usage</td></tr>
+<tr><th>Cluster autoscaler</th><td>The number of nodes</td><td>Minutes: a new machine must boot and join</td></tr>
+</tbody>
+</table>
+<p>The horizontal autoscaler is a controller like any other. Every 15 seconds by default it reads a metric, usually average CPU use as a percentage of what pods requested, and applies one formula.</p>
+<div class="formula">desired pods = ⌈ current pods × current value ÷ target value ⌉</div>
+<p>If ten pods average 90% against a target of 60%, it wants fifteen. Two refinements keep it from thrashing. A change is skipped when the ratio is within 10% of 1. And it scales up at once but waits five minutes before scaling down, using the highest recommendation from that period.</p>
+
+<div class="widget" data-widget="hpa">
+<h4>Horizontal autoscaler</h4>
+<p>What the autoscaler asks for, given what the pods are using now.</p>
+<div class="controls">
+  <label>Pods running now<input type="number" name="replicas" value="10" min="1" step="1"></label>
+  <label>Average CPU use, % of request<input type="number" name="current" value="90" min="0" step="5"></label>
+  <label>Target, %<input type="number" name="target" value="60" min="1" step="5"></label>
+  <label>Minimum pods<input type="number" name="min" value="2" min="1" step="1"></label>
+  <label>Maximum pods<input type="number" name="max" value="50" min="1" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Ratio to target</dt><dd data-out="ratio">1.5</dd></div>
+  <div><dt>Pods wanted</dt><dd data-out="desired">15</dd></div>
+  <div><dt>Change</dt><dd data-out="change">+5</dd></div>
+  <div><dt>Use per pod afterward</dt><dd data-out="after">60%</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Each of the 10 pods uses 90% of the CPU it requested, against a target of 60%. The ratio is 1.5, so the formula asks for 15 pods. That is 5 more. Spread over 15 pods, the same load comes to about 60% each.</p>
+</div>
+
+<p>Three things about autoscaling matter for design.</p>
+<p><b>The target is your headroom.</b> A target of 60% means pods normally run with 40% spare, which is what absorbs a surge during the time it takes new pods to arrive. A target of 90% is cheaper and leaves almost nothing. <x-ref to="latency-and-throughput#saturation"></x-ref> explains why latency climbs steeply long before 100%.</p>
+<p><b>The levels chain, and the delays add.</b> The pod autoscaler asks for five more pods. If the nodes are full, those pods wait as <code>Pending</code> until the cluster autoscaler notices, requests machines, and the machines boot. A surge that outruns free node capacity is answered in minutes. Keeping some spare node capacity is the remedy.</p>
+<p><b>CPU is not always the right signal.</b> A service that waits on a slow database has low CPU while its users queue. A queue consumer should scale on the length or age of its queue, as <x-ref to="message-queues#backpressure"></x-ref> suggested. Autoscalers can use such metrics, and choosing the signal that actually tracks load is most of the work.</p>
+<p>Autoscaling also needs limits in the other direction. A maximum protects the budget and whatever lies downstream, for the reasons in <x-ref to="serverless#connections"></x-ref>: fifty copies of a service can open fifty times the database connections.</p>
+
+<h2 id="shutdown">Stopping gracefully</h2>
+<p>Pods are stopped all the time: on every deployment, every scale-down, every node replacement. Each stop is a chance to drop requests, and avoiding that takes cooperation between the platform and the program.</p>
+
+<figure class="fig wide" id="fig-shutdown">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-labelledby="f467t f467d">
+<title id="f467t">The timeline of a graceful pod shutdown</title>
+<desc id="f467d">A timeline from 0 to 30 seconds after a pod is deleted. For about the first 3 seconds, load balancers are still sending it requests. A preStop hook sleeps for the first 5 seconds. At 5 seconds the application receives SIGTERM, finishes the requests in flight, and exits cleanly at about 12 seconds. At 30 seconds anything still running would be sent SIGKILL. Deleting a pod starts two things at once: removing it from load balancers, which takes a few seconds to reach them all, and stopping the container. The short sleep keeps the application serving until the load balancers have caught up.</desc>
+<line class="grid" x1="150" y1="26" x2="150" y2="150"/>
+<text class="ts mid" x="150" y="166">0 s</text>
+<line class="grid" x1="235" y1="26" x2="235" y2="150"/>
+<text class="ts mid" x="235" y="166">5 s</text>
+<line class="grid" x1="320" y1="26" x2="320" y2="150"/>
+<text class="ts mid" x="320" y="166">10 s</text>
+<line class="grid" x1="405" y1="26" x2="405" y2="150"/>
+<text class="ts mid" x="405" y="166">15 s</text>
+<line class="grid" x1="490" y1="26" x2="490" y2="150"/>
+<text class="ts mid" x="490" y="166">20 s</text>
+<line class="grid" x1="575" y1="26" x2="575" y2="150"/>
+<text class="ts mid" x="575" y="166">25 s</text>
+<line class="grid" x1="660" y1="26" x2="660" y2="150"/>
+<text class="ts mid" x="660" y="166">30 s</text>
+<g data-s="1">
+<text class="ts" x="10" y="46">Load balancers</text>
+<rect class="n fault" x="150" y="30" width="51" height="24" rx="4"/>
+<text class="ts" x="209" y="46">still sending requests here</text>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="78">preStop hook</text>
+<rect class="n async" x="150" y="62" width="85" height="24" rx="4"/>
+<text class="ts" x="243" y="78">sleep 5</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="110">Application</text>
+<rect class="n store" x="235" y="94" width="119" height="24" rx="4"/>
+<text class="ts" x="362" y="110">finishes requests in flight, then exits</text>
+</g>
+<g data-s="3">
+<path class="e none" d="M235 88V124"/>
+<text class="ts" x="239" y="136">SIGTERM</text>
+</g>
+<g data-s="5">
+<path class="e none fault" d="M660 26V150"/>
+<text class="ts end" x="656" y="136">SIGKILL</text>
+<text class="ts" x="10" y="192">Deleting a pod starts two things at once: removing it from load balancers, which takes a few seconds to reach them all,</text>
+<text class="ts" x="10" y="208">and stopping the container. The short sleep keeps the application serving until the load balancers have caught up.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>At 0 seconds the pod is deleted, and two things start at once. Load balancers begin removing it, which takes a moment, and for that moment they still send requests here.</li>
+  <li>The preStop hook runs first. It simply sleeps for 5 seconds while the application carries on serving.</li>
+  <li>Then the container receives SIGTERM.</li>
+  <li>The application stops accepting new work, finishes the requests in flight, and exits.</li>
+  <li>Anything still running at 30 seconds is killed outright. The short sleep is what kept the application serving until the load balancers had stopped sending.</li>
+</ol>
+<figcaption>The times are illustrative. The rule is that the program must keep serving for a few seconds after it has been told to stop.</figcaption>
+</figure>
+
+<p>When a pod is deleted, the container is sent the signal <code>SIGTERM</code> and given a grace period, 30 seconds by default, before it is killed outright. At the same moment, the pod is removed from its Service. Those two things are not coordinated, and the removal takes a moment to reach every proxy and load balancer. A program that exits the instant it receives <code>SIGTERM</code> will refuse requests that are still on their way.</p>
+<p>The fix has two parts. A short pause before the signal, the <code>preStop</code> line in the Deployment above, covers the gap. Then the program handles the signal properly.</p>
+
+<pre data-lang="ts" data-title="server.ts">import http from "node:http";
+
+let ready = true;                 // what the readiness endpoint reports
+
+const server = http.createServer((req, res) => {
+  if (req.url === "/ready") { res.writeHead(ready ? 200 : 503).end(); return; }
+  setTimeout(() => res.end("done\n"), 300);      // stands in for real work
+});
+server.listen(8080);
+
+process.on("SIGTERM", () => {
+  ready = false;                  // fail readiness so no new traffic is sent here
+  server.close(() => process.exit(0));           // stop accepting, finish what is in flight, then exit
+  setTimeout(() => process.exit(1), 25_000).unref();   // give up before the platform's 30 s deadline
+});</pre>
+
+<p>In a test, a request that was 100 ms into its 300 ms of work when the signal arrived still received its response, the process then exited with status 0, and a new connection afterward was refused. The same discipline applies to consumers of queues: stop taking new messages, finish or release the current one, then exit.</p>
+<p>Some stops are planned by an operator, such as emptying a node to upgrade it. A <dfn>disruption budget</dfn> tells Kubernetes how many pods of a service may be down at once for such reasons, so that draining three nodes at the same time cannot remove every copy.</p>
+
+<pre data-lang="text" data-title="pdb.yaml">apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: feed
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: feed</pre>
+
+<h2 id="state">Stateful workloads</h2>
+<p>Everything above assumes pods are interchangeable. A database is not. Its copies have distinct roles, each owns particular data, and they must be started, upgraded and replaced in a careful order.</p>
+<p>Kubernetes supports this with two things. A <dfn>persistent volume</dfn> is storage that exists independently of any pod and is reattached when a pod is replaced. A <dfn>StatefulSet</dfn> gives pods stable names such as <code>db-0</code> and <code>db-1</code>, starts them in order, and gives each its own volume that follows it. For real databases this is rarely enough, so an <dfn>operator</dfn> is added: a custom controller that encodes the procedures a database administrator would follow, such as promoting a replica or taking a backup, in the same reconciliation style.</p>
+<p>Whether to run databases this way is a judgment about your team. It works, and large companies do it. It also makes you responsible for failover, backups and upgrades of software where mistakes lose data. For most teams a managed database outside the cluster is the better trade, with Kubernetes running the stateless services that are easy to replace.</p>
+
+<h2 id="costs">What Kubernetes costs, and the alternatives</h2>
+<p>Kubernetes solves real problems and brings a large surface of its own: networking, storage, access control, upgrades three times a year, and a long list of settings whose defaults are not always safe. A small team can spend more time on the cluster than on its product.</p>
+<table>
+<thead><tr><th>Option</th><th>You manage</th><th>Suits</th></tr></thead>
+<tbody>
+<tr><th>A platform service or serverless containers</th><td>An image and a few settings</td><td>Small teams, a handful of services. See <x-ref to="serverless#containers"></x-ref></td></tr>
+<tr><th>A simpler orchestrator from your cloud</th><td>Service definitions. No cluster internals</td><td>Teams committed to one provider that want less to learn</td></tr>
+<tr><th>Managed Kubernetes</th><td>Workloads, nodes, add-ons and upgrades. Not the control plane</td><td>Many services, a need for portability or the wider ecosystem</td></tr>
+<tr><th>Kubernetes you run entirely yourself</th><td>Everything</td><td>Organizations with a dedicated platform team and a reason, such as their own data centers</td></tr>
+</tbody>
+</table>
+<p>The usual advice from <x-ref to="monoliths-and-microservices#choosing"></x-ref> holds: adopt the heavier tool when a problem you actually have requires it. Containers are worth using from the first day. An orchestrator of this size is worth it when the number of services and people makes a shared platform cheaper than each team’s own arrangements.</p>
+
+<div class="note interview"><p><span class="label">In an interview.</span> You will rarely be asked to design Kubernetes, and often be expected to design for it. Say that services are stateless containers behind a load balancer, scaled on a named metric with a stated minimum, maximum and target. Mention readiness probes when you describe deployments, zone spreading when you discuss availability, and connection limits when you mention autoscaling. If asked how a failed instance is replaced, describe the reconciliation loop in a sentence.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Deploying the tag <code>latest</code>.</b> Nobody can say what is running or go back to what ran yesterday.</li>
+  <li><b>No requests.</b> The scheduler packs nodes blindly and the first busy hour ends in evictions.</li>
+  <li><b>Memory limit above the request.</b> Nodes run out of memory when several containers grow at once.</li>
+  <li><b>Liveness probes that check dependencies.</b> A slow database becomes a restart of the whole fleet.</li>
+  <li><b>No readiness probe.</b> Traffic reaches pods that have not finished starting, and every deployment produces errors.</li>
+  <li><b>Ignoring <code>SIGTERM</code>.</b> Every deployment and scale-down drops the requests in flight.</li>
+  <li><b>All copies in one place.</b> Three replicas on one node or in one zone are one failure away from none.</li>
+  <li><b>Autoscaling on the wrong signal.</b> CPU for a service whose bottleneck is elsewhere.</li>
+  <li><b>No maximum.</b> A traffic spike, or a bug, scales a service until it overwhelms its database or the budget.</li>
+  <li><b>Local state in a pod.</b> Files written inside a container vanish when it is replaced, which is often.</li>
+  <li><b>Adopting Kubernetes for three services.</b> The platform becomes the project.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="scalability"></x-ref>: stateless services, which are what orchestrators move and multiply freely.</li>
+  <li><x-ref to="service-communication"></x-ref>: Services, discovery and meshes on top of pods.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref>: health checks and connection draining, which probes and graceful shutdown implement.</li>
+  <li><x-ref to="consensus"></x-ref> and <x-ref to="membership-and-coordination"></x-ref>: etcd, leases and leader election inside the control plane.</li>
+  <li><x-ref to="deployment-strategies"></x-ref>: how a Deployment replaces one version with another safely.</li>
+  <li><x-ref to="capacity-and-cost"></x-ref>: choosing targets, headroom and node sizes.</li>
+  <li><x-ref to="serverless"></x-ref>: the same containers with the cluster hidden.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A container is a process that the kernel isolates with namespaces and limits with cgroups. It shares the host’s kernel, which makes it light and less isolated than a virtual machine.</li>
+  <li>An image is an immutable, layered bundle of a program and its dependencies. Build it once, tag it uniquely, and run the same bytes everywhere.</li>
+  <li>An orchestrator places containers, replaces failed ones, scales them, connects them and rolls out new versions.</li>
+  <li>Kubernetes records desired state and runs controllers that reconcile actual state toward it. Deployment, scaling and recovery are the same loop.</li>
+  <li>Readiness decides whether a pod gets traffic. Liveness decides whether it is restarted, and should check only the process itself.</li>
+  <li>Requests reserve capacity for scheduling. Limits are enforced: CPU is throttled, memory overuse is fatal.</li>
+  <li>The pod autoscaler follows one formula toward a target. The target is the headroom, and new nodes take minutes.</li>
+  <li>Handle <code>SIGTERM</code>: stop accepting, finish work in flight, exit. Pods are stopped constantly.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>What two kernel features make a container, and what does each restrict?</summary><p>Namespaces restrict what the process can see: its own process list, network, hostname and filesystem. Control groups restrict what it can use: CPU, memory and I/O. A container is a normal process with both applied.</p></details>
+<details><summary>Why does the order of instructions in an image build file affect build time?</summary><p>Each instruction produces a layer, and a layer is rebuilt when it or anything before it changes. Putting rarely changed steps first, such as installing dependencies, means a code change rebuilds only the last layers and reuses the rest from cache.</p></details>
+<details><summary>A Deployment asks for 4 replicas. One node fails, taking 2 pods with it. Describe what happens without mentioning any event.</summary><p>The controller compares desired state, 4 pods, with actual state, 2 healthy pods. The difference is 2, so it creates 2 pods. The scheduler assigns them to nodes with room, and the kubelets there start them. The controller did not need to know why pods were missing.</p></details>
+<details><summary>What is the difference between a readiness probe failing and a liveness probe failing?</summary><p>A failing readiness probe removes the pod from its Service, so it gets no traffic, and leaves it running. It returns when the probe passes. A failing liveness probe restarts the container. Readiness is for “not now”. Liveness is for “never, unless restarted”.</p></details>
+<details><summary>A container has a CPU limit of 1 core and a memory limit of 1 GiB. What happens when it tries to use 2 cores? When it tries to use 1.5 GiB?</summary><p>CPU use above the limit is throttled: the container is paused for part of each accounting period, which appears as added latency. Memory above the limit cannot be throttled, so the container is killed for being out of memory and restarted.</p></details>
+<details><summary>Twelve pods average 45% CPU against a target of 75%. What does the horizontal autoscaler want, and when does it act?</summary><p>12 × 45 ÷ 75 = 7.2, rounded up to 8 pods. The ratio 0.6 is outside the 10% tolerance, so it will scale down, after the default five-minute stabilization period during which it keeps the highest recommendation. The widget shows that 8 pods would then run at about 67.5% each.</p></details>
+<details><summary>Why can a program that exits immediately on SIGTERM cause failed requests, even though the pod was removed from the Service at the same time?</summary><p>The removal has to reach every load balancer and proxy, which takes a few seconds, and it is not coordinated with the signal. Requests already routed to the pod, or routed in that gap, arrive after the program has gone. A short pre-stop pause and finishing in-flight requests before exiting close the gap.</p></details>
+<details><summary>The pod autoscaler asks for 20 more pods and they stay Pending for four minutes. What is the likely cause, and what reduces the delay?</summary><p>The existing nodes have no unreserved capacity, so the pods cannot be scheduled until the cluster autoscaler adds nodes, which must boot and join. Keeping spare node capacity, using nodes that start faster, or scaling nodes ahead of known peaks reduces the wait.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Kubernetes documentation, <a href="https://kubernetes.io/docs/concepts/">Concepts</a>. The reference for objects, controllers, probes and resources.</li>
+  <li>Kubernetes documentation, <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Horizontal Pod Autoscaling</a>. The algorithm, tolerance and stabilization.</li>
+  <li>Kubernetes documentation, <a href="https://kubernetes.io/docs/setup/best-practices/cluster-large/">Considerations for large clusters</a>. Supported scale limits.</li>
+  <li>Kubernetes, <a href="https://kubernetes.io/releases/">Releases</a>. Versions and support periods.</li>
+  <li>Brendan Burns, Brian Grant, David Oppenheimer, Eric Brewer and John Wilkes, “Borg, Omega, and Kubernetes”, ACM Queue, 2016. The lessons from Google’s earlier systems that shaped the design.</li>
+  <li>Abhishek Verma and others, “Large-scale cluster management at Google with Borg”, EuroSys 2015.</li>
+  <li>Open Container Initiative, <a href="https://opencontainers.org/">image and runtime specifications</a>. The formats that make images portable between tools.</li>
+  <li>Linux manual pages, <code>namespaces(7)</code> and <code>cgroups(7)</code>. The kernel features underneath.</li>
+</ol>
+</section>

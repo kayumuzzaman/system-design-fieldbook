@@ -1,0 +1,342 @@
+<!--meta
+{ "description": "Consistency models for distributed data: linearizability, the CAP theorem and what it does and does not say, PACELC, causal and session consistency, eventual consistency, the difference between linearizability and serializability, and how to choose a level for each operation.",
+  "lede": "When data lives on several machines, a read can return something other than the most recent write. How much of that a system permits is its consistency model. This chapter defines the models precisely, explains the theorem everyone quotes about them, and shows how to decide which one each operation in a product needs.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="what">A contract about what clients may see</h2>
+<p><x-ref to="replication#lag"></x-ref> showed a user posting a comment and failing to see it a moment later, because her read went to a copy that had not caught up. Whether that is a bug depends on what the system promised. A <dfn>consistency model</dfn> is that promise: a statement of which results a client may observe when it reads and writes data that is stored in more than one place.</p>
+<p>The word “consistency” is badly overloaded, so it helps to fix the meaning here.</p>
+<table>
+<thead><tr><th>Phrase</th><th>Meaning</th><th>Chapter</th></tr></thead>
+<tbody>
+<tr><th>The C in ACID</th><td>A transaction leaves the data satisfying the declared rules</td><td><x-ch to="transactions"></x-ch></td></tr>
+<tr><th>Consistency in this chapter, and the C in CAP</th><td>Copies of the data agree, as far as any client can tell</td><td>This one</td></tr>
+<tr><th>Consistent hashing</th><td>Unrelated: a way of assigning keys to servers</td><td><x-ch to="partitioning"></x-ch></td></tr>
+</tbody>
+</table>
+<p>Stronger models are easier to program against, since the system behaves more like a single machine. They are also slower and less available, because they need machines to coordinate before answering. The models form a ladder, and the art is to stand on the lowest rung that keeps each feature correct.</p>
+
+<h2 id="linearizability">Linearizability: the illusion of one copy</h2>
+<p>The strongest model in common use is <dfn>linearizability</dfn>. A linearizable system behaves as if there were a single copy of the data and every operation took effect at one instant, somewhere between the moment the request was sent and the moment the reply arrived. Two consequences follow, and they are what you would expect from a variable in a single program.</p>
+<ul>
+  <li>Once a write has completed, every read that starts afterward returns that value or a newer one.</li>
+  <li>Once any client has read a new value, no later read by anyone returns the older one.</li>
+</ul>
+
+<figure class="fig wide" id="fig-linearizable">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f271t f271d">
+<title id="f271t">A history of three clients that violates linearizability</title>
+<desc id="f271d">Client A writes x equals 1 over a long interval. During that interval client B reads and gets 1. After B’s read has finished, client C starts a read and gets 0, the old value. Because C’s read began after B had already observed the new value, the result is not possible with a single copy of the data.</desc>
+<text class="tb" x="10" y="49">Client A</text>
+<line class="axis" x1="110" y1="44" x2="700" y2="44"/>
+<text class="tb" x="10" y="99">Client B</text>
+<line class="axis" x1="110" y1="94" x2="700" y2="94"/>
+<text class="tb" x="10" y="149">Client C</text>
+<line class="axis" x1="110" y1="144" x2="700" y2="144"/>
+<g data-s="1">
+<rect class="n sig" x="160" y="31" width="280" height="26" rx="5"/>
+<text class="ts mid" x="300.0" y="48">write x = 1</text>
+</g>
+<g data-s="2">
+<rect class="n store" x="240" y="81" width="120" height="26" rx="5"/>
+<text class="ts mid" x="300.0" y="98">read → 1</text>
+</g>
+<g data-s="4">
+<rect class="n fault" x="400" y="131" width="120" height="26" rx="5"/>
+<text class="ts mid" x="460.0" y="148">read → 0</text>
+</g>
+<g data-s="3">
+<path class="e none dash" d="M360 20V170"/>
+<path class="e none dash" d="M400 20V170"/>
+<text class="ts mid" x="380" y="188">B’s read ended before C’s began</text>
+</g>
+<path class="e none" d="M120 206H690"/>
+<text class="ts end" x="690" y="222">time</text>
+<g data-s="4">
+<text class="ts" x="10" y="244">Each bar runs from the moment a request is sent until its reply arrives. B has already seen the new value, so every read</text>
+<text class="ts" x="10" y="260">that starts later must see it too. C’s result of 0 is impossible for a single copy of the data, so this history is not linearizable.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="B has read: nothing yet; C has read: nothing yet">Client A writes x = 1. The bar runs from the moment the request is sent until its reply arrives.</li>
+  <li data-state="B has read: 1; C has read: nothing yet">While that write is still in flight, client B reads x and gets 1. So the write has taken effect.</li>
+  <li>B’s read finishes before C’s read begins.</li>
+  <li data-state="B has read: 1; C has read: 0, afterward">C reads x and gets 0. B has already seen the new value, so any read that starts later must see it too. For a single copy of the data this result is impossible.</li>
+</ol>
+<figcaption>A replicated system that is not linearizable. B read from an up-to-date replica and C, later, from a stale one. The value appears to go backward in time.</figcaption>
+</figure>
+
+<p>Some things cannot be built correctly on anything weaker.</p>
+<ul>
+  <li><b>Locks and leader election.</b> If two nodes can each read “the lock is free” and each take it, it is not a lock.</li>
+  <li><b>Uniqueness.</b> Guaranteeing that a username, a seat or an order number is claimed once requires everyone to agree on who got there first.</li>
+  <li><b>Limits that must not be crossed</b>, such as a balance that may not go negative or stock that may not be oversold.</li>
+</ul>
+<p>The cost is coordination. To be sure a read reflects the latest write, a replica must confirm with others that it is not out of date, or all reads must go to one node that is known to be current. Every operation waits for network round trips, and when the network between replicas fails, some of them cannot answer at all. That last point is the subject of the most quoted theorem in distributed systems.</p>
+
+<h2 id="cap">The CAP theorem</h2>
+<p>The <dfn>CAP theorem</dfn> concerns three properties of a system that stores data on several nodes.</p>
+<ul>
+  <li><b>Consistency</b>, meaning linearizability as defined above.</li>
+  <li><b>Availability</b>, meaning every request to a node that has not crashed receives a real answer, not an error or a timeout.</li>
+  <li><b>Partition tolerance</b>, meaning the system keeps operating when the network drops messages between nodes.</li>
+</ul>
+<p>The theorem, conjectured by Eric Brewer in 2000 and proved by Seth Gilbert and Nancy Lynch in 2002, says that when a network partition occurs, a system cannot provide both consistency and availability. The argument fits in one picture.</p>
+
+<figure class="fig wide" id="fig-cap">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f272t f272d">
+<title id="f272t">The choice a replica faces during a network partition</title>
+<desc id="f272d">Two data centers each hold a replica and the link between them is down. A client in data center 1 writes x equals 2 to replica 1. A client in data center 2 asks replica 2 for x. Replica 2 still holds x equals 1 and cannot learn about the write. It must either refuse to answer, choosing consistency, or answer with the stale value 1, choosing availability.</desc>
+<rect class="grp" x="10" y="14" width="300" height="130" rx="8"/>
+<text class="ts" x="20" y="30">Data center 1</text>
+<rect class="grp" x="410" y="14" width="300" height="130" rx="8"/>
+<text class="ts" x="420" y="30">Data center 2</text>
+<rect class="n" x="30" y="56" width="110" height="50" rx="6"/>
+<text class="tb mid" x="85" y="77">Client</text>
+<text class="ts mid" x="85" y="94">writes x = 2</text>
+<rect class="n store" x="180" y="56" width="110" height="50" rx="6"/>
+<text class="tb mid" x="235" y="77">Replica 1</text>
+<text class="ts mid" x="235" y="94">x = 2</text>
+<rect class="n store" x="430" y="56" width="110" height="50" rx="6"/>
+<text class="tb mid" x="485" y="77">Replica 2</text>
+<text class="ts mid" x="485" y="94">x = 1</text>
+<rect class="n" x="580" y="56" width="110" height="50" rx="6"/>
+<text class="tb mid" x="635" y="77">Client</text>
+<text class="ts mid" x="635" y="94">reads x</text>
+<path class="e sig" d="M140 81H180"/>
+<path class="e sig" d="M580 81H540"/>
+<path class="e none dash" d="M290 81H430"/><path class="x" d="M352 69l16 24M368 69l-16 24"/>
+<text class="ts mid" x="360" y="116">partition</text>
+<rect class="n sig" x="180" y="170" width="250" height="56" rx="6"/>
+<text class="tb mid" x="305" y="194">Choose consistency</text>
+<text class="ts mid" x="305" y="211">Replica 2 refuses: “try again later”</text>
+<rect class="n async" x="460" y="170" width="250" height="56" rx="6"/>
+<text class="tb mid" x="585" y="194">Choose availability</text>
+<text class="ts mid" x="585" y="211">Replica 2 answers x = 1, which is stale</text>
+<path class="e none" d="M485 106V140H305V170"/>
+<path class="e none" d="M485 140H585V170"/>
+<path class="e" d="M305 164V170"/><path class="e" d="M585 164V170"/>
+<text class="ts" x="20" y="204">Replica 2 cannot know</text>
+<text class="ts" x="20" y="220">about the write.</text>
+
+</svg>
+</div>
+<figcaption>The whole of the CAP theorem. A replica that cannot reach the others must either decline to answer or risk being wrong.</figcaption>
+</figure>
+
+<p>There is no third option, because the information replica 2 needs is on the other side of a broken link. Systems are therefore described by which way they lean when a partition happens.</p>
+<table>
+<thead><tr><th></th><th>Consistent under partition (CP)</th><th>Available under partition (AP)</th></tr></thead>
+<tbody>
+<tr><th>During a partition</th><td>The side without a majority stops serving</td><td>Every side keeps serving, and the sides may diverge</td></tr>
+<tr><th>After it heals</th><td>Nothing to repair</td><td>Conflicting writes must be reconciled</td></tr>
+<tr><th>Suits</th><td>Locks, configuration, money, inventory</td><td>Shopping carts, feeds, likes, presence, metrics</td></tr>
+<tr><th>Examples</th><td>etcd, ZooKeeper, Spanner, CockroachDB</td><td>Cassandra, Riak, DynamoDB in its default mode</td></tr>
+</tbody>
+</table>
+
+<h3 id="cap-misread">What CAP does not say</h3>
+<p>The theorem is often summarized as “consistency, availability, partition tolerance: pick two”. That phrasing is misleading in several ways, and the misunderstandings lead to poor designs.</p>
+<ul>
+  <li><b>Partition tolerance is not optional.</b> Networks fail whether you permit it or not. A system that “gives up P” is simply one whose behavior during a partition is undefined. The real choice is between C and A, and it arises only while a partition lasts.</li>
+  <li><b>It says nothing about normal operation.</b> When the network is healthy, which is nearly always, a system can be both consistent and available. CAP is about a rare event.</li>
+  <li><b>Its definitions are narrow.</b> “Consistency” means linearizability and nothing weaker. “Availability” means every non-failed node answers every request, which is stricter than any real system’s availability target and ignores how slow the answer is.</li>
+  <li><b>It is not a property of a whole system.</b> Different operations in one product can make different choices, and many databases let each request choose.</li>
+  <li><b>It ignores everything else that goes wrong.</b> A system can be unavailable through overload, bugs or a bad deployment with no partition involved.</li>
+</ul>
+<p>CAP is best treated as a warning that there is a choice to make, and as vocabulary for stating which way a system leans. As a tool for designing, the next idea is more useful.</p>
+
+<h2 id="pacelc">PACELC: the trade-off you make every day</h2>
+<p>Partitions are rare. The coordination that strong consistency needs is paid for on every request, partition or not. <dfn>PACELC</dfn>, proposed by Daniel Abadi, extends CAP to say so: if there is a <b>P</b>artition, choose between <b>A</b>vailability and <b>C</b>onsistency, <b>E</b>lse, in normal operation, choose between <b>L</b>atency and <b>C</b>onsistency.</p>
+<p>The second half is the one that shapes ordinary design. A write that must be confirmed by replicas in three regions before it is acknowledged is consistent and slow. A write acknowledged by one node and copied later is fast and can be lost or read stale. This is the synchronous and asynchronous choice from <x-ref to="replication#sync-async"></x-ref>, and the quorum settings from <x-ref to="replication#leaderless"></x-ref>, under another name.</p>
+<table>
+<thead><tr><th>System</th><th>During a partition</th><th>Otherwise</th><th>In words</th></tr></thead>
+<tbody>
+<tr><th>Spanner, CockroachDB, etcd</th><td>Consistency</td><td>Consistency</td><td>Always correct, and pays in latency and, during partitions, availability</td></tr>
+<tr><th>Cassandra, Riak, DynamoDB by default</th><td>Availability</td><td>Latency</td><td>Always fast and up, and may return stale data</td></tr>
+<tr><th>A single-leader database with asynchronous replicas, reading from replicas</th><td>Availability for reads</td><td>Latency</td><td>The common web setup: fast reads that may lag</td></tr>
+</tbody>
+</table>
+<p>Many of these are adjustable. Cassandra lets each query choose how many replicas must respond. DynamoDB offers strongly consistent reads as an option on each request, at higher cost and latency. The classification describes defaults.</p>
+
+<h2 id="spectrum">The models between the extremes</h2>
+<p>Between “behaves like one copy” and “copies agree eventually” there are useful intermediate promises. Four cover most of practice.</p>
+
+<figure class="fig wide" id="fig-spectrum">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 196" role="img" aria-labelledby="f273t f273d">
+<title id="f273t">Four consistency models from strongest to weakest</title>
+<desc id="f273d">Linearizable consistency acts like one copy, needs coordination on every operation, has the highest latency, and during a partition the minority side stops. Causal consistency shows causes before effects, needs ordering metadata, has low latency, keeps working in a partition and allows concurrent conflicts. Session consistency lets you see your own writes, needs a session token, has low latency, keeps working and allows stale data from others. Eventual consistency converges in time, needs no coordination, has the lowest latency, keeps working and allows stale, unordered reads.</desc>
+<path class="e" d="M128 16H712"/>
+<text class="ts" x="128" y="10">stronger</text>
+<text class="ts end" x="712" y="10">weaker</text>
+<rect class="n sig" x="128" y="30" width="140" height="56" rx="6"/>
+<text class="tb mid" x="198" y="54">Linearizable</text>
+<text class="ts mid" x="198" y="71">acts like one copy</text>
+<rect class="n" x="276" y="30" width="140" height="56" rx="6"/>
+<text class="tb mid" x="346" y="54">Causal</text>
+<text class="ts mid" x="346" y="71">causes before effects</text>
+<rect class="n" x="424" y="30" width="140" height="56" rx="6"/>
+<text class="tb mid" x="494" y="54">Session</text>
+<text class="ts mid" x="494" y="71">see your own writes</text>
+<rect class="n" x="572" y="30" width="140" height="56" rx="6"/>
+<text class="tb mid" x="642" y="54">Eventual</text>
+<text class="ts mid" x="642" y="71">converges in time</text>
+<line class="grid" x1="10" y1="96" x2="712" y2="96"/>
+<text class="ts tb" x="10" y="112">Coordination</text>
+<text class="ts mid" x="198" y="112">every operation</text>
+<text class="ts mid" x="346" y="112">ordering metadata</text>
+<text class="ts mid" x="494" y="112">a session token</text>
+<text class="ts mid" x="642" y="112">none</text>
+<line class="grid" x1="10" y1="120" x2="712" y2="120"/>
+<text class="ts tb" x="10" y="136">Latency</text>
+<text class="ts mid" x="198" y="136">highest</text>
+<text class="ts mid" x="346" y="136">low</text>
+<text class="ts mid" x="494" y="136">low</text>
+<text class="ts mid" x="642" y="136">lowest</text>
+<line class="grid" x1="10" y1="144" x2="712" y2="144"/>
+<text class="ts tb" x="10" y="160">In a partition</text>
+<text class="ts mid" x="198" y="160">minority side stops</text>
+<text class="ts mid" x="346" y="160">keeps working</text>
+<text class="ts mid" x="494" y="160">keeps working</text>
+<text class="ts mid" x="642" y="160">keeps working</text>
+<line class="grid" x1="10" y1="168" x2="712" y2="168"/>
+<text class="ts tb" x="10" y="184">Still possible</text>
+<text class="ts mid" x="198" y="184">nothing surprising</text>
+<text class="ts mid" x="346" y="184">concurrent conflicts</text>
+<text class="ts mid" x="494" y="184">stale data from others</text>
+<text class="ts mid" x="642" y="184">stale, unordered reads</text>
+
+</svg>
+</div>
+<figcaption>The ladder of consistency models. Each step down removes a guarantee and removes a cost.</figcaption>
+</figure>
+
+<h3 id="eventual">Eventual consistency</h3>
+<p><dfn>Eventual consistency</dfn> promises one thing: if no new writes arrive, all copies will in time hold the same value. It says nothing about how long that takes or what is returned in the meantime. A read may return an old value, two successive reads may return a newer value and then an older one, and two clients may see different things at the same moment.</p>
+<p>That sounds alarming, and it is what you already have whenever you read from an asynchronous replica, a cache, a CDN or a search index. It is acceptable for a great deal of data: like counts, view counts, recommendations, timelines, analytics. The system must also have a rule for making the copies agree when they have accepted conflicting writes, and <x-ref to="replication#multi-leader"></x-ref> listed the options.</p>
+
+<h3 id="session">Session guarantees</h3>
+<p>Most complaints about eventual consistency come from one person seeing their own actions undone. <dfn>Session guarantees</dfn> fix that without the cost of strong consistency, by making promises to each client about its own sequence of operations.</p>
+<ul>
+  <li><b>Read your writes.</b> After you write something, your reads reflect it.</li>
+  <li><b>Monotonic reads.</b> Once you have seen a value, you never see an older one.</li>
+</ul>
+<p>Other users may still see stale data, and usually nobody minds. The implementation is a token: each write returns a marker of how far the log had advanced, the client presents it on later reads, and a replica that has not reached that point either waits or passes the request on. Azure Cosmos DB’s session level works this way, and so does the “read from the leader briefly after writing” policy described in the replication chapter. For user-facing products this is very often the right default.</p>
+
+<h3 id="causal">Causal consistency</h3>
+<p><dfn>Causal consistency</dfn> promises that if one operation could have influenced another, everyone sees them in that order. A reply is never visible before the comment it answers. A photo is never visible to someone who was removed from the album before it was added. Operations with no causal connection, the concurrent ones from <x-ref to="distributed-fundamentals#logical"></x-ref>, may be seen in different orders by different clients.</p>
+<p>Causal consistency matters for a theoretical reason. It is about the strongest model that can be provided while remaining available during a partition, since it requires each replica to hold back only what it has not yet received the cause of, and never requires asking another replica for permission. It is implemented by attaching version information to each write, in the manner of vector clocks.</p>
+
+<h3 id="tunable">A real menu</h3>
+<p>Azure Cosmos DB exposes the ladder directly as five settings, which makes a useful summary of this section.</p>
+<table>
+<thead><tr><th>Level</th><th>Promise</th></tr></thead>
+<tbody>
+<tr><th>Strong</th><td>Linearizable: reads return the latest committed write</td></tr>
+<tr><th>Bounded staleness</th><td>Reads lag by at most a configured number of versions or amount of time</td></tr>
+<tr><th>Session</th><td>Within one client session: read your writes and monotonic reads</td></tr>
+<tr><th>Consistent prefix</th><td>Reads never see writes out of order, and may be behind</td></tr>
+<tr><th>Eventual</th><td>No ordering promise. Copies converge.</td></tr>
+</tbody>
+</table>
+
+<h2 id="vs-serializability">Linearizability is not serializability</h2>
+<p>Two similar words name the strongest guarantees of two different areas, and they are frequently confused.</p>
+<table>
+<thead><tr><th></th><th>Serializability</th><th>Linearizability</th></tr></thead>
+<tbody>
+<tr><th>Comes from</th><td>Databases: transaction isolation</td><td>Distributed systems: replicated data</td></tr>
+<tr><th>Concerns</th><td>Transactions that each touch several objects</td><td>Single operations on a single object</td></tr>
+<tr><th>Promises</th><td>The result equals some one-at-a-time ordering of the transactions</td><td>Each operation takes effect at an instant, in real-time order</td></tr>
+<tr><th>Says about real time</th><td>Nothing. The equivalent order need not match the order in which things happened.</td><td>Everything. A completed write is visible to all later reads.</td></tr>
+<tr><th>Protects against</th><td>Concurrency anomalies such as lost updates and write skew</td><td>Stale reads from lagging replicas</td></tr>
+</tbody>
+</table>
+<p>A database can be serializable and still return stale data from a replica. A key-value store can be linearizable and have no transactions at all. A system with both is called <dfn>strictly serializable</dfn>: transactions behave as if run one at a time, in an order consistent with real time. That is what Spanner and the databases modeled on it provide, and it is the closest thing to a single machine that a distributed database offers.</p>
+
+<h2 id="choosing">Choosing, one operation at a time</h2>
+<p>Consistency is best decided for each operation, by asking what breaks if this read is stale or these two writes conflict. For the photo app:</p>
+<table>
+<thead><tr><th>Operation</th><th>If it is stale or conflicts</th><th>Level needed</th></tr></thead>
+<tbody>
+<tr><th>Claiming a username</th><td>Two people own the same name</td><td>Linearizable, through a unique constraint on a single leader</td></tr>
+<tr><th>Buying the last print in stock</th><td>The item is sold twice</td><td>Linearizable, in a transaction</td></tr>
+<tr><th>Changing who can see an album</th><td>A photo is shown to someone just removed</td><td>Causal at least: the permission change must be seen before later photos</td></tr>
+<tr><th>Viewing your own new comment</th><td>“It disappeared”</td><td>Read your writes</td></tr>
+<tr><th>Viewing someone else’s feed</th><td>A photo appears a second late</td><td>Eventual</td></tr>
+<tr><th>The like count on a photo</th><td>It reads 1,203 for a moment when it is 1,204</td><td>Eventual</td></tr>
+</tbody>
+</table>
+<p>A pattern is visible. Operations that enforce a rule involving more than one party need strong consistency, and they are a small minority of the traffic. Everything else can use something cheaper. A design that routes the few critical operations through a strongly consistent path and serves the bulk of reads from replicas and caches gets correctness where it matters and speed everywhere else.</p>
+<aside class="sn"><b>When no coordination is needed</b>A useful rule of thumb from research: if an operation only ever adds information and never needs to know that something is absent, replicas can apply it in any order and still agree, so no coordination is required. Adding a like fits. “Reserve this seat only if nobody else has” does not, because it depends on an absence. Asking which of your operations depend on an absence is a quick way to find the ones that need strong consistency.</aside>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Describing a design as “CP” or “AP” and stopping there. The label says little about how the system behaves on a normal day, when the question is latency against staleness, and nothing about which operations need what. State the guarantee each important operation requires and how it is provided.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> When asked about consistency, avoid reciting CAP. Say which operations must be strongly consistent and why, and which can be eventual: “seat reservation goes through the primary in a transaction, and the seat map users browse is served from a cache a second or two behind”. If the interviewer raises CAP, say that it applies during partitions, that the daily trade-off is latency against consistency, and which way your design leans for each kind of operation.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Reading CAP as “pick two of three”</b>, or believing a system can opt out of partitions.</li>
+  <li><b>One consistency level for a whole system</b>, when operations differ.</li>
+  <li><b>Confusing linearizability with serializability</b>, or either with the C in ACID.</li>
+  <li><b>Assuming a read after a write returns that write</b> on a system that reads from replicas.</li>
+  <li><b>Building a lock, a counter that must be exact, or a uniqueness check on an eventually consistent store.</b></li>
+  <li><b>Paying for strong consistency on data nobody needs fresh.</b></li>
+  <li><b>Forgetting the caches.</b> A strongly consistent database behind a cache with a five-minute lifetime is an eventually consistent system.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="replication"></x-ref>: where lag, quorums and conflicts come from.</li>
+  <li><x-ref to="transactions"></x-ref>: isolation levels, the other family of guarantees.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: partitions, clocks and causality.</li>
+  <li><x-ref to="consensus"></x-ref>: how linearizable systems are built.</li>
+  <li><x-ref to="caching"></x-ref> and <x-ref to="cdn-and-edge"></x-ref>: eventual consistency you add yourself.</li>
+  <li><x-ref to="multi-region"></x-ref>: where the latency cost of consistency becomes large.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A consistency model states what clients may observe when data is replicated.</li>
+  <li>Linearizability makes a replicated system behave like one copy. Locks, uniqueness and hard limits need it, and it costs coordination on every operation.</li>
+  <li>CAP: during a network partition a system must choose between linearizability and answering every request. It is not “pick two”, and partitions cannot be opted out of.</li>
+  <li>PACELC adds the everyday trade-off: without a partition, the choice is between latency and consistency.</li>
+  <li>Session guarantees give each user a coherent view of their own actions cheaply. Causal consistency preserves cause and effect and stays available.</li>
+  <li>Eventual consistency promises only convergence. It is what replicas, caches and search indexes already give you.</li>
+  <li>Serializability is about transactions and linearizability about recency. They are independent.</li>
+  <li>Choose a level for each operation by asking what breaks if it is stale.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A system has three replicas. A network fault isolates one of them, and a client connected to that one sends a read. What are its two options, and which does a CP system take?</summary><p>It can refuse or time out, since it cannot confirm it has the latest data, or it can answer with what it has, which may be stale. A CP system refuses, because the isolated replica is in the minority and cannot be sure.</p></details>
+<details><summary>Why is “we chose CA: consistency and availability, without partition tolerance” not a meaningful design choice for a distributed system?</summary><p>Partitions are a fact of networks and not a feature to decline. When one happens, the system will either refuse some requests or return possibly inconsistent data, so it has made the C or A choice whether or not anyone decided it.</p></details>
+<details><summary>A user changes their profile photo and still sees the old one, while a friend sees the new one. Which guarantee was violated, and what is a cheap fix?</summary><p>Read your writes. The user’s read went to a replica or cache that had not caught up. Route that user’s reads of their own profile to the leader for a short time after a write, or use a token from the write to pick a replica that has reached it.</p></details>
+<details><summary>Can a database be serializable without being linearizable? Give an example.</summary><p>Yes. A database can run every transaction with serializable isolation on its leader, while a read sent to an asynchronous replica returns data from a few seconds ago. The transactions are equivalent to some serial order, and a read after a completed write still does not see it.</p></details>
+<details><summary>According to PACELC, what is a database with asynchronous replication trading away in normal operation, and what does it gain?</summary><p>It gives up consistency for latency. Writes are acknowledged without waiting for replicas, so they are fast, and reads from replicas may be stale and recently acknowledged writes may be lost in a failover.</p></details>
+<details><summary>For each of these, would you accept eventual consistency: the number of unread notifications, the check that a coupon code is used at most once, a product’s average rating?</summary><p>The unread count and the average rating can be eventual, since a brief error harms nobody. The coupon check cannot, because two requests reading “not yet used” at the same time would both redeem it. It needs a linearizable check, such as a conditional update or unique constraint on a single leader.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 9, “Consistency and Consensus”.</li>
+  <li>Seth Gilbert and Nancy Lynch, <a href="https://www.comp.nus.edu.sg/~gilbert/pubs/BrewersConjecture-SigAct.pdf">Brewer’s Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services</a>, 2002. The proof of CAP.</li>
+  <li>Eric Brewer, <a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/">CAP Twelve Years Later: How the “Rules” Have Changed</a>, 2012. The author on how the theorem has been misread.</li>
+  <li>Daniel Abadi, <a href="https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf">Consistency Tradeoffs in Modern Distributed Database System Design</a>, IEEE Computer, 2012. PACELC.</li>
+  <li>Maurice Herlihy and Jeannette Wing, <a href="https://www.cs.columbia.edu/~wing/publications/HerlihyWing90.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a>, 1990.</li>
+  <li>Martin Kleppmann, <a href="https://martin.kleppmann.com/2015/05/11/please-stop-calling-databases-cp-or-ap.html">Please stop calling databases CP or AP</a>, 2015.</li>
+  <li>Jepsen, <a href="https://jepsen.io/consistency">Consistency Models</a>. A map of the models and how they relate.</li>
+  <li>Microsoft, <a href="https://learn.microsoft.com/en-us/azure/cosmos-db/consistency-levels">Consistency level choices in Azure Cosmos DB</a>. Checked October 2026.</li>
+  <li>Werner Vogels, <a href="https://www.allthingsdistributed.com/2008/12/eventually_consistent.html">Eventually Consistent</a>, 2008. Session guarantees and their variants.</li>
+  <li>Peter Bailis and others, <a href="https://www.vldb.org/pvldb/vol8/p185-bailis.pdf">Coordination Avoidance in Database Systems</a>, VLDB 2014. When coordination is and is not required.</li>
+</ol>
+</section>

@@ -1,0 +1,453 @@
+<!--meta
+{ "description": "Transactions that span several databases or services: the dual-write problem, two-phase commit and why it blocks, sagas with compensating transactions, orchestration and choreography, the transactional outbox, try-confirm-cancel, workflow engines and reconciliation.",
+  "lede": "Inside one database, a transaction makes a group of changes all happen or none. Once an operation touches two databases, or a database and a message queue, that guarantee is gone, and one half can succeed while the other fails. This chapter covers the techniques for keeping several systems in agreement, and argues that the best technique is often to avoid needing one.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="problem">When one transaction is not enough</h2>
+<p><x-ref to="transactions#beyond"></x-ref> ended with a boundary: a transaction covers one database and nothing outside it. Systems cross that boundary constantly. Placing an order in the photo app’s print shop might involve four changes owned by four services:</p>
+<ol>
+  <li>The order service records the order.</li>
+  <li>The inventory service reserves the print.</li>
+  <li>The payment service charges the card.</li>
+  <li>The shipping service schedules delivery.</li>
+</ol>
+<p>The business requires that these happen together. A customer must not be charged for an order that was never recorded, and stock must not stay reserved for an order whose payment failed. No single <code>COMMIT</code> spans the four.</p>
+<p>The problem appears in its smallest form whenever a service changes its database and also needs to tell someone else.</p>
+
+<figure class="fig wide" id="fig-dual-write">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 208" role="img" aria-labelledby="f291t f291d">
+<title id="f291t">The dual-write problem in both orders</title>
+<desc id="f291d">In the first case a service writes an order to its database, which succeeds, and then fails before publishing an event to the queue. The order exists and nobody is told. In the second case the service publishes the event first, then fails before writing to the database. Other services act on an order that does not exist.</desc>
+<g data-scene="db">
+<text class="tl" x="10" y="18">Database first, then the queue</text>
+<rect class="n" x="10" y="60" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="89.5">Service</text>
+<rect class="n store" x="230" y="34" width="110" height="44" rx="6"/>
+<text class="tb mid" x="285" y="52">Database</text>
+<text class="ts mid" x="285" y="69">order saved</text>
+<rect class="n async" x="230" y="96" width="110" height="44" rx="6"/>
+<text class="tb mid" x="285" y="114">Queue</text>
+<text class="ts mid" x="285" y="131">no event</text>
+<g data-s="1">
+<path class="e sig" d="M110 76 230 56"/>
+<text class="ts mid" x="160" y="54">1. succeeds</text>
+</g>
+<g data-s="2">
+<path class="e none dash" d="M110 96 178 110"/>
+<path class="x" d="M182 103l14 14M196 103l-14 14"/>
+<text class="ts mid" x="160" y="134">2. never happens</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="166">The order exists and nobody is told.</text>
+<text class="ts" x="10" y="182">No email, no shipment.</text>
+</g>
+</g>
+<path class="e none dash" d="M360 8V200"/>
+<g data-scene="queue">
+<text class="tl" x="380" y="18">Queue first, then the database</text>
+<rect class="n" x="380" y="60" width="100" height="50" rx="6"/>
+<text class="tb mid" x="430" y="89.5">Service</text>
+<rect class="n store" x="600" y="34" width="110" height="44" rx="6"/>
+<text class="tb mid" x="655" y="52">Queue</text>
+<text class="ts mid" x="655" y="69">event sent</text>
+<rect class="n async" x="600" y="96" width="110" height="44" rx="6"/>
+<text class="tb mid" x="655" y="114">Database</text>
+<text class="ts mid" x="655" y="131">no order</text>
+<g data-s="1">
+<path class="e sig" d="M480 76 600 56"/>
+<text class="ts mid" x="530" y="54">1. succeeds</text>
+</g>
+<g data-s="2">
+<path class="e none dash" d="M480 96 548 110"/>
+<path class="x" d="M552 103l14 14M566 103l-14 14"/>
+<text class="ts mid" x="530" y="134">2. never happens</text>
+</g>
+<g data-s="3">
+<text class="ts" x="380" y="166">Other services act on an order</text>
+<text class="ts" x="380" y="182">that does not exist.</text>
+</g>
+</g>
+
+</svg>
+</div>
+<ol class="steps" data-scene="db" data-label="Database first">
+  <li data-msg="save order" data-state="Database: has the order; Queue: no event">The service saves the order to the database. This succeeds.</li>
+  <li>Before it can publish the event, the service crashes. The second write never happens.</li>
+  <li>The order exists and nobody is told. No email is sent and nothing is shipped.</li>
+</ol>
+<ol class="steps" data-scene="queue" data-label="Queue first">
+  <li data-msg="publish event" data-state="Queue: has the event; Database: no order">This time the service publishes the event first. This succeeds.</li>
+  <li>It crashes before it can save the order.</li>
+  <li>Other services act on an order that does not exist.</li>
+</ol>
+<figcaption>The dual-write problem. Whichever system is written first, a failure between the two writes leaves them disagreeing, and no ordering of the two steps avoids it.</figcaption>
+</figure>
+
+<p>This is the <dfn>dual-write problem</dfn>. It is not rare. A process can crash, be redeployed or lose its network connection between any two lines of code, and at thousands of requests per second the gap between two writes is hit regularly. Wrapping the code in <code>try</code> and <code>catch</code> does not help, because the failure may be that the process no longer exists to run the handler.</p>
+<p>There are three families of solution: make the systems commit together, accept that they commit separately and repair failures, or arrange for there to be only one write.</p>
+
+<h2 id="2pc">Two-phase commit</h2>
+<p><dfn>Two-phase commit</dfn> (2PC) is the classical way to make several databases commit as one. A <dfn>coordinator</dfn> manages the transaction, and the databases taking part are <dfn>participants</dfn>. It proceeds in two rounds.</p>
+<ol>
+  <li><b>Prepare.</b> The coordinator asks every participant whether it can commit. Each does all the work short of committing: checks constraints, takes locks, writes the changes to its log. Then it votes yes or no. A yes is a binding promise that it will be able to commit if told to, even after a crash.</li>
+  <li><b>Commit or abort.</b> If every vote is yes, the coordinator records the decision to commit in its own log and tells all participants to commit. If any vote is no, or a participant does not answer, it tells all of them to abort.</li>
+</ol>
+
+<figure class="fig wide" id="fig-2pc">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 264" role="img" aria-labelledby="f292t f292d">
+<title id="f292t">The message sequence of two-phase commit</title>
+<desc id="f292d">A coordinator sends prepare to two databases. Each replies yes. The coordinator logs its decision to commit, then sends commit to both, and they acknowledge. The interval between a participant voting yes and receiving the decision is shaded: during it the participant is in doubt and holds its locks.</desc>
+<text class="tb mid" x="110" y="20">Coordinator</text>
+<text class="tb mid" x="360" y="20">Orders database</text>
+<text class="tb mid" x="610" y="20">Payments database</text>
+<g class="hide" data-s="2">
+<rect x="320" y="74" width="330" height="78" rx="4" fill="var(--fault-tint)"/>
+</g>
+<line class="axis" x1="110" y1="28" x2="110" y2="212"/>
+<line class="axis" x1="360" y1="28" x2="360" y2="212"/>
+<line class="axis" x1="610" y1="28" x2="610" y2="212"/>
+<g data-s="1">
+<path class="e sig" d="M111 52H359"/>
+<text class="ts mid" x="235.0" y="46">1. prepare</text>
+<path class="e sig" d="M111 60 C300 66 500 66 609 66"/>
+</g>
+<g data-s="2">
+<path class="e" d="M359 88H111"/>
+<text class="ts mid" x="235.0" y="82">2. yes, I can commit</text>
+<path class="e" d="M609 104 C500 104 300 110 111 110"/>
+<text class="ts mid" x="485" y="98">2. yes</text>
+</g>
+<g data-s="3">
+<circle class="n store" cx="110" cy="130" r="7"/>
+<text class="ts end" x="96" y="134">3. decision logged</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M111 158H359"/>
+<text class="ts mid" x="235.0" y="152">4. commit</text>
+<path class="e store" d="M111 166 C300 172 500 172 609 172"/>
+</g>
+<g data-s="5">
+<path class="e" d="M359 196H111"/>
+<text class="ts mid" x="235.0" y="190">5. done</text>
+</g>
+<g data-s="2">
+<text class="ts" x="658" y="116">in doubt:</text>
+<text class="ts" x="658" y="132">locks held</text>
+<text class="ts" x="10" y="236">Between voting yes and hearing the decision, a participant may neither commit nor abort on its own. If the coordinator fails</text>
+<text class="ts" x="10" y="252">in that window, the participants wait, holding their locks, until it returns.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="prepare" data-state="Each database: doing the work; Coordinator’s decision: none">The coordinator asks both databases to prepare: do the work, hold the locks, and promise that a commit will succeed.</li>
+  <li data-msg="yes" data-state="Each database: prepared, in doubt, holding locks; Coordinator’s decision: none">Each database votes yes. From this moment it is in doubt. It may neither commit nor abort on its own, and it holds its locks until it hears the decision.</li>
+  <li data-state="Each database: prepared, in doubt, holding locks; Coordinator’s decision: commit, logged">With every vote in, the coordinator writes its decision to its own log. This is the point of no return.</li>
+  <li data-msg="commit">The coordinator tells both databases to commit.</li>
+  <li data-msg="done" data-state="Each database: committed, locks released; Coordinator’s decision: commit, logged">The databases commit, release their locks and acknowledge.</li>
+</ol>
+<figcaption>Two-phase commit. The moment the coordinator logs its decision is the point of no return for the whole transaction.</figcaption>
+</figure>
+
+<p>The protocol does achieve atomicity. Its weakness is what happens in the shaded region. A participant that has voted yes is <dfn>in doubt</dfn>: it has promised to commit if asked, so it cannot abort on its own, and it has not been told to commit, so it cannot do that either. If the coordinator crashes at that moment, the participant must wait for it to come back, holding its locks the whole time. Every other transaction that needs those rows waits too. 2PC is therefore called a <dfn>blocking</dfn> protocol.</p>
+<p>The costs in practice:</p>
+<ul>
+  <li><b>Availability multiplies down.</b> The transaction needs the coordinator and every participant to be up. By the arithmetic of <x-ref to="availability-and-reliability#combining"></x-ref>, four components at 99.9% each give 99.6% together.</li>
+  <li><b>Latency adds up.</b> Two rounds of messages and several forced disk writes, with locks held throughout.</li>
+  <li><b>The coordinator is a single point of failure</b> unless its log is itself replicated.</li>
+  <li><b>Every participant must support the protocol.</b> Databases do, through a standard called XA. Most message queues, third-party APIs and payment providers do not.</li>
+</ul>
+<p>For these reasons 2PC across independent services has fallen out of favor. It remains the right tool in one place: inside a distributed database. Spanner, CockroachDB and similar systems use it to commit a transaction that touches several partitions, and they remove the blocking problem by making every participant, and the coordinator’s decision, a consensus group (<x-ref to="consensus"></x-ref>). A coordinator that fails is replaced by another replica that has the same log. The database does this for you, and you see an ordinary transaction.</p>
+
+<h2 id="sagas">Sagas</h2>
+<p>The alternative to committing together is to commit separately and undo on failure. A <dfn>saga</dfn> is a sequence of local transactions, each in one service, each committing on its own. For every step there is a <dfn>compensating transaction</dfn> that reverses its effect. If a step fails, the saga runs the compensations for the steps already completed, in reverse order.</p>
+
+<figure class="fig wide" id="fig-saga">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f293t f293d">
+<title id="f293t">A saga whose third step fails, and the compensations that follow</title>
+<desc id="f293d">Forward steps: create order with status pending, reserve stock holding one item, then charge card, which is declined. The fourth step, ship, is not reached. Because step three failed, compensating transactions run in reverse order: release stock, then cancel order.</desc>
+<g data-s="1">
+<rect class="n sig" x="10" y="30" width="150" height="54" rx="6"/>
+<text class="tb mid" x="85" y="53">Create order</text>
+<text class="ts mid" x="85" y="70">status: pending</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M160 57H190"/>
+<rect class="n sig" x="190" y="30" width="150" height="54" rx="6"/>
+<text class="tb mid" x="265" y="53">Reserve stock</text>
+<text class="ts mid" x="265" y="70">hold 1 item</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M340 57H370"/>
+<rect class="n fault" x="370" y="30" width="150" height="54" rx="6"/>
+<text class="tb mid" x="445" y="53">Charge card</text>
+<text class="ts mid" x="445" y="70">declined</text>
+</g>
+<g data-s="4">
+<path class="e dash" d="M520 57H550"/>
+<rect class="n ghost" x="550" y="30" width="150" height="54" rx="6"/>
+<text class="tb mid" x="625" y="53">Ship</text>
+<text class="ts mid" x="625" y="70">not reached</text>
+</g>
+<g data-s="1">
+<text class="ts" x="10" y="20">Forward: each step is a local transaction in one service</text>
+</g>
+<g data-s="6">
+<rect class="n async" x="10" y="140" width="150" height="54" rx="6"/>
+<text class="tb mid" x="85" y="163">Cancel order</text>
+<text class="ts mid" x="85" y="180">status: canceled</text>
+</g>
+<g data-s="5">
+<rect class="n async" x="190" y="140" width="150" height="54" rx="6"/>
+<text class="tb mid" x="265" y="163">Release stock</text>
+<text class="ts mid" x="265" y="180">hold removed</text>
+<path class="e async" d="M445 84V167H340"/>
+</g>
+<g data-s="6">
+<path class="e async" d="M190 167H160"/>
+</g>
+<g data-s="5">
+<text class="ts" x="452" y="150">step 3 failed: undo the completed</text>
+<text class="ts" x="452" y="166">steps, in reverse order</text>
+<text class="ts" x="10" y="130">Backward: compensating transactions</text>
+</g>
+<g data-s="6">
+<text class="ts" x="10" y="222">Nothing is rolled back. Each compensation is a new transaction that reverses the effect of an earlier one.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Order: pending; Stock: not held; Card: not charged">Create the order with the status “pending”. This is an ordinary local transaction in the order service.</li>
+  <li data-msg="reserve stock" data-state="Order: pending; Stock: 1 item held; Card: not charged">Reserve the stock, in the inventory service.</li>
+  <li data-msg="charge card" data-state="Order: pending; Stock: 1 item held; Card: declined">Charge the card, in the payment service. The card is declined.</li>
+  <li data-msg="none">Shipping is never reached.</li>
+  <li data-msg="release stock" data-state="Order: pending; Stock: released; Card: declined">The saga now runs backward through the steps that completed. First it releases the stock that was held.</li>
+  <li data-msg="cancel order" data-state="Order: canceled; Stock: released; Card: declined">Then it cancels the order. Nothing was rolled back: each compensation is a new transaction that reverses the effect of an earlier one.</li>
+</ol>
+<figcaption>A saga for placing an order. Each box is an ordinary transaction in one service.</figcaption>
+</figure>
+
+<p>A saga gives atomicity in the end: either all steps complete or all completed steps are compensated. It does not give isolation. Between the first step and the last, the system is in an intermediate state that everyone can see. The order exists and is unpaid. The stock is reserved for an order that may be canceled. Designing a saga is mostly designing for that visibility.</p>
+<ul>
+  <li><b>Use explicit states.</b> An order is <code>pending</code> until the saga finishes, and other code treats pending orders accordingly: not shown as confirmed, not shipped, not counted as revenue.</li>
+  <li><b>Compensation is not rollback.</b> A rollback makes it as if nothing happened. A compensation is a new action: a refund, a cancellation notice. If an email was sent, the compensation is another email. History shows both.</li>
+  <li><b>Order the steps by how reversible they are.</b> Put steps that are easy to undo first and the one that cannot be undone last. Charging a card can be refunded. Handing a parcel to a courier cannot be reversed. Once the irreversible step has succeeded, the saga must go forward, retrying the remaining steps until they succeed.</li>
+  <li><b>Compensations must succeed eventually.</b> They are retried until they do, so they must be safe to repeat (<x-ref to="idempotency-and-delivery"></x-ref>), and a compensation that keeps failing needs to alert a person.</li>
+</ul>
+
+<h3 id="coordination">Who drives the saga</h3>
+<p>Something has to decide what happens next. There are two styles.</p>
+<table>
+<thead><tr><th></th><th>Orchestration</th><th>Choreography</th></tr></thead>
+<tbody>
+<tr><th>How it works</th><td>A central orchestrator calls each service in turn and decides on the next step or the compensations</td><td>Each service reacts to events from the others and emits its own. No central controller.</td></tr>
+<tr><th>Where the process is defined</th><td>In one place, readable as a whole</td><td>Spread across the services. Nobody holds the full picture.</td></tr>
+<tr><th>Coupling</th><td>The orchestrator knows every participant</td><td>Services know only event types</td></tr>
+<tr><th>Seeing where a stuck order is</th><td>Ask the orchestrator</td><td>Reconstruct it from events across services</td></tr>
+<tr><th>Suits</th><td>Processes with several steps, branches and compensations</td><td>Simple reactions with two or three participants</td></tr>
+</tbody>
+</table>
+<p>Choreography looks appealingly decoupled and becomes hard to follow as steps are added, since the business process exists only as the sum of many handlers. For anything with more than a few steps, orchestration is usually easier to reason about and to debug. <x-ref to="event-driven-architecture"></x-ref> covers the event-driven style in more depth.</p>
+<pre data-lang="ts" data-title="The skeleton of an orchestrated saga">
+type Step = { name: string; run: () => Promise<void>; undo: () => Promise<void> };
+
+async function runSaga(steps: Step[]): Promise<void> {
+  const completed: Step[] = [];
+  try {
+    for (const step of steps) {
+      await step.run();
+      completed.push(step);
+    }
+  } catch (err) {
+    for (const step of completed.reverse()) {
+      await retryUntilSuccess(step.undo);       // a compensation must eventually succeed
+    }
+    throw err;
+  }
+}
+
+await runSaga([
+  { name: "create order",  run: () => orders.create(order),      undo: () => orders.cancel(order.id) },
+  { name: "reserve stock", run: () => inventory.reserve(order),  undo: () => inventory.release(order.id) },
+  { name: "charge card",   run: () => payments.charge(order),    undo: () => payments.refund(order.id) },
+  { name: "confirm order", run: () => orders.confirm(order.id),  undo: async () => {} },
+]);
+</pre>
+<p>This shows the shape and leaves out the hard part. The list of completed steps is in memory, so if the orchestrator crashes halfway, nothing remembers that a compensation is owed. A real orchestrator records its progress durably after every step, so that a restarted instance can continue or compensate. That is exactly what a workflow engine provides, which a later section describes.</p>
+
+<h2 id="outbox">The transactional outbox</h2>
+<p>Sagas need services to tell each other what happened, which brings back the dual-write problem: a step must update its database and send a message, atomically. The <dfn>transactional outbox</dfn> solves this by turning two writes into one.</p>
+<p>Instead of sending the message, the service inserts it into an <code>outbox</code> table in its own database, in the same transaction as the business change. Both rows commit together or neither does. A separate process, the relay, reads the outbox and publishes each message to the queue.</p>
+
+<figure class="fig wide" id="fig-outbox">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 204" role="img" aria-labelledby="f294t f294d">
+<title id="f294t">The transactional outbox pattern</title>
+<desc id="f294d">A service writes a new order row and an order-created event row to its own database in a single transaction. A relay process reads the outbox table and publishes each event to a message queue, retrying until the queue acknowledges it.</desc>
+<rect class="n" x="10" y="50" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="79.5">Service</text>
+<rect class="grp" x="160" y="14" width="220" height="130" rx="8"/>
+<text class="ts" x="170" y="30">one database transaction</text>
+<rect class="n store" x="180" y="40" width="180" height="40" rx="6"/>
+<text class="tb mid" x="270" y="56">orders</text>
+<text class="ts mid" x="270" y="73">new order row</text>
+<rect class="n store" x="180" y="90" width="180" height="40" rx="6"/>
+<text class="tb mid" x="270" y="106">outbox</text>
+<text class="ts mid" x="270" y="123">“order created” event</text>
+<g data-s="1">
+<path class="e sig" d="M110 68 180 60"/>
+<path class="e sig" d="M110 82 180 108"/>
+</g>
+<rect class="n" x="430" y="84" width="100" height="50" rx="6"/>
+<text class="tb mid" x="480" y="105">Relay</text>
+<text class="ts mid" x="480" y="122">reads outbox</text>
+<rect class="n async" x="580" y="84" width="130" height="50" rx="6"/>
+<text class="tb mid" x="645" y="105">Message queue</text>
+<text class="ts mid" x="645" y="122">at least once</text>
+<g data-s="2">
+<path class="e store" d="M360 110H430"/>
+</g>
+<g data-s="3">
+<path class="e async" d="M530 110H580"/>
+<text class="ts" x="10" y="172">The order and the event are saved together or not at all. A separate process publishes saved events and retries until</text>
+<text class="ts" x="10" y="188">each is acknowledged, so an event may be published twice and is never lost.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="one transaction" data-state="Orders table: the new order; Outbox table: 1 event, unsent; Queue: nothing yet">In one database transaction, the service saves the order and also writes an “order created” event into an outbox table. Both are saved, or neither is.</li>
+  <li data-msg="new rows">A separate relay process reads new rows from the outbox.</li>
+  <li data-msg="order created" data-state="Orders table: the new order; Outbox table: 1 event, marked sent; Queue: order created">It publishes each event to the message queue, and marks the row as sent once the queue acknowledges. If it crashes in between it publishes the event again, so an event may arrive twice and is never lost.</li>
+</ol>
+<figcaption>The outbox. The only atomic step is a single local transaction, and everything after it can be retried.</figcaption>
+</figure>
+
+<pre data-lang="sql" data-title="One transaction: the change and the message about it">
+BEGIN;
+
+INSERT INTO orders (id, user_id, total_cents, status)
+VALUES (5512, 42, 4200, 'pending');
+
+INSERT INTO outbox (id, topic, payload)
+VALUES ('01929f5e-7b1a-7c3e-9d2f-4a6b8c0d1e2f', 'order.created',
+        '{"orderId": 5512, "userId": 42, "totalCents": 4200}');
+
+COMMIT;
+</pre>
+<pre data-lang="ts" data-title="The relay: publish, then mark as published">
+async function relayOnce(): Promise<void> {
+  const rows = await db.query(
+    "SELECT id, topic, payload FROM outbox WHERE published_at IS NULL ORDER BY created_at LIMIT 100");
+
+  for (const row of rows) {
+    await queue.publish(row.topic, row.payload, { messageId: row.id });
+    await db.query("UPDATE outbox SET published_at = now() WHERE id = $1", [row.id]);
+  }
+}
+</pre>
+<p>The relay has the same gap in miniature: it can crash after publishing and before marking the row. On restart it publishes that message again. So the outbox guarantees that every message is delivered <em>at least once</em>, never that it is delivered exactly once. That is an acceptable trade, because a duplicate is something the receiver can detect, using the message ID, and a lost message is not. Consumers must be written to tolerate duplicates.</p>
+<p>The relay can find new rows by polling, as above, or by reading the database’s change log, which avoids polling delay and load. The second approach is <x-ref to="change-data-capture"></x-ref>.</p>
+<div class="note production"><p><span class="label">In production.</span> The outbox is the most widely useful pattern in this chapter. Any time a service must change its data and notify something else, such as a search index, a cache, another service or an email sender, write the notification to an outbox in the same transaction. It removes a whole class of “the database says one thing and everything else says another” incidents.</p></div>
+
+<h2 id="tcc">Reserve, then confirm</h2>
+<p>A saga’s lack of isolation is most awkward for scarce things: stock, seats, money. A useful refinement is to split each participant’s work into a tentative step and a final one, a pattern sometimes called <dfn>try-confirm-cancel</dfn>.</p>
+<ul>
+  <li><b>Try.</b> Reserve the resource without consuming it: place a hold on one item of stock, or on an amount of money. The reservation has an expiry time.</li>
+  <li><b>Confirm.</b> When every participant has reserved successfully, turn each reservation into the real thing.</li>
+  <li><b>Cancel.</b> If anything fails, release the reservations. Anything left behind by a crash expires on its own.</li>
+</ul>
+<p>You have met this as a customer. A hotel or fuel pump places a hold on a card and charges the final amount later. An airline holds a seat for ten minutes while you pay. The expiry is what makes the pattern robust: a reservation that nobody confirms or cancels cleans itself up, so a crashed coordinator cannot leave stock locked forever. The cost is that every participant must support reservations as a concept.</p>
+
+<h2 id="workflows">Workflow engines</h2>
+<p>An orchestrated saga needs durable progress tracking, retries with backoff, timeouts and timers, and visibility into what is stuck. Building these well is a project in itself. <dfn>Workflow engines</dfn>, also described as durable execution, provide them as a platform. You write the process as ordinary code or as a state machine, and the engine records every step’s result so that the process survives crashes and resumes exactly where it stopped, even days later. Temporal and AWS Step Functions are widely used examples.</p>
+<p>For multi-step business processes, especially ones that wait on people or external systems, a workflow engine is usually a better foundation than hand-written saga code. <x-ref to="scheduling-and-workflows"></x-ref> covers them.</p>
+
+<h2 id="choosing">Choosing an approach</h2>
+<table>
+<thead><tr><th>Approach</th><th>Atomic?</th><th>Isolated?</th><th>Cost</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><th>One local transaction</th><td>Yes</td><td>Yes</td><td>None</td><td>The data can live in one database. Always the first choice.</td></tr>
+<tr><th>A distributed SQL database</th><td>Yes</td><td>Yes</td><td>Latency, and operating such a database</td><td>One logical database that has outgrown one machine</td></tr>
+<tr><th>Two-phase commit across services</th><td>Yes</td><td>Yes</td><td>Blocking, reduced availability, needs XA everywhere</td><td>Rarely. A few databases under one team’s control.</td></tr>
+<tr><th>Saga</th><td>Eventually</td><td>No</td><td>Compensations to design. Intermediate states to handle.</td><td>Business processes across services</td></tr>
+<tr><th>Outbox with asynchronous consumers</th><td>Eventually</td><td>No</td><td>Lag. Consumers must tolerate duplicates.</td><td>Keeping derived data and other services informed</td></tr>
+</tbody>
+</table>
+<p>The first row deserves emphasis. The cheapest distributed transaction is the one you do not need. Data that must change together atomically is a strong signal that it belongs in the same service and the same database. Many systems that struggle with sagas drew their service boundaries through the middle of a transaction. <x-ref to="monoliths-and-microservices"></x-ref> returns to this when discussing how to split a system.</p>
+
+<h2 id="reconciliation">The backstop: reconciliation</h2>
+<p>However carefully a saga is built, some sequence of failures will eventually leave two systems disagreeing. A bug in a compensation, a message dropped by a misconfiguration, a provider that reports success and later reverses it. Mature systems assume this and check.</p>
+<p><dfn>Reconciliation</dfn> is a periodic job that compares two sources of truth and reports or repairs the differences: every charge at the payment provider against every paid order, every reserved item against an open order, every outbox row against what consumers received. Financial systems have done this for centuries under the name of balancing the books. It is unglamorous and it is what turns “eventually consistent, we hope” into “eventually consistent, and we know”. <x-ref to="hld-payments"></x-ref> builds a design around it.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Handling only the failure you can see. Code that calls a payment API, and on an error response cancels the order, has handled a declined card. It has not handled a timeout, where the charge may or may not have happened, or a crash after the charge and before the next line. Each step of a multi-system operation has three outcomes, success, failure and unknown, and the third needs an answer: retry with an idempotency key, or look up the result.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> When a flow crosses services, say how it stays consistent: “this is a saga, orchestrated by the order service, with the order in a pending state until payment confirms, and the stock reservation released if payment fails”. Mention the outbox for publishing events, that consumers are idempotent, and a reconciliation job. Proposing two-phase commit across microservices usually leads to a question about what happens when the coordinator dies.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Writing to a database and a queue in sequence</b> and hoping nothing fails in between.</li>
+  <li><b>Treating a multi-service operation as atomic</b> because the code is in one function.</li>
+  <li><b>Sagas with no compensations</b>, or with compensations that are never tested.</li>
+  <li><b>Compensations that are not safe to repeat.</b></li>
+  <li><b>No pending state</b>, so half-finished work looks finished to the rest of the system.</li>
+  <li><b>The irreversible step placed early</b> in the sequence.</li>
+  <li><b>Saga progress kept only in memory.</b></li>
+  <li><b>Ignoring the “unknown” outcome</b> of a remote call.</li>
+  <li><b>No reconciliation</b>, so drift is found by customers.</li>
+  <li><b>Service boundaries that cut through data needing a transaction.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="transactions"></x-ref>: what is being given up, and why it matters.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: making retries and duplicate messages harmless, which every pattern here depends on.</li>
+  <li><x-ref to="message-queues"></x-ref> and <x-ref to="change-data-capture"></x-ref>: carrying the messages and reading the outbox.</li>
+  <li><x-ref to="event-driven-architecture"></x-ref>: choreography at larger scale.</li>
+  <li><x-ref to="scheduling-and-workflows"></x-ref>: workflow engines.</li>
+  <li><x-ref to="monoliths-and-microservices"></x-ref>: choosing boundaries so that fewer transactions are distributed.</li>
+  <li><x-ref to="hld-payments"></x-ref> and <x-ref to="hld-ticket-booking"></x-ref>: these patterns applied.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A transaction covers one database. Writing to two systems in sequence can always leave them disagreeing.</li>
+  <li>Two-phase commit makes several participants commit together and blocks, holding locks, if the coordinator fails at the wrong moment. It belongs inside distributed databases.</li>
+  <li>A saga is a series of local transactions with compensations. It is atomic in the end and not isolated, so intermediate states must be designed for.</li>
+  <li>Order saga steps from most to least reversible, and make compensations safe to repeat.</li>
+  <li>The transactional outbox removes the dual write: save the message in the same transaction as the change, and publish it afterward, at least once.</li>
+  <li>Reservations with an expiry let scarce resources take part safely.</li>
+  <li>Record saga progress durably, or use a workflow engine that does.</li>
+  <li>Prefer keeping data that changes together in one database, and run reconciliation to catch what slips through.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A service saves an order and then publishes an event. Why does swapping the order of those two operations not fix the dual-write problem?</summary><p>A crash between the two steps leaves them inconsistent either way. Database first, and the order exists with no event. Event first, and other services act on an order that was never saved. The fix is to make it one write, by putting the event in an outbox table in the same transaction.</p></details>
+<details><summary>In two-phase commit, a participant has voted yes and the coordinator crashes. Why can the participant not simply abort after a timeout?</summary><p>The coordinator may have received all yes votes, logged a commit decision and told other participants to commit before crashing. If this participant aborted, some would have committed and it would not, breaking atomicity. It has to wait to learn the decision, holding its locks.</p></details>
+<details><summary>A saga has steps: reserve stock, send confirmation email, charge card. What is wrong with this order?</summary><p>The email cannot be unsent, and it comes before a step that can fail. If the charge is declined, the customer has been told the order is confirmed. Irreversible steps should come after the steps that might fail, so the charge goes before the email.</p></details>
+<details><summary>What does a saga not provide that a database transaction does, and how do designs cope?</summary><p>Isolation. Other requests can see the partial state between steps. Designs cope with explicit statuses such as pending, which the rest of the system treats as not yet real, and with reservations that hold a resource without committing it.</p></details>
+<details><summary>The outbox relay publishes a message and crashes before marking it as published. What happens next, and what does the consumer need?</summary><p>On restart the relay finds the row still unpublished and publishes it again, so the consumer receives the message twice. The consumer must detect the duplicate, typically by remembering the IDs of messages it has processed, and skip it.</p></details>
+<details><summary>Why might a design review suggest merging two services instead of adding a saga between them?</summary><p>If the two services’ data must frequently change together atomically, the service boundary is cutting through a transaction. A saga adds compensations, intermediate states and failure cases to recover what a single local transaction gives for free. Keeping that data in one service and one database removes the problem.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Hector Garcia-Molina and Kenneth Salem, <a href="https://www.cs.princeton.edu/research/techreps/598">Sagas</a>, 1987. The original paper, here as the Princeton technical report. It was presented at SIGMOD the same year.</li>
+  <li>Chris Richardson, <a href="https://microservices.io/patterns/data/saga.html">Pattern: Saga</a> and <a href="https://microservices.io/patterns/data/transactional-outbox.html">Pattern: Transactional outbox</a>, microservices.io.</li>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 9, on atomic commit and two-phase commit.</li>
+  <li>Pat Helland, <a href="https://queue.acm.org/detail.cfm?id=3025012">Life Beyond Distributed Transactions</a>, ACM Queue, 2016. Why large systems avoid them, and what they do instead.</li>
+  <li>Gregor Hohpe, <a href="https://www.enterpriseintegrationpatterns.com/ramblings/18_starbucks.html">Starbucks Does Not Use Two-Phase Commit</a>, 2004. A short, memorable account of compensation in everyday life.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/sql-prepare-transaction.html">PREPARE TRANSACTION</a>. The database side of two-phase commit, with warnings about leaving transactions prepared.</li>
+  <li><a href="https://docs.temporal.io/">Temporal documentation</a> and AWS, <a href="https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html">What is Step Functions?</a></li>
+  <li>James Corbett and others, <a href="https://research.google/pubs/spanner-googles-globally-distributed-database-2/">Spanner: Google’s Globally-Distributed Database</a>, OSDI 2012. Two-phase commit over Paxos groups.</li>
+</ol>
+</section>

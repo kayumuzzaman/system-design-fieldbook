@@ -1,0 +1,817 @@
+<!--meta
+{ "description": "Designing LRU and LFU caches in TypeScript, tested and measured: the contract and its invariants, a hash map with a doubly linked list for constant-time LRU, the shorter Map-based version and where it slows down, constant-time LFU with groups by frequency, checking a fast structure against a slow reference, hit ratios of FIFO, LRU and LFU on three kinds of traffic, and follow-up questions on expiry, concurrency and loading.",
+  "lede": "A cache with a size limit has to decide what to throw away, and it has to decide quickly, because a cache that is slow has no purpose. This is the classic problem of a data structure with a contract: two operations, a rule for eviction, and a requirement that both operations take constant time. This chapter builds the least-recently-used cache from a hash map and a linked list, builds the least-frequently-used cache from groups, tests both against simple versions that are obviously correct, and then measures what each policy is worth on real-looking traffic.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design an in-memory cache with a fixed capacity. It supports <code>get(key)</code> and <code>put(key, value)</code>, and both must run in constant time. When the cache is full and a new key arrives, it evicts the least recently used entry. Then: do the same for least frequently used.</p></div>
+<p><x-ref to="caching#eviction"></x-ref> described eviction policies from the outside, as a setting to choose. Here the task is to build one. In the terms of <x-ref to="lld-method#shapes"></x-ref>, it is a data structure with a contract, and the design is mostly the choice of structures that make the contract cheap to keep.</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>What is the capacity measured in?</th><td>Entries. Measuring in bytes is a follow-up</td></tr>
+<tr><th>What does <code>get</code> return for a missing key?</th><td><code>undefined</code>. A miss is not an error</td></tr>
+<tr><th>Does reading count as use?</th><td>Yes. So does updating an existing key</td></tr>
+<tr><th>Does updating an existing key ever evict?</th><td>No. Only a new key into a full cache does</td></tr>
+<tr><th>In LFU, which of two equally used entries goes first?</th><td>The one used longer ago</td></tr>
+<tr><th>What is out of scope at first?</th><td>Expiry by time, use from several threads, loading missing values. All three are follow-ups</td></tr>
+</tbody>
+</table>
+<p>“Constant time” needs one sentence of care. It means that the number of steps does not grow with the number of entries. It is usually written O(1), and a hash map’s operations are counted as constant, as is conventional (<x-ref to="indexes-and-queries"></x-ref>).</p>
+
+<h2 id="contract">Steps 2 and 3: The contract and its invariants</h2>
+<pre data-lang="ts" data-title="What every cache in this chapter promises">
+// The contract every cache in this chapter keeps: a fixed capacity, and a rule for what leaves when it is full.
+export interface Cache<K, V> {
+  get(key: K): V | undefined;
+  put(key: K, value: V): void;
+  delete(key: K): boolean;
+  readonly size: number;
+  readonly capacity: number;
+}
+</pre>
+<p>There are no entities to discover in this problem. The model is the interface, and the invariants are about the structure behind it.</p>
+<table>
+<thead><tr><th>Invariant</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><th>The cache never holds more than its capacity</th><td>That is the point of having one</td></tr>
+<tr><th>The entry evicted is exactly the one the policy names</th><td>Evicting a different entry still “works”, and silently lowers the hit ratio</td></tr>
+<tr><th>The lookup structure and the ordering structure hold the same keys</th><td>A key in one and not the other is a leak, or a crash on the next eviction</td></tr>
+<tr><th>Every operation is constant time</th><td>A cache sits on the hot path of whatever uses it</td></tr>
+</tbody>
+</table>
+<p>The second row is why this problem needs more testing than it appears to. A cache with a broken eviction order returns correct values for every key it holds. Nothing fails. It is merely worse, and only a test that knows which entry should have gone can tell.</p>
+
+<h2 id="lru">Least recently used</h2>
+<p>The cache has to answer two questions quickly. Where is the entry for this key? And which entry was used longest ago? No single common structure answers both.</p>
+<table>
+<thead><tr><th>Structure</th><th>Find by key</th><th>Find the least recently used</th><th>Mark as used</th></tr></thead>
+<tbody>
+<tr><th>Hash map alone</th><td>Constant</td><td>Must look at every entry</td><td>Constant, with a timestamp</td></tr>
+<tr><th>List in order of use, alone</th><td>Must walk the list</td><td>Constant: it is at the end</td><td>Constant once found</td></tr>
+<tr><th>Hash map of nodes, and the nodes in a doubly linked list</th><td>Constant</td><td>Constant</td><td>Constant</td></tr>
+</tbody>
+</table>
+
+<figure class="fig wide" id="fig-structure">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f701t f701d">
+<title id="f701t">A hash map and a doubly linked list holding the same three entries</title>
+<desc id="f701d">Two structures side by side. At the top, a hash map with three keys, e, d and a. Each key leads directly to a node. At the bottom, the same three nodes joined in a line, each linked to its neighbor in both directions, between two fixed end markers. The node next to the newest marker is e, the most recently used. The node next to the oldest marker is a, the least recently used, which is the next to be evicted. The map answers where a key’s node is. The list answers which node has gone unused the longest.</desc>
+<text class="tb" x="10" y="20">Hash map: finds a node by its key in one step</text>
+<rect class="n sunk" x="220" y="34" width="60" height="30" rx="4"/>
+<text class="ts mono mid" x="250" y="54">"a"</text>
+<rect class="n sunk" x="360" y="34" width="60" height="30" rx="4"/>
+<text class="ts mono mid" x="390" y="54">"d"</text>
+<rect class="n sunk" x="500" y="34" width="60" height="30" rx="4"/>
+<text class="ts mono mid" x="530" y="54">"e"</text>
+<path class="e assoc" d="M530 65L250 128"/>
+<path class="e assoc" d="M390 65L390 128"/>
+<path class="e assoc" d="M250 65L530 128"/>
+<text class="tb" x="10" y="100">Linked list: keeps the</text>
+<text class="tb" x="10" y="116">nodes in order of use</text>
+<rect class="n" x="120" y="130" width="70" height="40" rx="20" style="stroke-dasharray:4 3"/>
+<text class="ts mid" x="155" y="154">newest</text>
+<rect class="n" x="590" y="130" width="70" height="40" rx="20" style="stroke-dasharray:4 3"/>
+<text class="ts mid" x="625" y="154">oldest</text>
+<rect class="n sig" x="210" y="130" width="80" height="40" rx="5"/>
+<text class="tb mid" x="250" y="147">e</text>
+<text class="ts mid" x="250" y="163">value 5</text>
+<rect class="n sig" x="350" y="130" width="80" height="40" rx="5"/>
+<text class="tb mid" x="390" y="147">d</text>
+<text class="ts mid" x="390" y="163">value 4</text>
+<rect class="n sig" x="490" y="130" width="80" height="40" rx="5"/>
+<text class="tb mid" x="530" y="147">a</text>
+<text class="ts mid" x="530" y="163">value 1</text>
+<path class="e" d="M191 143H208"/>
+<path class="e" d="M209 158H192"/>
+<path class="e" d="M291 143H348"/>
+<path class="e" d="M349 158H292"/>
+<path class="e" d="M431 143H488"/>
+<path class="e" d="M489 158H432"/>
+<path class="e" d="M571 143H588"/>
+<path class="e" d="M589 158H572"/>
+<text class="ts mid" x="250" y="192">most recently used</text>
+<text class="ts mid" x="530" y="192">least recently used:</text>
+<text class="ts mid" x="530" y="208">the next to be evicted</text>
+<text class="ts" x="10" y="238">Moving a node to the front, or removing the one at the back, changes four links at most, however long the list is.</text>
+</svg>
+</div>
+<figcaption>Neither structure can do the job alone. A map cannot say which key is oldest, and a list cannot find a key without walking. Together, every operation is a fixed number of steps.</figcaption>
+</figure>
+
+<p>The list must be <dfn>doubly linked</dfn>, meaning each node points to both of its neighbors. Removing a node from the middle requires joining its two neighbors to each other, and with a link in one direction only, a node cannot reach the one before it without a walk from the start.</p>
+<pre data-lang="ts" data-title="LRU with a hash map and a doubly linked list">
+interface Node<K, V> {
+  key: K;
+  value: V;
+  newer: Node<K, V>;
+  older: Node<K, V>;
+}
+
+// Least recently used, with a hash map for finding an entry and a doubly linked list for the order of use.
+// Every operation touches a fixed number of nodes, whatever the size of the cache.
+export class LruCache<K, V> implements Cache<K, V> {
+  readonly capacity: number;
+  private readonly nodes = new Map<K, Node<K, V>>();
+  // Two sentinels that are never removed, so that every real node always has a neighbor on each side.
+  private readonly newest = {} as Node<K, V>;
+  private readonly oldest = {} as Node<K, V>;
+
+  constructor(capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 1) throw new Error("capacity must be a whole number of at least 1");
+    this.capacity = capacity;
+    this.newest.older = this.oldest;
+    this.oldest.newer = this.newest;
+  }
+
+  get size(): number {
+    return this.nodes.size;
+  }
+
+  get(key: K): V | undefined {
+    const node = this.nodes.get(key);
+    if (!node) return undefined;
+    this.unlink(node);
+    this.linkAsNewest(node); // reading is a use
+    return node.value;
+  }
+
+  put(key: K, value: V): void {
+    const existing = this.nodes.get(key);
+    if (existing) {
+      existing.value = value;
+      this.unlink(existing);
+      this.linkAsNewest(existing);
+      return;
+    }
+    if (this.nodes.size === this.capacity) {
+      const victim = this.oldest.newer; // the real node next to the old-end sentinel
+      this.unlink(victim);
+      this.nodes.delete(victim.key);
+    }
+    const node = { key, value } as Node<K, V>;
+    this.nodes.set(key, node);
+    this.linkAsNewest(node);
+  }
+
+  delete(key: K): boolean {
+    const node = this.nodes.get(key);
+    if (!node) return false;
+    this.unlink(node);
+    return this.nodes.delete(key);
+  }
+
+  // Newest first. For tests and for drawing: not part of the contract.
+  keys(): K[] {
+    const keys: K[] = [];
+    for (let node = this.newest.older; node !== this.oldest; node = node.older) keys.push(node.key);
+    return keys;
+  }
+
+  private unlink(node: Node<K, V>): void {
+    node.newer.older = node.older;
+    node.older.newer = node.newer;
+  }
+  private linkAsNewest(node: Node<K, V>): void {
+    node.older = this.newest.older;
+    node.newer = this.newest;
+    this.newest.older.newer = node;
+    this.newest.older = node;
+  }
+}
+</pre>
+<p>Two details make the code short and hard to get wrong.</p>
+<ul>
+  <li><b>Sentinels.</b> The list always contains two extra nodes, one at each end, that hold no entry and are never removed. Every real node therefore always has a neighbor on both sides, and <code>unlink</code> and <code>linkAsNewest</code> need no special case for an empty list or for the first or last entry.</li>
+  <li><b>Two small private operations.</b> Every public method is a combination of <code>unlink</code> and <code>linkAsNewest</code>. Getting four pointers right in two places is manageable. Getting them right inline, in each of four methods, is where interview answers go wrong.</li>
+</ul>
+
+<figure class="fig wide" id="fig-lru">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-labelledby="f702t f702d">
+<title id="f702t">Seven operations on a least-recently-used cache with room for three entries</title>
+<desc id="f702d">The order of entries in a cache of capacity 3 after each of seven operations, recorded from the chapter’s code. After put("a", 1): a. After put("b", 2): b, a. After put("c", 3): c, b, a. After get("a"): a, c, b. After put("d", 4): d, a, c, evicting b. After get("b"): d, a, c. After put("e", 5): e, d, a, evicting c.</desc>
+<text class="ts" x="170" y="24">most recently used</text>
+<text class="ts end" x="550" y="24">least recently used</text>
+<path class="e" d="M300 20H430"/>
+<rect class="n sunk" x="170" y="40" width="120" height="50" rx="6" style="stroke-dasharray:4 3"/>
+<rect class="n sunk" x="300" y="40" width="120" height="50" rx="6" style="stroke-dasharray:4 3"/>
+<rect class="n sunk" x="430" y="40" width="120" height="50" rx="6" style="stroke-dasharray:4 3"/>
+<text class="tb" x="10" y="70">the cache:</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n sig" x="170" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="230" y="71">a</text>
+<text class="ts mono tb" x="10" y="124">put("a", 1)</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n sig" x="170" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="230" y="71">b</text>
+<rect class="n " x="300" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="360" y="71">a</text>
+<text class="ts mono tb" x="10" y="124">put("b", 2)</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n sig" x="170" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="230" y="71">c</text>
+<rect class="n " x="300" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="360" y="71">b</text>
+<rect class="n " x="430" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="490" y="71">a</text>
+<text class="ts mono tb" x="10" y="124">put("c", 3)</text>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n sig" x="170" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="230" y="71">a</text>
+<rect class="n " x="300" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="360" y="71">c</text>
+<rect class="n " x="430" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="490" y="71">b</text>
+<text class="ts mono tb" x="10" y="124">get("a")</text>
+<text class="ts" x="10" y="146">found, value 1, and moved to the front</text>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<rect class="n sig" x="170" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="230" y="71">d</text>
+<rect class="n " x="300" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="360" y="71">a</text>
+<rect class="n " x="430" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="490" y="71">c</text>
+<text class="ts mono tb" x="10" y="124">put("d", 4)</text>
+<rect class="n fault" x="590" y="40" width="110" height="50" rx="6"/>
+<text class="tb mid" x="645" y="62">b</text>
+<text class="ts mid" x="645" y="80">evicted</text>
+</g>
+<g class="hide" data-s="6" data-e="6">
+<rect class="n " x="170" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="230" y="71">d</text>
+<rect class="n " x="300" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="360" y="71">a</text>
+<rect class="n " x="430" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="490" y="71">c</text>
+<text class="ts mono tb" x="10" y="124">get("b")</text>
+<text class="ts" x="10" y="146">not in the cache: a miss, and nothing moves</text>
+</g>
+<g class="hide" data-s="7">
+<rect class="n sig" x="170" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="230" y="71">e</text>
+<rect class="n " x="300" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="360" y="71">d</text>
+<rect class="n " x="430" y="40" width="120" height="50" rx="6"/>
+<text class="tb mid" x="490" y="71">a</text>
+<text class="ts mono tb" x="10" y="124">put("e", 5)</text>
+<rect class="n fault" x="590" y="40" width="110" height="50" rx="6"/>
+<text class="tb mid" x="645" y="62">c</text>
+<text class="ts mid" x="645" y="80">evicted</text>
+</g>
+<text class="ts" x="10" y="178">The entry at the right-hand end is always the one that has gone longest without being read or written.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Order, newest first: a">The cache is empty. The first entry goes in at the front.</li>
+  <li data-msg="none" data-state="Order, newest first: b, a">A second entry goes in at the front, and the first moves one place toward the back.</li>
+  <li data-msg="none" data-state="Order, newest first: c, b, a">The cache is now full: three entries, newest first.</li>
+  <li data-msg="none" data-state="Order, newest first: a, c, b">Reading a counts as using it. It moves from the back to the front, and b is now the least recently used.</li>
+  <li data-msg="none" data-state="Order, newest first: d, a, c; evicted: b">A new key arrives and there is no room. The entry at the back, b, is evicted, and d goes in at the front.</li>
+  <li data-msg="none" data-state="Order, newest first: d, a, c">A request for b finds nothing, because it was evicted in the previous step. A miss does not change the order.</li>
+  <li data-msg="none" data-state="Order, newest first: e, d, a; evicted: c">Another new key. The back of the list is now c, which has not been touched since it was added, so c is evicted. Entry a survives because it was read.</li>
+</ol>
+<figcaption>The whole policy is one rule about a list: whatever is used goes to the front, and whatever is at the back when room is needed goes out.</figcaption>
+</figure>
+
+<p>The figure is a recording of the code, and the test asserts the same sequence: after reading <code>a</code>, the next eviction took <code>b</code>, and the one after took <code>c</code>, while <code>a</code> survived both.</p>
+
+<h3 id="map">The same policy with a Map</h3>
+<p>JavaScript’s <code>Map</code> remembers the order in which keys were added. That is enough to express the policy without writing a list: deleting a key and adding it again moves it to the end, so the first key in the map is always the least recently used.</p>
+<pre data-lang="ts" data-title="LRU using the insertion order of a Map">
+// The same policy in the way most TypeScript code writes it. A Map remembers the order in which keys were added,
+// so deleting a key and adding it again moves it to the end, and the first key is always the least recently used.
+export class LruMapCache<K, V> implements Cache<K, V> {
+  readonly capacity: number;
+  private readonly entries = new Map<K, V>();
+
+  constructor(capacity: number) {
+    this.capacity = capacity;
+  }
+  get size(): number {
+    return this.entries.size;
+  }
+  get(key: K): V | undefined {
+    if (!this.entries.has(key)) return undefined;
+    const value = this.entries.get(key) as V;
+    this.entries.delete(key);
+    this.entries.set(key, value);
+    return value;
+  }
+  put(key: K, value: V): void {
+    if (this.entries.has(key)) this.entries.delete(key);
+    else if (this.entries.size === this.capacity) this.entries.delete(this.entries.keys().next().value as K);
+    this.entries.set(key, value);
+  }
+  delete(key: K): boolean {
+    return this.entries.delete(key);
+  }
+  keys(): K[] {
+    return [...this.entries.keys()].reverse();
+  }
+}
+</pre>
+<p>This is what most TypeScript code does, and in an interview it is worth showing after the linked list, as evidence that you know both the structure and the language. It has a cost that only measurement reveals, and the section on speed returns to it.</p>
+
+<h2 id="lfu">Least frequently used</h2>
+<p>The second policy evicts the entry that has been used the fewest times. The obvious structure, a counter on each entry and a search for the smallest at eviction time, looks at every entry. A <dfn>heap</dfn> ordered by count improves that to a logarithmic number of steps (<x-ref to="lld-parking-lot#code"></x-ref>). Constant time takes one more idea: group the entries by their count.</p>
+<ul>
+  <li>All entries used once are in one group, all entries used twice in another, and so on.</li>
+  <li>Using an entry moves it from its group to the next one up. It can only ever move by one.</li>
+  <li>The cache remembers which group has the fewest uses. The victim is the oldest entry in that group.</li>
+</ul>
+<pre data-lang="ts" data-title="LFU with entries grouped by number of uses">
+// Least frequently used, in constant time. Entries are grouped by how many times they have been used.
+// Within a group, a Map keeps them in order of last use, so ties are broken by evicting the least recent.
+export class LfuCache<K, V> implements Cache<K, V> {
+  readonly capacity: number;
+  private readonly entries = new Map<K, { value: V; uses: number }>();
+  private readonly groups = new Map<number, Map<K, true>>(); // uses -> keys with that many uses, oldest first
+  private fewestUses = 0; // the smallest number of uses that any entry has
+
+  constructor(capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 1) throw new Error("capacity must be a whole number of at least 1");
+    this.capacity = capacity;
+  }
+  get size(): number {
+    return this.entries.size;
+  }
+
+  get(key: K): V | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    this.promote(key, entry);
+    return entry.value;
+  }
+
+  put(key: K, value: V): void {
+    const existing = this.entries.get(key);
+    if (existing) {
+      existing.value = value;
+      this.promote(key, existing);
+      return;
+    }
+    if (this.entries.size === this.capacity) {
+      const group = this.groups.get(this.fewestUses) as Map<K, true>;
+      const victim = group.keys().next().value as K; // least used, and among those, least recently used
+      group.delete(victim);
+      this.entries.delete(victim);
+    }
+    this.entries.set(key, { value, uses: 1 });
+    this.groupFor(1).set(key, true);
+    this.fewestUses = 1; // a new entry always has the fewest uses
+  }
+
+  delete(key: K): boolean {
+    const entry = this.entries.get(key);
+    if (!entry) return false;
+    const group = this.groups.get(entry.uses) as Map<K, true>;
+    group.delete(key);
+    if (group.size === 0) this.groups.delete(entry.uses);
+    return this.entries.delete(key); // the cache is no longer full, and the next new entry resets fewestUses
+  }
+
+  // Moves an entry from its group to the next one up.
+  private promote(key: K, entry: { value: V; uses: number }): void {
+    const group = this.groups.get(entry.uses) as Map<K, true>;
+    group.delete(key);
+    if (group.size === 0) {
+      this.groups.delete(entry.uses);
+      if (this.fewestUses === entry.uses) this.fewestUses += 1; // the entry itself is about to be in the next group
+    }
+    entry.uses += 1;
+    this.groupFor(entry.uses).set(key, true);
+  }
+  private groupFor(uses: number): Map<K, true> {
+    let group = this.groups.get(uses);
+    if (!group) this.groups.set(uses, (group = new Map()));
+    return group;
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-lfu">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f703t f703d">
+<title id="f703t">Nine operations on a least-frequently-used cache with room for three entries</title>
+<desc id="f703d">The groups of entries in a cache of capacity 3 after each of nine operations, recorded from the chapter’s code. Entries are grouped by the number of times they have been used. After put("a", 1): used 1 time: a. After put("b", 2): used 1 time: a, b. After put("c", 3): used 1 time: a, b, c. After get("a"): used 1 time: b, c; used 2 times: a. After get("a"): used 1 time: b, c; used 3 times: a. After get("b"): used 1 time: c; used 2 times: b; used 3 times: a. After put("d", 4): used 1 time: d; used 2 times: b; used 3 times: a. Evicted c. After get("d"): used 2 times: b, d; used 3 times: a. After put("e", 5): used 1 time: e; used 2 times: d; used 3 times: a. Evicted b.</desc>
+<text class="tb" x="10" y="56">used 1 time</text>
+<rect class="n sunk" x="150" y="30" width="400" height="40" rx="6" style="stroke-dasharray:4 3"/>
+<text class="tb" x="10" y="104">used 2 times</text>
+<rect class="n sunk" x="150" y="78" width="400" height="40" rx="6" style="stroke-dasharray:4 3"/>
+<text class="tb" x="10" y="152">used 3 times</text>
+<rect class="n sunk" x="150" y="126" width="400" height="40" rx="6" style="stroke-dasharray:4 3"/>
+<text class="ts" x="150" y="22">oldest use first within a group</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n sig" x="160" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="55">a</text>
+<path class="e fault" d="M130 50H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">put("a", 1)</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n sig" x="160" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="55">a</text>
+<rect class="n sig" x="250" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="290" y="55">b</text>
+<path class="e fault" d="M130 50H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">put("b", 2)</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n sig" x="160" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="55">a</text>
+<rect class="n sig" x="250" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="290" y="55">b</text>
+<rect class="n sig" x="340" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="380" y="55">c</text>
+<path class="e fault" d="M130 50H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">put("c", 3)</text>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n sig" x="160" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="55">b</text>
+<rect class="n sig" x="250" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="290" y="55">c</text>
+<rect class="n sig" x="160" y="83" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="103">a</text>
+<path class="e fault" d="M130 50H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">get("a")</text>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<rect class="n sig" x="160" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="55">b</text>
+<rect class="n sig" x="250" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="290" y="55">c</text>
+<rect class="n sig" x="160" y="131" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="151">a</text>
+<path class="e fault" d="M130 50H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">get("a")</text>
+</g>
+<g class="hide" data-s="6" data-e="6">
+<rect class="n sig" x="160" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="55">c</text>
+<rect class="n sig" x="160" y="83" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="103">b</text>
+<rect class="n sig" x="160" y="131" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="151">a</text>
+<path class="e fault" d="M130 50H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">get("b")</text>
+</g>
+<g class="hide" data-s="7" data-e="7">
+<rect class="n sig" x="160" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="55">d</text>
+<rect class="n sig" x="160" y="83" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="103">b</text>
+<rect class="n sig" x="160" y="131" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="151">a</text>
+<path class="e fault" d="M130 50H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">put("d", 4)</text>
+<rect class="n fault" x="590" y="30" width="110" height="46" rx="6"/>
+<text class="tb mid" x="645" y="50">c</text>
+<text class="ts mid" x="645" y="68">evicted</text>
+</g>
+<g class="hide" data-s="8" data-e="8">
+<rect class="n sig" x="160" y="83" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="103">b</text>
+<rect class="n sig" x="250" y="83" width="80" height="30" rx="5"/>
+<text class="tb mid" x="290" y="103">d</text>
+<rect class="n sig" x="160" y="131" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="151">a</text>
+<path class="e fault" d="M130 98H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">get("d")</text>
+</g>
+<g class="hide" data-s="9">
+<rect class="n sig" x="160" y="35" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="55">e</text>
+<rect class="n sig" x="160" y="83" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="103">d</text>
+<rect class="n sig" x="160" y="131" width="80" height="30" rx="5"/>
+<text class="tb mid" x="200" y="151">a</text>
+<path class="e fault" d="M130 50H148" style="marker-end:none;stroke-width:3"/>
+<text class="ts mono tb" x="10" y="196">put("e", 5)</text>
+<rect class="n fault" x="590" y="30" width="110" height="46" rx="6"/>
+<text class="tb mid" x="645" y="50">b</text>
+<text class="ts mid" x="645" y="68">evicted</text>
+</g>
+<text class="ts" x="10" y="224">The red mark shows the group with the fewest uses. The victim is always the first entry of that group.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Uses: a 1">A new entry has been used once, by being added.</li>
+  <li data-msg="none" data-state="Uses: a 1, b 1">A second entry joins the group of entries used once.</li>
+  <li data-msg="none" data-state="Uses: a 1, b 1, c 1">The cache is full, with all three entries used once.</li>
+  <li data-msg="none" data-state="Uses: b 1, c 1, a 2">Reading a moves it up to the group used twice.</li>
+  <li data-msg="none" data-state="Uses: b 1, c 1, a 3">A second read moves a up again. Its old group is now empty and disappears.</li>
+  <li data-msg="none" data-state="Uses: c 1, b 2, a 3">Reading b moves it up one group. Only c is left with a single use.</li>
+  <li data-msg="none" data-state="Uses: d 1, b 2, a 3; evicted: c">A new key needs room. The group with the fewest uses holds only c, so c is evicted, and d starts in the group used once.</li>
+  <li data-msg="none" data-state="Uses: b 2, d 2, a 3">Reading d moves it up to join b, behind it in order of last use.</li>
+  <li data-msg="none" data-state="Uses: e 1, d 2, a 3; evicted: b">Another new key. The fewest uses anywhere is now two, shared by b and d. The one used longer ago, b, is evicted. Entry a, read twice long ago, is safe.</li>
+</ol>
+<figcaption>Grouping entries by their number of uses, and remembering which group is lowest, makes finding the victim a single step. No counting or sorting happens at eviction time.</figcaption>
+</figure>
+
+<p>The one subtle line is the upkeep of <code>fewestUses</code>. It can change in only two ways. A new entry always has one use, so after any insertion the answer is one. And when the last entry leaves the lowest group by being used, that entry lands in the next group up, so the answer rises by exactly one. Because counts only ever move by one, the cache never has to search for the lowest group.</p>
+
+<h2 id="testing">Testing against a slow reference</h2>
+<p>How do you know that the right entry is evicted, a hundred thousand operations in? Hand-written cases cover the first few steps. For the rest, the technique is to write the policy a second time in the most obvious way possible, with no concern for speed, and check that the two never disagree.</p>
+<p>The reference versions here keep a plain array of entries with a counter and a time of last use on each, and search the whole array for a victim. They are about thirty lines between them, and it is easy to convince yourself they are right. Each fast cache was then run beside its reference through 200,000 random reads, writes and deletions on a small set of keys, comparing every value returned and the size after every step. The linked-list LRU, the <code>Map</code> LRU and the grouped LFU all matched throughout.</p>
+<p>This is the property-testing idea of <x-ref to="errors-and-testing#property"></x-ref> in its most useful form: a clever implementation checked against a simple one. A small key set is deliberate. With 60 keys and room for 16, evictions and re-insertions of the same keys happen constantly, which is where bugs hide.</p>
+
+<h2 id="speed">Is it constant time?</h2>
+<p>The claim can be measured. Each implementation was filled to capacity and then given a mix of four reads to one write, on keys spread over twice the capacity.</p>
+
+<figure class="fig wide" id="fig-speed">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 386" role="img" aria-labelledby="f705t f705d">
+<title id="f705t">Time for one cache operation at four capacities, for four implementations</title>
+<desc id="f705d">Bars, on a logarithmic scale, of the time for one operation in nanoseconds, measured once on one machine. At a capacity of 100: linked list 77, Map order 113, LFU groups 192, scan every entry 510. At a capacity of 1,000: linked list 88, Map order 100, LFU groups 154, scan every entry 922. At a capacity of 10,000: linked list 111, Map order 399, LFU groups 227, scan every entry 8341. At a capacity of 100,000: linked list 198, Map order 1518, LFU groups 1641.</desc>
+<text class="tb" x="10" y="16">Nanoseconds for one get or put, by capacity. Bar lengths are logarithmic.</text>
+<text class="tb" x="10" y="48">100 entries</text>
+<text class="ts end" x="240" y="47">linked list</text>
+<rect class="bar " x="250" y="34" width="59.5" height="16" rx="3"/>
+<text class="ts tb" x="317.5" y="47">77 ns</text>
+<text class="ts end" x="240" y="67">Map order</text>
+<rect class="bar async" x="250" y="54" width="85.1" height="16" rx="3"/>
+<text class="ts tb" x="343.1" y="67">113 ns</text>
+<text class="ts end" x="240" y="87">LFU groups</text>
+<rect class="bar store" x="250" y="74" width="120.5" height="16" rx="3"/>
+<text class="ts tb" x="378.5" y="87">192 ns</text>
+<text class="ts end" x="240" y="107">scan every entry</text>
+<rect class="bar fault" x="250" y="94" width="185.8" height="16" rx="3"/>
+<text class="ts tb" x="443.8" y="107">510 ns</text>
+<text class="tb" x="10" y="136">1,000 entries</text>
+<text class="ts end" x="240" y="135">linked list</text>
+<rect class="bar " x="250" y="122" width="68.4" height="16" rx="3"/>
+<text class="ts tb" x="326.4" y="135">88 ns</text>
+<text class="ts end" x="240" y="155">Map order</text>
+<rect class="bar async" x="250" y="142" width="76.9" height="16" rx="3"/>
+<text class="ts tb" x="334.9" y="155">100 ns</text>
+<text class="ts end" x="240" y="175">LFU groups</text>
+<rect class="bar store" x="250" y="162" width="105.8" height="16" rx="3"/>
+<text class="ts tb" x="363.8" y="175">154 ns</text>
+<text class="ts end" x="240" y="195">scan every entry</text>
+<rect class="bar fault" x="250" y="182" width="225.3" height="16" rx="3"/>
+<text class="ts tb" x="483.3" y="195">922 ns</text>
+<text class="tb" x="10" y="224">10,000 entries</text>
+<text class="ts end" x="240" y="223">linked list</text>
+<rect class="bar " x="250" y="210" width="83.9" height="16" rx="3"/>
+<text class="ts tb" x="341.9" y="223">111 ns</text>
+<text class="ts end" x="240" y="243">Map order</text>
+<rect class="bar async" x="250" y="230" width="169.4" height="16" rx="3"/>
+<text class="ts tb" x="427.4" y="243">399 ns</text>
+<text class="ts end" x="240" y="263">LFU groups</text>
+<rect class="bar store" x="250" y="250" width="131.7" height="16" rx="3"/>
+<text class="ts tb" x="389.7" y="263">227 ns</text>
+<text class="ts end" x="240" y="283">scan every entry</text>
+<rect class="bar fault" x="250" y="270" width="372.5" height="16" rx="3"/>
+<text class="ts tb" x="630.5" y="283">8,341 ns</text>
+<text class="tb" x="10" y="312">100,000 entries</text>
+<text class="ts end" x="240" y="311">linked list</text>
+<rect class="bar " x="250" y="298" width="122.6" height="16" rx="3"/>
+<text class="ts tb" x="380.6" y="311">198 ns</text>
+<text class="ts end" x="240" y="331">Map order</text>
+<rect class="bar async" x="250" y="318" width="258.7" height="16" rx="3"/>
+<text class="ts tb" x="516.7" y="331">1,518 ns</text>
+<text class="ts end" x="240" y="351">LFU groups</text>
+<rect class="bar store" x="250" y="338" width="263.9" height="16" rx="3"/>
+<text class="ts tb" x="521.9" y="351">1,641 ns</text>
+<line class="axis" x1="250" y1="30" x2="250" y2="356"/>
+<text class="ts" x="10" y="374">One run on a two-core machine with Node 22. Scanning every entry was not run at 100,000.</text>
+<rect class="hit" x="10" y="31" width="700" height="20" data-tip="100 entries, linked list|77 ns for one operation|about 12,987,013 operations a second"/>
+<rect class="hit" x="10" y="51" width="700" height="20" data-tip="100 entries, Map order|113 ns for one operation|about 8,849,558 operations a second"/>
+<rect class="hit" x="10" y="71" width="700" height="20" data-tip="100 entries, LFU groups|192 ns for one operation|about 5,208,333 operations a second"/>
+<rect class="hit" x="10" y="91" width="700" height="20" data-tip="100 entries, scan every entry|510 ns for one operation|about 1,960,784 operations a second"/>
+<rect class="hit" x="10" y="119" width="700" height="20" data-tip="1,000 entries, linked list|88 ns for one operation|about 11,363,636 operations a second"/>
+<rect class="hit" x="10" y="139" width="700" height="20" data-tip="1,000 entries, Map order|100 ns for one operation|about 10,000,000 operations a second"/>
+<rect class="hit" x="10" y="159" width="700" height="20" data-tip="1,000 entries, LFU groups|154 ns for one operation|about 6,493,506 operations a second"/>
+<rect class="hit" x="10" y="179" width="700" height="20" data-tip="1,000 entries, scan every entry|922 ns for one operation|about 1,084,599 operations a second"/>
+<rect class="hit" x="10" y="207" width="700" height="20" data-tip="10,000 entries, linked list|111 ns for one operation|about 9,009,009 operations a second"/>
+<rect class="hit" x="10" y="227" width="700" height="20" data-tip="10,000 entries, Map order|399 ns for one operation|about 2,506,266 operations a second"/>
+<rect class="hit" x="10" y="247" width="700" height="20" data-tip="10,000 entries, LFU groups|227 ns for one operation|about 4,405,286 operations a second"/>
+<rect class="hit" x="10" y="267" width="700" height="20" data-tip="10,000 entries, scan every entry|8,341 ns for one operation|about 119,890 operations a second"/>
+<rect class="hit" x="10" y="295" width="700" height="20" data-tip="100,000 entries, linked list|198 ns for one operation|about 5,050,505 operations a second"/>
+<rect class="hit" x="10" y="315" width="700" height="20" data-tip="100,000 entries, Map order|1,518 ns for one operation|about 658,762 operations a second"/>
+<rect class="hit" x="10" y="335" width="700" height="20" data-tip="100,000 entries, LFU groups|1,641 ns for one operation|about 609,385 operations a second"/>
+</svg>
+</div>
+<figcaption>The linked list stays within a small factor from a hundred entries to a hundred thousand. Scanning grows in step with the capacity. The two versions that lean on the ordering of a JavaScript <code>Map</code> were fast when small and several times slower when large.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Nanoseconds for one operation</th><th>100 entries</th><th>1,000</th><th>10,000</th><th>100,000</th></tr></thead>
+<tbody>
+<tr><th>Hash map and linked list</th><td>77</td><td>88</td><td>111</td><td>198</td></tr>
+<tr><th>Scan every entry for the victim</th><td>510</td><td>922</td><td>8,341</td><td>not run</td></tr>
+<tr><th><code>Map</code> insertion order</th><td>113</td><td>100</td><td>399</td><td>1,518</td></tr>
+<tr><th>LFU with groups</th><td>192</td><td>154</td><td>227</td><td>1,641</td></tr>
+</tbody>
+</table>
+<p>The first two rows are what theory predicts. The linked list rises gently, from 77 to 198 nanoseconds across a thousandfold growth in size, which is the cost of memory that no longer fits in the processor’s own caches. The scan is ten times slower at ten times the size.</p>
+<p>The last two rows are a surprise, and a useful one. Both lean on a <code>Map</code> to find “the first key”, and both slow down sharply at 100,000 entries. A separate measurement isolated the cause: using a <code>Map</code> of 100,000 entries as a queue, removing the first key and adding a new one took about 65,000 nanoseconds when the first key was found with <code>keys().next()</code>, and about 150 when the same keys were deleted without asking for the first. Finding the first key gets slower as deletions accumulate at the front of the map. That is a property of this JavaScript engine, Node.js 22, and not of the language, and it may differ elsewhere.</p>
+<p>The practical reading: for a cache of a few thousand entries the <code>Map</code> version is fine and is less code to maintain. For a large one, use the linked list, or an LFU whose groups are linked lists too. And measure, because “it is a hash map, so it is constant time” was true of the algorithm and not of the program.</p>
+
+<h2 id="policy">Which policy</h2>
+<p>Speed says nothing about which entries are worth keeping. For that, the three policies were given the same 200,000 requests for 10,000 items, with popularity following the uneven pattern typical of real traffic, in which a few items receive most of the requests.</p>
+
+<figure class="fig wide" id="fig-hit">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 282" role="img" aria-labelledby="f704t f704d">
+<title id="f704t">Hit ratio of three eviction policies on three kinds of traffic</title>
+<desc id="f704d">Bars of the hit ratio measured for first-in-first-out, least-recently-used and least-frequently-used caches holding 5 percent of 10,000 items, over 200,000 requests. Steady popularity: FIFO 53.9 percent, LRU 58.6 percent, LFU 65.8 percent. With scans: FIFO 51.3 percent, LRU 53.9 percent, LFU 65.5 percent. Shifting popularity: FIFO 53.8 percent, LRU 58.4 percent, LFU 30.5 percent.</desc>
+<text class="tb" x="10" y="16">Requests served from the cache, with room for 500 of 10,000 items</text>
+<text class="tb" x="10" y="48">Steady popularity</text>
+<text class="ts" x="10" y="66">the same items stay popular</text>
+<text class="ts end" x="240" y="48">FIFO</text>
+<rect class="bar mute" x="250" y="34" width="255.9" height="18" rx="3"/>
+<text class="ts tb" x="513.9" y="48">53.9%</text>
+<text class="ts end" x="240" y="72">LRU</text>
+<rect class="bar " x="250" y="58" width="278.3" height="18" rx="3"/>
+<text class="ts tb" x="536.3" y="72">58.6%</text>
+<text class="ts end" x="240" y="96">LFU</text>
+<rect class="bar store" x="250" y="82" width="312.6" height="18" rx="3"/>
+<text class="ts tb" x="570.6" y="96">65.8%</text>
+<text class="tb" x="10" y="130">With scans</text>
+<text class="ts" x="10" y="148">a job reads 1,000 cold items every</text>
+<text class="ts" x="10" y="164">2,000 requests</text>
+<text class="ts end" x="240" y="130">FIFO</text>
+<rect class="bar mute" x="250" y="116" width="243.6" height="18" rx="3"/>
+<text class="ts tb" x="501.6" y="130">51.3%</text>
+<text class="ts end" x="240" y="154">LRU</text>
+<rect class="bar " x="250" y="140" width="256.0" height="18" rx="3"/>
+<text class="ts tb" x="514.0" y="154">53.9%</text>
+<text class="ts end" x="240" y="178">LFU</text>
+<rect class="bar store" x="250" y="164" width="311.3" height="18" rx="3"/>
+<text class="ts tb" x="569.3" y="178">65.5%</text>
+<text class="tb" x="10" y="212">Shifting popularity</text>
+<text class="ts" x="10" y="230">the popular set changes four times</text>
+<text class="ts end" x="240" y="212">FIFO</text>
+<rect class="bar mute" x="250" y="198" width="255.4" height="18" rx="3"/>
+<text class="ts tb" x="513.4" y="212">53.8%</text>
+<text class="ts end" x="240" y="236">LRU</text>
+<rect class="bar " x="250" y="222" width="277.5" height="18" rx="3"/>
+<text class="ts tb" x="535.5" y="236">58.4%</text>
+<text class="ts end" x="240" y="260">LFU</text>
+<rect class="bar store" x="250" y="246" width="145.1" height="18" rx="3"/>
+<text class="ts tb" x="403.1" y="260">30.5%</text>
+<line class="axis" x1="250" y1="30" x2="250" y2="268"/>
+<rect class="hit" x="10" y="31" width="700" height="24" data-tip="steady popularity, FIFO|hit ratio 53.9%|107,733 of 200,000 requests served from the cache"/>
+<rect class="hit" x="10" y="55" width="700" height="24" data-tip="steady popularity, LRU|hit ratio 58.6%|117,182 of 200,000 requests served from the cache"/>
+<rect class="hit" x="10" y="79" width="700" height="24" data-tip="steady popularity, LFU|hit ratio 65.8%|131,601 of 200,000 requests served from the cache"/>
+<rect class="hit" x="10" y="113" width="700" height="24" data-tip="with scans, FIFO|hit ratio 51.3%|102,579 of 200,000 requests served from the cache"/>
+<rect class="hit" x="10" y="137" width="700" height="24" data-tip="with scans, LRU|hit ratio 53.9%|107,796 of 200,000 requests served from the cache"/>
+<rect class="hit" x="10" y="161" width="700" height="24" data-tip="with scans, LFU|hit ratio 65.5%|131,082 of 200,000 requests served from the cache"/>
+<rect class="hit" x="10" y="195" width="700" height="24" data-tip="shifting popularity, FIFO|hit ratio 53.8%|107,526 of 200,000 requests served from the cache"/>
+<rect class="hit" x="10" y="219" width="700" height="24" data-tip="shifting popularity, LRU|hit ratio 58.4%|116,834 of 200,000 requests served from the cache"/>
+<rect class="hit" x="10" y="243" width="700" height="24" data-tip="shifting popularity, LFU|hit ratio 30.5%|61,074 of 200,000 requests served from the cache"/>
+</svg>
+</div>
+<figcaption>No policy wins everywhere. Counting uses is best while popularity holds still and through scans, and worst when popularity moves, because old favorites keep their high counts.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Hit ratio on steady traffic, by cache size</th><th>FIFO</th><th>LRU</th><th>LFU</th></tr></thead>
+<tbody>
+<tr><th>1% of the items</th><td>34%</td><td>39%</td><td>50%</td></tr>
+<tr><th>2%</th><td>43%</td><td>47%</td><td>57%</td></tr>
+<tr><th>5%</th><td>54%</td><td>59%</td><td>66%</td></tr>
+<tr><th>10%</th><td>63%</td><td>67%</td><td>73%</td></tr>
+<tr><th>20%</th><td>73%</td><td>76%</td><td>80%</td></tr>
+</tbody>
+</table>
+<p>Three things stand out.</p>
+<ul>
+  <li><b>Any policy with a small cache does a great deal.</b> Holding 5% of the items served more than half of the requests even under first in, first out. Popularity is uneven enough that a small cache covers much of the traffic, as <x-ref to="caching#eviction"></x-ref> said.</li>
+  <li><b>LFU is the best while popularity holds still, and through scans.</b> A job that read a thousand cold items every two thousand requests cost LRU almost five points on ordinary requests, because each scan pushed the popular entries out. LFU lost a fraction of a point: entries used once cannot displace entries used a hundred times.</li>
+  <li><b>LFU is the worst when popularity moves.</b> When a new set of items became popular, LFU’s hit ratio fell to 31%, far below even FIFO. Yesterday’s favorites kept their large counts and their places, and new arrivals were evicted before they could build a count.</li>
+</ul>
+<p>That last failure is why plain LFU is rarely used as written. Production caches keep the idea of frequency and add forgetting. Redis approximates both LRU and LFU by examining a few randomly chosen keys at each eviction, and its LFU counters decay over time. The Caffeine library for Java admits a new entry to its main space only if a compact frequency estimate says it is likely to be more useful than the entry it would replace, and ages that estimate. For an interview, LRU is the expected default, and being able to say when LFU beats it and when it collapses is the mark of having thought about it.</p>
+<div class="widget" data-widget="zipfcache">
+<h4>The best a cache of a given size can do</h4>
+<p>If popularity is uneven in the usual way, where the item of rank r is requested in proportion to 1 divided by r to the power of the skew, this is the share of requests answered by a cache that always holds the most popular items.</p>
+<div class="controls">
+  <label>Distinct items<input type="number" name="items" value="10000" min="10" max="1000000" step="1"></label>
+  <label>Entries the cache can hold<input type="number" name="capacity" value="500" min="1" max="1000000" step="1"></label>
+  <label>Skew<input type="number" name="skew" value="1" min="0" max="2" step="0.05"></label>
+</div>
+<dl class="results">
+  <div><dt>Share of items held</dt><dd data-out="share">5%</dd></div>
+  <div><dt>Best possible hit ratio</dt><dd data-out="hit">69.4%</dd></div>
+  <div><dt>Entries needed for 90%</dt><dd data-out="need">3,758 (37.6%)</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">A cache holding the 500 most popular of 10,000 items, 5% of them, would answer 69.4% of requests. No eviction policy can do better on this pattern of popularity, and a real one does somewhat worse because it has to discover which items are popular. The gap between 5% of the items and 69.4% of the requests is what makes caching worthwhile.</p>
+</div>
+<p>For the test’s own settings the limit is 69%. LFU reached 66% of requests, LRU 59% and FIFO 54%, so the policies differ in how much of an available 69% they capture.</p>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th></tr></thead>
+<tbody>
+<tr><th>Entries expire after a time</th><td>Store an expiry time with each value, and treat an expired entry as a miss when it is read, removing it then. The current time is passed in. Entries that are never read again are evicted by the size limit in due course, or by an occasional sweep</td></tr>
+<tr><th>Capacity in bytes</th><td>Each entry carries a weight. The cache tracks the total, and a <code>put</code> evicts in a loop until the new entry fits. One operation can now evict several entries, so it is constant time for each entry evicted</td></tr>
+<tr><th>Use from several threads</th><td>Even a read changes the list, so every operation needs the lock, and a single lock makes the cache a queue. The standard improvements are to split the cache into independently locked segments by hash of the key, or to record reads in a buffer and apply them to the list in batches (<x-ref to="concurrency-in-code#design"></x-ref>)</td></tr>
+<tr><th>Load missing values through the cache</th><td>A wrapper that stores the promise of a value, shown below</td></tr>
+<tr><th>Shared between several servers</th><td>A different problem: a cache service with a network in front of it, and the questions of <x-ref to="caching#distributed"></x-ref></td></tr>
+<tr><th>Tell me when something is evicted</th><td>An optional callback given to the cache and called with the key and value of each victim, for releasing resources or keeping statistics</td></tr>
+</tbody>
+</table>
+<pre data-lang="ts" data-title="Loading through the cache, with one fetch for many simultaneous callers">
+import type { Cache } from "./cache.ts";
+
+// A cache that fetches what it does not have. It stores the promise of a value, so that many callers
+// asking for the same missing key at once share one fetch. A failed fetch is not remembered.
+export class LoadingCache<K, V> {
+  private readonly cache: Cache<K, Promise<V>>;
+  private readonly load: (key: K) => Promise<V>;
+
+  constructor(cache: Cache<K, Promise<V>>, load: (key: K) => Promise<V>) {
+    this.cache = cache;
+    this.load = load;
+  }
+
+  get(key: K): Promise<V> {
+    const cached = this.cache.get(key);
+    if (cached) return cached;
+    const loading = this.load(key);
+    this.cache.put(key, loading); // before any await, so the next caller finds it
+    loading.catch(() => {
+      if (this.cache.get(key) === loading) this.cache.delete(key); // do not keep an error in the cache
+    });
+    return loading;
+  }
+}
+</pre>
+<p>Fifty requests for the same missing key, made at the same moment, caused one fetch, and all fifty received its result. A fetch that failed was not kept: the next caller tried again. The reasoning is that of <x-ref to="caching#stampede"></x-ref> and <x-ref to="concurrency-in-code#races"></x-ref>: store the promise before the first <code>await</code>, so that there is no gap in which a second caller sees nothing.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Start by asking the two questions a hash map alone cannot answer together, and draw the map and the list side by side. Write <code>unlink</code> and <code>linkAsNewest</code> first, with sentinels, and build <code>get</code> and <code>put</code> out of them. Then run three or four operations by hand on a cache of capacity two, saying the order aloud after each. If LFU follows, describe groups by count and the rule that the lowest count changes only by going to one on insertion or up by one. Expect “how would you make it thread-safe?” and “what about expiry?” as the closing questions.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>A timestamp on each entry, and a search for the oldest at eviction</th><td>Eviction takes time in proportion to the size of the cache</td><td>Keep the order in a structure, so that the victim is always at a known place</td></tr>
+<tr><th>A singly linked list</th><td>Removing a node from the middle needs a walk to find the node before it</td><td>Links in both directions</td></tr>
+<tr><th>Special cases for the empty list and for the first and last node</th><td>The four pointer updates go wrong in one of the cases</td><td>Two sentinel nodes that are never removed</td></tr>
+<tr><th>Forgetting that <code>get</code> is a use</th><td>The cache is first in, first out with extra steps</td><td>Move the entry to the front on every read</td></tr>
+<tr><th>Removing the victim from the list and not from the map</th><td>The map grows without limit, and returns values for evicted keys</td><td>Store the key in the node, and delete from both together</td></tr>
+<tr><th>Evicting when an existing key is updated</th><td>The cache holds fewer entries than its capacity</td><td>Only a new key into a full cache evicts</td></tr>
+<tr><th>Testing only that stored values come back</th><td>A wrong eviction order passes every test</td><td>Assert which key is gone, and compare with a slow reference over many random operations</td></tr>
+<tr><th>Plain LFU for traffic whose popular set changes</th><td>Old entries with high counts are never evicted</td><td>LRU, or a frequency policy that ages its counts</td></tr>
+<tr><th>Assuming a library structure’s operations are all constant time</th><td>The <code>Map</code> version here was fifteen times slower at 100,000 entries than at 1,000</td><td>Measure at the size you will run at</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="caching"></x-ref>: where a cache sits in a system, and eviction policies seen from outside.</li>
+  <li><x-ref to="lld-method"></x-ref>: the seven steps, here applied to a data structure.</li>
+  <li><x-ref to="errors-and-testing"></x-ref>: checking a property over many random inputs.</li>
+  <li><x-ref to="concurrency-in-code"></x-ref>: sharing one promise among callers, and locks in threaded code.</li>
+  <li><x-ref to="lld-rate-limiter"></x-ref>: another small structure with a contract and a concurrency question.</li>
+  <li><x-ref to="probabilistic-structures"></x-ref>: the compact frequency counters that production caches use in place of exact counts.</li>
+  <li><x-ref to="hld-key-value-store"></x-ref>: a store of keys and values at the scale of many machines.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A cache must find an entry by key and find its eviction victim, both in constant time. That takes two structures holding the same entries.</li>
+  <li>LRU is a hash map of nodes, with the nodes in a doubly linked list ordered by use. Use moves a node to the front, and eviction takes the node at the back.</li>
+  <li>Sentinel nodes and two small helper operations remove the special cases from the list code.</li>
+  <li>In JavaScript the insertion order of a <code>Map</code> gives LRU in a few lines. It is fine for small caches, and measurably slower for large ones.</li>
+  <li>LFU in constant time groups entries by their number of uses and remembers the lowest group.</li>
+  <li>A wrong eviction order fails silently. Test by asserting which key was evicted and by comparing with a slow, obvious implementation.</li>
+  <li>LFU keeps the most on steady traffic and through scans, and fails when popularity shifts. LRU is the safer default.</li>
+  <li>Reads modify an LRU cache, which is what makes it hard to share between threads.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>An LRU cache of capacity 2 receives: put(1, a), put(2, b), get(1), put(3, c), get(2), put(4, d). What does it hold at the end, and what did each get return?</summary><p>After the two puts it holds 2 and 1, newest first. <code>get(1)</code> returns a and makes 1 the newest. <code>put(3, c)</code> evicts 2, the least recently used, leaving 3 and 1. <code>get(2)</code> returns nothing: a miss. <code>put(4, d)</code> evicts 1, leaving 4 and 3.</p></details>
+<details><summary>Why does the list have to be doubly linked?</summary><p>To remove a node from the middle in constant time, the cache must join the node before it to the node after it. With links in one direction, a node knows only its successor, so finding its predecessor means walking from the start of the list, which takes time in proportion to its length.</p></details>
+<details><summary>What do the two sentinel nodes buy?</summary><p>They guarantee that every real node always has a neighbor on each side. Linking and unlinking are then the same four pointer assignments in every situation, with no checks for an empty list, a single entry, or the first or last node. Fewer branches means fewer places for a pointer bug.</p></details>
+<details><summary>In the grouped LFU, why can the cache always know the lowest count without searching?</summary><p>The lowest count changes in only two ways. Inserting a new entry makes it one, since a new entry has one use. And if the last entry in the lowest group is used, it moves up by exactly one, so the lowest count rises by one with it. Since evictions are always followed by an insertion, which resets the value to one, no other case arises.</p></details>
+<details><summary>A nightly job reads every row of a table through an LRU cache that normally serves a small set of popular rows. What happens to the cache, and which policy would have behaved better?</summary><p>Each row the job reads is the most recently used, so the scan pushes the popular rows out and fills the cache with rows that will not be asked for again. Ordinary requests then miss until the popular rows are reloaded. A frequency-based policy would have kept the popular rows, because rows read once cannot displace rows read many times. In the chapter’s measurement, frequent scans cost LRU almost five points of hit ratio and LFU less than half a point.</p></details>
+<details><summary>Why is plain LFU a poor choice for a news site’s article cache?</summary><p>What is popular changes every few hours. Under plain LFU, last week’s most-read article has a count in the millions and is never evicted, while today’s new article enters with a count of one and is the first to go. The cache fills with stale favorites. LRU adapts at once, and practical frequency-based caches age their counts for this reason.</p></details>
+<details><summary>Two versions of a cache return the right value for every key they hold, but one has a bug in its eviction order. How would a test find it?</summary><p>Not by checking stored values, since both return those correctly. Assert directly which key is missing after an eviction, in small hand-worked cases. Then run the cache beside a slow reference implementation of the same policy through many random operations on a small set of keys, and compare the result of every read. The first time the buggy cache evicts a different key, a later read will hit in one and miss in the other.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Ketan Shah, Anirban Mitra and Dhruv Matani, <a href="https://arxiv.org/abs/2110.11602">An O(1) algorithm for implementing the LFU cache eviction scheme</a>, written in 2010. The grouping by frequency used in this chapter.</li>
+  <li>Redis documentation, <a href="https://redis.io/docs/latest/develop/reference/eviction/">Key eviction</a>. Approximated LRU by sampling, and LFU with decaying counters.</li>
+  <li>Ben Manes, <a href="https://github.com/ben-manes/caffeine/wiki/Efficiency">Caffeine: Efficiency</a>. Window TinyLFU, and hit ratios of many policies on recorded traces.</li>
+  <li>Gil Einziger, Roy Friedman and Ben Manes, “TinyLFU: A Highly Efficient Cache Admission Policy”, <cite>ACM Transactions on Storage</cite>, 2017.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map">Map</a>. The guarantee that a Map iterates its keys in insertion order.</li>
+  <li>Thomas H. Cormen, Charles E. Leiserson, Ronald L. Rivest and Clifford Stein, <cite>Introduction to Algorithms</cite>, 4th edition, MIT Press, 2022. Hash tables, linked lists and sentinels.</li>
+</ol>
+</section>

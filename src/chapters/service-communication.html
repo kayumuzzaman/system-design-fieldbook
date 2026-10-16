@@ -1,0 +1,574 @@
+<!--meta
+{ "description": "Service discovery and service mesh for system design: how services find each other, client-side and server-side discovery, Kubernetes Services, DNS and long-lived connection pitfalls, sidecar and ambient service meshes, mutual TLS and workload identity, traffic management with the Gateway API, contracts between services and deciding whether a mesh is needed.",
+  "lede": "Once a system is more than one service, every call between two of them raises the same questions. Where is the other service right now? Which of its instances should take this request? Is the caller who it claims to be? What happens when the call is slow? This chapter covers the machinery that answers those questions, from a name that resolves to a healthy instance up to a mesh of proxies that handles the conversation on every service’s behalf.",
+  "updated": "2026-10-16" }
+-->
+
+<h2 id="problem">What every service-to-service call needs</h2>
+<p>When the web service asks the feed service for Ana’s feed, the business logic is one line. Around that line sits a list of concerns that have nothing to do with feeds.</p>
+<table>
+<thead><tr><th>Concern</th><th>The question</th></tr></thead>
+<tbody>
+<tr><th>Discovery</th><td>What addresses does the feed service have at this moment?</td></tr>
+<tr><th>Load balancing</th><td>Which of its instances gets this request?</td></tr>
+<tr><th>Health</th><td>Which instances should be avoided?</td></tr>
+<tr><th>Security</th><td>Is the connection encrypted? Is the caller really the web service, and is it allowed to make this call?</td></tr>
+<tr><th>Resilience</th><td>How long to wait, whether to retry, when to give up</td></tr>
+<tr><th>Observability</th><td>How long did it take, did it fail, and which request was it part of?</td></tr>
+<tr><th>Release control</th><td>Can 5% of calls go to a new version first?</td></tr>
+</tbody>
+</table>
+<p>Every pair of services needs all seven. The question for an architecture is where the answers live: in each application’s code, in a shared library, in the platform, or in a proxy. The chapter moves through those options in the order they were invented.</p>
+
+<h2 id="styles">Calling or sending</h2>
+<p>First, a reminder that not every interaction should be a call. Earlier chapters covered both styles.</p>
+<table>
+<thead><tr><th></th><th>Synchronous call</th><th>Asynchronous message</th></tr></thead>
+<tbody>
+<tr><th>Mechanism</th><td>REST or gRPC (<x-ref to="api-styles"></x-ref>)</td><td>Queue or log (<x-ref to="message-queues"></x-ref>, <x-ref to="event-streaming"></x-ref>)</td></tr>
+<tr><th>The caller</th><td>Waits for the answer</td><td>Continues at once</td></tr>
+<tr><th>Both sides must be up together</th><td>Yes</td><td>No</td></tr>
+<tr><th>Use when</th><td>The caller needs the result to respond</td><td>The caller only needs the work to happen</td></tr>
+</tbody>
+</table>
+<p>A healthy system uses synchronous calls sparingly and keeps the chains short, for the reasons in <x-ref to="monoliths-and-microservices#microservices"></x-ref>. The rest of this chapter is about the synchronous calls that remain.</p>
+
+<h2 id="discovery">Service discovery</h2>
+<p>In a modern deployment, instances of a service have no fixed addresses. They are started and stopped by autoscaling, replaced on every deployment, and moved when a machine fails. An address written into a configuration file is wrong within the hour.</p>
+<p><dfn>Service discovery</dfn> is the mechanism that turns a stable name, such as <code>feed</code>, into the current set of healthy addresses. <x-ref to="membership-and-coordination#discovery"></x-ref> described its core: a registry that instances are added to when they start and removed from when they stop or fail a health check. What varies is who consults the registry.</p>
+
+<figure class="fig wide" id="fig-discovery">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f411t f411d">
+<title id="f411t">Three arrangements for service discovery</title>
+<desc id="f411d">In client-side discovery, the caller asks a registry for the instances of the feed service and calls one of them directly, balancing the load itself with no extra hop. In server-side discovery, the caller knows one address, that of a load balancer, and the balancer follows the registry. In the platform arrangement, the caller uses a stable name and address provided by the platform, which registers instances, checks them and routes to the healthy ones, as Kubernetes Services and cloud load balancers do.</desc>
+<text class="tb" x="10" y="18">Client-side discovery</text>
+<rect class="n sig" x="10" y="70" width="70" height="40" rx="6"/>
+<text class="ts tb mid" x="45" y="94.5">Caller</text>
+<rect class="n store" x="90" y="150" width="100" height="34" rx="6"/>
+<text class="ts tb mid" x="140" y="171.5">Registry</text>
+<rect class="n" x="150" y="36" width="70" height="26" rx="6"/>
+<text class="ts mid" x="185" y="53.5">feed 1</text>
+<rect class="n" x="150" y="70" width="70" height="26" rx="6"/>
+<text class="ts mid" x="185" y="87.5">feed 2</text>
+<rect class="n" x="150" y="104" width="70" height="26" rx="6"/>
+<text class="ts mid" x="185" y="121.5">feed 3</text>
+<path class="e store dash" d="M45 110C45 150 60 167 90 167"/>
+<text class="ts" x="10" y="198">1. look up “feed”</text>
+<path class="e sig" d="M80 84C110 84 120 83 150 83"/>
+<text class="ts mid" x="112" y="62">2. call one</text>
+<text class="ts" x="10" y="222">The caller holds the list and</text>
+<text class="ts" x="10" y="237">balances itself. No extra hop.</text>
+<path class="e none dash" d="M240 8V250"/>
+<text class="tb" x="260" y="18">Server-side discovery</text>
+<rect class="n sig" x="260" y="70" width="60" height="40" rx="6"/>
+<text class="ts tb mid" x="290" y="94.5">Caller</text>
+<rect class="n" x="336" y="70" width="58" height="40" rx="6"/>
+<text class="ts tb mid" x="365" y="94.5">Balancer</text>
+<rect class="n" x="404" y="36" width="70" height="26" rx="6"/>
+<text class="ts mid" x="439" y="53.5">feed 1</text>
+<rect class="n" x="404" y="70" width="70" height="26" rx="6"/>
+<text class="ts mid" x="439" y="87.5">feed 2</text>
+<rect class="n" x="404" y="104" width="70" height="26" rx="6"/>
+<text class="ts mid" x="439" y="121.5">feed 3</text>
+<rect class="n store" x="336" y="150" width="100" height="34" rx="6"/>
+<text class="ts tb mid" x="386" y="171.5">Registry</text>
+<path class="e sig" d="M320 90H336"/>
+<path class="e" d="M394 90H404"/>
+<path class="e store dash" d="M365 150V110"/>
+<text class="ts" x="260" y="222">The caller knows one address.</text>
+<text class="ts" x="260" y="237">The balancer follows the registry.</text>
+<path class="e none dash" d="M486 8V250"/>
+<text class="tb" x="500" y="18">Built into the platform</text>
+<rect class="n sig" x="494" y="70" width="54" height="40" rx="6"/>
+<text class="ts tb mid" x="521" y="94.5">Caller</text>
+<rect class="n async" x="558" y="62" width="78" height="56" rx="6"/>
+<text class="ts tb mid" x="597" y="77.5">feed</text>
+<text class="ts mid" x="597" y="94.5">stable name</text>
+<text class="ts mid" x="597" y="111.5">and address</text>
+<rect class="n" x="646" y="36" width="70" height="26" rx="6"/>
+<text class="ts mid" x="681" y="53.5">feed 1</text>
+<rect class="n" x="646" y="70" width="70" height="26" rx="6"/>
+<text class="ts mid" x="681" y="87.5">feed 2</text>
+<rect class="n" x="646" y="104" width="70" height="26" rx="6"/>
+<text class="ts mid" x="681" y="121.5">feed 3</text>
+<path class="e sig" d="M548 90H558"/>
+<path class="e async" d="M636 90H646"/>
+<text class="ts" x="500" y="150">The platform registers instances,</text>
+<text class="ts" x="500" y="165">checks them, and routes to the</text>
+<text class="ts" x="500" y="180">healthy ones.</text>
+<text class="ts" x="500" y="222">What Kubernetes Services and</text>
+<text class="ts" x="500" y="237">cloud load balancers give you.</text>
+</svg>
+</div>
+<figcaption>Who knows the list of instances: the caller, a balancer, or the platform.</figcaption>
+</figure>
+
+<h3 id="client-server">Client-side and server-side</h3>
+<p>With <b>client-side discovery</b>, the caller fetches the list of instances, keeps it current by watching the registry, and chooses one for each request. There is no extra network hop, and the caller can balance intelligently because it sees its own in-flight requests. The cost is that this logic must exist in every calling service, in every language in use.</p>
+<p>With <b>server-side discovery</b>, the caller sends to one stable address, and a load balancer behind that address tracks the instances (<x-ref to="proxies-and-load-balancers"></x-ref>). Callers stay simple. The balancer is an extra hop and one more thing that must be highly available.</p>
+<p>The client-side version is small enough to read in full, and it shows what any of these mechanisms does internally.</p>
+<pre data-lang="ts" data-title="A client that follows a registry, balances load and rests failing instances">
+interface Instance { address: string; inFlight: number; failures: number; ejectedUntil: number; }
+
+class ServiceClient {
+  private instances = new Map<string, Instance>();
+
+  // Called with the full current list whenever the registry reports a change.
+  update(addresses: string[]): void {
+    for (const address of addresses) {
+      if (!this.instances.has(address)) {
+        this.instances.set(address, { address, inFlight: 0, failures: 0, ejectedUntil: 0 });
+      }
+    }
+    for (const known of [...this.instances.keys()]) {
+      if (!addresses.includes(known)) this.instances.delete(known);
+    }
+  }
+
+  // Take two instances at random and use the one with fewer requests in flight.
+  private pick(now: number): Instance {
+    const all = [...this.instances.values()];
+    const healthy = all.filter((i) => i.ejectedUntil <= now);
+    const pool = healthy.length > 0 ? healthy : all;          // if every instance is ejected, try anyway
+    if (pool.length === 0) throw new Error("no instances known");
+    const a = pool[Math.floor(Math.random() * pool.length)];
+    const b = pool[Math.floor(Math.random() * pool.length)];
+    return a.inFlight <= b.inFlight ? a : b;
+  }
+
+  async call<T>(request: (address: string) => Promise<T>, now = Date.now()): Promise<T> {
+    const instance = this.pick(now);
+    instance.inFlight += 1;
+    try {
+      const result = await request(instance.address);
+      instance.failures = 0;
+      return result;
+    } catch (error) {
+      instance.failures += 1;
+      if (instance.failures >= 3) instance.ejectedUntil = now + 30_000;   // rest it for 30 seconds
+      throw error;
+    } finally {
+      instance.inFlight -= 1;
+    }
+  }
+}
+</pre>
+<p>Three ideas are in those forty lines. The list follows the registry. The choice between two random instances by load is the technique from <x-ref to="proxies-and-load-balancers#algorithms"></x-ref>. And an instance that fails three times in a row is left alone for thirty seconds, which is the passive health checking that Envoy calls outlier detection. In a test with three instances of which one refused every connection, callers saw three failures out of 300 calls, after which the bad instance received no traffic. With one slow instance among three, it received about a quarter as many calls as each healthy one.</p>
+<p>The line that says “if every instance is ejected, try anyway” matters more than it looks. A client that ejects all instances has cut itself off entirely, often because the client’s own network is the problem. Systems that remove unhealthy targets should refuse to remove all of them.</p>
+
+<h2 id="kubernetes">How Kubernetes does it</h2>
+<p>Most teams never build the above, because the platform provides server-side discovery as a primitive. Kubernetes is the common case, and its mechanism is worth knowing since so much is built on it.</p>
+<pre data-lang="text" data-title="A Kubernetes Service: a stable name for whichever pods carry the label app=feed">
+apiVersion: v1
+kind: Service
+metadata:
+  name: feed
+  namespace: social
+spec:
+  selector:
+    app: feed            # every ready pod with this label is an instance
+  ports:
+    - port: 80           # callers connect to feed:80
+      targetPort: 8080   # the pods listen on 8080
+</pre>
+
+<figure class="fig wide" id="fig-k8s">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 248" role="img" aria-labelledby="f412t f412d">
+<title id="f412t">How a call to a Kubernetes Service reaches a pod</title>
+<desc id="f412d">A web pod calls the name feed. Step one, cluster DNS resolves feed in the social namespace to the virtual address 10.96.0.42, which never changes. Step two, the pod connects to that address. Step three, the node rewrites the destination to one of the ready pods, 10.1.2.7 or 10.1.5.3. A third pod, 10.1.9.8, is not ready and receives no traffic. The list of ready pods is kept up to date from readiness checks.</desc>
+<rect class="n sig" x="10" y="70" width="110" height="50" rx="6"/>
+<text class="tb mid" x="65" y="91">web pod</text>
+<text class="ts mid" x="65" y="108">calls http://feed</text>
+<rect class="n" x="170" y="20" width="170" height="46" rx="6"/>
+<text class="ts tb mid" x="255" y="39">Cluster DNS</text>
+<text class="ts mid" x="255" y="56">feed.social → 10.96.0.42</text>
+<rect class="n async" x="170" y="110" width="170" height="58" rx="6"/>
+<text class="ts tb mid" x="255" y="126.5">Service “feed”</text>
+<text class="ts mid" x="255" y="143.5">virtual address 10.96.0.42</text>
+<text class="ts mid" x="255" y="160.5">never changes</text>
+<g data-s="1">
+<path class="e dash" d="M120 84C150 84 140 43 170 43"/>
+<text class="ts mid" x="96" y="50">1. look up the name</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M120 106C150 106 140 139 170 139"/>
+<text class="ts mid" x="100" y="150">2. connect</text>
+</g>
+<rect class="n" x="470" y="34" width="140" height="42" rx="6"/>
+<text class="ts tb mid" x="540" y="51">feed pod 1</text>
+<text class="ts mid" x="540" y="68">10.1.2.7, ready</text>
+<g data-s="3">
+<path class="e async" d="M340 139C410 139 400 55 470 55"/>
+</g>
+<rect class="n" x="470" y="90" width="140" height="42" rx="6"/>
+<text class="ts tb mid" x="540" y="107">feed pod 2</text>
+<text class="ts mid" x="540" y="124">10.1.5.3, ready</text>
+<g data-s="3">
+<path class="e async" d="M340 139C410 139 400 111 470 111"/>
+</g>
+<rect class="n ghost" x="470" y="146" width="140" height="42" rx="6"/>
+<text class="ts tb mid" x="540" y="163">feed pod 3</text>
+<text class="ts mid" x="540" y="180">10.1.9.8, not ready</text>
+<g data-s="3">
+<text class="ts mid" x="372" y="196">3. the node rewrites the address</text>
+<text class="ts mid" x="372" y="212">to one ready pod</text>
+</g>
+<g data-s="4">
+<text class="ts" x="626" y="60">The list of ready</text>
+<text class="ts" x="626" y="75">pods is kept up</text>
+<text class="ts" x="626" y="90">to date from</text>
+<text class="ts" x="626" y="105">readiness</text>
+<text class="ts" x="626" y="120">checks.</text>
+<text class="ts" x="10" y="236">The caller uses a name that never changes. Pods come and go behind it, and one that fails its readiness check stops receiving traffic.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="feed?">The web pod calls <code>http://feed</code>. First it asks the cluster’s DNS, which answers with the Service’s virtual address, 10.96.0.42.</li>
+  <li data-msg="connect">It connects to that address. The address never changes, and no single machine owns it.</li>
+  <li data-msg="to a ready pod">The node rewrites the destination to one of the pods that are ready. Pod 3 is not ready, so it receives nothing.</li>
+  <li>The list of ready pods follows the readiness checks. Pods come and go behind the name, and the caller never notices.</li>
+</ol>
+<figcaption>A name, a virtual address and a list of ready pods. Nothing in the path is a single machine that could fail.</figcaption>
+</figure>
+
+<p>Three parts cooperate.</p>
+<ul>
+  <li><b>A name.</b> The cluster’s DNS answers <code>feed.social.svc.cluster.local</code>, or simply <code>feed</code> from inside the same namespace, with the Service’s virtual address.</li>
+  <li><b>A virtual address.</b> It belongs to no machine. Rules installed in the kernel of every node intercept connections to it and redirect each to a real pod.</li>
+  <li><b>A list of endpoints.</b> Kubernetes maintains the set of pods that match the selector <em>and</em> pass their readiness check. A pod that is starting, shutting down or unhealthy is absent from the list.</li>
+</ul>
+<p>The readiness check is therefore the control that matters. It should report ready only when the pod can really serve, and should stop reporting ready as soon as shutdown begins, so that traffic drains before the process exits (<x-ref to="proxies-and-load-balancers#draining"></x-ref>).</p>
+
+<h3 id="pitfalls">Two traps</h3>
+<p><b>Stale DNS.</b> Where discovery returns instance addresses through DNS, clients and libraries may cache answers longer than they should, or forever. A client holding the address of a pod that no longer exists fails until restarted (<x-ref to="dns#caching"></x-ref>). The virtual-address design above sidesteps this, since the address that DNS returns never changes.</p>
+<p><b>Long-lived connections.</b> The kernel rules choose a pod when a connection is <em>opened</em>. HTTP/1.1 clients open many short connections, so load spreads. HTTP/2 and gRPC open one connection and send every request down it for hours. All of one caller’s traffic then lands on a single pod, and new pods added by autoscaling receive nothing. This is the commonest surprise for teams adopting gRPC on Kubernetes. The fixes are to balance each <em>request</em>, with a proxy that understands HTTP/2 or with client-side balancing in the gRPC library, or as a blunt measure to close connections periodically (<x-ref to="proxies-and-load-balancers#http2"></x-ref>).</p>
+
+<h2 id="mesh">The service mesh</h2>
+<p>Discovery and basic balancing come with the platform. The remaining concerns from the opening table, encryption and identity, retries and timeouts, uniform metrics, gradual releases, were first solved with libraries: Netflix and Twitter each published one around 2012. A library works well in a company with one language. With five languages it must be written and maintained five times, and upgrading it means redeploying every service.</p>
+<p>A <dfn>service mesh</dfn> moves that logic out of the application and into a proxy that sits next to it. The classic arrangement is the <dfn>sidecar</dfn>: a small proxy container added to every pod, with the pod’s network configured so that all traffic in and out passes through it.</p>
+
+<figure class="fig wide" id="fig-mesh">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f413t f413d">
+<title id="f413t">A service mesh with sidecar proxies and a control plane</title>
+<desc id="f413d">The web pod contains the web application and a sidecar proxy. The feed pod contains a sidecar proxy and the feed application. Each application speaks plain HTTP to its own proxy. The two proxies talk to each other over a connection that is encrypted with both sides identified, and they apply retries, timeouts and load balancing. A control plane distributes routing rules, policy and certificates to every proxy.</desc>
+<rect class="n async" x="230" y="6" width="260" height="42" rx="6"/>
+<text class="ts tb mid" x="360" y="23">Control plane</text>
+<text class="ts mid" x="360" y="40">routing rules, policy, certificates</text>
+<rect class="grp" x="20" y="86" width="240" height="96" rx="8"/>
+<text class="ts" x="30" y="176">pod: web</text>
+<rect class="grp" x="460" y="86" width="240" height="96" rx="8"/>
+<text class="ts" x="470" y="176">pod: feed</text>
+<rect class="n sig" x="34" y="116" width="90" height="48" rx="6"/>
+<text class="ts tb mid" x="79" y="136">web app</text>
+<text class="ts mid" x="79" y="153">plain HTTP</text>
+<rect class="n" x="156" y="116" width="90" height="48" rx="6"/>
+<text class="ts tb mid" x="201" y="136">proxy</text>
+<text class="ts mid" x="201" y="153">sidecar</text>
+<rect class="n" x="474" y="116" width="90" height="48" rx="6"/>
+<text class="ts tb mid" x="519" y="136">proxy</text>
+<text class="ts mid" x="519" y="153">sidecar</text>
+<rect class="n sig" x="596" y="116" width="90" height="48" rx="6"/>
+<text class="ts tb mid" x="641" y="136">feed app</text>
+<text class="ts mid" x="641" y="153">plain HTTP</text>
+<path class="e sig" d="M124 140H156"/>
+<path class="e sig" d="M564 140H596"/>
+<path class="e store" d="M246 140H474"/>
+<text class="ts mid" x="360" y="132">encrypted, both sides identified</text>
+<text class="ts mid" x="360" y="158">retries, timeouts, load balancing</text>
+<path class="e async" d="M300 48C300 80 201 86 201 116"/>
+<path class="e async" d="M420 48C420 80 519 86 519 116"/>
+<text class="ts" x="20" y="210">The applications make ordinary calls. The proxies beside them do discovery, balancing, encryption, retries and measurement,</text>
+<text class="ts" x="20" y="226">configured from one place. The same behavior applies to every service, whatever language it is written in.</text>
+</svg>
+</div>
+<figcaption>The data plane is the proxies, which carry every request. The control plane configures them and carries none.</figcaption>
+</figure>
+
+<p>The mesh has two halves.</p>
+<ul>
+  <li>The <dfn>data plane</dfn> is the set of proxies. Every request between services passes through two of them, one on each side. Envoy is the proxy most meshes use.</li>
+  <li>The <dfn>control plane</dfn> watches the cluster and pushes each proxy its configuration: where every service’s instances are, what the routing rules and policies say, and the certificates it should present. It handles no requests, so if it stops, the proxies carry on with the configuration they last received. That is the right way round, and the lesson of <x-ref to="membership-and-coordination#depending"></x-ref> applied.</li>
+</ul>
+<p>What the mesh provides, for every service in any language without a line of application code:</p>
+<ul>
+  <li>encryption and authenticated identity on every connection, covered in the next section,</li>
+  <li>request-level load balancing, including for HTTP/2 and gRPC,</li>
+  <li>timeouts, retries and circuit breaking (<x-ref to="resilience-patterns"></x-ref>),</li>
+  <li>the same metrics for every call: rate, errors and latency, by caller and callee,</li>
+  <li>trace context passed along, provided the application forwards the headers it receives,</li>
+  <li>weighted routing between versions.</li>
+</ul>
+<p>What it costs:</p>
+<ul>
+  <li><b>Latency.</b> Two extra proxy hops on every call, typically a few milliseconds in total at the tail.</li>
+  <li><b>Resources.</b> A proxy in every pod uses memory and CPU. Across thousands of pods that is a noticeable share of the bill.</li>
+  <li><b>Complexity.</b> A mesh is a distributed system of its own, with its own upgrades and failure modes. When a call fails, there are now two more components where the cause might be.</li>
+  <li><b>Hidden behavior.</b> Retries and timeouts that live in mesh configuration are invisible to someone reading the application’s code.</li>
+</ul>
+
+<h3 id="ambient">Meshes without sidecars</h3>
+<p>The per-pod cost led to designs that share the proxy.</p>
+
+<figure class="fig wide" id="fig-ambient">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-labelledby="f414t f414d">
+<title id="f414t">The sidecar model compared with the ambient model of a service mesh</title>
+<desc id="f414d">On the left, in the sidecar model, each of three application pods on a node has its own proxy. This gives full features for every pod, at the cost of memory and CPU for every proxy, each of which must be restarted to upgrade. On the right, in the ambient model, the three application pods share one small node proxy that handles encryption and identity, and an optional waypoint proxy applies HTTP rules only where needed.</desc>
+<text class="tb" x="10" y="18">Sidecars: a proxy in every pod</text>
+<rect class="grp" x="10" y="30" width="330" height="120" rx="8"/>
+<text class="ts" x="20" y="48">one node</text>
+<rect class="n sig" x="24" y="60" width="90" height="32" rx="6"/>
+<text class="ts tb mid" x="69" y="80.5">app 1</text>
+<rect class="n" x="24" y="100" width="90" height="32" rx="6"/>
+<text class="ts mid" x="69" y="120.5">proxy</text>
+<rect class="n sig" x="128" y="60" width="90" height="32" rx="6"/>
+<text class="ts tb mid" x="173" y="80.5">app 2</text>
+<rect class="n" x="128" y="100" width="90" height="32" rx="6"/>
+<text class="ts mid" x="173" y="120.5">proxy</text>
+<rect class="n sig" x="232" y="60" width="90" height="32" rx="6"/>
+<text class="ts tb mid" x="277" y="80.5">app 3</text>
+<rect class="n" x="232" y="100" width="90" height="32" rx="6"/>
+<text class="ts mid" x="277" y="120.5">proxy</text>
+<text class="ts" x="10" y="174">Full features for every pod. Memory and CPU for</text>
+<text class="ts" x="10" y="189">every proxy, and each must be restarted to upgrade.</text>
+<path class="e none dash" d="M360 8V214"/>
+<text class="tb" x="380" y="18">Ambient: shared per node, with optional extras</text>
+<rect class="grp" x="380" y="30" width="330" height="120" rx="8"/>
+<text class="ts" x="390" y="48">one node</text>
+<rect class="n sig" x="394" y="60" width="66" height="32" rx="6"/>
+<text class="ts tb mid" x="427" y="80.5">app 1</text>
+<rect class="n sig" x="470" y="60" width="66" height="32" rx="6"/>
+<text class="ts tb mid" x="503" y="80.5">app 2</text>
+<rect class="n sig" x="546" y="60" width="66" height="32" rx="6"/>
+<text class="ts tb mid" x="579" y="80.5">app 3</text>
+<rect class="n store" x="394" y="104" width="218" height="32" rx="6"/>
+<text class="ts mid" x="503" y="124.5">node proxy: encryption and identity</text>
+<rect class="n ghost" x="628" y="60" width="72" height="76" rx="6"/>
+<text class="ts tb mid" x="664" y="85.5">waypoint</text>
+<text class="ts mid" x="664" y="102.5">HTTP rules,</text>
+<text class="ts mid" x="664" y="119.5">if needed</text>
+<path class="e dash" d="M612 120C622 120 618 110 628 106"/>
+<text class="ts" x="380" y="174">One small proxy per node secures all traffic. Routing</text>
+<text class="ts" x="380" y="189">by HTTP path or method is added only where wanted.</text>
+
+</svg>
+</div>
+<figcaption>Two ways to place the proxies. The ambient model separates the cheap, universal part of the job from the expensive, optional part.</figcaption>
+</figure>
+
+<p>Istio’s <dfn>ambient mode</dfn>, generally available since late 2024, runs one lightweight proxy on each node that gives every pod encryption and identity. Features that need to understand HTTP, such as routing by path or retrying by status code, are handled by separate shared proxies that are deployed only for the services that want them. Other projects reach a similar place by doing the low-level work in the kernel with eBPF, and gRPC libraries can receive mesh configuration directly and act on it with no proxy at all. The direction is the same in each: pay for what you use.</p>
+<p>As of October 2026, Istio, at version 1.31, and Linkerd are the most widely used meshes, with Cilium’s mesh common where Cilium already provides the cluster’s networking.</p>
+
+<h2 id="mtls">Identity and encryption between services</h2>
+<p>Inside a private network it was once normal for services to trust any caller that could reach them. That makes the network perimeter the only defense: one compromised service, or one misconfigured firewall rule, and everything is open. The modern position, usually called <dfn>zero trust</dfn>, is that being on the network proves nothing. Every call is encrypted, and both ends prove who they are.</p>
+<p>The mechanism is <dfn>mutual TLS</dfn>, or mTLS. Ordinary TLS has the server present a certificate so that the client knows who it is talking to (<x-ref to="http-and-tls"></x-ref>). In mutual TLS the client presents one as well. Each side then knows the other’s identity with cryptographic certainty.</p>
+<p>The certificates name workloads, not machines. An identity looks like <code>spiffe://cluster.local/ns/social/sa/feed</code>: the feed service’s account in the social namespace. The format comes from SPIFFE, a standard for workload identity. The mesh’s control plane acts as the certificate authority. It issues each workload a certificate when it starts, valid for hours, and replaces it automatically before it expires. Nobody handles a key, and a stolen certificate is useless by the next day.</p>
+<p>Knowing who is calling makes it possible to decide what they may do.</p>
+<pre data-lang="text" data-title="An Istio policy: only the web front end may read feeds">
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: feed-callers
+  namespace: social
+spec:
+  selector:
+    matchLabels:
+      app: feed
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/web/sa/web-frontend"]
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/feed/*"]
+</pre>
+<p>This answers “which service is calling?”. It does not answer “on behalf of which user?”. That is carried separately, as a token in the request that each service validates (<x-ref to="oauth-and-sso#hops"></x-ref>, <x-ref to="authorization"></x-ref>). Both are needed: the service identity stops a compromised internal system from calling anything it likes, and the user identity stops one user from reading another’s data.</p>
+
+<h2 id="traffic">Steering traffic</h2>
+<p>Because every request passes through a proxy that the control plane configures, routing becomes something you declare instead of something you deploy.</p>
+<table>
+<thead><tr><th>Technique</th><th>What it does</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><th>Weighted routing</th><td>Send a percentage of requests to a different version</td><td>Canary releases: 1%, then 10%, then all (<x-ref to="deployment-strategies"></x-ref>)</td></tr>
+<tr><th>Matching on headers</th><td>Route requests carrying a particular header to a particular version</td><td>Testing a new version with internal users only</td></tr>
+<tr><th>Mirroring</th><td>Copy live requests to a second version and discard its responses</td><td>Testing with real traffic and no user impact</td></tr>
+<tr><th>Fault injection</th><td>Delay or fail a percentage of requests on purpose</td><td>Checking that callers cope (<x-ref to="resilience-patterns#testing"></x-ref>)</td></tr>
+<tr><th>Locality preference</th><td>Prefer instances in the caller’s own zone</td><td>Lower latency and lower transfer cost, with spill-over when the zone is unhealthy</td></tr>
+</tbody>
+</table>
+<p>In Kubernetes these rules are increasingly written with the <dfn>Gateway API</dfn>, a standard set of resources that most gateways and meshes now implement, so that the same definition works across products. It has been stable since 2023 and reached version 1.6 in mid-2026.</p>
+<pre data-lang="text" data-title="A Gateway API route: 10% of calls to the feed service go to version 2">
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: feed
+  namespace: social
+spec:
+  parentRefs:
+    - group: ""
+      kind: Service
+      name: feed           # applies to calls made to the "feed" Service
+  rules:
+    - backendRefs:
+        - name: feed-v1
+          port: 8080
+          weight: 90
+        - name: feed-v2
+          port: 8080
+          weight: 10
+      timeouts:
+        request: 2s
+</pre>
+
+<h2 id="north-south">Gateway and mesh</h2>
+<p>Traffic is described by direction. <dfn>North-south</dfn> traffic enters the system from outside. <dfn>East-west</dfn> traffic flows between services inside it. The two have different needs and are handled by different components.</p>
+
+<figure class="fig wide" id="fig-traffic">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 248" role="img" aria-labelledby="f415t f415d">
+<title id="f415t">North-south traffic through an API gateway and east-west traffic through a mesh</title>
+<desc id="f415d">Clients such as apps and browsers send north-south traffic to an API gateway, which establishes who the user is, applies limits and routes requests. Inside the system, the web, feed, media and identity services exchange east-west traffic. The gateway handles traffic entering from outside: authenticating people, applying plans and quotas, exposing a stable public API. The mesh handles traffic between services: which service may call which, encryption, retries and measurement.</desc>
+<rect class="n" x="10" y="76" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="55" y="94">Clients</text>
+<text class="ts mid" x="55" y="111">apps, browsers</text>
+<rect class="n sig" x="160" y="66" width="130" height="64" rx="6"/>
+<text class="ts tb mid" x="225" y="85.5">API gateway</text>
+<text class="ts mid" x="225" y="102.5">who is the user?</text>
+<text class="ts mid" x="225" y="119.5">limits, routing</text>
+<path class="e sig" d="M100 98H160"/>
+<text class="ts mid" x="130" y="58">north-south</text>
+<rect class="grp" x="340" y="16" width="370" height="170" rx="8"/>
+<text class="ts" x="352" y="34">inside the system: east-west traffic</text>
+<rect class="n" x="360" y="78" width="90" height="40" rx="6"/>
+<text class="ts tb mid" x="405" y="102.5">web</text>
+<rect class="n" x="500" y="44" width="90" height="40" rx="6"/>
+<text class="ts tb mid" x="545" y="68.5">feed</text>
+<rect class="n" x="500" y="116" width="90" height="40" rx="6"/>
+<text class="ts tb mid" x="545" y="140.5">media</text>
+<rect class="n" x="612" y="80" width="84" height="40" rx="6"/>
+<text class="ts tb mid" x="654" y="104.5">identity</text>
+<path class="e sig" d="M290 98H360"/>
+<path class="e store" d="M450 90C475 90 475 64 500 64"/>
+<path class="e store" d="M450 106C475 106 475 136 500 136"/>
+<path class="e store" d="M590 64C601 64 601 92 612 92"/>
+<path class="e store" d="M590 136C601 136 601 108 612 108"/>
+<text class="ts" x="10" y="214">The gateway handles traffic entering from outside: authenticating people, applying plans and quotas, exposing a stable public API.</text>
+<text class="ts" x="10" y="230">The mesh handles traffic between services (green): which service may call which, encryption, retries and measurement.</text>
+
+</svg>
+</div>
+<figcaption>Two directions, two jobs. The gateway faces strangers. The mesh connects colleagues.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th></th><th>API gateway</th><th>Service mesh</th></tr></thead>
+<tbody>
+<tr><th>Traffic</th><td>From outside clients</td><td>Between internal services</td></tr>
+<tr><th>Identifies</th><td>Users and API keys</td><td>Services</td></tr>
+<tr><th>Typical work</th><td>Authentication, quotas, public routing, request validation (<x-ref to="proxies-and-load-balancers#api-gateway"></x-ref>)</td><td>mTLS, balancing, retries, telemetry, release control</td></tr>
+<tr><th>Where it runs</th><td>At the edge, as a few shared instances</td><td>Beside or beneath every service</td></tr>
+</tbody>
+</table>
+<p>Both are proxies, often the same proxy software, and products increasingly do both. They remain worth separating in a design because the trust model differs: the gateway assumes the caller may be hostile.</p>
+
+<h2 id="contracts">Contracts between services</h2>
+<p>Infrastructure delivers the bytes. Whether the two services still understand each other after next week’s deployment is a separate problem, and it causes at least as many outages.</p>
+<ul>
+  <li><b>Define the interface in a schema.</b> OpenAPI for REST, Protocol Buffers for gRPC. Generate clients and servers from it, so that the definition and the code cannot drift.</li>
+  <li><b>Change compatibly.</b> Add optional fields. Never remove, rename or repurpose a field that a caller may still send or read. Services are deployed one at a time, so for a while old callers talk to new servers and new callers to old servers. Both combinations must work (<x-ref to="api-styles"></x-ref>).</li>
+  <li><b>Test the contract, not the whole system.</b> A <dfn>consumer-driven contract test</dfn> records what each caller actually relies on and runs those expectations against the provider in its own build. A breaking change fails the provider’s pipeline before it is deployed, without an environment containing every service.</li>
+  <li><b>Pass deadlines along.</b> If the web service has 800 ms left to answer the user, it should tell the feed service so, and the feed service should tell whatever it calls. Work that cannot finish in time should not start. gRPC carries deadlines natively (<x-ref to="resilience-patterns#timeouts"></x-ref>).</li>
+  <li><b>Pass context along.</b> Trace identifiers and the user’s token travel in headers that each service must forward on its outgoing calls. The mesh cannot do this part, because only the application knows which outgoing call belongs to which incoming request.</li>
+</ul>
+
+<h2 id="need">Do you need a mesh?</h2>
+<p>A mesh solves real problems and adds a real system to operate. The decision follows from how many of its problems you have.</p>
+<table>
+<thead><tr><th>Situation</th><th>Reasonable choice</th></tr></thead>
+<tbody>
+<tr><th>A monolith, or a handful of services in one language</th><td>The platform’s Services, and a well-configured HTTP or gRPC client library. No mesh.</td></tr>
+<tr><th>gRPC everywhere, with uneven load across pods</th><td>Client-side balancing in gRPC, or a request-level proxy. A mesh is one way, not the only one.</td></tr>
+<tr><th>A requirement that all internal traffic be encrypted and authenticated</th><td>A mesh, possibly in its lightest mode, is usually the cheapest way to get it everywhere</td></tr>
+<tr><th>Dozens of services in several languages, owned by many teams</th><td>A mesh, run by a platform team</td></tr>
+<tr><th>Gradual releases and traffic shifting as routine practice</th><td>A mesh, or a gateway that implements the Gateway API</td></tr>
+</tbody>
+</table>
+<p>Adopt it for a reason you can state, begin with the feature that reason needs, which is usually mTLS and metrics, and add routing features later. A mesh installed “because we will need it” tends to be remembered mostly for the incidents it took part in.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> You are rarely asked to design a mesh. You are often asked “how does service A find service B?” or “how do you secure calls between services?”. Short, concrete answers serve best: “Each service has a stable DNS name backed by a virtual address, and the platform routes only to instances passing readiness checks. Between services we use mutual TLS with short-lived workload certificates issued by the mesh, and authorization policies saying which service may call which.” Mention the gRPC connection problem if you have proposed gRPC.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Addresses of other services in configuration files</th><td>Calls fail after every redeployment or scaling event</td><td>Stable names, resolved through discovery</td></tr>
+<tr><th>Readiness checks that always succeed</th><td>Traffic reaches pods that cannot serve</td><td>Report ready only when dependencies needed to serve are usable, and not ready as soon as shutdown begins</td></tr>
+<tr><th>gRPC behind connection-level balancing</th><td>One pod takes all of a caller’s traffic, and new pods take none</td><td>Balance per request, in the client or in a proxy</td></tr>
+<tr><th>Clients that cache DNS answers indefinitely</th><td>Calls to instances that no longer exist</td><td>Honor TTLs, or use a virtual address that does not change</td></tr>
+<tr><th>Trusting any caller inside the network</th><td>One compromised service can call everything</td><td>Mutual TLS and explicit policy for who may call whom</td></tr>
+<tr><th>Treating service identity as user identity</th><td>Any service can act as any user</td><td>Carry and validate the user’s token as well</td></tr>
+<tr><th>Retries configured in the mesh and also in the application</th><td>Retries multiply at each layer</td><td>Decide on one layer, and document where it is</td></tr>
+<tr><th>Not forwarding trace headers</th><td>Traces break at every service</td><td>Propagate context on every outgoing call</td></tr>
+<tr><th>Breaking a field that callers still use</th><td>Callers fail as soon as the provider deploys</td><td>Compatible changes, and contract tests in the provider’s build</td></tr>
+<tr><th>Adopting a mesh with no team to run it</th><td>An extra failure domain that nobody understands</td><td>Start with platform defaults, and adopt a mesh for a stated need</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="dns"></x-ref>: names, TTLs and the caching behavior that discovery inherits.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref>: balancing algorithms, health checks and gateways.</li>
+  <li><x-ref to="api-styles"></x-ref>: REST and gRPC, versioning and compatible change.</li>
+  <li><x-ref to="membership-and-coordination"></x-ref>: registries, leases and health as the basis of discovery.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: the timeouts, retries and circuit breakers that the mesh applies.</li>
+  <li><x-ref to="oauth-and-sso"></x-ref> and <x-ref to="cryptography-in-practice"></x-ref>: identity for services, TLS and certificates.</li>
+  <li><x-ref to="containers-and-orchestration"></x-ref>: Kubernetes, pods and readiness.</li>
+  <li><x-ref to="observability"></x-ref>: metrics and traces across service calls.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Every call between services needs discovery, balancing, health, security, resilience, observability and release control. The design question is where each of those lives.</li>
+  <li>Discovery maps a stable name to the current healthy instances. The caller can hold the list, a balancer can, or the platform can.</li>
+  <li>A Kubernetes Service is a name, a virtual address that never changes, and a list of pods that pass their readiness check.</li>
+  <li>Connection-level balancing fails for HTTP/2 and gRPC, because one long-lived connection carries everything. Balance requests.</li>
+  <li>A service mesh puts the communication logic in proxies configured by a control plane, giving every service the same behavior in any language.</li>
+  <li>Mutual TLS with short-lived workload certificates gives every call encryption and a verified service identity. User identity travels separately.</li>
+  <li>The gateway handles traffic from outside, and the mesh handles traffic between services.</li>
+  <li>Compatible schemas and contract tests keep services able to talk across deployments.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>After moving from REST over HTTP/1.1 to gRPC, a team sees one pod of a service at 90% CPU while four others are idle. What is happening?</summary><p>gRPC uses one long-lived HTTP/2 connection for all requests. The platform’s balancing chooses a pod when a connection is opened, so every request from that caller goes to the same pod, and pods added later receive nothing. Balancing must be done for each request, by a proxy that understands HTTP/2 or by client-side balancing in the gRPC library.</p></details>
+<details><summary>What three things make up a Kubernetes Service, and which one decides whether a particular pod receives traffic?</summary><p>A DNS name, a virtual address that does not change, and the list of endpoints. The list contains only pods that match the selector and pass their readiness check, so the readiness check decides. A pod that reports ready when it cannot serve will receive traffic and fail it.</p></details>
+<details><summary>In a service mesh, the control plane goes down for ten minutes. What happens to requests between services?</summary><p>They continue. Requests pass through the data plane, the proxies, which keep operating with the configuration and certificates they already hold. What stops is change: new instances may not be learned about, policy updates do not arrive and certificates are not renewed. A short outage is therefore tolerable, which is the purpose of the separation.</p></details>
+<details><summary>What does mutual TLS between services establish, and what does it not?</summary><p>It encrypts the connection and proves to each side which service the other is. That allows policies such as “only the web service may call the feed service”. It says nothing about which user the request is for. The user’s identity must be carried in the request as a token that the receiving service validates.</p></details>
+<details><summary>Why do the client in this chapter and real load balancers refuse to eject every instance, even when all appear to be failing?</summary><p>If every instance looks unhealthy, the likelier explanation is a problem with the observer, its network or the health check itself, than the simultaneous failure of all instances. Ejecting them all guarantees total failure. Sending traffic anyway gives some chance of success and lets recovery be noticed.</p></details>
+<details><summary>A team adds a field rename to an internal API and deploys the provider first. Callers begin failing at once. Which two practices would have prevented this?</summary><p>Compatible change: add the new field and keep the old one until every caller has moved, since old and new versions run side by side during any rollout. And consumer-driven contract tests in the provider’s build, which would have failed when the field that callers depend on disappeared.</p></details>
+<details><summary>A company has six services, all in Go, run by two teams. Someone proposes a service mesh. What do you ask?</summary><p>Which problem it would solve. With one language and few services, a shared client library and the platform’s own discovery cover balancing, timeouts and retries cheaply. A mesh becomes worthwhile for a specific need, such as a requirement for mutual TLS on all internal traffic, or uniform telemetry and traffic shifting across many teams and languages. Without such a need it adds a system to operate for little return.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Kubernetes, <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Service</a>. Virtual addresses, selectors and endpoints.</li>
+  <li>Kubernetes, <a href="https://kubernetes.io/blog/2026/08/03/gateway-api-v1-6-release/">Gateway API v1.6</a>, August 2026, and the <a href="https://gateway-api.sigs.k8s.io/">Gateway API documentation</a>.</li>
+  <li>Istio, <a href="https://istio.io/latest/docs/ops/deployment/architecture/">Architecture</a>, and <a href="https://istio.io/latest/blog/2024/ambient-reaches-ga/">Fast, Secure, and Simple: Istio’s Ambient Mode Reaches General Availability in v1.24</a>, November 2024.</li>
+  <li>Istio, <a href="https://istio.io/latest/news/releases/1.31.x/announcing-1.31/">Announcing Istio 1.31.0</a>, August 2026.</li>
+  <li>SPIFFE, <a href="https://spiffe.io/docs/latest/spiffe-about/overview/">SPIFFE Overview</a>. Workload identities and how they are issued.</li>
+  <li>gRPC, <a href="https://grpc.io/blog/loadbalancing/">gRPC Load Balancing</a>. Why connection-level balancing is not enough, and the alternatives.</li>
+  <li>Envoy, <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier">Outlier detection</a>. Passive health checking and the limit on how many hosts may be ejected.</li>
+  <li>Pact, <a href="https://docs.pact.io/">Documentation</a>. Consumer-driven contract testing.</li>
+  <li>Sam Newman, <cite>Building Microservices</cite>, 2nd edition, O’Reilly, 2021. Communication styles, contracts and service meshes.</li>
+</ol>
+</section>

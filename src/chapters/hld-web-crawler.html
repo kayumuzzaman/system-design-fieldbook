@@ -1,0 +1,741 @@
+<!--meta
+{ "description": "A high-level design of a web crawler: requirements and estimates, the requests a polite crawler makes, a URL frontier with a queue per host and a heap of ready times, measured against a single queue, URL normalization and a Bloom filter for seen URLs, exact and near-duplicate content with SimHash, robots.txt and crawler traps, partitioning by host, failures and scale.",
+  "lede": "A crawler looks like the simplest program in this book: fetch a page, find its links, fetch those. At a scale of billions of pages, every part of that loop turns into a design problem. Sites must not be overwhelmed, the same page hides behind many addresses, a quarter of the web seems to be copies of the rest, and some sites are infinite. This chapter designs a crawler for two billion pages a month and measures, in a simulated web, what each of its defenses is worth.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a web crawler that downloads two billion pages a month for a search engine or a research archive, starting from a list of seed URLs. It must respect site owners’ rules, never overload a site, avoid fetching the same content twice, and keep its copy of important pages fresh.</p></div>
+<p>The difficulty is that the crawler’s speed is limited by other people’s servers. A crawler could fetch a thousand pages a second from one site, and must instead wait seconds between requests to it, so the only way to be fast is to fetch from thousands of sites at once. Meanwhile the crawler is turning a graph of unknown size, full of duplicates and traps, into a queue it can finish. In the terms of <x-ref to="hld-method"></x-ref>, it is a throughput problem shaped by a constraint the designer does not control, and the central structure is the queue of URLs to fetch.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Fetch pages from seed URLs and from the links found in fetched pages</th><td>Yes</td></tr>
+<tr><th>Obey robots.txt and limit the request rate to each site</th><td>Yes</td></tr>
+<tr><th>Store each distinct page once, with its URL, time and headers</th><td>Yes</td></tr>
+<tr><th>Revisit pages, more often those that change often or matter more</th><td>Yes</td></tr>
+<tr><th>Avoid traps: sites that generate endless distinct URLs</th><td>Yes</td></tr>
+<tr><th>Run JavaScript to render pages</th><td>No: a follow-up, with a much higher cost per page</td></tr>
+<tr><th>Index and rank the pages</th><td>No: <x-ref to="search-systems"></x-ref> consumes the stored pages</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>2 billion pages a month; tens of billions of URLs known</td></tr>
+<tr><th>Politeness</th><td>At most one request at a time to a site, and a pause of a few seconds between requests</td></tr>
+<tr><th>Durability</th><td>Stored pages are not lost; the frontier survives restarts without losing or repeating much work</td></tr>
+<tr><th>Freshness</th><td>Important pages revisited at least daily, the rest within weeks</td></tr>
+<tr><th>Latency</th><td>None for any one page: throughput is what matters</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<p>The average page size comes from a real crawl: Common Crawl’s August 2026 archive held 2.14 billion pages in 360 TiB, uncompressed, about 185 KB per page including headers. The rest follows from the target (<x-ref to="estimation#method"></x-ref>), with assumptions stated:</p>
+<div class="formula">fetch rate: 2 billion pages ÷ 30 days ≈ 772 pages a second, steady, since the crawler sets its own pace<br>
+bandwidth: 772 × 185 KB ≈ 143 MB a second ≈ 1.1 Gbit/s; storage: about 370 TB a month before compression<br>
+fetches in flight: 772 a second × 1 s per fetch = 772 at once, by Little’s law (<x-ref to="latency-and-throughput#littles-law"></x-ref>)<br>
+sites in progress: one request per site every 1 s fetch + 2 s pause ⇒ at least 772 × 3 ≈ 2,300 sites being crawled at every moment<br>
+seen-URL filter: 10 billion URLs × 9.6 bits at 1% false positives ≈ 12 GB</div>
+<p>The bandwidth and storage are ordinary. The two numbers that shape the design are the 2,300 sites that must be in progress at once, which rules out any queue that takes URLs in the order they were found, and the tens of billions of URLs that must be checked against everything seen before, which rules out keeping their full text in memory.</p>
+
+<div class="widget" data-widget="crawl88">
+<h4>Sizing a crawl</h4>
+<p>Rates, concurrency and memory for a crawl of a given size.</p>
+<div class="controls">
+  <label>Pages a month, billions<input type="number" name="pages" value="2" min="0.001" max="1000" step="0.1"></label>
+  <label>Average page, KB<input type="number" name="size" value="185" min="1" max="100000" step="1"></label>
+  <label>Seconds per fetch<input type="number" name="fetch" value="1" min="0.01" max="60" step="0.1"></label>
+  <label>Pause between requests to a site, seconds<input type="number" name="delay" value="2" min="0" max="600" step="0.5"></label>
+  <label>URLs known, billions<input type="number" name="urls" value="10" min="0.001" max="10000" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Pages a second</dt><dd data-out="rate">772</dd></div>
+  <div><dt>Bandwidth</dt><dd data-out="bandwidth">1.14 Gbit/s</dd></div>
+  <div><dt>Fetches in flight</dt><dd data-out="flight">772</dd></div>
+  <div><dt>Sites in progress, at least</dt><dd data-out="sites">2,315</dd></div>
+  <div><dt>Seen-URL filter at 1%</dt><dd data-out="filter">12 GB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Crawling 2 billion pages in 30 days means 772 pages a second and about 370 TB of pages a month. With 3 s from the start of one request to a site to the start of the next, at least 2,315 sites must be in progress at once, so the frontier must keep that many hosts ready. Remembering 10 billion seen URLs at a 1% error rate takes 12 GB of memory.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<p>A crawler’s most important interface is the one it presents to other people’s servers. It identifies itself, asks only for what changed, and accepts compressed responses.</p>
+<pre data-lang="http" data-title="What the crawler sends to a site">
+GET /robots.txt HTTP/1.1
+Host: news.example
+User-Agent: ExampleBot/2.1 (+https://crawler.example/about)
+
+GET /p/7 HTTP/1.1
+Host: news.example
+User-Agent: ExampleBot/2.1 (+https://crawler.example/about)
+If-Modified-Since: Tue, 06 Oct 2026 09:12:44 GMT
+If-None-Match: "a91f3"
+Accept-Encoding: gzip, br
+                                → 304 Not Modified (nothing to download), or 200 with the page
+</pre>
+<p>A conditional request (<x-ref to="http-and-tls#caching"></x-ref>) turns a revisit of an unchanged page into a few hundred bytes. The page linked from the user agent tells a site owner who is crawling and how to reach them.</p>
+<pre data-lang="http" data-title="Inside the crawler: adding URLs and leasing work">
+POST /v1/frontier/urls                   { "urls": [{ "url": "https://news.example/p/9", "priority": 2 }, …] }
+                                         → 202 Accepted: filtered and queued in the background
+POST /v1/frontier/lease?fetcher=f17&max=50
+                                         → { "lease": "L-88213", "expires_in": 300,
+                                             "urls": [ { "url": …, "host": …, "not_before": … }, … ] }
+POST /v1/frontier/leases/L-88213/done    { "results": [{ "url": …, "status": 200, "content_hash": … }, …] }
+</pre>
+<p>Fetchers lease batches of URLs rather than taking them for good. A fetcher that crashes stops renewing its lease, and the URLs return to the frontier when it expires, so a lost machine costs a few minutes of work rather than a hole in the crawl. Reporting results twice is harmless, because recording a fetch is keyed by URL and time (<x-ref to="idempotency-and-delivery"></x-ref>).</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>URL record</th><td>host, then a fingerprint of the URL</td><td>The URL, last fetch time and status, validators (date, ETag), content fingerprint, when to fetch next, priority</td><td>A wide-column or key-value store, partitioned by host (<x-ref to="data-models#wide-column"></x-ref>)</td></tr>
+<tr><th>Host record</th><td>host</td><td>robots.txt rules and when they were fetched, address and its DNS expiry, pause between requests, budget, error counts</td><td>The same store; cached in the frontier’s memory</td></tr>
+<tr><th>Pages</th><td>file and offset</td><td>The raw response, headers and body, appended to large archive files</td><td>Object storage (<x-ref to="object-and-file-storage"></x-ref>)</td></tr>
+<tr><th>Seen URLs</th><td>normalized URL</td><td>Membership only</td><td>A Bloom filter in memory, per frontier partition (<x-ref to="probabilistic-structures#bloom"></x-ref>)</td></tr>
+<tr><th>Content fingerprints</th><td>hash, and SimHash</td><td>Which URL first had this content</td><td>A key-value store, and a SimHash index for near matches</td></tr>
+</tbody>
+</table>
+<p>Everything is keyed by host first, because the host is the unit of politeness. Partitioning the crawl by a hash of the host (<x-ref to="partitioning#consistent-hashing"></x-ref>) puts every URL of a site, its robots rules and its timing on one machine, so politeness never needs coordination between machines. Links that point to a host owned by another machine are batched and sent to it.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 286" role="img" aria-labelledby="f881t f881d">
+<title id="f881t">The parts of a web crawler</title>
+<desc id="f881d">A loop. Seed URLs enter the URL frontier, which holds a queue for each host and hands out URLs only when their host may be fetched again. Fetchers take URLs, resolve host names through a DNS cache, check robots.txt through a robots cache, and download pages. Each page goes to a content filter, which drops exact and near duplicates by fingerprint, and new pages are stored in object storage for indexing. A link extractor takes the page’s links, a URL filter normalizes them, removes those already seen with a Bloom filter, applies robots rules and budgets, and adds the rest to the frontier.</desc>
+<rect class="n " x="10" y="40" width="100" height="52" rx="6"/>
+<text class="tb mid" x="60.0" y="71.0">Seed URLs</text>
+<rect class="n sig" x="160" y="30" width="150" height="72" rx="6"/>
+<text class="tb mid" x="235.0" y="63.0">URL frontier</text>
+<text class="ts mid" x="235.0" y="80.0">queue per host,</text>
+<text class="ts mid" x="235" y="94">heap of ready times</text>
+<rect class="n sig" x="370" y="40" width="130" height="52" rx="6"/>
+<text class="tb mid" x="435.0" y="63.0">Fetchers</text>
+<text class="ts mid" x="435.0" y="80.0">hundreds at once</text>
+<rect class="n " x="560" y="30" width="150" height="32" rx="6"/>
+<text class="tb mid" x="635.0" y="51.0">DNS cache</text>
+<rect class="n " x="560" y="72" width="150" height="32" rx="6"/>
+<text class="tb mid" x="635.0" y="93.0">robots.txt cache</text>
+<rect class="n " x="370" y="170" width="130" height="52" rx="6"/>
+<text class="tb mid" x="435.0" y="193.0">Content filter</text>
+<text class="ts mid" x="435.0" y="210.0">fingerprints</text>
+<rect class="n store" x="560" y="170" width="150" height="52" rx="6"/>
+<text class="tb mid" x="635.0" y="193.0">Page store</text>
+<text class="ts mid" x="635.0" y="210.0">object storage</text>
+<rect class="n " x="160" y="170" width="150" height="52" rx="6"/>
+<text class="tb mid" x="235.0" y="193.0">URL filter</text>
+<text class="ts mid" x="235.0" y="210.0">normalize, seen?</text>
+<rect class="n store" x="10" y="170" width="100" height="52" rx="6"/>
+<text class="tb mid" x="60.0" y="193.0">Seen URLs</text>
+<text class="ts mid" x="60.0" y="210.0">Bloom filter</text>
+<path class="e sig" d="M110 66H160"/>
+<path class="e sig" d="M310 66H370"/>
+<text class="ts mid" x="340" y="60">next</text>
+<path class="e sig both" d="M500 50H560"/>
+<path class="e sig both" d="M500 84H560"/>
+<path class="e sig" d="M435 92V170"/>
+<text class="ts" x="443" y="136">page</text>
+<path class="e store" d="M500 196H560"/>
+<text class="ts mid" x="530" y="190">new</text>
+<path class="e async" d="M370 206H310"/>
+<text class="ts mid" x="340" y="226">links</text>
+<path class="e async" d="M235 170V102"/>
+<text class="ts" x="243" y="136">new URLs</text>
+<path class="e store both" d="M160 196H110"/>
+<text class="ts" x="10" y="262">Every link found goes back through the URL filter. The frontier, not the fetchers, decides when each site is visited.</text>
+</svg>
+</div>
+<figcaption>The crawl is a loop: fetch, extract, filter, enqueue. Its two hard parts sit at the ends of the loop: the frontier, which enforces politeness, and the filters, which keep the loop from fetching the same thing twice.</figcaption>
+</figure>
+
+<p>The loop runs on many machines, each owning the frontier for its share of hosts and running hundreds of fetchers. The fetchers keep caches of DNS answers and robots rules per host, since asking the DNS for every one of 772 fetches a second would be slow and impolite to DNS servers too (<x-ref to="dns#caching"></x-ref>).</p>
+
+<figure class="fig wide" id="fig-fetch">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f882t f882d">
+<title id="f882t">Fetching one page</title>
+<desc id="f882d">A sequence between the frontier, a fetcher, the DNS and robots caches, the web site, and the filters. The frontier hands the fetcher a URL whose host is ready. The fetcher asks the caches for the host’s address and robots rules; the robots cache has none and fetches robots.txt from the site, keeping it for up to 24 hours. The page is allowed, so the fetcher requests it, with the date of the copy it already has. The site returns the page; its fingerprint is new, so it is stored; its links are normalized and checked against the seen-URL filter, and the new ones are added to the frontier, which schedules the host again two seconds after this fetch ended.</desc>
+<text class="tb mid" x="50" y="20">Frontier</text>
+<line class="axis" x1="50" y1="28" x2="50" y2="257"/>
+<text class="tb mid" x="200" y="20">Fetcher</text>
+<line class="axis" x1="200" y1="28" x2="200" y2="257"/>
+<text class="tb mid" x="350" y="20">DNS, robots</text>
+<line class="axis" x1="350" y1="28" x2="350" y2="257"/>
+<text class="tb mid" x="505" y="20">news.example</text>
+<line class="axis" x1="505" y1="28" x2="505" y2="257"/>
+<text class="tb mid" x="660" y="20">Filters</text>
+<line class="axis" x1="660" y1="28" x2="660" y2="257"/>
+<g data-s="1">
+<path class="e sig" d="M51 56H199"/>
+<text class="ts mid" x="125.0" y="50">1. next: /p/7</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M201 83H349"/>
+<text class="ts mid" x="275.0" y="77">2. address, rules?</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M351 110H504"/>
+<text class="ts mid" x="427.5" y="104">3. GET /robots.txt</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M349 137H201"/>
+<text class="ts mid" x="275.0" y="131">4. allowed, 203.0.113.9</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M201 164H504"/>
+<text class="ts mid" x="352.5" y="158">5. GET /p/7, If-Modified-Since</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M504 191H201"/>
+<text class="ts mid" x="352.5" y="185">6. 200 OK, 92 KB</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M201 218H659"/>
+<text class="ts mid" x="430.0" y="212">7. page and its 41 links</text>
+</g>
+<g data-s="8">
+<path class="e async" d="M659 245H51"/>
+<text class="ts mid" x="355.0" y="239">8. 12 new URLs</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="/p/7" data-state="news.example: being fetched">The frontier hands out a URL whose host may be fetched now. Other fetchers are busy with other hosts.</li>
+  <li data-msg="host?">Both answers are cached per host, so most fetches skip a DNS lookup and never fetch robots.txt again.</li>
+  <li data-msg="robots.txt">No rules are cached for this host, so they are fetched first and kept for up to a day.</li>
+  <li data-msg="allowed">The path is not disallowed for this crawler. The address comes from the DNS cache.</li>
+  <li data-msg="GET">The crawler has an older copy, so it asks for the page only if it changed since then.</li>
+  <li data-msg="200">The page changed and comes back whole.</li>
+  <li data-msg="page">The content fingerprint is new, so the page is stored. Its links are normalized and checked against the seen-URL filter.</li>
+  <li data-msg="12 URLs" data-state="news.example: ready again 2 s after this fetch ended; 12 URLs added">Only links never seen before reach the frontier, each in its host’s queue.</li>
+</ol>
+<figcaption>One fetch, in order. Most of what a fetcher does is decide whether, and when, it may fetch at all.</figcaption>
+</figure>
+
+<h2 id="frontier">Step 6a: The frontier and politeness</h2>
+<p>The <dfn>URL frontier</dfn> is the crawler’s list of URLs waiting to be fetched, together with the rules for which comes next. Those rules carry <dfn>politeness</dfn>: limiting how often and how heavily a crawler requests pages from one site, so that crawling never degrades the site for its real users. A single first-in, first-out queue cannot do it. The links on a page mostly point to the same site, so a queue fills with runs of URLs from one host, and a polite crawler must wait seconds before each, with everything behind it waiting too.</p>
+<p>The answer, from the Mercator crawler of 1999, is a queue for each host and a heap that orders hosts by the time each may next be fetched. A free fetcher takes the host at the top. A host that was fetched a moment ago goes back into the heap with a later time and delays only its own URLs.</p>
+
+<figure class="fig wide" id="fig-frontier">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 268" role="img" aria-labelledby="f883t f883d">
+<title id="f883t">A frontier with a queue per host and a heap of ready times</title>
+<desc id="f883d">Three hosts with queued URLs: news with three, blog with two, shop with two. Three fetchers. Each fetch takes 0.5 seconds for news, 0.3 for blog and 0.7 for shop, and a host may be fetched again 2 seconds after a fetch ends. At time 0 the fetchers take news/1, shop/1 and blog/1, and the hosts go back into the heap at 2.5, 2.7 and 2.3 seconds. At 0.3 seconds fetcher 3 is free but no host is ready until blog at 2.3, so it fetches blog/2 then. At 2.5 seconds fetcher 1 takes news/2. With so few hosts, the fetchers are idle most of the time.</desc>
+<text class="tb" x="10" y="18">Back queues: one per host</text>
+<text class="tb" x="330" y="18">Heap: host, ready at</text>
+<text class="tb" x="530" y="18">Fetchers</text>
+<text class="ts" x="10" y="67">news.example</text>
+<rect class="n" x="110" y="50" width="58" height="26" rx="4"/>
+<text class="ts mid" x="139" y="67">news/1</text>
+<g data-s="1">
+<rect class="bar" x="110" y="79" width="58" height="4" rx="2"/>
+</g>
+<rect class="n" x="174" y="50" width="58" height="26" rx="4"/>
+<text class="ts mid" x="203" y="67">news/2</text>
+<g data-s="5">
+<rect class="bar" x="174" y="79" width="58" height="4" rx="2"/>
+</g>
+<rect class="n" x="238" y="50" width="58" height="26" rx="4"/>
+<text class="ts mid" x="267" y="67">news/3</text>
+<text class="ts" x="10" y="117">blog.example</text>
+<rect class="n" x="110" y="100" width="58" height="26" rx="4"/>
+<text class="ts mid" x="139" y="117">blog/1</text>
+<g data-s="3">
+<rect class="bar" x="110" y="129" width="58" height="4" rx="2"/>
+</g>
+<rect class="n" x="174" y="100" width="58" height="26" rx="4"/>
+<text class="ts mid" x="203" y="117">blog/2</text>
+<g data-s="4">
+<rect class="bar" x="174" y="129" width="58" height="4" rx="2"/>
+</g>
+<text class="ts" x="10" y="167">shop.example</text>
+<rect class="n" x="110" y="150" width="58" height="26" rx="4"/>
+<text class="ts mid" x="139" y="167">shop/1</text>
+<g data-s="2">
+<rect class="bar" x="110" y="179" width="58" height="4" rx="2"/>
+</g>
+<rect class="n" x="174" y="150" width="58" height="26" rx="4"/>
+<text class="ts mid" x="203" y="167">shop/2</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n sunk" x="330" y="50" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="67">blog</text>
+<text class="ts end" x="480" y="67">0.0 s</text>
+<rect class="n sunk" x="330" y="84" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="101">shop</text>
+<text class="ts end" x="480" y="101">0.0 s</text>
+<rect class="n sunk" x="330" y="118" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="135">news</text>
+<text class="ts end" x="480" y="135">2.5 s</text>
+<rect class="n sig" x="530" y="50" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="67">1: news/1 until 0.5</text>
+<rect class="n" x="530" y="100" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="117">2: idle</text>
+<rect class="n" x="530" y="150" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="167">3: idle</text>
+<text class="tb" x="10" y="214">t = 0</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n sunk" x="330" y="50" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="67">blog</text>
+<text class="ts end" x="480" y="67">0.0 s</text>
+<rect class="n sunk" x="330" y="84" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="101">news</text>
+<text class="ts end" x="480" y="101">2.5 s</text>
+<rect class="n sunk" x="330" y="118" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="135">shop</text>
+<text class="ts end" x="480" y="135">2.7 s</text>
+<rect class="n" x="530" y="50" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="67">1: news/1 until 0.5</text>
+<rect class="n sig" x="530" y="100" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="117">2: shop/1 until 0.7</text>
+<rect class="n" x="530" y="150" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="167">3: idle</text>
+<text class="tb" x="10" y="214">t = 0</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n sunk" x="330" y="50" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="67">blog</text>
+<text class="ts end" x="480" y="67">2.3 s</text>
+<rect class="n sunk" x="330" y="84" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="101">news</text>
+<text class="ts end" x="480" y="101">2.5 s</text>
+<rect class="n sunk" x="330" y="118" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="135">shop</text>
+<text class="ts end" x="480" y="135">2.7 s</text>
+<rect class="n" x="530" y="50" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="67">1: news/1 until 0.5</text>
+<rect class="n" x="530" y="100" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="117">2: shop/1 until 0.7</text>
+<rect class="n sig" x="530" y="150" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="167">3: blog/1 until 0.3</text>
+<text class="tb" x="10" y="214">t = 0</text>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n sunk" x="330" y="50" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="67">news</text>
+<text class="ts end" x="480" y="67">2.5 s</text>
+<rect class="n sunk" x="330" y="84" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="101">shop</text>
+<text class="ts end" x="480" y="101">2.7 s</text>
+<rect class="n" x="530" y="50" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="67">1: news/1 until 0.5</text>
+<rect class="n" x="530" y="100" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="117">2: shop/1 until 0.7</text>
+<rect class="n sig" x="530" y="150" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="167">3: blog/2 from 2.3</text>
+<text class="tb" x="10" y="214">t = 0.3 s</text>
+</g>
+<g class="hide" data-s="5">
+<rect class="n sunk" x="330" y="50" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="67">shop</text>
+<text class="ts end" x="480" y="67">2.7 s</text>
+<rect class="n sunk" x="330" y="84" width="160" height="26" rx="4"/>
+<text class="ts" x="340" y="101">news</text>
+<text class="ts end" x="480" y="101">5.0 s</text>
+<rect class="n sig" x="530" y="50" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="67">1: news/2 from 2.5</text>
+<rect class="n" x="530" y="100" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="117">2: shop/1 until 0.7</text>
+<rect class="n" x="530" y="150" width="180" height="26" rx="4"/>
+<text class="ts" x="540" y="167">3: blog/2 from 2.3</text>
+<text class="tb" x="10" y="214">t = 2.5 s</text>
+</g>
+<text class="ts" x="10" y="240">Underlined: URLs handed to a fetcher. A host goes back into the heap 2 seconds after its fetch ends.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Heap: blog 0, shop 0, news 2.5">Fetcher 1 is free at time 0 and takes the host at the top of the heap, news. news goes back in at 0.5 + 2 = 2.5 s.</li>
+  <li data-msg="none" data-state="Heap: blog 0, news 2.5, shop 2.7">Fetcher 2 takes the next ready host, shop. It may be asked again at 2.7 s.</li>
+  <li data-msg="none" data-state="Heap: blog 2.3, news 2.5, shop 2.7">Fetcher 3 takes blog. Every host is now waiting, and the heap is ordered by when each may be fetched again.</li>
+  <li data-msg="none" data-state="Heap: news 2.5, shop 2.7">Fetcher 3 finishes at 0.3 s, but no host is ready before blog at 2.3 s. With thousands of hosts there would be one; here the fetcher waits.</li>
+  <li data-msg="none" data-state="Heap: shop 2.7, news 5.0">At 2.5 s news is ready again and fetcher 1 takes news/2. Three fetchers made four requests in 2.5 seconds: the hosts, not the fetchers, set the pace.</li>
+</ol>
+<figcaption>Generated from the chapter’s HostQueueFrontier. A crawl is fast only when it has many more hosts ready than it has fetchers.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="A queue per host, and a heap of ready times">
+// A queue for each host, and a heap of hosts ordered by the earliest time each may be fetched
+// again. A free fetcher takes the host that is ready first, so a slow or busy host delays only
+// its own URLs. Mercator's "back queues" work the same way.
+export class HostQueueFrontier implements Frontier {
+  private readonly queues = new Map<string, string[]>();
+  private readonly ready = new MinHeap<{ at: number; host: string }>((a, b) => a.at < b.at);
+  private readonly waiting = new Set<string>(); // hosts in the heap or being fetched
+  private readonly allowed = new Map<string, number>();
+  private readonly delay: number;
+  private count = 0;
+  constructor(delay: number) {
+    this.delay = delay;
+  }
+  add(url: string, host: string): void {
+    let q = this.queues.get(host);
+    if (!q) this.queues.set(host, (q = []));
+    q.push(url);
+    this.count += 1;
+    if (!this.waiting.has(host)) {
+      this.waiting.add(host);
+      this.ready.push({ at: this.allowed.get(host) ?? 0, host });
+    }
+  }
+  next(now: number): Next | null {
+    const top = this.ready.pop();
+    if (!top) return null;
+    const url = (this.queues.get(top.host) as string[]).shift() as string;
+    this.count -= 1;
+    return { url, host: top.host, start: Math.max(now, top.at) };
+  }
+  fetched(host: string, end: number): void {
+    const at = end + this.delay;
+    this.allowed.set(host, at);
+    if ((this.queues.get(host) as string[]).length > 0) this.ready.push({ at, host });
+    else this.waiting.delete(host);
+  }
+  earliest(): number | null {
+    return this.ready.peek()?.at ?? null;
+  }
+  size(): number {
+    return this.count;
+  }
+}
+</pre>
+
+<p>The chapter’s code crawled 20,000 pages of a synthetic web of 5,000 hosts, generated so that 80% of links stay on their own host, with 100 fetchers, half a second per fetch on average, and a pause of 2 seconds between requests to one host.</p>
+
+<figure class="fig wide" id="fig-politeness">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f884t f884d">
+<title id="f884t">Pages fetched per second by number of fetchers</title>
+<desc id="f884d">Simulated crawls of 10,000 pages from 50 seeds, with fetches of half a second on average and 2 seconds required between requests to one host. 5 fetchers: one queue waiting for hosts 0.55, one queue ignoring politeness 10.05 with 76% of requests impolite, a queue per host 10.05. 10 fetchers: one queue waiting for hosts 0.55, one queue ignoring politeness 20.08 with 77% of requests impolite, a queue per host 20.08. 25 fetchers: one queue waiting for hosts 0.56, one queue ignoring politeness 50.07 with 79% of requests impolite, a queue per host 50.07. 50 fetchers: one queue waiting for hosts 0.57, one queue ignoring politeness 99.71 with 81% of requests impolite, a queue per host 99.71. 100 fetchers: one queue waiting for hosts 0.57, one queue ignoring politeness 196.33 with 81% of requests impolite, a queue per host 196.01. 200 fetchers: one queue waiting for hosts 0.57, one queue ignoring politeness 378.51 with 82% of requests impolite, a queue per host 373.32. 400 fetchers: one queue waiting for hosts 0.57, one queue ignoring politeness 701.41 with 84% of requests impolite, a queue per host 643.93. 800 fetchers: one queue waiting for hosts 0.57, one queue ignoring politeness 1198.2 with 87% of requests impolite, a queue per host 870.38.</desc>
+<line class="grid" x1="90" y1="250.0" x2="610" y2="250.0"/>
+<text class="ts end" x="82" y="254.0">0.1</text>
+<line class="grid" x1="90" y1="200.0" x2="610" y2="200.0"/>
+<text class="ts end" x="82" y="204.0">1</text>
+<line class="grid" x1="90" y1="150.0" x2="610" y2="150.0"/>
+<text class="ts end" x="82" y="154.0">10</text>
+<line class="grid" x1="90" y1="100.0" x2="610" y2="100.0"/>
+<text class="ts end" x="82" y="104.0">100</text>
+<line class="grid" x1="90" y1="50.0" x2="610" y2="50.0"/>
+<text class="ts end" x="82" y="54.0">1,000</text>
+<text class="ts mid" x="90.0" y="268">5</text>
+<text class="ts mid" x="161.0" y="268">10</text>
+<text class="ts mid" x="254.9" y="268">25</text>
+<text class="ts mid" x="325.9" y="268">50</text>
+<text class="ts mid" x="396.9" y="268">100</text>
+<text class="ts mid" x="468.0" y="268">200</text>
+<text class="ts mid" x="539.0" y="268">400</text>
+<text class="ts mid" x="610.0" y="268">800</text>
+<text class="ts mid" x="350.0" y="288">fetchers</text>
+<text class="ts" x="10" y="24">pages a second</text>
+<path class="line" style="stroke:var(--ink-3)" d="M90.0 213.0 L161.0 213.0 L254.9 212.6 L325.9 212.2 L396.9 212.2 L468.0 212.2 L539.0 212.2 L610.0 212.2"/>
+<circle class="dot" cx="90.0" cy="213.0" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="161.0" cy="213.0" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="254.9" cy="212.6" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="325.9" cy="212.2" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="396.9" cy="212.2" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="468.0" cy="212.2" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="539.0" cy="212.2" r="3" style="fill:var(--ink-3)"/>
+<circle class="dot" cx="610.0" cy="212.2" r="3" style="fill:var(--ink-3)"/>
+<path class="line" style="stroke:var(--fault);stroke-dasharray:6 4" d="M90.0 149.9 L161.0 134.9 L254.9 115.0 L325.9 100.1 L396.9 85.4 L468.0 71.1 L539.0 57.7 L610.0 46.1"/>
+<circle class="dot" cx="90.0" cy="149.9" r="3" style="fill:var(--fault)"/>
+<circle class="dot" cx="161.0" cy="134.9" r="3" style="fill:var(--fault)"/>
+<circle class="dot" cx="254.9" cy="115.0" r="3" style="fill:var(--fault)"/>
+<circle class="dot" cx="325.9" cy="100.1" r="3" style="fill:var(--fault)"/>
+<circle class="dot" cx="396.9" cy="85.4" r="3" style="fill:var(--fault)"/>
+<circle class="dot" cx="468.0" cy="71.1" r="3" style="fill:var(--fault)"/>
+<circle class="dot" cx="539.0" cy="57.7" r="3" style="fill:var(--fault)"/>
+<circle class="dot" cx="610.0" cy="46.1" r="3" style="fill:var(--fault)"/>
+<path class="line" style="stroke:var(--sig)" d="M90.0 149.9 L161.0 134.9 L254.9 115.0 L325.9 100.1 L396.9 85.4 L468.0 71.4 L539.0 59.6 L610.0 53.0"/>
+<circle class="dot" cx="90.0" cy="149.9" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="161.0" cy="134.9" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="254.9" cy="115.0" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="325.9" cy="100.1" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="396.9" cy="85.4" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="468.0" cy="71.4" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="539.0" cy="59.6" r="3" style="fill:var(--sig)"/>
+<circle class="dot" cx="610.0" cy="53.0" r="3" style="fill:var(--sig)"/>
+<path class="line" style="stroke:var(--fault);stroke-dasharray:6 4" d="M161.0 53.7h22"/>
+<text class="ts" x="189.0" y="57.7">one queue, ignoring politeness</text>
+<path class="line" style="stroke:var(--sig)" d="M396.9 121.2h22"/>
+<text class="ts" x="424.9" y="125.2">a queue per host, polite</text>
+<text class="ts" x="254.9" y="202.6">one queue, waiting for each host in turn</text>
+<rect class="hit" x="70" y="30" width="40" height="220" data-tip="5 fetchers|one queue, waiting: 0.55 pages a second|one queue, ignoring politeness: 10.05 pages a second, 76% of requests impolite|a queue per host: 10.05 pages a second"/>
+<rect class="hit" x="141.02" y="30" width="40" height="220" data-tip="10 fetchers|one queue, waiting: 0.55 pages a second|one queue, ignoring politeness: 20.08 pages a second, 77% of requests impolite|a queue per host: 20.08 pages a second"/>
+<rect class="hit" x="234.902" y="30" width="40" height="220" data-tip="25 fetchers|one queue, waiting: 0.56 pages a second|one queue, ignoring politeness: 50.07 pages a second, 79% of requests impolite|a queue per host: 50.07 pages a second"/>
+<rect class="hit" x="305.922" y="30" width="40" height="220" data-tip="50 fetchers|one queue, waiting: 0.57 pages a second|one queue, ignoring politeness: 99.71 pages a second, 81% of requests impolite|a queue per host: 99.71 pages a second"/>
+<rect class="hit" x="376.941" y="30" width="40" height="220" data-tip="100 fetchers|one queue, waiting: 0.57 pages a second|one queue, ignoring politeness: 196.33 pages a second, 81% of requests impolite|a queue per host: 196.01 pages a second"/>
+<rect class="hit" x="447.961" y="30" width="40" height="220" data-tip="200 fetchers|one queue, waiting: 0.57 pages a second|one queue, ignoring politeness: 378.51 pages a second, 82% of requests impolite|a queue per host: 373.32 pages a second"/>
+<rect class="hit" x="518.98" y="30" width="40" height="220" data-tip="400 fetchers|one queue, waiting: 0.57 pages a second|one queue, ignoring politeness: 701.41 pages a second, 84% of requests impolite|a queue per host: 643.93 pages a second"/>
+<rect class="hit" x="590" y="30" width="40" height="220" data-tip="800 fetchers|one queue, waiting: 0.57 pages a second|one queue, ignoring politeness: 1198.2 pages a second, 87% of requests impolite|a queue per host: 870.38 pages a second"/>
+</svg>
+</div>
+<figcaption>Measured by the chapter’s simulation. Waiting in one queue is polite and useless; ignoring politeness is fast and abusive; a queue per host is both fast and polite, until the hosts that are ready run out.</figcaption>
+</figure>
+
+<p>One polite queue managed 0.61 pages a second, whatever the number of fetchers: each run of same-host URLs was fetched one at a time, three seconds apart. Ignoring politeness was fast, 198 pages a second, and 15,666 of the 20,000 requests went to a host that had been asked less than two seconds before. A queue per host was as fast as the impolite queue, 197 pages a second, with no impolite requests at all, and it kept scaling with fetchers, to 870 pages a second with 800, as long as there were enough hosts with URLs ready. The figure above shows what happens when there are not: fetchers idle while every host waits out its pause. That is why a crawl must spread across thousands of sites, and why the estimate asked how many must be in progress.</p>
+<p>The pause itself can adapt. Making it a multiple of the time the host’s last response took means a slow, struggling server is asked less often, and a crawler should back off further on errors and on <code>429</code> or <code>503</code> responses (<x-ref to="resilience-patterns#retries"></x-ref>). Real frontiers also have a layer in front of the host queues that orders URLs by priority, so that important and frequently changing pages are fetched first, and a schedule for revisiting each page based on how often it has changed before.</p>
+
+<h2 id="dedup">Step 6b: Not fetching the same thing twice</h2>
+<p>Duplicates arrive in three forms, and each needs its own filter.</p>
+<p><b>The same URL, spelled differently.</b> <code>HTTPS://News.Example:443/p/7#top</code> and <code>https://news.example/p/7</code> are one page. <dfn>URL normalization</dfn> rewrites every URL into one canonical form before it is compared: lower-case scheme and host, no default port, no fragment, no tracking parameters, the other parameters sorted.</p>
+<pre data-lang="ts" data-title="One canonical form for each URL">
+const tracking = /^(utm_[a-z]+|fbclid|gclid|sid|sessionid)$/i;
+
+export function normalize(raw: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  u.hash = ""; // the server never sees the fragment
+  const params = [...u.searchParams].filter(([k]) => !tracking.test(k)).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  u.search = new URLSearchParams(params).toString();
+  return u.toString(); // URL already lower-cases the scheme and host and drops a default port
+}
+</pre>
+<p>In the simulated web, where 15% of links were written with a capitalized host, a fragment or a tracking parameter, crawling without normalization spent 3,668 of 20,000 fetches, 18.3%, on pages it had already fetched.</p>
+<p><b>A URL already seen.</b> Every link found must be checked against every URL the crawler has ever accepted, tens of billions of them. A Bloom filter answers in memory with about 9.6 bits per URL for a 1% error rate; in the test, a filter for 200,000 URLs took 239,627 bytes and wrongly reported 1.00% of unseen URLs as seen. Its errors fall in the safe direction for a crawler: it never reports a seen URL as new, and a false “seen” means a page is skipped. Used in the crawl, sized for the 55,000 URLs it would end up holding, it skipped 74 of about 55,000 new URLs, 0.13%, fewer than 1% because the filter is emptier for most of the crawl. A page skipped this way is often found again through another link later, after the filter is rebuilt.</p>
+<p><b>The same content at another URL.</b> Mirrors, printer-friendly versions and pages that differ only in an advertisement are separate URLs with the same or nearly the same content. Exact copies are caught by a hash of the content: in the test, 196 of 20,000 fetched pages had been seen before, from mirror hosts. Mercator found 8.5% of its successful downloads were exact duplicates. Near copies need a fingerprint in which similar pages differ by a few bits, such as SimHash (<x-ref to="probabilistic-structures#similarity"></x-ref>).</p>
+
+<figure class="fig wide" id="fig-simhash">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 318" role="img" aria-labelledby="f885t f885d">
+<title id="f885t">SimHash distances between a page and three kinds of other page</title>
+<desc id="f885d">For 1,000 articles of 300 words, the number of differing bits between the 64-bit SimHash of the article and of: a copy with a different 12-word footer, from 0 to 11 bits; a copy with 5% of its words changed, from 1 to 21 bits; and an unrelated article, from 17 to 43 bits. A threshold of 10 bits catches nearly all footer copies, half of the edited copies, and no unrelated pages.</desc>
+<text class="ts end" x="140" y="62">new footer</text>
+<line class="axis" x1="150" y1="78" x2="690" y2="78"/>
+<rect class="bar store" x="151" y="73.8" width="10" height="4.2" rx="1"/>
+<rect class="bar store" x="163" y="66.5" width="10" height="11.5" rx="1"/>
+<rect class="bar store" x="175" y="42.9" width="10" height="35.1" rx="1"/>
+<rect class="bar store" x="187" y="30.0" width="10" height="48.0" rx="1"/>
+<rect class="bar store" x="199" y="32.1" width="10" height="45.9" rx="1"/>
+<rect class="bar store" x="211" y="38.2" width="10" height="39.8" rx="1"/>
+<rect class="bar store" x="223" y="52.6" width="10" height="25.4" rx="1"/>
+<rect class="bar store" x="235" y="63.6" width="10" height="14.4" rx="1"/>
+<rect class="bar store" x="247" y="70.9" width="10" height="7.1" rx="1"/>
+<rect class="bar store" x="259" y="75.2" width="10" height="2.8" rx="1"/>
+<rect class="bar store" x="271" y="77.1" width="10" height="0.9" rx="1"/>
+<rect class="bar store" x="283" y="77.8" width="10" height="0.2" rx="1"/>
+<text class="ts end" x="140" y="138">5% of words changed</text>
+<line class="axis" x1="150" y1="154" x2="690" y2="154"/>
+<rect class="bar " x="163" y="153.8" width="10" height="0.2" rx="1"/>
+<rect class="bar " x="175" y="153.3" width="10" height="0.7" rx="1"/>
+<rect class="bar " x="187" y="153.3" width="10" height="0.7" rx="1"/>
+<rect class="bar " x="199" y="150.7" width="10" height="3.3" rx="1"/>
+<rect class="bar " x="211" y="148.6" width="10" height="5.4" rx="1"/>
+<rect class="bar " x="223" y="142.5" width="10" height="11.5" rx="1"/>
+<rect class="bar " x="235" y="136.6" width="10" height="17.4" rx="1"/>
+<rect class="bar " x="247" y="134.7" width="10" height="19.3" rx="1"/>
+<rect class="bar " x="259" y="127.9" width="10" height="26.1" rx="1"/>
+<rect class="bar " x="271" y="125.1" width="10" height="28.9" rx="1"/>
+<rect class="bar " x="283" y="127.2" width="10" height="26.8" rx="1"/>
+<rect class="bar " x="295" y="127.6" width="10" height="26.4" rx="1"/>
+<rect class="bar " x="307" y="131.9" width="10" height="22.1" rx="1"/>
+<rect class="bar " x="319" y="138.9" width="10" height="15.1" rx="1"/>
+<rect class="bar " x="331" y="140.4" width="10" height="13.6" rx="1"/>
+<rect class="bar " x="343" y="148.1" width="10" height="5.9" rx="1"/>
+<rect class="bar " x="355" y="148.6" width="10" height="5.4" rx="1"/>
+<rect class="bar " x="367" y="150.7" width="10" height="3.3" rx="1"/>
+<rect class="bar " x="379" y="152.8" width="10" height="1.2" rx="1"/>
+<rect class="bar " x="391" y="152.8" width="10" height="1.2" rx="1"/>
+<rect class="bar " x="403" y="153.3" width="10" height="0.7" rx="1"/>
+<text class="ts end" x="140" y="214">unrelated article</text>
+<line class="axis" x1="150" y1="230" x2="690" y2="230"/>
+<rect class="bar mute" x="355" y="229.8" width="10" height="0.2" rx="1"/>
+<rect class="bar mute" x="379" y="229.8" width="10" height="0.2" rx="1"/>
+<rect class="bar mute" x="391" y="229.5" width="10" height="0.5" rx="1"/>
+<rect class="bar mute" x="403" y="229.1" width="10" height="0.9" rx="1"/>
+<rect class="bar mute" x="415" y="227.6" width="10" height="2.4" rx="1"/>
+<rect class="bar mute" x="427" y="229.1" width="10" height="0.9" rx="1"/>
+<rect class="bar mute" x="439" y="226.5" width="10" height="3.5" rx="1"/>
+<rect class="bar mute" x="451" y="225.5" width="10" height="4.5" rx="1"/>
+<rect class="bar mute" x="463" y="223.9" width="10" height="6.1" rx="1"/>
+<rect class="bar mute" x="475" y="221.8" width="10" height="8.2" rx="1"/>
+<rect class="bar mute" x="487" y="213.8" width="10" height="16.2" rx="1"/>
+<rect class="bar mute" x="499" y="214.0" width="10" height="16.0" rx="1"/>
+<rect class="bar mute" x="511" y="203.6" width="10" height="26.4" rx="1"/>
+<rect class="bar mute" x="523" y="206.2" width="10" height="23.8" rx="1"/>
+<rect class="bar mute" x="535" y="212.1" width="10" height="17.9" rx="1"/>
+<rect class="bar mute" x="547" y="205.5" width="10" height="24.5" rx="1"/>
+<rect class="bar mute" x="559" y="209.8" width="10" height="20.2" rx="1"/>
+<rect class="bar mute" x="571" y="212.1" width="10" height="17.9" rx="1"/>
+<rect class="bar mute" x="583" y="216.1" width="10" height="13.9" rx="1"/>
+<rect class="bar mute" x="595" y="218.5" width="10" height="11.5" rx="1"/>
+<rect class="bar mute" x="607" y="221.5" width="10" height="8.5" rx="1"/>
+<rect class="bar mute" x="619" y="224.4" width="10" height="5.6" rx="1"/>
+<rect class="bar mute" x="631" y="226.9" width="10" height="3.1" rx="1"/>
+<rect class="bar mute" x="643" y="229.1" width="10" height="0.9" rx="1"/>
+<rect class="bar mute" x="655" y="229.1" width="10" height="0.9" rx="1"/>
+<rect class="bar mute" x="667" y="229.5" width="10" height="0.5" rx="1"/>
+<text class="ts mid" x="156.0" y="256">0</text>
+<text class="ts mid" x="216.0" y="256">5</text>
+<text class="ts mid" x="276.0" y="256">10</text>
+<text class="ts mid" x="336.0" y="256">15</text>
+<text class="ts mid" x="396.0" y="256">20</text>
+<text class="ts mid" x="456.0" y="256">25</text>
+<text class="ts mid" x="516.0" y="256">30</text>
+<text class="ts mid" x="576.0" y="256">35</text>
+<text class="ts mid" x="636.0" y="256">40</text>
+<text class="ts mid" x="690" y="256">45</text>
+<text class="ts mid" x="420.0" y="276">bits that differ, of 64</text>
+<path class="e none dash" d="M282 20V236"/>
+<text class="ts" x="288" y="24">threshold: 10 bits or fewer means near duplicate</text>
+<text class="ts" x="10" y="302">Bar heights share one scale. 1,000 pairs in each row.</text>
+<rect class="hit" x="150" y="30" width="12" height="212" data-tip="0 bits differ|new footer: 18 pairs|5% of words changed: 0 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="162" y="30" width="12" height="212" data-tip="1 bits differ|new footer: 49 pairs|5% of words changed: 1 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="174" y="30" width="12" height="212" data-tip="2 bits differ|new footer: 149 pairs|5% of words changed: 3 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="186" y="30" width="12" height="212" data-tip="3 bits differ|new footer: 204 pairs|5% of words changed: 3 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="198" y="30" width="12" height="212" data-tip="4 bits differ|new footer: 195 pairs|5% of words changed: 14 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="210" y="30" width="12" height="212" data-tip="5 bits differ|new footer: 169 pairs|5% of words changed: 23 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="222" y="30" width="12" height="212" data-tip="6 bits differ|new footer: 108 pairs|5% of words changed: 49 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="234" y="30" width="12" height="212" data-tip="7 bits differ|new footer: 61 pairs|5% of words changed: 74 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="246" y="30" width="12" height="212" data-tip="8 bits differ|new footer: 30 pairs|5% of words changed: 82 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="258" y="30" width="12" height="212" data-tip="9 bits differ|new footer: 12 pairs|5% of words changed: 111 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="270" y="30" width="12" height="212" data-tip="10 bits differ|new footer: 4 pairs|5% of words changed: 123 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="282" y="30" width="12" height="212" data-tip="11 bits differ|new footer: 1 pairs|5% of words changed: 114 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="294" y="30" width="12" height="212" data-tip="12 bits differ|new footer: 0 pairs|5% of words changed: 112 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="306" y="30" width="12" height="212" data-tip="13 bits differ|new footer: 0 pairs|5% of words changed: 94 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="318" y="30" width="12" height="212" data-tip="14 bits differ|new footer: 0 pairs|5% of words changed: 64 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="330" y="30" width="12" height="212" data-tip="15 bits differ|new footer: 0 pairs|5% of words changed: 58 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="342" y="30" width="12" height="212" data-tip="16 bits differ|new footer: 0 pairs|5% of words changed: 25 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="354" y="30" width="12" height="212" data-tip="17 bits differ|new footer: 0 pairs|5% of words changed: 23 pairs|unrelated: 1 pairs"/>
+<rect class="hit" x="366" y="30" width="12" height="212" data-tip="18 bits differ|new footer: 0 pairs|5% of words changed: 14 pairs|unrelated: 0 pairs"/>
+<rect class="hit" x="378" y="30" width="12" height="212" data-tip="19 bits differ|new footer: 0 pairs|5% of words changed: 5 pairs|unrelated: 1 pairs"/>
+<rect class="hit" x="390" y="30" width="12" height="212" data-tip="20 bits differ|new footer: 0 pairs|5% of words changed: 5 pairs|unrelated: 2 pairs"/>
+<rect class="hit" x="402" y="30" width="12" height="212" data-tip="21 bits differ|new footer: 0 pairs|5% of words changed: 3 pairs|unrelated: 4 pairs"/>
+<rect class="hit" x="414" y="30" width="12" height="212" data-tip="22 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 10 pairs"/>
+<rect class="hit" x="426" y="30" width="12" height="212" data-tip="23 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 4 pairs"/>
+<rect class="hit" x="438" y="30" width="12" height="212" data-tip="24 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 15 pairs"/>
+<rect class="hit" x="450" y="30" width="12" height="212" data-tip="25 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 19 pairs"/>
+<rect class="hit" x="462" y="30" width="12" height="212" data-tip="26 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 26 pairs"/>
+<rect class="hit" x="474" y="30" width="12" height="212" data-tip="27 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 35 pairs"/>
+<rect class="hit" x="486" y="30" width="12" height="212" data-tip="28 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 69 pairs"/>
+<rect class="hit" x="498" y="30" width="12" height="212" data-tip="29 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 68 pairs"/>
+<rect class="hit" x="510" y="30" width="12" height="212" data-tip="30 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 112 pairs"/>
+<rect class="hit" x="522" y="30" width="12" height="212" data-tip="31 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 101 pairs"/>
+<rect class="hit" x="534" y="30" width="12" height="212" data-tip="32 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 76 pairs"/>
+<rect class="hit" x="546" y="30" width="12" height="212" data-tip="33 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 104 pairs"/>
+<rect class="hit" x="558" y="30" width="12" height="212" data-tip="34 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 86 pairs"/>
+<rect class="hit" x="570" y="30" width="12" height="212" data-tip="35 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 76 pairs"/>
+<rect class="hit" x="582" y="30" width="12" height="212" data-tip="36 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 59 pairs"/>
+<rect class="hit" x="594" y="30" width="12" height="212" data-tip="37 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 49 pairs"/>
+<rect class="hit" x="606" y="30" width="12" height="212" data-tip="38 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 36 pairs"/>
+<rect class="hit" x="618" y="30" width="12" height="212" data-tip="39 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 24 pairs"/>
+<rect class="hit" x="630" y="30" width="12" height="212" data-tip="40 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 13 pairs"/>
+<rect class="hit" x="642" y="30" width="12" height="212" data-tip="41 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 4 pairs"/>
+<rect class="hit" x="654" y="30" width="12" height="212" data-tip="42 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 4 pairs"/>
+<rect class="hit" x="666" y="30" width="12" height="212" data-tip="43 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 2 pairs"/>
+<rect class="hit" x="678" y="30" width="12" height="212" data-tip="44 bits differ|new footer: 0 pairs|5% of words changed: 0 pairs|unrelated: 0 pairs"/>
+</svg>
+</div>
+<figcaption>Measured by the chapter’s code, with word triples as features. The gap between copies and unrelated pages is what a threshold relies on; how much editing still counts as a copy is a choice.</figcaption>
+</figure>
+
+<p>With word triples as features, a copy with a new 12-word footer differed from the original in 0 to 11 of 64 bits, a copy with 5% of its words changed in 1 to 21, and unrelated articles in 17 to 43. A threshold of 3 bits caught only 42% of the footer copies; a threshold of 10 caught 99.9% of them, 48% of the edited ones, and no unrelated pages. The threshold must be measured on real pages, because it depends on the features chosen and on how much difference still counts as the same page.</p>
+
+<h2 id="traps">Step 6c: Robots rules and traps</h2>
+<p>Site owners state their rules in <code>/robots.txt</code>, a long-standing convention standardized as RFC 9309 in 2022. A crawler reads the groups that apply to its user agent, follows the most specific matching rule, and caches the file, but per the RFC should not use a cached copy for more than 24 hours unless the file cannot be fetched. Two of its rules are easy to get backwards. A missing file, a <code>404</code>, means everything may be crawled; a server error or no answer means nothing may be, until the file can be read. And the RFC states plainly that “these rules are not a form of access authorization”: they ask for good behavior, and a crawler that respects them is choosing to.</p>
+<p>A <dfn>crawler trap</dfn> is a site, usually unintentionally, that generates an unbounded number of distinct URLs: a calendar with a link to the next day forever, session ids added to every link, search pages for every combination of filters. In the test, a crawl that started at an endless calendar fetched 2,000 calendar pages, all it was allowed, and had more queued. Politeness alone limited the damage to 0.40 pages a second, but that is about 34,700 pages a day, forever. A budget of 100 URLs for the host stopped it at 100.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Detecting traps only by URL length or depth. A calendar’s URLs are short and its pages are one link apart. Give every host a budget that grows with its importance, such as the number of other sites linking to it, and strip session parameters during normalization; then a trap costs a bounded number of fetches however it is built.</p></div>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A fetcher machine dies</th><td>Nothing</td><td>Its leases expire and the URLs return to the frontier</td></tr>
+<tr><th>A frontier machine dies</th><td>Its hosts pause briefly</td><td>The frontier is checkpointed to durable storage; its host partitions move to other machines, which reload them</td></tr>
+<tr><th>A site slows down or returns errors</th><td>For the site owner: fewer requests</td><td>The pause grows with response time and errors; after repeated failures the host is retried later</td></tr>
+<tr><th>The crawler is blocked or a site owner complains</th><td>Missing pages; an email</td><td>The contact page in the user agent, per-host overrides of the pause, and honoring robots changes within a day</td></tr>
+<tr><th>DNS is slow or failing</th><td>Fetch rate drops</td><td>Per-host DNS cache with its own resolvers; hosts whose lookups fail are retried later</td></tr>
+<tr><th>The seen filter fills beyond its design size</th><td>More pages silently skipped</td><td>Size it for the URLs expected, monitor its fill, and rebuild it larger from the URL store</td></tr>
+</tbody>
+</table>
+<p><b>At ten times the scale</b>, 20 billion pages a month, the arithmetic gives 7,700 pages a second, 11 Gbit/s and 23,000 sites in progress: more machines and more hosts, the same design. The URL store grows into hundreds of billions of records and becomes the main cost, and choosing what not to crawl, by priority and budgets, matters more than crawling faster. <b>At a hundred times</b>, the limit is the web itself: there are not enough distinct, useful pages to fetch that fast politely, and the work shifts to revisiting, deciding how often each page changes and fetching it about that often.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Mercator</b> (Heydon and Najork, 1999) gave each worker thread its own first-in, first-out queue and put all URLs of a host into the same one, so that “at most one worker thread will download documents from a given Web server”. Over an eight-day crawl of 77.4 million requests it averaged 112 documents a second, and 8.5% of successful downloads were duplicates of content already fetched.</li>
+  <li><b>IRLbot</b> (Lee, Leonard, Wang and Loguinov, 2008) crawled 6.3 billion valid HTML pages in 41 days on a single server, about 1,789 pages a second, and was designed around three problems: checking URL uniqueness at that scale, spam sites with endless links, and per-host rate limits.</li>
+  <li><b>Common Crawl’s</b> August 2026 archive, crawled from 7 to 20 August, holds 2.14 billion pages, 360 TiB uncompressed, of which 0.7 billion URLs had not been in earlier crawls.</li>
+  <li><b>Googlebot</b>, per Google’s documentation updated in February 2026, “shouldn’t access your site more than once every few seconds on average” for most sites, and crawls the first 2 MB of a supported file type and the first 64 MB of a PDF.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Render JavaScript</th><td>A second, much slower tier of headless browsers for pages that need it, fed from the first; many times the cost per page</td><td>The frontier and politeness, which now count the page’s extra requests too</td></tr>
+<tr><th>Keep important pages fresh</th><td>A revisit schedule per URL from its past change rate; conditional requests make unchanged pages cheap; sitemaps give hints</td><td>Discovery of new URLs</td></tr>
+<tr><th>Crawl only one topic</th><td>A classifier scores pages, and links from relevant pages get higher priority</td><td>The fetch loop</td></tr>
+<tr><th>Crawl from several regions</th><td>Hosts assigned to the region nearest them; seen filters partitioned by host as before</td><td>Politeness per host, now enforced in one region</td></tr>
+<tr><th>Respect a site’s requested crawl rate</th><td>A per-host pause stored in the host record and set by the owner</td><td>The heap, which already orders hosts by time</td></tr>
+<tr><th>Store a history of each page</th><td>Keep each changed version as a new record; deduplicate unchanged fetches by content hash</td><td>The archive format</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Start with the loop and say at once that politeness, not bandwidth, limits the rate. Estimate pages a second and then sites in progress, which leads straight to the frontier with a queue per host. Spend the deep dives on the frontier and on duplicates in all three forms: normalization, the seen filter with the direction of its errors, and content fingerprints. Mention robots.txt rules, traps with per-host budgets, and partitioning by host near the end, and keep JavaScript rendering for the follow-ups.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>One first-in, first-out queue</th><td>Either impolite bursts at one site or, if polite, 0.61 pages a second in the test</td><td>A queue per host and a heap of ready times</td></tr>
+<tr><th>Comparing URLs as written</th><td>18.3% of fetches wasted on pages already fetched, in the test</td><td>Normalize before checking or storing</td></tr>
+<tr><th>Keeping every seen URL in a hash set in memory</th><td>Hundreds of gigabytes for tens of billions of URLs</td><td>A Bloom filter, about 1.2 bytes per URL at 1%, backed by the URL store</td></tr>
+<tr><th>Treating a robots.txt server error as “allowed”</th><td>Crawling a site whose rules forbid it</td><td>A 404 allows; a 5xx or no answer forbids until the rules can be read</td></tr>
+<tr><th>Partitioning by URL hash</th><td>One site’s URLs spread over every machine; politeness needs coordination</td><td>Partition by host</td></tr>
+<tr><th>No per-host budget</th><td>A trap takes a fetch slot forever and fills the frontier</td><td>Budgets by importance, and session parameters stripped</td></tr>
+<tr><th>Fetching unchanged pages in full</th><td>Bandwidth spent on what is already stored</td><td>Conditional requests with the stored date and ETag</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="probabilistic-structures#bloom"></x-ref>: the seen-URL filter and why its errors suit a crawler.</li>
+  <li><x-ref to="probabilistic-structures#similarity"></x-ref>: SimHash and MinHash for near duplicates.</li>
+  <li><x-ref to="partitioning#consistent-hashing"></x-ref>: assigning hosts to machines.</li>
+  <li><x-ref to="http-and-tls#caching"></x-ref>: conditional requests for revisits.</li>
+  <li><x-ref to="search-systems"></x-ref>: what is built from the pages a crawler stores.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A crawler’s rate is limited by politeness to each site, so it is fast only by fetching from thousands of sites at once.</li>
+  <li>Give each host its own queue and order hosts by when each may be fetched next. In the test that was 197 pages a second with no impolite requests, against 0.61 for one polite queue.</li>
+  <li>Normalize every URL before comparing it. Without it, 18.3% of fetches in the test were pages already fetched.</li>
+  <li>A Bloom filter holds tens of billions of seen URLs in gigabytes, and its false “seen” costs a skipped page, which a crawler can tolerate.</li>
+  <li>Catch exact copies with a content hash and near copies with SimHash, and measure the threshold on real pages.</li>
+  <li>Read robots.txt with its failure rules the right way round, and give every host a budget so that no trap costs more than it allows.</li>
+  <li>Partition everything by host, so politeness needs no coordination between machines.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does a single first-in, first-out queue make a polite crawler slow, even with hundreds of fetchers?</summary><p>Links mostly point to the same site, so the queue holds runs of URLs from one host. To be polite, the URL at the head must wait out its host’s pause, and in a single queue everything behind it waits too. In the test the rate stayed near 0.6 pages a second whatever the number of fetchers.</p></details>
+<details><summary>The crawl must fetch 772 pages a second with a 2-second pause per site and 1 second per fetch. How many sites must be in progress?</summary><p>Each site can give one page every 3 seconds, a third of a page a second, so at least 772 × 3 ≈ 2,300 sites must be in progress at every moment, and in practice many more, since many sites have few pages left to fetch.</p></details>
+<details><summary>A Bloom filter of seen URLs reports a new URL as seen. What happens, and why is that acceptable here?</summary><p>The URL is not queued, so its page is skipped in this crawl. That is the safe direction for a crawler: the filter never reports a seen URL as new, so it never causes a duplicate fetch, and a skipped page is often found again through another link or in a later crawl.</p></details>
+<details><summary>Why partition the crawl by host rather than by a hash of the whole URL?</summary><p>Politeness is per host. With all of a host’s URLs, its robots rules and its last request time on one machine, that machine can enforce the pause alone. Partitioning by URL would spread one site over every machine, which would then have to coordinate every request to it.</p></details>
+<details><summary>Fetching robots.txt for a site returns 503. May the crawler fetch the site’s pages?</summary><p>No. RFC 9309 treats a server error or an unreachable file as a complete disallow, until the file can be read. Only a 4xx response, such as 404, means there are no rules and everything may be crawled.</p></details>
+<details><summary>A calendar page links to the next day, forever. Why does politeness alone not solve this, and what does?</summary><p>Politeness limits the rate, not the total: one fetch every few seconds is still tens of thousands of pages a day, for as long as the crawl runs, and the frontier and seen filter keep growing. A budget of URLs per host, sized by the site’s importance, caps the total.</p></details>
+<details><summary>Why are near duplicates found with SimHash instead of an ordinary hash of the page?</summary><p>An ordinary hash changes completely when one character changes, so a page with a new footer or advertisement looks unrelated. SimHash is built so that pages sharing most of their features differ in only a few bits of the fingerprint, and comparing the number of differing bits with a threshold finds them.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martijn Koster, Gary Illyes, Henner Zeller and Lizzi Sassman, <a href="https://www.rfc-editor.org/rfc/rfc9309.html">RFC 9309: Robots Exclusion Protocol</a>, IETF, September 2022. The rules, caching, and what errors mean.</li>
+  <li>Allan Heydon and Marc Najork, <a href="https://webpages.charlotte.edu/sakella/courses/cloud09/papers/Mercator.pdf">Mercator: A scalable, extensible Web crawler</a>, <cite>World Wide Web</cite> 2, 1999, pages 219 to 229. Per-host queues, URL-seen and content-seen tests.</li>
+  <li>Hsin-Tsang Lee, Derek Leonard, Xiaoming Wang and Dmitri Loguinov, <a href="https://archives.iw3c2.org/www2008/papers/fp865.html">IRLbot: Scaling to 6 Billion Pages and Beyond</a>, WWW 2008. Uniqueness checks, spam and politeness at billions of pages.</li>
+  <li>Common Crawl, <a href="https://commoncrawl.org/blog/august-2026-crawl-archive-now-available">August 2026 crawl archive now available</a>, 24 August 2026. The size of a current monthly crawl.</li>
+  <li>Google Search Central, <a href="https://developers.google.com/search/docs/crawling-indexing/googlebot">Googlebot</a>, last updated 3 February 2026. Crawl rate and size limits of a large production crawler.</li>
+</ol>
+</section>

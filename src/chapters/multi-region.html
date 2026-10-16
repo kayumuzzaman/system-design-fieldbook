@@ -1,0 +1,627 @@
+<!--meta
+{ "description": "Multi-region architecture explained for system design: why to run in several regions, the latency floor set by distance, active-passive and active-active topologies, routing users, replicating data across regions with asynchronous copies, consensus, multi-writer stores and home regions, data residency, and regional failover with static stability.",
+  "lede": "A region is a group of data centers in one part of the world. Running in more than one brings users closer, survives the loss of a whole region, and lets data stay in the country that requires it. It is also the most expensive architectural step most systems ever take, because distance turns every decision about data into a trade between speed, consistency and availability. This chapter explains the physics, the options, and how to fail over without making things worse.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Why leave one region</h2>
+<p>A cloud <dfn>region</dfn> is a set of data centers in one metropolitan area, divided into <dfn>availability zones</dfn> that are a few tens of kilometers apart and fail mostly independently. <x-ref to="availability-and-reliability#failure-domains"></x-ref> introduced both. A system spread over three zones of one region already survives the loss of a building, and for most systems that is the right place to stop.</p>
+<p>There are three reasons to go further, and it helps to know which one applies, because they lead to different designs.</p>
+<table>
+<thead><tr><th>Reason</th><th>What it requires</th><th>What it does not require</th></tr></thead>
+<tbody>
+<tr><th>Latency: users are far away</th><td>Serving reads, and ideally writes, near each user</td><td>Every region able to take over from every other</td></tr>
+<tr><th>Availability: survive a regional outage</th><td>A second region that can carry all traffic, with current data</td><td>Regions far apart or near users</td></tr>
+<tr><th>Residency: data must stay in a jurisdiction</th><td>Certain data stored and processed only in certain places</td><td>Any redundancy between regions at all</td></tr>
+</tbody>
+</table>
+<p>The reasons also conflict. Residency says some data must not leave Europe. Availability says a copy of everything should exist somewhere else. A design has to state which requirement wins for which data.</p>
+<p>The cost comes in the same three parts every time: more machines, more engineering in every feature that touches data, and new ways to fail. Regional outages are rare, and a multi-region design that is seldom exercised can cause more downtime through its own complexity than the outages it was built for. Go multi-region when a requirement forces it, and then only as far as that requirement goes.</p>
+
+<h2 id="physics">The floor set by distance</h2>
+<p>Light in optical fiber travels at about two thirds of its speed in a vacuum: roughly 200,000 km a second, or 200 km per millisecond. No engineering improves on that. A request and its response must cross the distance twice, so a server 6,000 km away cannot answer in under 60 ms even if it does no work.</p>
+<p>Real paths are longer than the straight line. Cables follow coastlines and ocean ridges, and packets pass through routers. A round trip of about one and a half times the theoretical minimum is a reasonable planning figure, and it varies widely by route.</p>
+
+<figure class="fig wide" id="fig-rtt">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 252" role="img" aria-labelledby="f451t f451d">
+<title id="f451t">Round-trip time between pairs of cities, from distance alone</title>
+<desc id="f451d">A bar chart of round-trip time in milliseconds for eight city pairs, showing the physical minimum for a straight fiber and a typical value one and a half times larger. London to Frankfurt, 640 kilometers: 6 to 10 milliseconds. New York to Chicago, 1,140 kilometers: 11 to 17. New York to San Francisco, 4,130 kilometers: 41 to 62. New York to London, 5,570 kilometers: 56 to 84. London to Mumbai, 7,190 kilometers: 72 to 108. San Francisco to Tokyo, 8,270 kilometers: 83 to 124. London to Singapore, 10,850 kilometers: 108 to 163. New York to Sydney, 15,990 kilometers: 160 to 240.</desc>
+<line class="axis" x1="250" y1="24" x2="250" y2="206"/>
+<text class="ts mid" x="250.0" y="226">0</text>
+<line class="axis" x1="328" y1="206" x2="328" y2="211"/>
+<text class="ts mid" x="328.0" y="226">50</text>
+<line class="axis" x1="406" y1="206" x2="406" y2="211"/>
+<text class="ts mid" x="406.0" y="226">100</text>
+<line class="axis" x1="484" y1="206" x2="484" y2="211"/>
+<text class="ts mid" x="484.0" y="226">150</text>
+<line class="axis" x1="562" y1="206" x2="562" y2="211"/>
+<text class="ts mid" x="562.0" y="226">200</text>
+<line class="axis" x1="640" y1="206" x2="640" y2="211"/>
+<text class="ts mid" x="640.0" y="226">250</text>
+<line class="axis" x1="250" y1="206" x2="640" y2="206"/>
+<text class="ts mid" x="445.0" y="244">round-trip time, ms</text>
+<text class="ts" x="10" y="43">London – Frankfurt</text>
+<text class="ts end" x="242" y="43">640 km</text>
+<rect class="bar mute" x="250" y="30" width="14.9" height="16" rx="2"/>
+<rect class="bar" x="250" y="30" width="10.0" height="16" rx="2"/>
+<text class="ts" x="270.9292" y="43">6 to 10</text>
+<text class="ts" x="10" y="65">New York – Chicago</text>
+<text class="ts end" x="242" y="65">1,140 km</text>
+<rect class="bar mute" x="250" y="52" width="26.8" height="16" rx="2"/>
+<rect class="bar" x="250" y="52" width="17.8" height="16" rx="2"/>
+<text class="ts" x="282.7696" y="65">11 to 17</text>
+<text class="ts" x="10" y="87">New York – San Francisco</text>
+<text class="ts end" x="242" y="87">4,130 km</text>
+<rect class="bar mute" x="250" y="74" width="96.6" height="16" rx="2"/>
+<rect class="bar" x="250" y="74" width="64.4" height="16" rx="2"/>
+<text class="ts" x="352.6186" y="87">41 to 62</text>
+<text class="ts" x="10" y="109">New York – London</text>
+<text class="ts end" x="242" y="109">5,570 km</text>
+<rect class="bar mute" x="250" y="96" width="130.3" height="16" rx="2"/>
+<rect class="bar" x="250" y="96" width="86.9" height="16" rx="2"/>
+<text class="ts" x="386.338" y="109">56 to 84</text>
+<text class="ts" x="10" y="131">London – Mumbai</text>
+<text class="ts end" x="242" y="131">7,190 km</text>
+<rect class="bar mute" x="250" y="118" width="168.3" height="16" rx="2"/>
+<rect class="bar" x="250" y="118" width="112.2" height="16" rx="2"/>
+<text class="ts" x="424.2928" y="131">72 to 108</text>
+<text class="ts" x="10" y="153">San Francisco – Tokyo</text>
+<text class="ts end" x="242" y="153">8,270 km</text>
+<rect class="bar mute" x="250" y="140" width="193.6" height="16" rx="2"/>
+<rect class="bar" x="250" y="140" width="129.0" height="16" rx="2"/>
+<text class="ts" x="449.5648" y="153">83 to 124</text>
+<text class="ts" x="10" y="175">London – Singapore</text>
+<text class="ts end" x="242" y="175">10,850 km</text>
+<rect class="bar mute" x="250" y="162" width="253.8" height="16" rx="2"/>
+<rect class="bar" x="250" y="162" width="169.2" height="16" rx="2"/>
+<text class="ts" x="509.8432" y="175">108 to 163</text>
+<text class="ts" x="10" y="197">New York – Sydney</text>
+<text class="ts end" x="242" y="197">15,990 km</text>
+<rect class="bar mute" x="250" y="184" width="374.1" height="16" rx="2"/>
+<rect class="bar" x="250" y="184" width="249.4" height="16" rx="2"/>
+<text class="ts" x="630.1192" y="197">160 to 240</text>
+<rect class="bar" x="10" y="232" width="14" height="12" rx="2"/>
+<text class="ts" x="30" y="242">physical minimum</text>
+<rect class="bar mute" x="136" y="232" width="14" height="12" rx="2"/>
+<text class="ts" x="156" y="242">typical</text>
+<rect class="hit" x="6" y="28" width="708" height="20" data-tip="London – Frankfurt|640 km|physical minimum: 6 ms round trip|typical: 10 ms"/>
+<rect class="hit" x="6" y="50" width="708" height="20" data-tip="New York – Chicago|1,140 km|physical minimum: 11 ms round trip|typical: 17 ms"/>
+<rect class="hit" x="6" y="72" width="708" height="20" data-tip="New York – San Francisco|4,130 km|physical minimum: 41 ms round trip|typical: 62 ms"/>
+<rect class="hit" x="6" y="94" width="708" height="20" data-tip="New York – London|5,570 km|physical minimum: 56 ms round trip|typical: 84 ms"/>
+<rect class="hit" x="6" y="116" width="708" height="20" data-tip="London – Mumbai|7,190 km|physical minimum: 72 ms round trip|typical: 108 ms"/>
+<rect class="hit" x="6" y="138" width="708" height="20" data-tip="San Francisco – Tokyo|8,270 km|physical minimum: 83 ms round trip|typical: 124 ms"/>
+<rect class="hit" x="6" y="160" width="708" height="20" data-tip="London – Singapore|10,850 km|physical minimum: 108 ms round trip|typical: 163 ms"/>
+<rect class="hit" x="6" y="182" width="708" height="20" data-tip="New York – Sydney|15,990 km|physical minimum: 160 ms round trip|typical: 240 ms"/>
+</svg>
+</div>
+<figcaption>Great-circle distances, computed from coordinates. The minimum assumes a straight cable. The typical value assumes a path one and a half times as long. Measured values differ by route and by hour.</figcaption>
+</figure>
+
+<p>One round trip is the best case. A new connection needs several before the first byte of the response arrives: one for the TCP handshake, one for TLS 1.3, then the request itself, as <x-ref to="http-and-tls#handshake"></x-ref> showed. HTTP/3 merges the first two.</p>
+
+<div class="widget" data-widget="distance">
+<h4>Distance and response time</h4>
+<p>How long a user waits for a server at a given distance, on a new connection and on one that is already open.</p>
+<div class="controls">
+  <label>Distance, in km<input type="number" name="km" value="6500" min="1" max="20000" step="500"></label>
+  <label>Path length compared with a straight line<input type="number" name="factor" value="1.5" min="1" max="4" step="0.1"></label>
+  <label>Server processing time, in ms<input type="number" name="server" value="50" min="0" step="10"></label>
+</div>
+<dl class="results">
+  <div><dt>One round trip</dt><dd data-out="rtt">97.5 ms</dd></div>
+  <div><dt>First request, TCP and TLS 1.3</dt><dd data-out="fresh">343 ms</dd></div>
+  <div><dt>First request, HTTP/3</dt><dd data-out="quic">245 ms</dd></div>
+  <div><dt>Request on an open connection</dt><dd data-out="reuse">148 ms</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Light in fiber covers 6,500 km in 32.5 ms, and real routes are longer, so one round trip takes about 97.5 ms. A first request over TCP and TLS 1.3 needs three round trips before the response arrives: 343 ms. Over HTTP/3 it needs two: 245 ms. On a connection that is already open it needs one: 148 ms. Server time is 50 ms of each. Only moving closer reduces the rest.</p>
+</div>
+
+<p>The default distance, 6,500 km, is roughly New York to Frankfurt. Two conclusions follow from the numbers.</p>
+<p>First, much of the delay on a first request is connection setup, and that part can be fixed without a second region. A content delivery network terminates the user’s connection at a nearby point of presence and reuses warm connections to the origin, as <x-ref to="cdn-and-edge#dynamic"></x-ref> described. For a product with one region and users everywhere, this is the first step, and often a sufficient one.</p>
+<p>Second, what remains is one round trip to wherever the data is. To remove that, the data itself must move closer to the user, and that is where multi-region becomes hard.</p>
+
+<h2 id="topologies">Four shapes</h2>
+<p>Multi-region designs differ mainly in which regions accept writes.</p>
+
+<figure class="fig wide" id="fig-topologies">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-labelledby="f452t f452d">
+<title id="f452t">Four multi-region topologies</title>
+<desc id="f452d">Four arrangements of two regions. Active-passive: region A serves everyone and copies its data to region B, a standby. It is simple, and B does no work until a failover, so nobody knows whether it works. Read local, write central: region A handles reads and writes, region B handles reads only and sends writes to A. Reads are fast everywhere, writes from far users travel, and their next read may be stale. Active-active where each user has a home: region A holds Europe’s users and region B holds Asia’s users, with backup copies in both directions. Reads and writes are local for nearly everyone, and features that span regions need care. Active-active, write anywhere: both regions accept any write from any user and replicate both ways. Writes are local for all, and concurrent changes must be merged, or agreed at a latency cost.</desc>
+<text class="tb" x="10" y="18">Active-passive</text>
+<rect class="n sig" x="10" y="30" width="120" height="46" rx="6"/>
+<text class="ts tb mid" x="70" y="49">Region A</text>
+<text class="ts mid" x="70" y="66">serves everyone</text>
+<rect class="n ghost" x="225" y="30" width="120" height="46" rx="6"/>
+<text class="ts tb mid" x="285" y="49">Region B</text>
+<text class="ts mid" x="285" y="66">standby</text>
+<path class="e store" d="M130 58H225"/>
+<text class="ts mid" x="177" y="50">copy</text>
+<text class="ts" x="10" y="96">Simple. B does no work until a failover,</text>
+<text class="ts" x="10" y="111">so nobody knows whether it works.</text>
+<text class="tb" x="380" y="18">Read local, write central</text>
+<rect class="n sig" x="380" y="30" width="120" height="46" rx="6"/>
+<text class="ts tb mid" x="440" y="49">Region A</text>
+<text class="ts mid" x="440" y="66">reads and writes</text>
+<rect class="n store" x="595" y="30" width="120" height="46" rx="6"/>
+<text class="ts tb mid" x="655" y="49">Region B</text>
+<text class="ts mid" x="655" y="66">reads only</text>
+<path class="e store" d="M500 48H595"/>
+<text class="ts mid" x="547" y="42">copy</text>
+<path class="e" d="M595 62H500"/>
+<text class="ts mid" x="547" y="75">writes</text>
+<text class="ts" x="380" y="96">Fast reads everywhere. Writes from far</text>
+<text class="ts" x="380" y="111">users travel, and their next read may be stale.</text>
+<text class="tb" x="10" y="154">Active-active, each user has a home</text>
+<rect class="n sig" x="10" y="166" width="120" height="46" rx="6"/>
+<text class="ts tb mid" x="70" y="185">Region A</text>
+<text class="ts mid" x="70" y="202">Europe’s users</text>
+<rect class="n sig" x="225" y="166" width="120" height="46" rx="6"/>
+<text class="ts tb mid" x="285" y="185">Region B</text>
+<text class="ts mid" x="285" y="202">Asia’s users</text>
+<path class="e store dash both" d="M130 194H225"/>
+<text class="ts mid" x="177" y="186">backups</text>
+<text class="ts" x="10" y="232">Local reads and writes for nearly everyone.</text>
+<text class="ts" x="10" y="247">Features that span regions need care.</text>
+<text class="tb" x="380" y="154">Active-active, write anywhere</text>
+<rect class="n sig" x="380" y="166" width="120" height="46" rx="6"/>
+<text class="ts tb mid" x="440" y="185">Region A</text>
+<text class="ts mid" x="440" y="202">any user, any write</text>
+<rect class="n sig" x="595" y="166" width="120" height="46" rx="6"/>
+<text class="ts tb mid" x="655" y="185">Region B</text>
+<text class="ts mid" x="655" y="202">any user, any write</text>
+<path class="e store both" d="M500 194H595"/>
+<text class="ts mid" x="547" y="186">both ways</text>
+<text class="ts" x="380" y="232">Local writes for all. Concurrent changes must</text>
+<text class="ts" x="380" y="247">be merged, or agreed at a latency cost.</text>
+</svg>
+</div>
+<figcaption>From top left to bottom right, each shape serves more traffic locally and asks more of the data layer.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Shape</th><th>Read latency for far users</th><th>Write latency for far users</th><th>Loses data on failover?</th><th>Main difficulty</th></tr></thead>
+<tbody>
+<tr><th>Active-passive</th><td>High</td><td>High</td><td>The last moments, if replication is asynchronous</td><td>The standby is untested</td></tr>
+<tr><th>Read local, write central</th><td>Low</td><td>High</td><td>The same</td><td>Stale reads after a write</td></tr>
+<tr><th>Active-active, home regions</th><td>Low</td><td>Low</td><td>The same, for the failed region’s users</td><td>Anything that spans regions</td></tr>
+<tr><th>Active-active, write anywhere</th><td>Low</td><td>Low, or one quorum round trip</td><td>Depends on the store</td><td>Conflicts, or consensus latency</td></tr>
+</tbody>
+</table>
+<p>The stateless parts of a system are easy in every shape: run the same containers in each region. All of the difficulty is in the data, and the sections after routing take it in order.</p>
+
+<h2 id="routing">Getting users to a region</h2>
+<p>Something must send each user to a region. Three mechanisms do it, and large systems combine them.</p>
+<ul>
+  <li><b>DNS steering.</b> The authoritative DNS server answers with a different address depending on where the question comes from, or on measured latency, as in <x-ref to="dns#steering"></x-ref>. It is simple and universal. It is also slow to change, because resolvers cache answers for the record’s time to live and some ignore it, so a failover by DNS takes minutes for most users and longer for a few.</li>
+  <li><b>Anycast.</b> The same IP address is announced from every region, and internet routing delivers each packet to a nearby one, as in <x-ref to="ip-and-routing#anycast"></x-ref>. A region that stops announcing loses its traffic within seconds, with no caches to wait for. This is how content delivery networks and the cloud providers’ global load balancers work.</li>
+  <li><b>Application-level redirection.</b> The client learns its region after login and then calls a regional hostname directly, such as <code>eu.api.photos.example</code>. The application decides, using knowledge the network does not have, such as where the user’s data lives.</li>
+</ul>
+<p>Routing by nearness alone is not enough once data is involved. A user sent to the nearest region may find that their data is somewhere else, or is a second behind. Two rules keep this manageable. Keep a user on one region for the length of a session, so that they read what they wrote. Let the application override the network’s choice when the data requires it. The home-region pattern below is built on the second rule.</p>
+
+<h2 id="data">Data across regions</h2>
+<p><x-ref to="replication"></x-ref> set out the choices for keeping copies in step. Distance changes their prices. Within a region, a synchronous copy costs a millisecond. Across an ocean it costs a hundred. The PACELC rule from <x-ref to="consistency-models#pacelc"></x-ref> describes exactly this: even with no failure, you choose between latency and consistency.</p>
+
+<h3 id="async">Asynchronous copies</h3>
+<p>One region holds the primary. Others receive its changes a moment later and serve reads from their copies. This is the “read local, write central” shape, and it is where most systems start, because every mainstream database supports it.</p>
+<p>It has two costs. The first is that copies lag, usually by well under a second and occasionally by much more. A user in Singapore who changes their profile and reloads the page reads from the Singapore copy, which may not have the change yet. The remedies are those in <x-ref to="replication#lag"></x-ref> and <x-ref to="consistency-models#session"></x-ref>: for a short time after a write, send that user’s reads to the primary, or have the client carry a position that the copy must have reached.</p>
+<p>The second cost appears on failover. Changes that had not yet reached the other region when the primary was lost are gone, or stranded until the old region returns. The amount is the replication lag at that moment: the recovery point objective from <x-ref to="availability-and-reliability#rto-rpo"></x-ref> cannot be zero.</p>
+
+<h3 id="consensus-across">Consensus across regions</h3>
+<p>To lose nothing when a region fails, a write must be stored in more than one region before it is acknowledged. Databases built for this replicate every write with a consensus protocol among replicas in different regions, as <x-ref to="consensus"></x-ref> described: Google Spanner, CockroachDB, YugabyteDB and Amazon Aurora DSQL are examples. Since June 2025 DynamoDB global tables also offer a strongly consistent mode across three regions, alongside their original eventually consistent mode.</p>
+<p>The price is latency on every write. A leader must hear from a majority before it commits, so each write waits for a round trip to the nearest other replica. Where the replicas are placed decides how long that is.</p>
+
+<figure class="fig wide" id="fig-quorum">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f453t f453d">
+<title id="f453t">Commit latency of a three-replica consensus group, placed near and placed far</title>
+<desc id="f453d">Two placements of three replicas with the leader in northern Virginia. With the other two in Ohio and Oregon, the round trips are 7 and 53 milliseconds, and a write commits when the nearest follower answers, in about 7 milliseconds. All three share one continent and whatever affects it. With the other two in Ireland and Tokyo, the round trips are 82 and 163 milliseconds, and a write commits in about 82 milliseconds. From a user in Tokyo it takes 163 milliseconds to reach the leader first, about 245 milliseconds in all.</desc>
+<text class="tb" x="10" y="18">Three regions close together</text>
+<rect class="n sig" x="10" y="70" width="110" height="46" rx="6"/>
+<text class="ts tb mid" x="65" y="89">N. Virginia</text>
+<text class="ts mid" x="65" y="106">leader</text>
+<rect class="n store" x="220" y="34" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="275" y="58.5">Ohio</text>
+<rect class="n" x="220" y="112" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="275" y="136.5">Oregon</text>
+<path class="e store both" d="M120 84L220 56"/>
+<text class="ts mid" x="160" y="58">7 ms</text>
+<path class="e both" d="M120 102L220 130"/>
+<text class="ts mid" x="160" y="134">53 ms</text>
+<text class="ts" x="10" y="178">A write commits when the nearest follower</text>
+<text class="ts" x="10" y="193">answers: about 7 ms. All three share one</text>
+<text class="ts" x="10" y="208">continent and whatever affects it.</text>
+<path class="e none dash" d="M360 8V224"/>
+<text class="tb" x="380" y="18">Three regions around the world</text>
+<rect class="n sig" x="380" y="70" width="110" height="46" rx="6"/>
+<text class="ts tb mid" x="435" y="89">N. Virginia</text>
+<text class="ts mid" x="435" y="106">leader</text>
+<rect class="n store" x="590" y="34" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="645" y="58.5">Ireland</text>
+<rect class="n" x="590" y="112" width="110" height="40" rx="6"/>
+<text class="ts tb mid" x="645" y="136.5">Tokyo</text>
+<path class="e store both" d="M490 84L590 56"/>
+<text class="ts mid" x="530" y="58">82 ms</text>
+<path class="e both" d="M490 102L590 130"/>
+<text class="ts mid" x="530" y="134">163 ms</text>
+<text class="ts" x="380" y="178">A write commits in about 82 ms. From a user in</text>
+<text class="ts" x="380" y="193">Tokyo it takes 163 ms to reach the leader</text>
+<text class="ts" x="380" y="208">first: about 245 ms in all.</text>
+
+</svg>
+</div>
+<figcaption>Typical round-trip times estimated from distance, as in the earlier chart. A majority of three is two, so the leader waits for the nearer of its two followers.</figcaption>
+</figure>
+
+<p>The function that produced those figures is short, and worth reading because it states the rule exactly.</p>
+
+<pre data-lang="ts" data-title="commit-latency.ts">type Place = { name: string; lat: number; lon: number };
+
+/** Great-circle distance in km. */
+export function distanceKm(a: Place, b: Place): number {
+  const rad = (d: number) => (d * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat), dLon = rad(b.lon - a.lon);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(h));
+}
+
+const FIBER_KM_PER_MS = 200;   // light in glass travels at about two thirds of its speed in vacuum
+
+/** Round-trip time in ms. routeFactor 1 is a straight cable, 1.5 is a typical real path. */
+export function roundTripMs(a: Place, b: Place, routeFactor = 1.5): number {
+  return (2 * distanceKm(a, b) * routeFactor) / FIBER_KM_PER_MS;
+}
+
+/** The leader needs acknowledgments from a majority, counting itself: wait for the nearest ones. */
+export function commitMs(leader: Place, replicas: Place[]): number {
+  const others = replicas.filter((r) => r !== leader).map((r) => roundTripMs(leader, r)).sort((x, y) => x - y);
+  const majority = Math.floor(replicas.length / 2) + 1;
+  const needed = majority - 1;            // acknowledgments beyond the leader's own
+  return needed === 0 ? 0 : others[needed - 1];
+}</pre>
+
+<p>Three consequences follow from it.</p>
+<ul>
+  <li><b>Nearby replicas are fast and share risks.</b> Three regions on one continent commit in a few milliseconds and survive the loss of any one region. They do nothing for users on other continents.</li>
+  <li><b>Distant replicas are slow for everyone.</b> Spread around the world, every write waits most of a hundred milliseconds, and a transaction with several statements waits several times.</li>
+  <li><b>The leader’s location matters most.</b> With the leader in Tokyo instead of Virginia, the same three regions commit in about 144 ms, because both followers are far away. Users far from the leader pay to reach it before the commit even starts. These databases therefore let you choose a leader region, and some move leaders to follow the traffic.</li>
+</ul>
+<p>Reads need care as well. A read that must be current has to consult the leader or prove that its local replica is up to date. Most of these systems also offer reads that are a few seconds stale from the nearest replica, which is fast and enough for much of what an application shows.</p>
+
+<h3 id="multi-writer">Writing anywhere without waiting</h3>
+<p>The opposite choice is to accept writes in every region immediately and replicate afterward. DynamoDB global tables in their default mode, Cassandra across data centers, and Azure Cosmos DB with multi-region writes work this way. Writes are fast everywhere and each region keeps working when cut off from the others.</p>
+<p>The cost is conflicts. Two regions can accept different changes to the same item before either hears of the other’s, and something must decide the outcome. <x-ref to="replication#multi-leader"></x-ref> covered the options. The usual default is that the write with the later timestamp wins and the other is silently discarded. That is acceptable for data where the last value is all that matters, such as a profile field, and wrong for anything that accumulates, such as a counter, an inventory level or a balance. For those, either use data types designed to merge, or do not use this model.</p>
+
+<h3 id="geo-partitioning">Giving each piece of data one home</h3>
+<p>The fourth choice avoids both costs for most requests by observing that most data belongs to someone, and that person is usually in one place. Keep each user’s data in the region nearest to them, with its replicas in zones of that region or in neighboring regions. Their reads and writes are then local and strongly consistent, at single-region speed.</p>
+<p>Some distributed SQL databases build this in. CockroachDB, for example, can pin each row of a table to a region named in one of its columns, and treats small, rarely changing reference tables as global so that every region can read them quickly. The same pattern can be built by hand on ordinary databases, one cluster per region, and that version is common enough to deserve its own section.</p>
+
+<h2 id="home-region">The home-region pattern</h2>
+<p>Each user, or each tenant, is assigned a <dfn>home region</dfn> when they sign up. Their data lives there. Each region runs a complete copy of the application and its own databases, which makes each region a cell in the sense of <x-ref to="multi-tenancy#cells"></x-ref>.</p>
+<p>One small piece of data must be global: the directory that says which region each user belongs to. It is replicated to every region and read locally. It changes only when a user signs up or moves, so replicating it is cheap and a slightly stale copy does little harm.</p>
+
+<figure class="fig wide" id="fig-home">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f454t f454d">
+<title id="f454t">Routing a request to the user’s home region</title>
+<desc id="f454d">Two regions, Europe and the US, each with an application and a database. Ana’s data is in the Europe region and Ben’s data is in the US region. When Ana is at home in Berlin her request goes to the Europe application and is served from her data there. When Ana is traveling in New York her request lands on the US application. Step one, it asks a user directory, which has a copy in every region and is read locally, where Ana is, and learns that her home is Europe. Step two, it forwards the request to the Europe application, adding about 98 milliseconds.</desc>
+<rect class="n" x="10" y="44" width="120" height="44" rx="6"/>
+<text class="ts tb mid" x="70" y="62">Ana, at home</text>
+<text class="ts mid" x="70" y="79">in Berlin</text>
+<rect class="n" x="10" y="162" width="120" height="44" rx="6"/>
+<text class="ts tb mid" x="70" y="180">Ana, traveling</text>
+<text class="ts mid" x="70" y="197">in New York</text>
+<rect class="n ghost" x="180" y="22" width="330" height="88" rx="8"/>
+<text class="ts tb end" x="498" y="40">Europe region</text>
+<rect class="n ghost" x="180" y="140" width="330" height="88" rx="8"/>
+<text class="ts tb end" x="498" y="158">US region</text>
+<rect class="n sig" x="192" y="52" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="237" y="78.5">App</text>
+<rect class="n store" x="296" y="52" width="100" height="44" rx="6"/>
+<text class="ts tb mid" x="346" y="78.5">Ana’s data</text>
+<rect class="n async" x="410" y="52" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="455" y="70">Directory</text>
+<text class="ts mid" x="455" y="87">local copy</text>
+<rect class="n sig" x="192" y="170" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="237" y="196.5">App</text>
+<rect class="n async" x="296" y="170" width="100" height="44" rx="6"/>
+<text class="ts tb mid" x="346" y="188">Directory</text>
+<text class="ts mid" x="346" y="205">local copy</text>
+<rect class="n" x="410" y="170" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="455" y="196.5">Ben’s data</text>
+<g data-s="1">
+<path class="e" d="M130 66H192"/>
+<path class="e store" d="M282 74H296"/>
+</g>
+<g data-s="2">
+<path class="e" d="M130 184H192"/>
+</g>
+<g data-s="3">
+<path class="e async" d="M282 192H296"/>
+</g>
+<g data-s="4">
+<path class="e async" d="M237 170V96"/>
+<text class="ts" x="245" y="130">forward, +98 ms</text>
+</g>
+<g data-s="5">
+<text class="ts" x="530" y="50">The directory is the only</text>
+<text class="ts" x="530" y="66">global data:</text>
+<text class="ts" x="530" y="82">ana → europe</text>
+<text class="ts" x="530" y="98">ben → us</text>
+<text class="ts" x="530" y="150">Every region holds a copy</text>
+<text class="ts" x="530" y="166">and reads it locally. It</text>
+<text class="ts" x="530" y="182">changes only when a user</text>
+<text class="ts" x="530" y="198">signs up or moves.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="request|read">At home in Berlin, Ana’s requests reach the Europe region, where her data lives. Everything is local.</li>
+  <li data-msg="request">Traveling in New York, she reaches the nearest region, which is the US one.</li>
+  <li data-msg="where is Ana?">The app there looks her up in its local copy of the directory. Ana’s home is Europe.</li>
+  <li data-msg="forward">So it forwards her request to the Europe region, which adds about 98 ms. She is slower while she travels, and correct everywhere.</li>
+  <li>The directory is the only global data. Every region holds a copy and reads it locally, and it changes only when a user signs up or moves.</li>
+</ol>
+<figcaption>Ana is slower while she travels and correct everywhere. The alternative, copying her data to follow her, is a migration and not something to do per request.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="route.ts">type Decision = { serveIn: string; forwarded: boolean; reason: string };
+
+/**
+ * Reads of replicated, public data are served where the request landed.
+ * Anything that touches the user's own data goes to the user's home region.
+ */
+export function route(
+  landedIn: string,
+  homeRegion: string,
+  kind: "public-read" | "own-data",
+  healthy: Set<string>,
+): Decision {
+  if (kind === "public-read") return { serveIn: landedIn, forwarded: false, reason: "replicated data, read locally" };
+  if (!healthy.has(homeRegion)) throw new Error(`home region ${homeRegion} is unavailable`);
+  return landedIn === homeRegion
+    ? { serveIn: homeRegion, forwarded: false, reason: "already at home" }
+    : { serveIn: homeRegion, forwarded: true, reason: "forwarded to the home region" };
+}</pre>
+
+<p>The function shows the pattern’s two limits.</p>
+<p><b>What crosses regions.</b> In the photo app, Ana in Europe follows Ben in the US. Her feed needs his public photos. The usual answer splits data by kind. Private data, such as Ana’s settings, drafts and messages, lives only at home. Public or shared data, such as Ben’s published photos, is copied asynchronously to every region so that anyone can read it locally, slightly late. Operations that must change data in two regions at once, such as a transfer between two users’ balances, need the sagas of <x-ref to="distributed-transactions#sagas"></x-ref>, and are best avoided in the design where possible.</p>
+<p><b>What happens when a home is down.</b> The function throws. Ana’s data is in Europe, and if Europe is unreachable, she cannot be served from elsewhere unless a current copy exists elsewhere and is allowed to exist there. A home-region design gives every region’s users independence from other regions’ failures. It does not by itself give them protection from their own region’s failure. That needs replicas outside the region, which brings back the earlier choice between asynchronous copies that may lose the latest writes and consensus that slows every write.</p>
+
+<h2 id="residency">Data residency</h2>
+<p><dfn>Data residency</dfn> is a requirement that certain data be stored, and often processed, within a particular country or bloc. It comes from law in some countries and sectors, and more often from customer contracts: a European bank or a public agency will make it a condition of buying. This section describes the engineering. What a given law requires is a question for a lawyer, and the answer changes.</p>
+<p>The home-region pattern is the natural fit. The tenant’s region becomes a property chosen at signup, recorded in the directory and enforced by placement, as in <x-ref to="multi-tenancy#placement"></x-ref>. The difficult part is that residency applies to every copy of the data, and a system makes more copies than its designers remember.</p>
+<table>
+<thead><tr><th>Copy</th><th>Why it is missed</th></tr></thead>
+<tbody>
+<tr><th>Backups and snapshots</th><td>Often sent to another region by default, for safety</td></tr>
+<tr><th>Logs, traces and error reports</th><td>Collected centrally, and full of user content unless care is taken</td></tr>
+<tr><th>Analytics and the data warehouse</th><td>One global warehouse is the convenient design</td></tr>
+<tr><th>Search indexes and caches</th><td>Derived data is still the data</td></tr>
+<tr><th>Queues and streams in transit</th><td>A global event bus carries everything everywhere</td></tr>
+<tr><th>Third-party services</th><td>Email, support desk, payment and monitoring vendors store what you send them, where they choose</td></tr>
+<tr><th>Staff access</th><td>An engineer in another country reading production data may count as a transfer</td></tr>
+<tr><th>The global directory itself</th><td>If it maps email addresses to regions, it holds personal data from every region</td></tr>
+</tbody>
+</table>
+<p>The last row needs a design decision. A login page must find a user’s region before it can authenticate them. Common answers are to keep only a hash of the identifier in the global directory, to put the region in the hostname the customer uses, such as <code>acme.eu.photos.example</code>, or to ask each region in turn.</p>
+<p>Residency also constrains failover. If European data may not leave Europe, its standby must be a second European region, and the plan for losing both is to be unavailable. That is a legitimate outcome to write down: for this data, the residency requirement outranks availability.</p>
+
+<h2 id="failover">Regional failover</h2>
+<p>Having a second region is not the same as being able to use it. Failover is a procedure with several steps, each of which can fail, carried out during an incident that is already going badly. Its design matters more than the standby’s existence.</p>
+
+<h3 id="capacity">Capacity for the survivors</h3>
+<p>When a region is lost, its traffic lands on the others. They must have room for it, already running.</p>
+
+<figure class="fig wide" id="fig-capacity">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f455t f455d">
+<title id="f455t">Load on each surviving region after one region is lost</title>
+<desc id="f455d">A bar chart with four scenarios, showing the load on each region normally and after losing one region. Two regions at 50 percent: the survivor runs at 100 percent. Three regions at 60 percent: each survivor runs at 90 percent. Four regions at 70 percent: each survivor runs at 93 percent. Two regions at 80 percent: the survivor would need 160 percent, which is above its capacity. The survivors inherit the lost region’s traffic, so with N regions each must normally run below N minus 1 over N of its capacity.</desc>
+<line class="axis" x1="64" y1="204" x2="470" y2="204"/>
+<text class="ts end" x="56" y="208.0">0%</text>
+<line class="grid" x1="64" y1="147.75" x2="470" y2="147.75"/>
+<text class="ts end" x="56" y="151.75">50%</text>
+<line class="grid" x1="64" y1="91.5" x2="470" y2="91.5"/>
+<text class="ts end" x="56" y="95.5">100%</text>
+<line class="grid" x1="64" y1="35.25" x2="470" y2="35.25"/>
+<text class="ts end" x="56" y="39.25">150%</text>
+<text class="ts mid" transform="translate(14 114) rotate(-90)">load on each region</text>
+<rect class="bar mute" x="86" y="147.8" width="26" height="56.2" rx="3"/>
+<rect class="bar store" x="116" y="91.5" width="26" height="112.5" rx="3"/>
+<text class="ts mid" x="129" y="85.5">100%</text>
+<text class="ts mid" x="114" y="222">2 regions</text>
+<text class="ts mid" x="114" y="238">at 50%</text>
+<rect class="bar mute" x="184" y="136.5" width="26" height="67.5" rx="3"/>
+<rect class="bar store" x="214" y="102.8" width="26" height="101.2" rx="3"/>
+<text class="ts mid" x="227" y="85.5">90%</text>
+<text class="ts mid" x="212" y="222">3 regions</text>
+<text class="ts mid" x="212" y="238">at 60%</text>
+<rect class="bar mute" x="282" y="125.2" width="26" height="78.8" rx="3"/>
+<rect class="bar store" x="312" y="99.4" width="26" height="104.6" rx="3"/>
+<text class="ts mid" x="325" y="85.5">93%</text>
+<text class="ts mid" x="310" y="222">4 regions</text>
+<text class="ts mid" x="310" y="238">at 70%</text>
+<rect class="bar mute" x="380" y="114.0" width="26" height="90.0" rx="3"/>
+<rect class="bar fault" x="410" y="24.0" width="26" height="180.0" rx="3"/>
+<text class="ts mid" x="423" y="18.0">160%</text>
+<text class="ts mid" x="408" y="222">2 regions</text>
+<text class="ts mid" x="408" y="238">at 80%</text>
+<path class="e none dash" d="M64 91.5H470"/>
+<rect class="bar mute" x="492" y="30" width="14" height="12" rx="2"/>
+<text class="ts" x="512" y="40">normally</text>
+<rect class="bar store" x="492" y="50" width="14" height="12" rx="2"/>
+<text class="ts" x="512" y="60">after losing one region</text>
+<text class="ts" x="492" y="96">The survivors inherit the lost</text>
+<text class="ts" x="492" y="112">region’s traffic. With N regions,</text>
+<text class="ts" x="492" y="128">each must normally run below</text>
+<text class="ts" x="492" y="144">(N − 1) / N of its capacity.</text>
+<text class="ts" x="492" y="180">At 80% in two regions, losing</text>
+<text class="ts" x="492" y="196">one puts 160% on the other.</text>
+<text class="ts" x="492" y="212">The failover causes the outage.</text>
+<rect class="hit" x="74" y="10" width="80" height="232" data-tip="2 regions at 50%|normally: 50% on each|after losing one: 100% on the survivor|no room left at all"/>
+<rect class="hit" x="172" y="10" width="80" height="232" data-tip="3 regions at 60%|normally: 60% on each|after losing one: 90% on each survivor|10% to spare"/>
+<rect class="hit" x="270" y="10" width="80" height="232" data-tip="4 regions at 70%|normally: 70% on each|after losing one: 93% on each survivor|7% to spare"/>
+<rect class="hit" x="368" y="10" width="80" height="232" data-tip="2 regions at 80%|normally: 80% on each|after losing one: 160% on the survivor|more than it can carry"/>
+</svg>
+</div>
+<figcaption>More regions waste less: two regions must each idle half their capacity, four only a quarter. Running at exactly the limit is still too close, for the reasons in <x-ref to="latency-and-throughput#saturation"></x-ref>.</figcaption>
+</figure>
+
+<div class="formula">with N regions: normal load on each ≤ (N − 1) / N of its capacity</div>
+<p>Relying on automatic scaling to add the missing capacity at the moment of failure is a common plan and a weak one. Every other customer of the failed region is requesting capacity in the same neighboring regions at the same time, and the systems that hand it out are under their heaviest load. A survivor that receives double traffic with cold caches can also fall into the self-sustaining overload described in <x-ref to="resilience-patterns#metastable"></x-ref>. Shift traffic in steps where the situation allows, and shed load before the survivor saturates.</p>
+
+<h3 id="planes">Control planes and static stability</h3>
+<p>Cloud services have two parts. The <dfn>data plane</dfn> does the work: it forwards packets, serves queries, answers DNS lookups. The <dfn>control plane</dfn> changes things: it launches machines, edits records, alters configuration. Data planes are built to be simpler and more available than control planes, and during large incidents it is usually a control plane that is impaired. The AWS outage of October 2025 in <x-ref to="availability-and-reliability#aws-2025"></x-ref> went that way: servers kept running, and for hours new ones could not be launched.</p>
+<p>A system is <dfn>statically stable</dfn> if it keeps working, and can recover, without making any change through a control plane. AWS uses the term for its own designs, and it is the most useful single test of a failover plan.</p>
+
+<figure class="fig wide" id="fig-planes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 258" role="img" aria-labelledby="f456t f456d">
+<title id="f456t">A failover that depends on control planes compared with a statically stable one</title>
+<desc id="f456d">On the left, a failover that needs the control plane has four steps: detect that region A is failing, ask the cloud API to start servers in region B, change DNS records through an API, and promote the database in B. The second and third steps call management systems that may be overloaded or dependent on the failing region, at the moment every other customer is doing the same. On the right, a statically stable failover: before the incident, servers in B already run with spare room and both regions are in DNS with health checks. During it, health checks fail for A and traffic goes to B, then the database in B is promoted. Nothing new has to be created during the incident.</desc>
+<text class="tb" x="10" y="18">A failover that needs the control plane</text>
+<rect class="n " x="10" y="32" width="320" height="30" rx="5"/>
+<text class="ts" x="22" y="52">1  Detect that region A is failing</text>
+<rect class="n fault" x="10" y="72" width="320" height="30" rx="5"/>
+<text class="ts" x="22" y="92">2  Ask the cloud API to start servers in B</text>
+<rect class="n fault" x="10" y="112" width="320" height="30" rx="5"/>
+<text class="ts" x="22" y="132">3  Change DNS records through an API</text>
+<rect class="n " x="10" y="152" width="320" height="30" rx="5"/>
+<text class="ts" x="22" y="172">4  Promote the database in B</text>
+<text class="ts" x="10" y="208">Steps 2 and 3 call management systems that may be</text>
+<text class="ts" x="10" y="223">overloaded or dependent on the failing region, at</text>
+<text class="ts" x="10" y="238">the moment every other customer is doing the same.</text>
+<path class="e none dash" d="M360 8V250"/>
+<text class="tb" x="380" y="18">A statically stable failover</text>
+<rect class="n store" x="380" y="32" width="330" height="30" rx="5"/>
+<text class="ts" x="392" y="52">Before: servers in B already run, with spare room</text>
+<rect class="n store" x="380" y="72" width="330" height="30" rx="5"/>
+<text class="ts" x="392" y="92">Before: both regions are in DNS, with health checks</text>
+<rect class="n store" x="380" y="112" width="330" height="30" rx="5"/>
+<text class="ts" x="392" y="132">1  Health checks fail for A. Traffic goes to B</text>
+<rect class="n " x="380" y="152" width="330" height="30" rx="5"/>
+<text class="ts" x="392" y="172">2  Promote the database in B</text>
+<text class="ts" x="380" y="208">Nothing new has to be created during the incident.</text>
+<text class="ts" x="380" y="223">Recovery uses only what was already in place and</text>
+<text class="ts" x="380" y="238">what the data path does on its own.</text>
+
+</svg>
+</div>
+<figcaption>The plan on the right costs more every day and works on the day it is needed.</figcaption>
+</figure>
+
+<p>Some control planes are themselves hosted in one region, whatever region your resources are in. A failover plan that calls such an API depends on that region being healthy. Find out, for every step in your runbook, what it calls and where that runs.</p>
+
+<h3 id="deciding">Deciding and promoting</h3>
+<p><b>Detection.</b> A region rarely vanishes. More often it degrades: some requests fail, some are slow, one service is broken. Health checks that test only whether a server answers will report a sick region as healthy. Check what users experience, from outside the region, and from more than one place, so that a failure of the checker is not mistaken for a failure of the region.</p>
+<p><b>Who decides.</b> Routing away from a region that stops answering can be automatic. Promoting a database in another region usually should not be, because it can lose data and is hard to undo. Many teams automate everything up to that decision and leave the decision to a person with a single command. Slack’s design in <x-ref to="multi-tenancy#cells"></x-ref> works that way.</p>
+<p><b>Promotion.</b> With asynchronous replication, promoting the standby discards whatever it had not received, and the old primary must be prevented from accepting writes if it is still alive, or the two will diverge. <x-ref to="replication#failover"></x-ref> and the fencing tokens in <x-ref to="consensus#fencing"></x-ref> cover this. A consensus-replicated store does it without a person: the surviving majority elects a leader and nothing committed is lost.</p>
+<p><b>Failing back.</b> Returning to the original region is a second migration. The old region’s data is behind, its caches are cold, and any writes it accepted in isolation must be reconciled or thrown away. Plan it with as much care as the failover, and do it at a quiet time.</p>
+<p><b>Practice.</b> A failover that has never been run does not work. The configuration has drifted, a new service was never deployed to the standby, a credential expired. Netflix has described routinely evacuating a whole region’s traffic as an exercise, and cutting the time it takes from most of an hour to about seven minutes. Teams without that scale can still fail over on a schedule, a few times a year, in working hours. Active-active designs have an advantage here: every region serves real traffic every day, so there is no untested standby.</p>
+
+<h3 id="global-changes">The failures that regions do not contain</h3>
+<p>Regions isolate faults in hardware, power, networks and local software. They do not isolate anything that is applied to all regions at once, and those are now the common causes of the largest outages.</p>
+<ul>
+  <li><b>Global configuration.</b> The Google Cloud incident in <x-ref to="resilience-patterns#google-2025"></x-ref> came from a policy change that replicated to every region within seconds and crashed the same service in all of them. Many regions gave no protection, because the change did not respect them.</li>
+  <li><b>Simultaneous deployment.</b> The same bad build released everywhere at once.</li>
+  <li><b>Shared global services.</b> A single identity service, DNS provider, certificate or directory that every region depends on.</li>
+  <li><b>Data.</b> A bad write or a deletion replicates faithfully to every copy. Replication is not a backup.</li>
+</ul>
+<p>The defense is to treat changes like traffic: roll out code and configuration one region at a time, wait, watch, and continue. Global configuration systems should enforce this and should be the most conservative part of the system. For each global dependency, decide what every region does when it is unreachable. The safest answer is usually to continue with the last known good copy.</p>
+
+<h2 id="cost">What it costs</h2>
+<ul>
+  <li><b>Capacity.</b> At least the idle headroom from the capacity rule, and often full duplicates of systems that do not scale down.</li>
+  <li><b>Data transfer.</b> Providers charge for each gigabyte that leaves a region. Replicating a busy database, an event stream and object storage continuously can cost more than the machines.</li>
+  <li><b>Engineering.</b> Every feature that stores data now needs an answer to “which region, and what if it is read from another?”. Schema changes, deployments and incident response all gain a dimension. This cost recurs with every feature and is the largest.</li>
+  <li><b>Testing.</b> Realistic tests need several regions and injected delay and partitions between them.</li>
+</ul>
+<p>Much of this can be bought. A managed multi-region database, a global load balancer and an object store with built-in replication move work to the provider, at a price and with their guarantees to read closely. The decisions about consistency, conflicts, residency and failover remain yours.</p>
+
+<div class="note interview"><p><span class="label">In an interview.</span> If asked to make a design “global”, first ask which of the three reasons applies. For latency, add a CDN and regional read replicas, and name the stale-read problem. For availability, add a second region with stated recovery objectives, and say how traffic and the database each fail over. For both, propose home regions with a global directory. Give one number from physics, such as 80 ms across the Atlantic, and say what your design does when a user’s home region is down.</p></div>
+
+<h2 id="choosing">Choosing</h2>
+<table>
+<thead><tr><th>Need</th><th>Reasonable design</th></tr></thead>
+<tbody>
+<tr><th>Survive a data center failure</th><td>One region, three availability zones. Stop here if you can</td></tr>
+<tr><th>Faster pages for distant users, mostly reads</th><td>One region and a CDN, then read replicas in other regions</td></tr>
+<tr><th>Survive a regional outage, minutes of downtime acceptable</th><td>Active-passive with a warm standby, practiced. See <x-ref to="disaster-recovery"></x-ref></td></tr>
+<tr><th>Fast reads and writes for users on several continents</th><td>Home regions, with public data copied everywhere</td></tr>
+<tr><th>No data loss even if a region is destroyed</th><td>A consensus-replicated database across three regions, placed as close together as the requirement allows</td></tr>
+<tr><th>Writes must succeed locally even when regions are cut off</th><td>A multi-writer store, for data whose conflicts can be merged</td></tr>
+<tr><th>Data must stay in a jurisdiction</th><td>Home regions pinned by tenant, with every copy accounted for</td></tr>
+</tbody>
+</table>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Going multi-region for availability before using several zones well.</b> Most outages are caused by changes and by software, which a second region does not prevent.</li>
+  <li><b>Replicating the stateless tier and calling it done.</b> The servers are in three regions and the database is in one.</li>
+  <li><b>Ignoring the round trips.</b> A chatty protocol that was fine at 1 ms per call is unusable at 80 ms. Count the cross-region calls on each request path.</li>
+  <li><b>Treating replicas as current.</b> Reading from a local copy right after writing to a distant primary.</li>
+  <li><b>Last-write-wins on data that accumulates.</b> Counters, balances and inventories lose updates silently.</li>
+  <li><b>A standby that is never used.</b> It will not work when needed.</li>
+  <li><b>No spare capacity in the survivors.</b> The failover overloads them and the outage spreads.</li>
+  <li><b>A failover that needs the control plane.</b> Launching, scaling or reconfiguring as the first step of recovery.</li>
+  <li><b>Global changes all at once.</b> Configuration and deployments that reach every region in the same minute.</li>
+  <li><b>Residency for the database only.</b> Backups, logs, analytics and vendors holding the same data somewhere else.</li>
+  <li><b>Hidden single-region dependencies.</b> An authentication service, a build system or a secret store that every region calls and that lives in one.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="availability-and-reliability"></x-ref>: failure domains, recovery objectives, and the outages referred to here.</li>
+  <li><x-ref to="replication"></x-ref> and <x-ref to="consistency-models"></x-ref>: the mechanisms and guarantees that distance makes expensive.</li>
+  <li><x-ref to="consensus"></x-ref>: why a majority must answer, and what that costs across regions.</li>
+  <li><x-ref to="dns"></x-ref>, <x-ref to="ip-and-routing"></x-ref> and <x-ref to="cdn-and-edge"></x-ref>: how users reach a region, and what the edge fixes without one.</li>
+  <li><x-ref to="multi-tenancy"></x-ref>: cells and tenant placement, which home regions reuse.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: overload during failover and recovery.</li>
+  <li><x-ref to="disaster-recovery"></x-ref>: backups, recovery objectives and standby strategies in detail.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>There are three reasons to use several regions: latency, surviving a regional outage, and residency. They need different designs and sometimes conflict.</li>
+  <li>Distance sets a floor of about 1 ms of round trip per 100 km, and real paths are longer. A CDN removes connection setup. Only moving data removes the rest.</li>
+  <li>Stateless services are easy to run everywhere. The design is decided by where writes are accepted.</li>
+  <li>Asynchronous copies are fast and can lose the latest writes. Consensus across regions loses nothing and adds a quorum round trip to every write. Multi-writer stores are fast and must resolve conflicts.</li>
+  <li>Giving each user or tenant a home region makes most requests local and consistent, with a small global directory to find the home.</li>
+  <li>Residency applies to every copy: backups, logs, analytics, vendors and the directory.</li>
+  <li>Survivors need spare capacity already running: at most (N − 1) / N load with N regions. A failover should need no control-plane action, and must be practiced.</li>
+  <li>Changes applied to all regions at once defeat regional isolation. Roll out code and configuration region by region.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A server is 9,000 km from a user. What is the least possible round-trip time, and roughly what should you plan for? How long does a first HTTPS request over TCP take if the server needs 40 ms?</summary><p>At 200 km per millisecond, 9,000 km each way is 45 ms, so 90 ms for the round trip at the physical minimum. With a path one and a half times as long, plan for about 135 ms. A first request over TCP and TLS 1.3 needs three round trips plus the server’s time: 3 × 135 + 40 = 445 ms.</p></details>
+<details><summary>A product has one region in the US and many users in India who mostly read. What are the first two steps, in order, and what problem does the second introduce?</summary><p>First, a CDN, which caches static content near users and removes connection setup round trips for dynamic requests. Second, a read replica in a nearby region with reads served locally. The replica lags, so a user who writes and then reads may not see their own change unless their reads are sent to the primary for a short time or the replica is checked for a required position.</p></details>
+<details><summary>A consensus group has replicas in Virginia, Ohio and Oregon, with round trips from Virginia of 7 ms and 53 ms. What is the commit latency with the leader in Virginia? What if two more replicas are added in Ireland (82 ms) and Tokyo (163 ms)?</summary><p>With three replicas the majority is two, so the leader needs one acknowledgment and waits for the nearest: about 7 ms. With five replicas the majority is three, so it needs two acknowledgments: Ohio at 7 ms and Oregon at 53 ms, giving about 53 ms. Adding distant replicas raised the latency by enlarging the majority.</p></details>
+<details><summary>Why is last-write-wins unsafe for a counter replicated between two regions that both accept writes?</summary><p>Each region reads the counter, adds one and writes the result. If both do so before hearing from the other, both write the same new value, and after replication one write replaces the other. Two increments produced one. The loss is silent. A counter needs a mergeable data type or a single place where writes happen.</p></details>
+<details><summary>In a home-region design, what data must be global, and why is that acceptable?</summary><p>The directory that maps each user or tenant to a region, because any region may receive a request and must know where to send it. It is acceptable because the directory is small, changes only at signup or migration, and tolerates slight staleness, so replicating it everywhere is cheap. It should hold as little personal data as possible.</p></details>
+<details><summary>Three regions each run at 75% of capacity. One is lost. What load do the survivors see, and what is the highest safe normal load?</summary><p>Total load is 3 × 75 = 225 units of a region’s capacity in percent, shared by two regions: 112.5% each, which is an overload. With three regions the limit is two thirds, about 67%, and in practice lower to leave room for cold caches and retries.</p></details>
+<details><summary>What does it mean for a failover to be statically stable, and why does it matter?</summary><p>It can complete without any change made through a control plane: no launching servers, scaling groups or editing configuration through an API. Standby capacity already runs, and traffic moves by mechanisms on the data path such as health checks. It matters because control planes are the part most often impaired during large incidents, and are under their heaviest load exactly when many customers fail over at once.</p></details>
+<details><summary>A company runs in five regions, and a configuration change takes all five down at once. What principle was violated?</summary><p>Changes were not contained by the same boundaries as failures. Regions isolate faults only if nothing is applied to all of them simultaneously. Configuration, like code, should be rolled out one region at a time with a pause to observe, and each region should be able to keep running on its last known good configuration.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Becky Weiss and Mike Furr, <a href="https://aws.amazon.com/builders-library/static-stability-using-availability-zones">Static stability using Availability Zones</a>, Amazon Builders’ Library. The origin of the term as used here.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/whitepapers/latest/aws-fault-isolation-boundaries/static-stability.html">Static stability</a>, in the whitepaper <cite>AWS Fault Isolation Boundaries</cite>. Which control planes are regional, zonal or global.</li>
+  <li>AWS, <a href="https://aws.amazon.com/about-aws/whats-new/2025/06/amazon-dynamo-db-global-tables-multi-region-strong-consistency-generally-available/">DynamoDB global tables with multi-Region strong consistency</a>, June 2025.</li>
+  <li>Google Cloud, <a href="https://docs.cloud.google.com/spanner/docs/region-types">Spanner region types</a>. Read-write, read-only and witness regions, and the role of the leader region.</li>
+  <li>Cockroach Labs, <a href="https://www.cockroachlabs.com/docs/stable/multiregion-overview">Multi-region capabilities overview</a>, CockroachDB documentation. Survival goals and row-level region placement.</li>
+  <li>James Corbett and others, “Spanner: Google’s Globally-Distributed Database”, OSDI 2012. Consensus replication across regions with synchronized clocks.</li>
+  <li>Amjith Ramanujam, <a href="https://opensource.com/article/18/4/how-netflix-does-failovers-7-minutes-flat">How Netflix does failovers in 7 minutes flat</a>, 2018.</li>
+  <li>Cooper Bethea, <a href="https://slack.engineering/slacks-migration-to-a-cellular-architecture/">Slack’s migration to a cellular architecture</a>, Slack Engineering, 2023. Draining a zone on a human decision.</li>
+  <li>Google Cloud, <a href="https://status.cloud.google.com/incidents/ow5i3PPK96RduMcb1SsW">Incident report for 12 June 2025</a>. A global change that regions did not contain.</li>
+  <li>Daniel Abadi, “Consistency Tradeoffs in Modern Distributed Database System Design”, IEEE Computer, 2012. The PACELC formulation of the latency and consistency trade.</li>
+</ol>
+</section>

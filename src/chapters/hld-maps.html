@@ -1,0 +1,978 @@
+<!--meta
+{ "description": "A high-level design of a maps and navigation service: map tiles in a zoom pyramid served from a CDN, raster and vector tiles, routing over a road graph with Dijkstra, A*, bidirectional search, contraction hierarchies and a cell overlay, all measured on a generated city, live traffic from phones’ positions, and travel-time estimates compared on simulated mornings. Requirements, estimates, APIs, data, failures and scale.",
+  "lede": "A maps app looks like one product and is three systems. The map itself is a vast set of static files that must appear instantly anywhere on Earth. Directions are a shortest-path search over tens of millions of intersections that has to finish in milliseconds, where the textbook algorithm takes seconds. And the travel times that drive that search change every minute, learned from the phones of the people driving. This chapter designs all three, and measures how much work each routing method does and how good each way of predicting a travel time is.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a maps and navigation service. Users see a map of the world that they can pan and zoom, search for places and addresses, and ask for driving directions between two points. They get up to three routes with travel times that account for current traffic, then follow one turn by turn, with the arrival time kept up to date and a new route when they leave the planned one.</p></div>
+<p>Three things make it hard, and they pull in different directions. The map is a static data set far too large to send whole, so it is cut into pieces that a content delivery network can cache. Routing is a search over a road graph of continental size, and the plain algorithm settles millions of nodes per query, so the graph is preprocessed to make searches thousands of times cheaper. Then traffic changes the cost of every road all day, which undoes exactly that preprocessing. In the terms of <x-ref to="hld-method#shapes"></x-ref>, this is a location problem whose central difficulty is routes over a continent’s roads, timed by live traffic.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>A map of the world that pans and zooms, on phones and in browsers</th><td>Yes</td></tr>
+<tr><th>Search for places and addresses, and the address of a point</th><td>Yes, as a service: the index is the one in <x-ref to="search-systems"></x-ref></td></tr>
+<tr><th>Driving directions with up to three alternatives, timed with traffic</th><td>Yes</td></tr>
+<tr><th>Turn-by-turn navigation, arrival time updates, rerouting</th><td>Yes</td></tr>
+<tr><th>Live traffic drawn on the map</th><td>Yes</td></tr>
+<tr><th>Walking, cycling and public transport directions</th><td>No: a follow-up question</td></tr>
+<tr><th>Places near a point</th><td>No: <x-ref to="hld-proximity"></x-ref></td></tr>
+<tr><th>Editing the map</th><td>No</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>200 million daily users, two routes each; 10 million cars navigating at the peak</td></tr>
+<tr><th>Latency</th><td>Map tiles in under 100 ms from the nearest edge; directions in under a second end to end, with the search itself taking milliseconds; a reroute within a few seconds</td></tr>
+<tr><th>Availability</th><td>99.99% for tiles and routing, since people are driving; traffic may degrade to typical speeds</td></tr>
+<tr><th>Freshness</th><td>Traffic within about two minutes; map changes within a week</td></tr>
+<tr><th>Accuracy</th><td>Arrival times within about 10% for most trips</td></tr>
+<tr><th>Privacy</th><td>Positions used in aggregate; trips not kept with an identity beyond a short period</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">directions: 200 million × 2 ÷ 86,400 s ≈ 4,600 a second, about 13,900 at a peak of three times that<br>
+navigation: 10 million cars × one position a second = 10 million fixes a second, sent in batches every 15 s: 667,000 requests a second<br>
+ingest: 10 million × 40 bytes = 400 MB a second; at an average of a third of the peak, 11.5 TB a day<br>
+road graph, Western Europe: 18.0 million intersections and 42.5 million directed segments (reported); at about 16 bytes a node and 12 an edge ≈ 0.8 GB, and about double with the preprocessing<br>
+traffic: 100 million directed segments × 4 bytes for a speed = 400 MB, refreshed every minute<br>
+tiles, as images to zoom 18: 91.6 billion tiles; if 30% show anything and an image is 20 KB, about 550 TB</div>
+<p>The numbers sort the problem (<x-ref to="estimation#method"></x-ref>). A continent’s graph fits in one server’s memory, so each routing server holds a whole region and the query rate decides only how many copies there are; fourteen thousand searches a second is modest at a millisecond each and impossible at the two seconds a plain search of Europe takes. Positions are the heavy write path, a job for a partitioned stream (<x-ref to="event-streaming#partitions"></x-ref>). Tiles are the heavy read path, and as images at every zoom they are far too many to make in advance.</p>
+
+<div class="widget" data-widget="maps91">
+<h4>Load and storage of a maps service</h4>
+<p>Directions, the stream of positions from navigating cars, and the storage for map tiles down to a zoom level.</p>
+<div class="controls">
+  <label>Daily users, millions<input type="number" name="users" value="200" min="0.1" max="5000" step="10"></label>
+  <label>Routes per user a day<input type="number" name="routes" value="2" min="0" max="50" step="0.5"></label>
+  <label>Cars navigating at the peak, millions<input type="number" name="cars" value="10" min="0" max="500" step="1"></label>
+  <label>Seconds between uploads<input type="number" name="every" value="15" min="1" max="600" step="1"></label>
+  <label>Deepest zoom stored<input type="number" name="zoom" value="18" min="0" max="22" step="1"></label>
+  <label>Average tile, KB<input type="number" name="kb" value="20" min="0.1" max="1000" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 231" role="img" aria-label="A bar for each zoom level, showing its share of all stored tiles: each level holds four times as many as the one above, so the deepest levels hold nearly everything."><text x="10" y="14" class="ts">Share of all stored tiles at each zoom level</text><text x="92" y="36" class="ts end">zoom 0 to 8</text><rect x="100" y="26" width="1" height="12" rx="2" class="bar"></rect><text x="109" y="36" class="ts">under 0.01%</text><text x="92" y="53" class="ts end">zoom 9</text><rect x="100" y="43" width="1" height="12" rx="2" class="bar"></rect><text x="92" y="70" class="ts end">zoom 10</text><rect x="100" y="60" width="1" height="12" rx="2" class="bar"></rect><text x="92" y="87" class="ts end">zoom 11</text><rect x="100" y="77" width="1" height="12" rx="2" class="bar"></rect><text x="92" y="104" class="ts end">zoom 12</text><rect x="100" y="94" width="1" height="12" rx="2" class="bar"></rect><text x="92" y="121" class="ts end">zoom 13</text><rect x="100" y="111" width="1" height="12" rx="2" class="bar"></rect><text x="92" y="138" class="ts end">zoom 14</text><rect x="100" y="128" width="1.3" height="12" rx="2" class="bar"></rect><text x="92" y="155" class="ts end">zoom 15</text><rect x="100" y="145" width="5.2" height="12" rx="2" class="bar"></rect><text x="113.2" y="155" class="ts">1.17%</text><text x="92" y="172" class="ts end">zoom 16</text><rect x="100" y="162" width="20.6" height="12" rx="2" class="bar"></rect><text x="128.6" y="172" class="ts">4.69%</text><text x="92" y="189" class="ts end">zoom 17</text><rect x="100" y="179" width="82.5" height="12" rx="2" class="bar"></rect><text x="190.5" y="189" class="ts">18.8%</text><text x="92" y="206" class="ts end">zoom 18</text><rect x="100" y="196" width="330" height="12" rx="2" class="bar dot"></rect><text x="438" y="206" class="ts tb">75%</text><text x="10" y="223" class="ts">Each level holds four times as many tiles as the one above it.</text></svg>
+<dl class="results">
+  <div><dt>Directions at the peak</dt><dd data-out="routes">13.9 thousand a second</dd></div>
+  <div><dt>Upload requests a second</dt><dd data-out="uploads">667 thousand</dd></div>
+  <div><dt>Positions, bytes a second</dt><dd data-out="ingest">400 MB a second</dd></div>
+  <div><dt>Tiles stored</dt><dd data-out="tiles">27.5 billion</dd></div>
+  <div><dt>Tile storage</dt><dd data-out="storage">550 TB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At the peak, 13.9 thousand route searches a second, each a few milliseconds of work on a preprocessed graph. 10 million positions a second arrive in 667 thousand uploads, 400 MB a second for the stream. Tiles to zoom 18 come to 27.5 billion with content and 550 TB, and the deepest level alone is 75% of them: too much to make in advance, so tiles this deep are rendered when first asked for and then cached.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Map tiles: static files with a version in the path">
+GET https://tiles.example.com/v42/14/4823/6160.mvt
+
+200 OK
+Content-Type: application/vnd.mapbox-vector-tile
+Cache-Control: public, max-age=31536000, immutable
+</pre>
+<pre data-lang="http" data-title="Directions, and places by name">
+POST /v1/routes
+{ "from": { "lat": 40.6413, "lon": -73.7781 },
+  "to": { "place": "pl-77310" },
+  "mode": "drive", "depart": "now", "alternatives": 3 }
+
+200 OK
+{ "traffic_as_of": "2026-10-13T07:40:00Z",
+  "routes": [ { "id": "r-1", "duration_s": 1686, "typical_s": 1420, "distance_m": 31240,
+                "polyline": "o~kwFzy…", "steps": [ { "do": "turn right", "onto": "Main St", "m": 400 }, … ] },
+              … ] }
+
+GET /v1/geocode?q=Central+Station&near=40.70,-73.90     → candidates, best first
+GET /v1/reverse?lat=40.7527&lon=-73.9772               → the address at a point
+</pre>
+<pre data-lang="http" data-title="During navigation: positions in batches">
+POST /v1/trips/t-5521/positions
+{ "fixes": [ { "t": "2026-10-13T07:52:01Z", "lat": 40.7012, "lon": -73.8204,
+               "speed": 13.2, "heading": 271, "accuracy_m": 5 }, … 15 in all ] }
+
+200 OK
+{ "remaining_s": 1520, "arrive": "2026-10-13T08:31:00Z", "reroute": null }
+</pre>
+<p>The tile path carries the map’s version, so a tile never changes once published and can be cached for a year at every layer (<x-ref to="cdn-and-edge#freshness"></x-ref>); a new map build is a new version, not an invalidation. Directions return the typical time beside the time with traffic, which is what lets the app say “12 minutes slower than usual”. Positions travel in batches because sending each one would multiply the request rate by fifteen and wake the phone’s radio every second. A batch can be retried safely: each fix is keyed by trip and time, so a repeat overwrites itself (<x-ref to="idempotency-and-delivery#natural"></x-ref>). The reply to a batch is where the server delivers a new arrival time or a new route.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>Tiles</th><td>version, zoom, column, row</td><td>The map’s features inside one square, as vector data</td><td>Object storage behind a CDN (<x-ref to="object-and-file-storage"></x-ref>)</td></tr>
+<tr><th>Road graph</th><td>region; node and edge ids</td><td>Intersections with coordinates; segments with length, road class, speed limit, direction, turn restrictions and shape</td><td>Built offline as files; loaded into memory by routing servers</td></tr>
+<tr><th>Routing preprocessing</th><td>region, graph version</td><td>The hierarchy or the cell overlay of Step 6b</td><td>Files beside the graph, rebuilt with it</td></tr>
+<tr><th>Places and addresses</th><td>place id</td><td>Names, addresses, categories, a point</td><td>A search index (<x-ref to="search-systems#inverted-index"></x-ref>)</td></tr>
+<tr><th>Live speeds</th><td>segment and direction</td><td>Current speed, number of cars it is based on, when</td><td>In memory, published as a snapshot each minute; an entry older than a few minutes is ignored</td></tr>
+<tr><th>Typical speeds</th><td>segment, 15-minute slot of the week</td><td>The usual speed at that time: 672 slots per segment</td><td>Built nightly from the archive into compact files per region</td></tr>
+<tr><th>Positions</th><td>trip, time</td><td>Latitude, longitude, speed, heading, accuracy</td><td>A stream partitioned by area, then an archive by day and area, kept for a limited period</td></tr>
+</tbody>
+</table>
+<p>Most of this is derived data in the sense of <x-ref to="change-data-capture#derived"></x-ref>: tiles, the graph and its preprocessing are all built from one source, the map data, and can be thrown away and built again. Only two things are written by users while the system runs, positions and the speeds computed from them, and both are short-lived by design.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 438" role="img" aria-labelledby="f912t f912d">
+<title id="f912t">A maps service: tiles, directions, and live traffic</title>
+<desc id="f912d">Three parts. Showing the map: phones fetch tiles from a CDN, which fetches misses from tile storage, filled by an offline map build that also builds the road graph. Directions: a gateway asks a geocoding service to turn names into points and a routing service, which holds its region’s graph in memory with speeds from the traffic store, for routes. Navigation: phones send batches of positions to a location service, which appends them to a stream; a traffic service turns them into speeds per road segment for the traffic store, and an archive feeds a nightly job that computes typical speeds.</desc>
+<text class="tb" x="10" y="18">Showing the map: static files, built offline, served from the edge</text>
+<rect class="n " x="10" y="32" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="54.0">Phones</text>
+<text class="ts mid" x="60" y="71.0">map screen</text>
+<rect class="n sig" x="170" y="32" width="150" height="50" rx="6"/>
+<text class="tb mid" x="245" y="54.0">CDN</text>
+<text class="ts mid" x="245" y="71.0">tiles, cached</text>
+<rect class="n store" x="380" y="32" width="150" height="50" rx="6"/>
+<text class="tb mid" x="455" y="54.0">Tile storage</text>
+<text class="ts mid" x="455" y="71.0">z/x/y, versioned</text>
+<rect class="n async" x="570" y="32" width="140" height="50" rx="6"/>
+<text class="tb mid" x="640" y="54.0">Map build</text>
+<text class="ts mid" x="640" y="71.0">nightly or weekly</text>
+<path class="e sig both" d="M110 57H170"/>
+<text class="ts mid" x="140" y="51">tiles</text>
+<path class="e sig" d="M320 57H380"/>
+<text class="ts mid" x="350" y="51">miss</text>
+<path class="e async" d="M570 57H530"/>
+<text class="ts" x="570" y="100">also builds the road graph</text>
+<text class="ts" x="570" y="114">that routing servers load</text>
+<path class="e none dash" d="M10 126H710"/>
+<text class="tb" x="10" y="148">Directions: a search over the road graph, held in memory</text>
+<rect class="n " x="10" y="162" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="184.0">Phones</text>
+<text class="ts mid" x="60" y="201.0">directions</text>
+<rect class="n sig" x="170" y="162" width="150" height="50" rx="6"/>
+<text class="tb mid" x="245" y="192.0">API gateway</text>
+<rect class="n sig" x="380" y="162" width="150" height="50" rx="6"/>
+<text class="tb mid" x="455" y="184.0">Routing service</text>
+<text class="ts mid" x="455" y="201.0">graph in memory</text>
+<rect class="n sig" x="170" y="232" width="150" height="40" rx="6"/>
+<text class="tb mid" x="245" y="249.0">Geocoding</text>
+<text class="ts mid" x="245" y="266.0">names to points</text>
+<rect class="n store" x="380" y="232" width="150" height="40" rx="6"/>
+<text class="tb mid" x="455" y="249.0">Traffic store</text>
+<text class="ts mid" x="455" y="266.0">speed per segment</text>
+<path class="e sig both" d="M110 187H170"/>
+<path class="e sig both" d="M320 187H380"/>
+<text class="ts mid" x="350" y="181">route</text>
+<path class="e sig both" d="M245 212V232"/>
+<path class="e store" d="M455 232V212"/>
+<text class="ts" x="462" y="226">every minute</text>
+<path class="e none dash" d="M10 290H710"/>
+<text class="tb" x="10" y="312">Navigation and live traffic: a stream of positions becomes speeds</text>
+<rect class="n " x="10" y="326" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="348.0">Phones</text>
+<text class="ts mid" x="60" y="365.0">navigating</text>
+<rect class="n sig" x="170" y="326" width="150" height="50" rx="6"/>
+<text class="tb mid" x="245" y="348.0">Location service</text>
+<text class="ts mid" x="245" y="365.0">batches of fixes</text>
+<rect class="n async" x="380" y="326" width="150" height="50" rx="6"/>
+<text class="tb mid" x="455" y="348.0">Stream</text>
+<text class="ts mid" x="455" y="365.0">positions, by area</text>
+<rect class="n async" x="570" y="326" width="140" height="50" rx="6"/>
+<text class="tb mid" x="640" y="348.0">Traffic service</text>
+<text class="ts mid" x="640" y="365.0">match, average</text>
+<rect class="n store" x="570" y="394" width="140" height="34" rx="6"/>
+<text class="tb mid" x="640" y="416.0">Position archive</text>
+<path class="e sig both" d="M110 351H170"/>
+<text class="ts mid" x="140" y="345">fixes</text>
+<path class="e async" d="M320 351H380"/>
+<path class="e async" d="M530 351H570"/>
+<path class="e async" d="M640 326V252H530"/>
+<text class="ts end" x="632" y="270">current speeds</text>
+<path class="e async" d="M640 376V394"/>
+<text class="ts" x="380" y="404">Nightly: archive → typical speeds</text>
+<text class="ts" x="380" y="418">for each segment and time of week</text>
+</svg>
+</div>
+<figcaption>Three systems share one map. Tiles are files on a CDN. Directions are a search over an in-memory graph. Traffic is a stream of positions turned into speeds, which feed the search.</figcaption>
+</figure>
+
+<p><b>Showing the map.</b> An offline map build cuts the map data (roads, buildings, borders, places) into tiles for every zoom level, written to object storage under a new version. Phones fetch the tiles that cover the screen from the CDN. Nothing on this path runs code per request.</p>
+<p><b>Directions.</b> The gateway sends names to a geocoding service and the two points to a routing server for the region. A routing server holds the region’s graph and its preprocessing in memory, loads the latest speeds every minute, and answers in milliseconds. Roads rarely cross oceans, so a region can be a continent.</p>
+<p><b>Navigation and traffic.</b> Navigating phones send positions to a location service, which answers with the new arrival time and appends the positions to a stream. A traffic service reads the stream, works out which road each car is on and how fast it is moving, and publishes speeds per segment. The same positions, archived, are turned each night into the typical speed of every segment for every quarter hour of the week.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 556" role="img" aria-labelledby="f913t f913d">
+<title id="f913t">Asking for directions, then driving them</title>
+<desc id="f913d">Two sequences. Directions: the gateway has the geocoder turn the destination into a point; the routing service snaps both ends to roads, searches with current speeds and returns three routes. Driving: every 15 seconds the phone sends 15 positions; the location service appends them to the stream and replies with the arrival time; the traffic service turns the stream into a new speed for a segment, which routing servers load; when the car leaves the route, the location service asks for a new one.</desc>
+<text class="tb" x="10" y="16">Directions</text>
+<g data-scene="route">
+<text class="tb mid" x="40" y="36">Phone</text>
+<line class="axis" x1="40" y1="44" x2="40" y2="270"/>
+<text class="tb mid" x="180" y="36">Gateway</text>
+<line class="axis" x1="180" y1="44" x2="180" y2="270"/>
+<text class="tb mid" x="330" y="36">Geocoder</text>
+<line class="axis" x1="330" y1="44" x2="330" y2="270"/>
+<text class="tb mid" x="480" y="36">Routing</text>
+<line class="axis" x1="480" y1="44" x2="480" y2="270"/>
+<text class="tb mid" x="640" y="36">Traffic store</text>
+<line class="axis" x1="640" y1="44" x2="640" y2="270"/>
+<g data-s="1">
+<path class="e sig" d="M41 68H179"/>
+<text class="ts mid" x="110.0" y="62">1. POST /routes to “Central Station”</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M181 96H329"/>
+<text class="ts mid" x="255.0" y="90">2. “Central Station”</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M329 124H181"/>
+<text class="ts mid" x="255.0" y="118">3. 40.751, −73.977</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M181 152H479"/>
+<text class="ts mid" x="330.0" y="146">4. route(from, to, now)</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n sig" x="262" y="166" width="210" height="22" rx="4"/>
+<text class="ts mid" x="367" y="181">5. snap both ends to roads; search</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M479 208H181"/>
+<text class="ts mid" x="330.0" y="202">6. 3 routes: 28, 31, 34 min</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M179 236H41"/>
+<text class="ts mid" x="110.0" y="230">7. routes, fastest first</text>
+</g>
+</g>
+<path class="e none dash" d="M10 284H710"/>
+<text class="tb" x="10" y="304">Driving</text>
+<g data-scene="drive">
+<text class="tb mid" x="40" y="324">Phone</text>
+<line class="axis" x1="40" y1="332" x2="40" y2="546"/>
+<text class="tb mid" x="180" y="324">Location</text>
+<line class="axis" x1="180" y1="332" x2="180" y2="546"/>
+<text class="tb mid" x="330" y="324">Stream</text>
+<line class="axis" x1="330" y1="332" x2="330" y2="546"/>
+<text class="tb mid" x="480" y="324">Traffic svc</text>
+<line class="axis" x1="480" y1="332" x2="480" y2="546"/>
+<text class="tb mid" x="640" y="324">Routing</text>
+<line class="axis" x1="640" y1="332" x2="640" y2="546"/>
+<g data-s="1">
+<path class="e sig" d="M41 356H179"/>
+<text class="ts mid" x="110.0" y="350">1. 15 positions</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M181 382H329"/>
+<text class="ts mid" x="255.0" y="376">2. append</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M179 408H41"/>
+<text class="ts mid" x="110.0" y="402">3. arrive 08:31</text>
+</g>
+<g data-s="4">
+<path class="e async" d="M331 434H479"/>
+<text class="ts mid" x="405.0" y="428">4. positions of all cars</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n async" x="488" y="446" width="150" height="22" rx="4"/>
+<text class="ts mid" x="563" y="461">5. segment 4411: 18 km/h</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M481 486H639"/>
+<text class="ts mid" x="560.0" y="480">6. new speeds, once a minute</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M41 512H179"/>
+<text class="ts mid" x="110.0" y="506">7. 15 positions: off the route</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M181 538H639"/>
+<text class="ts mid" x="410.0" y="532">8. reroute from here</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="route" data-label="Directions">
+  <li data-msg="POST /v1/routes">The phone sends its position and the destination as typed.</li>
+  <li data-msg="geocode">The geocoder, a search index over places and addresses, turns the name into a point.</li>
+  <li data-msg="point">It returns the best match; an ambiguous name returns several to choose from.</li>
+  <li data-msg="route">The gateway asks the routing server for this region.</li>
+  <li data-msg="none">The server snaps each point to a road and searches its in-memory graph with the speeds it loaded a minute ago.</li>
+  <li data-msg="routes">It returns up to three routes with their shapes, distances and times.</li>
+  <li data-msg="200 OK">The phone draws them over the tiles it already has.</li>
+</ol>
+<ol class="steps" data-scene="drive" data-label="Driving">
+  <li data-msg="POST fixes" data-state="Traffic store, segment 4411: 52 km/h; route: 28 min">Every 15 seconds the phone sends the positions it recorded, one a second.</li>
+  <li data-msg="append">The batch is appended to a stream partitioned by area.</li>
+  <li data-msg="ETA 08:31">The reply carries the arrival time for the remaining route at current speeds.</li>
+  <li data-msg="batch">The traffic service matches all cars’ positions to road segments and averages their speeds.</li>
+  <li data-msg="none" data-state="Traffic store, segment 4411: 18 km/h; route: 28 min">Cars on segment 4411 have slowed to 18 km/h; the speed goes to the traffic store.</li>
+  <li data-msg="speeds" data-state="Traffic store, segment 4411: 18 km/h; route: 33 min">Routing servers load the new speeds and update the cells whose roads changed.</li>
+  <li data-msg="POST fixes">A later batch shows the car has taken a different turn.</li>
+  <li data-msg="route" data-state="Traffic store, segment 4411: 18 km/h; route: new, 31 min">The location service asks for a new route from where the car is.</li>
+</ol>
+<figcaption>A route is computed once and then corrected. The phone’s positions do double duty: they track this trip and, averaged with everyone else’s, they become the traffic that the next search uses.</figcaption>
+</figure>
+
+<p>Two loops run at different speeds. The fast one is a single trip: positions go up, an arrival time comes back. The slow one is everyone at once: positions become speeds, speeds become the weights of the graph, and the weights decide the next driver’s route.</p>
+
+<h2 id="tiles">Step 6a: Map tiles</h2>
+<p>The map is drawn on a square. The usual projection, Web Mercator, stretches the globe into a square that stops at about 85 degrees north and south, and at zoom level 0 that square is one picture 256 pixels wide. Each level up doubles the width and height, so at zoom <i>z</i> the world is 256 × 2<sup><i>z</i></sup> pixels across. A <dfn>map tile</dfn> is one square of that picture, 256 pixels on a side, named by its zoom level, column and row: tile 14/4823/6160 is column 4,823 and row 6,160 of zoom 14.</p>
+
+<figure class="fig wide" id="fig-tiles">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f911t f911d">
+<title id="f911t">The tile pyramid, and how a tile is named</title>
+<desc id="f911d">Four zoom levels drawn side by side. Zoom 0 is one tile showing the whole world. Zoom 1 divides it into 2 by 2 tiles, zoom 2 into 4 by 4, zoom 3 into 8 by 8. One tile is highlighted at each level, each inside the one before: at zoom 1 the tile at column 0, row 1, quadkey 2; at zoom 2 column 1, row 2, quadkey 21; at zoom 3 column 3, row 5, quadkey 213. A tile is fetched as zoom, column, row, for example 3/3/5, and its quadkey starts with its parent’s quadkey.</desc>
+<text class="tb mid" x="85" y="22">zoom 0: 1 tile</text>
+<rect class="n sunk" x="10" y="40" width="150" height="150" rx="2"/>
+<text class="ts mid" x="85" y="119.0">the whole world</text>
+<text class="ts mid mono" x="85" y="212">URL: 0/0/0</text>
+<text class="ts mid mono" x="85" y="230">quadkey: (empty)</text>
+<text class="tb mid" x="263" y="22">zoom 1: 4 tiles</text>
+<rect class="n sunk" x="188" y="40" width="150" height="150" rx="2"/>
+<line class="axis" x1="263" y1="40" x2="263" y2="190"/>
+<line class="axis" x1="188" y1="115" x2="338" y2="115"/>
+<rect class="n sig" x="188" y="115" width="75" height="75" rx="1"/>
+<text class="ts mid mono" x="263" y="212">URL: 1/0/1</text>
+<text class="ts mid mono" x="263" y="230">quadkey: 2</text>
+<text class="tb mid" x="441" y="22">zoom 2: 16 tiles</text>
+<rect class="n sunk" x="366" y="40" width="150" height="150" rx="2"/>
+<line class="axis" x1="403.5" y1="40" x2="403.5" y2="190"/>
+<line class="axis" x1="366" y1="77.5" x2="516" y2="77.5"/>
+<line class="axis" x1="441" y1="40" x2="441" y2="190"/>
+<line class="axis" x1="366" y1="115" x2="516" y2="115"/>
+<line class="axis" x1="478.5" y1="40" x2="478.5" y2="190"/>
+<line class="axis" x1="366" y1="152.5" x2="516" y2="152.5"/>
+<rect class="n sig" x="403.5" y="115" width="37.5" height="37.5" rx="1"/>
+<text class="ts mid mono" x="441" y="212">URL: 2/1/2</text>
+<text class="ts mid mono" x="441" y="230">quadkey: 21</text>
+<text class="tb mid" x="619" y="22">zoom 3: 64 tiles</text>
+<rect class="n sunk" x="544" y="40" width="150" height="150" rx="2"/>
+<line class="axis" x1="562.75" y1="40" x2="562.75" y2="190"/>
+<line class="axis" x1="544" y1="58.75" x2="694" y2="58.75"/>
+<line class="axis" x1="581.5" y1="40" x2="581.5" y2="190"/>
+<line class="axis" x1="544" y1="77.5" x2="694" y2="77.5"/>
+<line class="axis" x1="600.25" y1="40" x2="600.25" y2="190"/>
+<line class="axis" x1="544" y1="96.25" x2="694" y2="96.25"/>
+<line class="axis" x1="619" y1="40" x2="619" y2="190"/>
+<line class="axis" x1="544" y1="115" x2="694" y2="115"/>
+<line class="axis" x1="637.75" y1="40" x2="637.75" y2="190"/>
+<line class="axis" x1="544" y1="133.75" x2="694" y2="133.75"/>
+<line class="axis" x1="656.5" y1="40" x2="656.5" y2="190"/>
+<line class="axis" x1="544" y1="152.5" x2="694" y2="152.5"/>
+<line class="axis" x1="675.25" y1="40" x2="675.25" y2="190"/>
+<line class="axis" x1="544" y1="171.25" x2="694" y2="171.25"/>
+<rect class="n sig" x="600.25" y="133.75" width="18.75" height="18.75" rx="1"/>
+<text class="ts mid mono" x="619" y="212">URL: 3/3/5</text>
+<text class="ts mid mono" x="619" y="230">quadkey: 213</text>
+<text class="ts" x="10" y="252">Each tile splits into four at the next zoom. Columns count from the west, rows from the north. Zoom 18 has 68.7 billion tiles.</text>
+</svg>
+</div>
+<figcaption>Every zoom level has four times the tiles of the one above. A quadkey spells out the path down the pyramid, so a tile’s key begins with its parent’s.</figcaption>
+</figure>
+
+<p>A phone screen of 412 by 915 points overlaps at most 15 tiles of 256 pixels, or 6 of 512, by the chapter’s tile code, so moving the map means fetching a handful of small files, the same for every user and cacheable at the edge. At zoom 18 a pixel covers 0.60 m of ground at the equator.</p>
+<p>A <dfn>quadkey</dfn> is a tile’s name written as one digit from 0 to 3 for each zoom level, the digit saying which quarter of the parent the tile is in. Microsoft’s documentation of the Bing Maps tile system gives the example that the figure follows: column 3, row 5 at zoom 3 is quadkey 213. Every tile’s quadkey starts with its parent’s, so tiles of one area sort together, which makes quadkeys good storage keys, for the same reason as the geohash of <x-ref to="hld-proximity#geohash"></x-ref>.</p>
+<p>A tile can hold a picture or the data to draw one. A <dfn>vector tile</dfn> holds the features inside its square (road lines, building outlines, labels, each with its attributes) in a compact binary format, and the device draws them. The common format is the Mapbox Vector Tile specification, version 2.1, encoded with protocol buffers and stored as <code>.mvt</code> files.</p>
+<table>
+<thead><tr><th></th><th>Image (raster) tiles</th><th>Vector tiles</th></tr></thead>
+<tbody>
+<tr><th>What travels</th><td>A picture, PNG or JPEG</td><td>Geometry and attributes</td></tr>
+<tr><th>Who draws</th><td>A rendering server, once per tile</td><td>The device’s graphics chip, every frame</td></tr>
+<tr><th>Dark mode, another language, a new style</th><td>A whole new set of tiles</td><td>The same tiles, a different style sheet on the device</td></tr>
+<tr><th>Rotating, tilting, sharp on any screen</th><td>No: the text turns with the picture and blurs</td><td>Yes</td></tr>
+<tr><th>Deep zoom levels</th><td>Each level must be rendered</td><td>Stop at about zoom 15 and stretch the data beyond it</td></tr>
+<tr><th>Best for</th><td>Satellite imagery, simple clients</td><td>The map itself</td></tr>
+</tbody>
+</table>
+<p>That difference decides whether tiles can be made in advance. Images down to zoom 18 would be 91.6 billion tiles, about 550 TB at the estimate’s assumptions, mostly ocean and fields nobody zooms into, so image tiles are rendered on the first request and then cached, and only the popular ones exist. Vector tiles stop at about zoom 15 and the device enlarges the last level’s data for closer views, which is why a whole planet fits in one file: the Protomaps project publishes a daily planet build of about 120 GB covering zooms 0 to 15. The calculator in Step 2 shows why the deepest levels dominate: each holds four times the tiles of the one above, so the last level alone is three quarters of everything.</p>
+<p>Either way the CDN does the serving (<x-ref to="cdn-and-edge#shield"></x-ref>), and a new build is a new version in the URL, never an invalidation. The traffic colors on roads, which change by the minute, go in their own small layer of tiles cached for a minute, drawn over the immutable base map.</p>
+
+<h2 id="routing">Step 6b: Finding the fastest route</h2>
+<p>For routing, the map becomes a graph. Intersections are nodes; each road segment is an edge in each direction it can be driven, weighted by the time it takes. Forbidden turns are modeled by making segments the nodes, so a turn is an edge that can be left out. The two ends are snapped to the nearest segments first.</p>
+<p><dfn>Dijkstra’s algorithm</dfn> finds the fastest route by settling nodes in order of their travel time from the start: it repeatedly takes the unsettled node with the smallest known time, which is then final, and offers each neighbor a time through it. It stops when the destination is settled. The work is the number of nodes settled, the measure used below.</p>
+<p>The chapter measures every method on a generated city: a grid of 128 by 128 intersections 250 m apart, moved a little at random, with local streets at 30 km/h, an arterial at 50 km/h on every eighth line, a highway at 100 km/h on every 32nd, and 12% of local streets missing. Times are whole tenths of a second, so that the answers of all the methods can be compared exactly. Over 300 random trips, all five methods below found the same fastest time every time; they differ only in how many nodes they settled.</p>
+<p>Dijkstra settled 8,457 nodes on average, half the city. Its search grows as a disc around the start, and a trip across a continent settles most of the continent. <dfn>A* search</dfn> adds to each node’s time an estimate of the time still to go, which must never be too high, and so steers the search toward the destination. For travel time the only safe estimate is the straight-line distance at the top speed of any road, as if a highway led straight there, which is far from the truth in town, so A* settled 2,935 nodes: 35% of Dijkstra. A bidirectional search runs Dijkstra from both ends and stops when the two meet; two small discs cover half the area of one large one, and it settled 4,200, or 50%.</p>
+
+<figure class="fig wide" id="fig-search">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 526" role="img" aria-labelledby="f914t f914d">
+<title id="f914t">Five ways to find the same route, and the work each one does</title>
+<desc id="f914d">Five copies of the same 128 by 128 grid of streets with highways every 32 blocks, and the same trip from the lower left to the upper right, 31.2 km in a straight line and 28.1 minutes by the fastest route. Shaded: the nodes each method settled before it was sure of the fastest route. Dijkstra: 15,097 nodes; A*: 8,799 nodes; Bidirectional: 11,428 nodes; Overlay: 3,108 nodes; Contraction hierarchy: 172 nodes.</desc>
+<text class="tb" x="10" y="18">Dijkstra</text>
+<text class="ts" x="10" y="32">15,097 nodes settled</text>
+<rect class="n sunk" x="10" y="40" width="192" height="192" rx="2"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M10 207.25h192M34.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M10 159.25h192M82.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M10 111.25h192M130.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M10 63.25h192M178.75 40v192"/>
+<path class="bar" style="fill-opacity:.42" d="M10 229h192v3h-192zM10 226h192v3h-192zM10 223h192v3h-192zM10 220h192v3h-192zM10 217h192v3h-192zM10 214h192v3h-192zM10 211h192v3h-192zM10 208h192v3h-192zM10 205h192v3h-192zM10 202h192v3h-192zM10 199h192v3h-192zM10 196h192v3h-192zM10 193h192v3h-192zM10 190h192v3h-192zM10 187h192v3h-192zM10 184h192v3h-192zM10 181h192v3h-192zM10 178h192v3h-192zM10 175h192v3h-192zM10 172h192v3h-192zM10 169h192v3h-192zM10 166h192v3h-192zM10 163h192v3h-192zM10 160h192v3h-192zM10 157h192v3h-192zM10 154h192v3h-192zM10 151h192v3h-192zM10 148h192v3h-192zM10 145h192v3h-192zM10 142h192v3h-192zM10 139h192v3h-192zM10 136h192v3h-192zM10 133h192v3h-192zM10 130h192v3h-192zM10 127h192v3h-192zM10 124h192v3h-192zM10 121h189v3h-189zM10 118h189v3h-189zM10 115h189v3h-189zM10 112h192v3h-192zM10 109h192v3h-192zM10 106h192v3h-192zM10 103h192v3h-192zM10 100h180v3h-180zM196 100h3v3h-3zM10 97h177v3h-177zM10 94h177v3h-177zM10 91h180v3h-180zM10 88h156v3h-156zM172 88h15v3h-15zM10 85h144v3h-144zM157 85h6v3h-6zM175 85h9v3h-9zM10 82h144v3h-144zM160 82h3v3h-3zM175 82h6v3h-6zM10 79h147v3h-147zM175 79h6v3h-6zM10 76h144v3h-144zM178 76h3v3h-3zM10 73h141v3h-141zM178 73h3v3h-3zM10 70h141v3h-141zM10 67h144v3h-144zM10 64h153v3h-153zM10 61h159v3h-159zM10 58h147v3h-147zM10 55h144v3h-144zM10 52h132v3h-132zM10 49h129v3h-129zM10 46h129v3h-129zM10 43h129v3h-129zM10 40h108v3h-108zM124 40h12v3h-12z"/>
+<polyline class="e store" style="stroke-width:2.4" points="31.75,201.25 33.25,201.25 34.75,201.25 34.75,199.75 34.75,198.25 34.75,196.75 34.75,195.25 34.75,193.75 34.75,192.25 34.75,190.75 34.75,189.25 34.75,187.75 34.75,186.25 34.75,184.75 34.75,183.25 34.75,181.75 34.75,180.25 34.75,178.75 34.75,177.25 34.75,175.75 34.75,174.25 34.75,172.75 34.75,171.25 34.75,169.75 34.75,168.25 34.75,166.75 34.75,165.25 34.75,163.75 34.75,162.25 34.75,160.75 34.75,159.25 34.75,157.75 34.75,156.25 34.75,154.75 34.75,153.25 34.75,151.75 34.75,150.25 34.75,148.75 34.75,147.25 34.75,145.75 34.75,144.25 34.75,142.75 34.75,141.25 34.75,139.75 34.75,138.25 34.75,136.75 34.75,135.25 34.75,133.75 34.75,132.25 34.75,130.75 34.75,129.25 34.75,127.75 34.75,126.25 34.75,124.75 34.75,123.25 34.75,121.75 34.75,120.25 34.75,118.75 34.75,117.25 34.75,115.75 34.75,114.25 34.75,112.75 34.75,111.25 36.25,111.25 37.75,111.25 39.25,111.25 40.75,111.25 42.25,111.25 43.75,111.25 45.25,111.25 46.75,111.25 48.25,111.25 49.75,111.25 51.25,111.25 52.75,111.25 54.25,111.25 55.75,111.25 57.25,111.25 58.75,111.25 60.25,111.25 61.75,111.25 63.25,111.25 64.75,111.25 66.25,111.25 67.75,111.25 69.25,111.25 70.75,111.25 72.25,111.25 73.75,111.25 75.25,111.25 76.75,111.25 78.25,111.25 79.75,111.25 81.25,111.25 82.75,111.25 84.25,111.25 85.75,111.25 87.25,111.25 88.75,111.25 90.25,111.25 91.75,111.25 93.25,111.25 94.75,111.25 96.25,111.25 97.75,111.25 99.25,111.25 100.75,111.25 102.25,111.25 103.75,111.25 105.25,111.25 106.75,111.25 108.25,111.25 109.75,111.25 111.25,111.25 112.75,111.25 114.25,111.25 115.75,111.25 117.25,111.25 118.75,111.25 120.25,111.25 121.75,111.25 123.25,111.25 124.75,111.25 126.25,111.25 127.75,111.25 129.25,111.25 130.75,111.25 132.25,111.25 133.75,111.25 135.25,111.25 136.75,111.25 138.25,111.25 139.75,111.25 141.25,111.25 142.75,111.25 144.25,111.25 145.75,111.25 147.25,111.25 148.75,111.25 150.25,111.25 151.75,111.25 153.25,111.25 154.75,111.25 156.25,111.25 157.75,111.25 159.25,111.25 160.75,111.25 162.25,111.25 163.75,111.25 165.25,111.25 166.75,111.25 168.25,111.25 169.75,111.25 171.25,111.25 172.75,111.25 174.25,111.25 175.75,111.25 177.25,111.25 178.75,111.25 178.75,109.75 178.75,108.25 178.75,106.75 178.75,105.25 178.75,103.75 178.75,102.25 178.75,100.75 178.75,99.25 178.75,97.75 178.75,96.25 178.75,94.75 178.75,93.25 178.75,91.75 178.75,90.25 178.75,88.75 178.75,87.25 178.75,85.75 178.75,84.25 178.75,82.75 178.75,81.25 177.25,81.25 175.75,81.25"/>
+<circle class="fill-ink" cx="31.75" cy="201.25" r="4.5"/>
+<circle class="fill-ink" cx="175.75" cy="81.25" r="4.5"/>
+<text class="tb" x="262" y="18">A*</text>
+<text class="ts" x="262" y="32">8,799 nodes settled</text>
+<rect class="n sunk" x="262" y="40" width="192" height="192" rx="2"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M262 207.25h192M286.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M262 159.25h192M334.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M262 111.25h192M382.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M262 63.25h192M430.75 40v192"/>
+<path class="bar" style="fill-opacity:.42" d="M277 229h33v3h-33zM316 229h6v3h-6zM328 229h18v3h-18zM271 226h84v3h-84zM382 226h3v3h-3zM268 223h90v3h-90zM364 223h3v3h-3zM379 223h6v3h-6zM265 220h93v3h-93zM361 220h6v3h-6zM376 220h12v3h-12zM262 217h129v3h-129zM262 214h132v3h-132zM400 214h3v3h-3zM262 211h144v3h-144zM412 211h3v3h-3zM262 208h159v3h-159zM262 205h165v3h-165zM262 202h156v3h-156zM421 202h6v3h-6zM262 199h156v3h-156zM262 196h147v3h-147zM412 196h3v3h-3zM262 193h144v3h-144zM412 193h3v3h-3zM262 190h141v3h-141zM262 187h141v3h-141zM262 184h141v3h-141zM262 181h135v3h-135zM262 178h141v3h-141zM262 175h144v3h-144zM262 172h141v3h-141zM265 169h132v3h-132zM400 169h3v3h-3zM262 166h144v3h-144zM412 166h3v3h-3zM262 163h156v3h-156zM262 160h171v3h-171zM262 157h177v3h-177zM262 154h171v3h-171zM262 151h174v3h-174zM262 148h156v3h-156zM424 148h9v3h-9zM265 145h153v3h-153zM424 145h9v3h-9zM265 142h141v3h-141zM409 142h6v3h-6zM427 142h6v3h-6zM265 139h150v3h-150zM427 139h6v3h-6zM268 136h138v3h-138zM412 136h3v3h-3zM427 136h6v3h-6zM271 133h132v3h-132zM427 133h6v3h-6zM271 130h135v3h-135zM427 130h6v3h-6zM268 127h141v3h-141zM427 127h9v3h-9zM271 124h135v3h-135zM427 124h6v3h-6zM274 121h93v3h-93zM373 121h30v3h-30zM427 121h6v3h-6zM274 118h129v3h-129zM427 118h6v3h-6zM271 115h147v3h-147zM427 115h6v3h-6zM268 112h165v3h-165zM265 109h171v3h-171zM271 106h162v3h-162zM274 103h159v3h-159zM277 100h141v3h-141zM424 100h9v3h-9zM280 97h90v3h-90zM373 97h21v3h-21zM397 97h9v3h-9zM409 97h6v3h-6zM424 97h9v3h-9zM280 94h30v3h-30zM313 94h9v3h-9zM325 94h33v3h-33zM361 94h9v3h-9zM373 94h24v3h-24zM400 94h3v3h-3zM412 94h3v3h-3zM427 94h6v3h-6zM277 91h33v3h-33zM313 91h9v3h-9zM325 91h33v3h-33zM364 91h3v3h-3zM376 91h27v3h-27zM427 91h9v3h-9zM280 88h18v3h-18zM328 88h21v3h-21zM379 88h15v3h-15zM427 88h6v3h-6zM283 85h12v3h-12zM331 85h12v3h-12zM379 85h12v3h-12zM427 85h6v3h-6zM283 82h12v3h-12zM331 82h12v3h-12zM379 82h12v3h-12zM430 82h3v3h-3zM283 79h15v3h-15zM331 79h15v3h-15zM379 79h15v3h-15zM427 79h6v3h-6zM283 76h9v3h-9zM331 76h9v3h-9zM382 76h3v3h-3zM286 73h3v3h-3zM334 73h3v3h-3zM382 73h3v3h-3zM286 70h3v3h-3zM334 70h3v3h-3z"/>
+<polyline class="e store" style="stroke-width:2.4" points="283.75,201.25 285.25,201.25 286.75,201.25 286.75,199.75 286.75,198.25 286.75,196.75 286.75,195.25 286.75,193.75 286.75,192.25 286.75,190.75 286.75,189.25 286.75,187.75 286.75,186.25 286.75,184.75 286.75,183.25 286.75,181.75 286.75,180.25 286.75,178.75 286.75,177.25 286.75,175.75 286.75,174.25 286.75,172.75 286.75,171.25 286.75,169.75 286.75,168.25 286.75,166.75 286.75,165.25 286.75,163.75 286.75,162.25 286.75,160.75 286.75,159.25 286.75,157.75 286.75,156.25 286.75,154.75 286.75,153.25 286.75,151.75 286.75,150.25 286.75,148.75 286.75,147.25 286.75,145.75 286.75,144.25 286.75,142.75 286.75,141.25 286.75,139.75 286.75,138.25 286.75,136.75 286.75,135.25 286.75,133.75 286.75,132.25 286.75,130.75 286.75,129.25 286.75,127.75 286.75,126.25 286.75,124.75 286.75,123.25 286.75,121.75 286.75,120.25 286.75,118.75 286.75,117.25 286.75,115.75 286.75,114.25 286.75,112.75 286.75,111.25 288.25,111.25 289.75,111.25 291.25,111.25 292.75,111.25 294.25,111.25 295.75,111.25 297.25,111.25 298.75,111.25 300.25,111.25 301.75,111.25 303.25,111.25 304.75,111.25 306.25,111.25 307.75,111.25 309.25,111.25 310.75,111.25 312.25,111.25 313.75,111.25 315.25,111.25 316.75,111.25 318.25,111.25 319.75,111.25 321.25,111.25 322.75,111.25 324.25,111.25 325.75,111.25 327.25,111.25 328.75,111.25 330.25,111.25 331.75,111.25 333.25,111.25 334.75,111.25 336.25,111.25 337.75,111.25 339.25,111.25 340.75,111.25 342.25,111.25 343.75,111.25 345.25,111.25 346.75,111.25 348.25,111.25 349.75,111.25 351.25,111.25 352.75,111.25 354.25,111.25 355.75,111.25 357.25,111.25 358.75,111.25 360.25,111.25 361.75,111.25 363.25,111.25 364.75,111.25 366.25,111.25 367.75,111.25 369.25,111.25 370.75,111.25 372.25,111.25 373.75,111.25 375.25,111.25 376.75,111.25 378.25,111.25 379.75,111.25 381.25,111.25 382.75,111.25 384.25,111.25 385.75,111.25 387.25,111.25 388.75,111.25 390.25,111.25 391.75,111.25 393.25,111.25 394.75,111.25 396.25,111.25 397.75,111.25 399.25,111.25 400.75,111.25 402.25,111.25 403.75,111.25 405.25,111.25 406.75,111.25 408.25,111.25 409.75,111.25 411.25,111.25 412.75,111.25 414.25,111.25 415.75,111.25 417.25,111.25 418.75,111.25 420.25,111.25 421.75,111.25 423.25,111.25 424.75,111.25 426.25,111.25 427.75,111.25 429.25,111.25 430.75,111.25 430.75,109.75 430.75,108.25 430.75,106.75 430.75,105.25 430.75,103.75 430.75,102.25 430.75,100.75 430.75,99.25 430.75,97.75 430.75,96.25 430.75,94.75 430.75,93.25 430.75,91.75 430.75,90.25 430.75,88.75 430.75,87.25 430.75,85.75 430.75,84.25 430.75,82.75 430.75,81.25 429.25,81.25 427.75,81.25"/>
+<circle class="fill-ink" cx="283.75" cy="201.25" r="4.5"/>
+<circle class="fill-ink" cx="427.75" cy="81.25" r="4.5"/>
+<text class="tb" x="514" y="18">Bidirectional</text>
+<text class="ts" x="514" y="32">11,428 nodes settled</text>
+<rect class="n sunk" x="514" y="40" width="192" height="192" rx="2"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M514 207.25h192M538.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M514 159.25h192M586.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M514 111.25h192M634.75 40v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M514 63.25h192M682.75 40v192"/>
+<path class="bar" style="fill-opacity:.42" d="M514 229h99v3h-99zM616 229h3v3h-3zM631 229h6v3h-6zM514 226h108v3h-108zM631 226h9v3h-9zM514 223h111v3h-111zM628 223h15v3h-15zM514 220h108v3h-108zM625 220h15v3h-15zM514 217h129v3h-129zM514 214h132v3h-132zM514 211h135v3h-135zM652 211h3v3h-3zM682 211h3v3h-3zM514 208h147v3h-147zM679 208h6v3h-6zM514 205h153v3h-153zM676 205h12v3h-12zM514 202h141v3h-141zM679 202h9v3h-9zM514 199h135v3h-135zM652 199h3v3h-3zM676 199h12v3h-12zM514 196h129v3h-129zM676 196h12v3h-12zM514 193h129v3h-129zM676 193h15v3h-15zM514 190h126v3h-126zM673 190h21v3h-21zM514 187h111v3h-111zM628 187h15v3h-15zM670 187h27v3h-27zM514 184h99v3h-99zM616 184h3v3h-3zM631 184h9v3h-9zM673 184h18v3h-18zM514 181h96v3h-96zM616 181h3v3h-3zM631 181h6v3h-6zM670 181h24v3h-24zM514 178h96v3h-96zM634 178h3v3h-3zM667 178h33v3h-33zM514 175h99v3h-99zM634 175h3v3h-3zM664 175h39v3h-39zM514 172h93v3h-93zM661 172h6v3h-6zM670 172h33v3h-33zM514 169h87v3h-87zM604 169h3v3h-3zM652 169h3v3h-3zM658 169h48v3h-48zM514 166h96v3h-96zM649 166h57v3h-57zM514 163h105v3h-105zM634 163h3v3h-3zM640 163h66v3h-66zM514 160h111v3h-111zM634 160h72v3h-72zM514 157h192v3h-192zM514 154h108v3h-108zM631 154h75v3h-75zM514 151h99v3h-99zM616 151h3v3h-3zM628 151h12v3h-12zM646 151h60v3h-60zM514 148h93v3h-93zM628 148h12v3h-12zM649 148h57v3h-57zM514 145h84v3h-84zM628 145h15v3h-15zM652 145h54v3h-54zM514 142h84v3h-84zM625 142h21v3h-21zM649 142h57v3h-57zM514 139h87v3h-87zM622 139h84v3h-84zM514 136h60v3h-60zM577 136h18v3h-18zM625 136h18v3h-18zM646 136h60v3h-60zM514 133h57v3h-57zM580 133h12v3h-12zM622 133h84v3h-84zM514 130h57v3h-57zM583 130h9v3h-9zM619 130h87v3h-87zM514 127h57v3h-57zM580 127h12v3h-12zM616 127h90v3h-90zM514 124h51v3h-51zM583 124h6v3h-6zM613 124h6v3h-6zM622 124h84v3h-84zM517 121h45v3h-45zM586 121h3v3h-3zM604 121h3v3h-3zM613 121h93v3h-93zM517 118h45v3h-45zM586 118h3v3h-3zM601 118h105v3h-105zM514 115h51v3h-51zM568 115h3v3h-3zM586 115h3v3h-3zM592 115h114v3h-114zM514 112h63v3h-63zM586 112h120v3h-120zM514 109h192v3h-192zM514 106h57v3h-57zM586 106h120v3h-120zM514 103h48v3h-48zM598 103h108v3h-108zM517 100h42v3h-42zM604 100h3v3h-3zM610 100h96v3h-96zM520 97h3v3h-3zM529 97h21v3h-21zM556 97h3v3h-3zM613 97h93v3h-93zM529 94h21v3h-21zM616 94h90v3h-90zM526 91h27v3h-27zM616 91h90v3h-90zM529 88h18v3h-18zM622 88h84v3h-84zM532 85h15v3h-15zM616 85h90v3h-90zM535 82h9v3h-9zM613 82h93v3h-93zM532 79h12v3h-12zM586 79h3v3h-3zM604 79h3v3h-3zM610 79h96v3h-96zM535 76h6v3h-6zM586 76h3v3h-3zM601 76h6v3h-6zM610 76h96v3h-96zM535 73h6v3h-6zM583 73h6v3h-6zM592 73h3v3h-3zM598 73h108v3h-108zM538 70h3v3h-3zM583 70h123v3h-123zM538 67h3v3h-3zM580 67h126v3h-126zM574 64h132v3h-132zM568 61h138v3h-138zM577 58h129v3h-129zM580 55h126v3h-126zM583 52h12v3h-12zM598 52h108v3h-108zM583 49h6v3h-6zM592 49h3v3h-3zM601 49h105v3h-105zM586 46h3v3h-3zM601 46h6v3h-6zM610 46h96v3h-96zM586 43h3v3h-3zM610 43h96v3h-96zM613 40h93v3h-93z"/>
+<polyline class="e store" style="stroke-width:2.4" points="535.75,201.25 537.25,201.25 538.75,201.25 538.75,199.75 538.75,198.25 538.75,196.75 538.75,195.25 538.75,193.75 538.75,192.25 538.75,190.75 538.75,189.25 538.75,187.75 538.75,186.25 538.75,184.75 538.75,183.25 538.75,181.75 538.75,180.25 538.75,178.75 538.75,177.25 538.75,175.75 538.75,174.25 538.75,172.75 538.75,171.25 538.75,169.75 538.75,168.25 538.75,166.75 538.75,165.25 538.75,163.75 538.75,162.25 538.75,160.75 538.75,159.25 538.75,157.75 538.75,156.25 538.75,154.75 538.75,153.25 538.75,151.75 538.75,150.25 538.75,148.75 538.75,147.25 538.75,145.75 538.75,144.25 538.75,142.75 538.75,141.25 538.75,139.75 538.75,138.25 538.75,136.75 538.75,135.25 538.75,133.75 538.75,132.25 538.75,130.75 538.75,129.25 538.75,127.75 538.75,126.25 538.75,124.75 538.75,123.25 538.75,121.75 538.75,120.25 538.75,118.75 538.75,117.25 538.75,115.75 538.75,114.25 538.75,112.75 538.75,111.25 540.25,111.25 541.75,111.25 543.25,111.25 544.75,111.25 546.25,111.25 547.75,111.25 549.25,111.25 550.75,111.25 552.25,111.25 553.75,111.25 555.25,111.25 556.75,111.25 558.25,111.25 559.75,111.25 561.25,111.25 562.75,111.25 564.25,111.25 565.75,111.25 567.25,111.25 568.75,111.25 570.25,111.25 571.75,111.25 573.25,111.25 574.75,111.25 576.25,111.25 577.75,111.25 579.25,111.25 580.75,111.25 582.25,111.25 583.75,111.25 585.25,111.25 586.75,111.25 588.25,111.25 589.75,111.25 591.25,111.25 592.75,111.25 594.25,111.25 595.75,111.25 597.25,111.25 598.75,111.25 600.25,111.25 601.75,111.25 603.25,111.25 604.75,111.25 606.25,111.25 607.75,111.25 609.25,111.25 610.75,111.25 612.25,111.25 613.75,111.25 615.25,111.25 616.75,111.25 618.25,111.25 619.75,111.25 621.25,111.25 622.75,111.25 624.25,111.25 625.75,111.25 627.25,111.25 628.75,111.25 630.25,111.25 631.75,111.25 633.25,111.25 634.75,111.25 636.25,111.25 637.75,111.25 639.25,111.25 640.75,111.25 642.25,111.25 643.75,111.25 645.25,111.25 646.75,111.25 648.25,111.25 649.75,111.25 651.25,111.25 652.75,111.25 654.25,111.25 655.75,111.25 657.25,111.25 658.75,111.25 660.25,111.25 661.75,111.25 663.25,111.25 664.75,111.25 666.25,111.25 667.75,111.25 669.25,111.25 670.75,111.25 672.25,111.25 673.75,111.25 675.25,111.25 676.75,111.25 678.25,111.25 679.75,111.25 681.25,111.25 682.75,111.25 682.75,109.75 682.75,108.25 682.75,106.75 682.75,105.25 682.75,103.75 682.75,102.25 682.75,100.75 682.75,99.25 682.75,97.75 682.75,96.25 682.75,94.75 682.75,93.25 682.75,91.75 682.75,90.25 682.75,88.75 682.75,87.25 682.75,85.75 682.75,84.25 682.75,82.75 682.75,81.25 681.25,81.25 679.75,81.25"/>
+<circle class="fill-ink" cx="535.75" cy="201.25" r="4.5"/>
+<circle class="fill-ink" cx="679.75" cy="81.25" r="4.5"/>
+<text class="tb" x="10" y="278">Overlay, cells of 16 × 16</text>
+<text class="ts" x="10" y="292">3,108 nodes settled</text>
+<rect class="n sunk" x="10" y="300" width="192" height="192" rx="2"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M10 467.25h192M34.75 300v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M10 419.25h192M82.75 300v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M10 371.25h192M130.75 300v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M10 323.25h192M178.75 300v192"/>
+<path class="e none dash" style="stroke:var(--rule-2);stroke-width:1" d="M10 468h192M34 300v192"/>
+<path class="e none dash" style="stroke:var(--rule-2);stroke-width:1" d="M10 444h192M58 300v192"/>
+<path class="e none dash" style="stroke:var(--rule-2);stroke-width:1" d="M10 420h192M82 300v192"/>
+<path class="e none dash" style="stroke:var(--rule-2);stroke-width:1" d="M10 396h192M106 300v192"/>
+<path class="e none dash" style="stroke:var(--rule-2);stroke-width:1" d="M10 372h192M130 300v192"/>
+<path class="e none dash" style="stroke:var(--rule-2);stroke-width:1" d="M10 348h192M154 300v192"/>
+<path class="e none dash" style="stroke:var(--rule-2);stroke-width:1" d="M10 324h192M178 300v192"/>
+<path class="bar" style="fill-opacity:.42" d="M31 489h6v3h-6zM55 489h6v3h-6zM79 489h6v3h-6zM103 489h6v3h-6zM127 489h6v3h-6zM151 489h6v3h-6zM175 489h6v3h-6zM31 486h6v3h-6zM55 486h6v3h-6zM79 486h6v3h-6zM103 486h6v3h-6zM127 486h6v3h-6zM151 486h6v3h-6zM175 486h6v3h-6zM31 483h6v3h-6zM55 483h6v3h-6zM79 483h6v3h-6zM103 483h6v3h-6zM127 483h6v3h-6zM151 483h6v3h-6zM175 483h6v3h-6zM31 480h6v3h-6zM55 480h6v3h-6zM103 480h6v3h-6zM127 480h6v3h-6zM151 480h6v3h-6zM175 480h6v3h-6zM31 477h6v3h-6zM55 477h6v3h-6zM79 477h6v3h-6zM103 477h6v3h-6zM127 477h6v3h-6zM151 477h6v3h-6zM175 477h6v3h-6zM31 474h6v3h-6zM55 474h6v3h-6zM79 474h6v3h-6zM103 474h6v3h-6zM127 474h6v3h-6zM151 474h6v3h-6zM175 474h6v3h-6zM31 471h6v3h-6zM55 471h6v3h-6zM79 471h6v3h-6zM103 471h6v3h-6zM127 471h6v3h-6zM151 471h6v3h-6zM175 471h6v3h-6zM10 468h51v3h-51zM64 468h138v3h-138zM10 465h51v3h-51zM64 465h138v3h-138zM10 462h27v3h-27zM55 462h6v3h-6zM79 462h6v3h-6zM103 462h6v3h-6zM127 462h6v3h-6zM151 462h6v3h-6zM175 462h6v3h-6zM10 459h27v3h-27zM55 459h6v3h-6zM79 459h6v3h-6zM103 459h6v3h-6zM127 459h6v3h-6zM151 459h6v3h-6zM175 459h6v3h-6zM10 456h27v3h-27zM55 456h6v3h-6zM79 456h6v3h-6zM103 456h6v3h-6zM127 456h6v3h-6zM151 456h6v3h-6zM175 456h6v3h-6zM10 453h27v3h-27zM55 453h6v3h-6zM79 453h6v3h-6zM103 453h6v3h-6zM127 453h6v3h-6zM151 453h6v3h-6zM175 453h6v3h-6zM10 450h27v3h-27zM55 450h6v3h-6zM79 450h6v3h-6zM103 450h6v3h-6zM127 450h6v3h-6zM151 450h6v3h-6zM175 450h6v3h-6zM10 447h27v3h-27zM55 447h6v3h-6zM79 447h6v3h-6zM103 447h6v3h-6zM127 447h6v3h-6zM151 447h6v3h-6zM175 447h6v3h-6zM10 444h192v3h-192zM10 441h192v3h-192zM31 438h6v3h-6zM55 438h6v3h-6zM79 438h6v3h-6zM103 438h6v3h-6zM127 438h6v3h-6zM175 438h6v3h-6zM31 435h6v3h-6zM55 435h6v3h-6zM79 435h6v3h-6zM103 435h6v3h-6zM127 435h6v3h-6zM151 435h6v3h-6zM175 435h6v3h-6zM31 432h6v3h-6zM55 432h6v3h-6zM79 432h6v3h-6zM103 432h6v3h-6zM127 432h6v3h-6zM151 432h6v3h-6zM175 432h6v3h-6zM31 429h6v3h-6zM55 429h6v3h-6zM79 429h6v3h-6zM103 429h6v3h-6zM127 429h6v3h-6zM151 429h6v3h-6zM175 429h6v3h-6zM31 426h6v3h-6zM55 426h6v3h-6zM79 426h6v3h-6zM103 426h6v3h-6zM127 426h6v3h-6zM151 426h6v3h-6zM175 426h6v3h-6zM31 423h6v3h-6zM55 423h6v3h-6zM79 423h6v3h-6zM103 423h6v3h-6zM127 423h6v3h-6zM151 423h6v3h-6zM175 423h6v3h-6zM10 420h192v3h-192zM10 417h192v3h-192zM31 414h6v3h-6zM55 414h6v3h-6zM79 414h6v3h-6zM103 414h6v3h-6zM127 414h6v3h-6zM151 414h6v3h-6zM175 414h6v3h-6zM31 411h6v3h-6zM55 411h6v3h-6zM79 411h6v3h-6zM103 411h6v3h-6zM127 411h6v3h-6zM151 411h6v3h-6zM175 411h6v3h-6zM31 408h6v3h-6zM55 408h6v3h-6zM79 408h6v3h-6zM103 408h6v3h-6zM127 408h6v3h-6zM151 408h6v3h-6zM175 408h6v3h-6zM31 405h6v3h-6zM55 405h6v3h-6zM79 405h6v3h-6zM103 405h6v3h-6zM127 405h6v3h-6zM151 405h6v3h-6zM175 405h6v3h-6zM31 402h6v3h-6zM55 402h6v3h-6zM79 402h6v3h-6zM127 402h6v3h-6zM151 402h6v3h-6zM175 402h6v3h-6zM31 399h6v3h-6zM55 399h6v3h-6zM79 399h6v3h-6zM103 399h6v3h-6zM127 399h6v3h-6zM151 399h6v3h-6zM175 399h6v3h-6zM10 396h192v3h-192zM10 393h192v3h-192zM31 390h6v3h-6zM55 390h6v3h-6zM79 390h6v3h-6zM103 390h6v3h-6zM127 390h6v3h-6zM151 390h6v3h-6zM175 390h6v3h-6zM31 387h6v3h-6zM55 387h6v3h-6zM79 387h6v3h-6zM103 387h6v3h-6zM127 387h6v3h-6zM151 387h6v3h-6zM175 387h6v3h-6zM31 384h6v3h-6zM55 384h6v3h-6zM79 384h6v3h-6zM103 384h6v3h-6zM127 384h6v3h-6zM151 384h6v3h-6zM175 384h6v3h-6zM31 381h6v3h-6zM55 381h6v3h-6zM79 381h6v3h-6zM103 381h6v3h-6zM127 381h6v3h-6zM151 381h6v3h-6zM175 381h6v3h-6zM31 378h6v3h-6zM55 378h6v3h-6zM79 378h6v3h-6zM103 378h6v3h-6zM127 378h6v3h-6zM151 378h6v3h-6zM175 378h6v3h-6zM31 375h6v3h-6zM55 375h6v3h-6zM79 375h6v3h-6zM103 375h6v3h-6zM127 375h6v3h-6zM151 375h6v3h-6zM175 375h6v3h-6zM10 372h192v3h-192zM10 369h192v3h-192zM31 366h6v3h-6zM55 366h6v3h-6zM79 366h6v3h-6zM103 366h6v3h-6zM127 366h6v3h-6zM151 366h6v3h-6zM175 366h6v3h-6zM31 363h6v3h-6zM55 363h6v3h-6zM79 363h6v3h-6zM103 363h6v3h-6zM127 363h6v3h-6zM151 363h6v3h-6zM175 363h6v3h-6zM31 360h6v3h-6zM55 360h6v3h-6zM79 360h6v3h-6zM103 360h6v3h-6zM127 360h6v3h-6zM151 360h6v3h-6zM175 360h6v3h-6zM31 357h6v3h-6zM55 357h6v3h-6zM79 357h6v3h-6zM103 357h6v3h-6zM127 357h6v3h-6zM151 357h6v3h-6zM175 357h6v3h-6zM31 354h6v3h-6zM55 354h6v3h-6zM79 354h6v3h-6zM103 354h6v3h-6zM127 354h6v3h-6zM151 354h6v3h-6zM175 354h6v3h-6zM31 351h6v3h-6zM55 351h6v3h-6zM79 351h6v3h-6zM103 351h6v3h-6zM127 351h6v3h-6zM151 351h6v3h-6zM175 351h6v3h-6zM10 348h153v3h-153zM175 348h6v3h-6zM10 345h144v3h-144zM157 345h6v3h-6zM175 345h6v3h-6zM31 342h6v3h-6zM55 342h6v3h-6zM79 342h6v3h-6zM103 342h6v3h-6zM127 342h6v3h-6zM151 342h3v3h-3zM160 342h3v3h-3zM175 342h6v3h-6zM31 339h6v3h-6zM55 339h6v3h-6zM79 339h6v3h-6zM103 339h6v3h-6zM127 339h6v3h-6zM151 339h6v3h-6zM175 339h6v3h-6zM31 336h6v3h-6zM55 336h6v3h-6zM79 336h6v3h-6zM103 336h6v3h-6zM127 336h6v3h-6zM151 336h3v3h-3zM178 336h3v3h-3zM31 333h6v3h-6zM55 333h6v3h-6zM79 333h6v3h-6zM103 333h6v3h-6zM127 333h6v3h-6zM178 333h3v3h-3zM31 330h6v3h-6zM55 330h6v3h-6zM79 330h6v3h-6zM103 330h6v3h-6zM127 330h6v3h-6zM31 327h6v3h-6zM55 327h6v3h-6zM79 327h6v3h-6zM103 327h6v3h-6zM127 327h6v3h-6zM151 327h3v3h-3zM10 324h153v3h-153zM10 321h159v3h-159zM31 318h6v3h-6zM55 318h6v3h-6zM79 318h6v3h-6zM103 318h6v3h-6zM127 318h6v3h-6zM151 318h6v3h-6zM31 315h6v3h-6zM55 315h6v3h-6zM79 315h6v3h-6zM103 315h6v3h-6zM127 315h6v3h-6zM31 312h6v3h-6zM55 312h6v3h-6zM79 312h6v3h-6zM103 312h6v3h-6zM127 312h6v3h-6zM31 309h6v3h-6zM55 309h6v3h-6zM79 309h6v3h-6zM103 309h6v3h-6zM127 309h6v3h-6zM31 306h6v3h-6zM55 306h6v3h-6zM79 306h6v3h-6zM103 306h6v3h-6zM127 306h6v3h-6zM31 303h6v3h-6zM55 303h6v3h-6zM79 303h6v3h-6zM103 303h6v3h-6zM127 303h6v3h-6zM31 300h6v3h-6zM55 300h6v3h-6zM79 300h6v3h-6zM103 300h6v3h-6zM127 300h6v3h-6z"/>
+<polyline class="e store" style="stroke-width:2.4" points="31.75,461.25 33.25,461.25 34.75,461.25 34.75,459.75 34.75,458.25 34.75,456.75 34.75,455.25 34.75,453.75 34.75,452.25 34.75,450.75 34.75,449.25 34.75,447.75 34.75,446.25 34.75,444.75 34.75,443.25 34.75,441.75 34.75,440.25 34.75,438.75 34.75,437.25 34.75,435.75 34.75,434.25 34.75,432.75 34.75,431.25 34.75,429.75 34.75,428.25 34.75,426.75 34.75,425.25 34.75,423.75 34.75,422.25 34.75,420.75 34.75,419.25 34.75,417.75 34.75,416.25 34.75,414.75 34.75,413.25 34.75,411.75 34.75,410.25 34.75,408.75 34.75,407.25 34.75,405.75 34.75,404.25 34.75,402.75 34.75,401.25 34.75,399.75 34.75,398.25 34.75,396.75 34.75,395.25 34.75,393.75 34.75,392.25 34.75,390.75 34.75,389.25 34.75,387.75 34.75,386.25 34.75,384.75 34.75,383.25 34.75,381.75 34.75,380.25 34.75,378.75 34.75,377.25 34.75,375.75 34.75,374.25 34.75,372.75 34.75,371.25 36.25,371.25 37.75,371.25 39.25,371.25 40.75,371.25 42.25,371.25 43.75,371.25 45.25,371.25 46.75,371.25 48.25,371.25 49.75,371.25 51.25,371.25 52.75,371.25 54.25,371.25 55.75,371.25 57.25,371.25 58.75,371.25 60.25,371.25 61.75,371.25 63.25,371.25 64.75,371.25 66.25,371.25 67.75,371.25 69.25,371.25 70.75,371.25 72.25,371.25 73.75,371.25 75.25,371.25 76.75,371.25 78.25,371.25 79.75,371.25 81.25,371.25 82.75,371.25 84.25,371.25 85.75,371.25 87.25,371.25 88.75,371.25 90.25,371.25 91.75,371.25 93.25,371.25 94.75,371.25 96.25,371.25 97.75,371.25 99.25,371.25 100.75,371.25 102.25,371.25 103.75,371.25 105.25,371.25 106.75,371.25 108.25,371.25 109.75,371.25 111.25,371.25 112.75,371.25 114.25,371.25 115.75,371.25 117.25,371.25 118.75,371.25 120.25,371.25 121.75,371.25 123.25,371.25 124.75,371.25 126.25,371.25 127.75,371.25 129.25,371.25 130.75,371.25 132.25,371.25 133.75,371.25 135.25,371.25 136.75,371.25 138.25,371.25 139.75,371.25 141.25,371.25 142.75,371.25 144.25,371.25 145.75,371.25 147.25,371.25 148.75,371.25 150.25,371.25 151.75,371.25 153.25,371.25 154.75,371.25 156.25,371.25 157.75,371.25 159.25,371.25 160.75,371.25 162.25,371.25 163.75,371.25 165.25,371.25 166.75,371.25 168.25,371.25 169.75,371.25 171.25,371.25 172.75,371.25 174.25,371.25 175.75,371.25 177.25,371.25 178.75,371.25 178.75,369.75 178.75,368.25 178.75,366.75 178.75,365.25 178.75,363.75 178.75,362.25 178.75,360.75 178.75,359.25 178.75,357.75 178.75,356.25 178.75,354.75 178.75,353.25 178.75,351.75 178.75,350.25 178.75,348.75 178.75,347.25 178.75,345.75 178.75,344.25 178.75,342.75 178.75,341.25 177.25,341.25 175.75,341.25"/>
+<circle class="fill-ink" cx="31.75" cy="461.25" r="4.5"/>
+<circle class="fill-ink" cx="175.75" cy="341.25" r="4.5"/>
+<text class="tb" x="262" y="278">Contraction hierarchy</text>
+<text class="ts" x="262" y="292">172 nodes settled</text>
+<rect class="n sunk" x="262" y="300" width="192" height="192" rx="2"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M262 467.25h192M286.75 300v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M262 419.25h192M334.75 300v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M262 371.25h192M382.75 300v192"/>
+<path class="e none" style="stroke:var(--ink-3);stroke-width:1.6" d="M262 323.25h192M430.75 300v192"/>
+<circle class="fill-sig" cx="283.75" cy="461.25" r="2.2"/>
+<circle class="fill-sig" cx="427.75" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="429.25" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="426.25" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="461.25" r="2.2"/>
+<circle class="fill-sig" cx="280.75" cy="461.25" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="339.75" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="344.25" r="2.2"/>
+<circle class="fill-sig" cx="427.75" cy="338.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="467.25" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="335.25" r="2.2"/>
+<circle class="fill-sig" cx="277.75" cy="461.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="453.75" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="348.75" r="2.2"/>
+<circle class="fill-sig" cx="280.75" cy="456.75" r="2.2"/>
+<circle class="fill-sig" cx="292.75" cy="467.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="449.25" r="2.2"/>
+<circle class="fill-sig" cx="436.75" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="283.75" cy="458.25" r="2.2"/>
+<circle class="fill-sig" cx="280.75" cy="467.25" r="2.2"/>
+<circle class="fill-sig" cx="424.75" cy="338.25" r="2.2"/>
+<circle class="fill-sig" cx="280.75" cy="453.75" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="323.25" r="2.2"/>
+<circle class="fill-sig" cx="424.75" cy="339.75" r="2.2"/>
+<circle class="fill-sig" cx="274.75" cy="467.25" r="2.2"/>
+<circle class="fill-sig" cx="426.25" cy="335.25" r="2.2"/>
+<circle class="fill-sig" cx="432.25" cy="336.75" r="2.2"/>
+<circle class="fill-sig" cx="285.25" cy="456.75" r="2.2"/>
+<circle class="fill-sig" cx="424.75" cy="333.75" r="2.2"/>
+<circle class="fill-sig" cx="292.75" cy="455.25" r="2.2"/>
+<circle class="fill-sig" cx="280.75" cy="473.25" r="2.2"/>
+<circle class="fill-sig" cx="423.25" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="437.25" r="2.2"/>
+<circle class="fill-sig" cx="268.75" cy="467.25" r="2.2"/>
+<circle class="fill-sig" cx="436.75" cy="345.75" r="2.2"/>
+<circle class="fill-sig" cx="423.25" cy="335.25" r="2.2"/>
+<circle class="fill-sig" cx="436.75" cy="348.75" r="2.2"/>
+<circle class="fill-sig" cx="420.25" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="424.75" cy="356.25" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="445.75" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="424.75" cy="345.75" r="2.2"/>
+<circle class="fill-sig" cx="268.75" cy="456.75" r="2.2"/>
+<circle class="fill-sig" cx="295.75" cy="455.25" r="2.2"/>
+<circle class="fill-sig" cx="276.25" cy="449.25" r="2.2"/>
+<circle class="fill-sig" cx="271.75" cy="465.75" r="2.2"/>
+<circle class="fill-sig" cx="417.25" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="412.75" cy="323.25" r="2.2"/>
+<circle class="fill-sig" cx="421.75" cy="333.75" r="2.2"/>
+<circle class="fill-sig" cx="424.75" cy="348.75" r="2.2"/>
+<circle class="fill-sig" cx="280.75" cy="443.25" r="2.2"/>
+<circle class="fill-sig" cx="439.75" cy="333.75" r="2.2"/>
+<circle class="fill-sig" cx="418.75" cy="335.25" r="2.2"/>
+<circle class="fill-sig" cx="435.25" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="441.25" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="429.25" cy="347.25" r="2.2"/>
+<circle class="fill-sig" cx="418.75" cy="347.25" r="2.2"/>
+<circle class="fill-sig" cx="448.75" cy="347.25" r="2.2"/>
+<circle class="fill-sig" cx="427.75" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="407.25" r="2.2"/>
+<circle class="fill-sig" cx="295.75" cy="432.75" r="2.2"/>
+<circle class="fill-sig" cx="280.75" cy="434.25" r="2.2"/>
+<circle class="fill-sig" cx="412.75" cy="335.25" r="2.2"/>
+<circle class="fill-sig" cx="412.75" cy="347.25" r="2.2"/>
+<circle class="fill-sig" cx="262.75" cy="455.25" r="2.2"/>
+<circle class="fill-sig" cx="418.75" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="298.75" cy="434.25" r="2.2"/>
+<circle class="fill-sig" cx="304.75" cy="449.25" r="2.2"/>
+<circle class="fill-sig" cx="405.25" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="365.25" r="2.2"/>
+<circle class="fill-sig" cx="309.25" cy="479.25" r="2.2"/>
+<circle class="fill-sig" cx="444.25" cy="360.75" r="2.2"/>
+<circle class="fill-sig" cx="415.75" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="334.75" cy="453.75" r="2.2"/>
+<circle class="fill-sig" cx="271.75" cy="437.25" r="2.2"/>
+<circle class="fill-sig" cx="312.25" cy="419.25" r="2.2"/>
+<circle class="fill-sig" cx="436.75" cy="368.25" r="2.2"/>
+<circle class="fill-sig" cx="442.75" cy="309.75" r="2.2"/>
+<circle class="fill-sig" cx="352.75" cy="467.25" r="2.2"/>
+<circle class="fill-sig" cx="388.75" cy="329.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="389.25" r="2.2"/>
+<circle class="fill-sig" cx="409.75" cy="329.25" r="2.2"/>
+<circle class="fill-sig" cx="448.75" cy="336.75" r="2.2"/>
+<circle class="fill-sig" cx="309.25" cy="441.75" r="2.2"/>
+<circle class="fill-sig" cx="409.75" cy="332.25" r="2.2"/>
+<circle class="fill-sig" cx="394.75" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="304.75" cy="437.25" r="2.2"/>
+<circle class="fill-sig" cx="274.75" cy="425.25" r="2.2"/>
+<circle class="fill-sig" cx="418.75" cy="365.25" r="2.2"/>
+<circle class="fill-sig" cx="334.75" cy="419.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="419.25" r="2.2"/>
+<circle class="fill-sig" cx="268.75" cy="446.25" r="2.2"/>
+<circle class="fill-sig" cx="400.75" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="304.75" cy="467.25" r="2.2"/>
+<circle class="fill-sig" cx="352.75" cy="323.25" r="2.2"/>
+<circle class="fill-sig" cx="292.75" cy="425.25" r="2.2"/>
+<circle class="fill-sig" cx="382.75" cy="357.75" r="2.2"/>
+<circle class="fill-sig" cx="316.75" cy="458.25" r="2.2"/>
+<circle class="fill-sig" cx="448.75" cy="323.25" r="2.2"/>
+<circle class="fill-sig" cx="382.75" cy="395.25" r="2.2"/>
+<circle class="fill-sig" cx="400.75" cy="323.25" r="2.2"/>
+<circle class="fill-sig" cx="412.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="316.75" cy="437.25" r="2.2"/>
+<circle class="fill-sig" cx="382.75" cy="342.75" r="2.2"/>
+<circle class="fill-sig" cx="321.25" cy="443.25" r="2.2"/>
+<circle class="fill-sig" cx="352.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="322.75" cy="408.75" r="2.2"/>
+<circle class="fill-sig" cx="411.25" cy="360.75" r="2.2"/>
+<circle class="fill-sig" cx="264.25" cy="470.25" r="2.2"/>
+<circle class="fill-sig" cx="268.75" cy="410.25" r="2.2"/>
+<circle class="fill-sig" cx="321.25" cy="461.25" r="2.2"/>
+<circle class="fill-sig" cx="412.75" cy="356.25" r="2.2"/>
+<circle class="fill-sig" cx="406.75" cy="317.25" r="2.2"/>
+<circle class="fill-sig" cx="328.75" cy="467.25" r="2.2"/>
+<circle class="fill-sig" cx="442.75" cy="383.25" r="2.2"/>
+<circle class="fill-sig" cx="423.25" cy="440.25" r="2.2"/>
+<circle class="fill-sig" cx="400.75" cy="344.25" r="2.2"/>
+<circle class="fill-sig" cx="382.75" cy="323.25" r="2.2"/>
+<circle class="fill-sig" cx="400.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="334.75" cy="437.25" r="2.2"/>
+<circle class="fill-sig" cx="316.75" cy="323.25" r="2.2"/>
+<circle class="fill-sig" cx="324.25" cy="437.25" r="2.2"/>
+<circle class="fill-sig" cx="382.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="345.25" cy="449.25" r="2.2"/>
+<circle class="fill-sig" cx="334.75" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="405.25" cy="348.75" r="2.2"/>
+<circle class="fill-sig" cx="292.75" cy="401.25" r="2.2"/>
+<circle class="fill-sig" cx="393.25" cy="362.25" r="2.2"/>
+<circle class="fill-sig" cx="304.75" cy="405.75" r="2.2"/>
+<circle class="fill-sig" cx="364.75" cy="335.25" r="2.2"/>
+<circle class="fill-sig" cx="304.75" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="382.75" cy="395.25" r="2.2"/>
+<circle class="fill-sig" cx="364.75" cy="377.25" r="2.2"/>
+<circle class="fill-sig" cx="352.75" cy="437.25" r="2.2"/>
+<circle class="fill-sig" cx="334.75" cy="419.25" r="2.2"/>
+<circle class="fill-sig" cx="334.75" cy="384.75" r="2.2"/>
+<circle class="fill-sig" cx="334.75" cy="384.75" r="2.2"/>
+<circle class="fill-sig" cx="394.75" cy="389.25" r="2.2"/>
+<circle class="fill-sig" cx="297.25" cy="393.75" r="2.2"/>
+<circle class="fill-sig" cx="352.75" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="316.75" cy="401.25" r="2.2"/>
+<circle class="fill-sig" cx="406.75" cy="311.25" r="2.2"/>
+<circle class="fill-sig" cx="304.75" cy="341.25" r="2.2"/>
+<circle class="fill-sig" cx="393.25" cy="386.25" r="2.2"/>
+<circle class="fill-sig" cx="309.25" cy="389.25" r="2.2"/>
+<circle class="fill-sig" cx="307.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="346.75" cy="360.75" r="2.2"/>
+<circle class="fill-sig" cx="304.75" cy="383.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="389.25" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="419.25" r="2.2"/>
+<circle class="fill-sig" cx="400.75" cy="405.75" r="2.2"/>
+<circle class="fill-sig" cx="423.25" cy="440.25" r="2.2"/>
+<circle class="fill-sig" cx="352.75" cy="419.25" r="2.2"/>
+<circle class="fill-sig" cx="352.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="364.75" cy="365.25" r="2.2"/>
+<circle class="fill-sig" cx="439.75" cy="431.25" r="2.2"/>
+<circle class="fill-sig" cx="273.25" cy="311.25" r="2.2"/>
+<circle class="fill-sig" cx="307.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="394.75" cy="401.25" r="2.2"/>
+<circle class="fill-sig" cx="304.75" cy="368.25" r="2.2"/>
+<circle class="fill-sig" cx="340.75" cy="401.25" r="2.2"/>
+<circle class="fill-sig" cx="271.75" cy="357.75" r="2.2"/>
+<circle class="fill-sig" cx="439.75" cy="431.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="388.75" cy="419.25" r="2.2"/>
+<circle class="fill-sig" cx="340.75" cy="389.25" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="371.25" r="2.2"/>
+<circle class="fill-sig" cx="382.75" cy="413.25" r="2.2"/>
+<circle class="fill-sig" cx="286.75" cy="353.25" r="2.2"/>
+<circle class="fill-sig" cx="295.75" cy="432.75" r="2.2"/>
+<circle class="fill-sig" cx="430.75" cy="419.25" r="2.2"/>
+<circle class="fill-sig" cx="382.75" cy="467.25" r="2.2"/>
+<polyline class="e store" style="stroke-width:2.4" points="283.75,461.25 285.25,461.25 286.75,461.25 286.75,459.75 286.75,458.25 286.75,456.75 286.75,455.25 286.75,453.75 286.75,452.25 286.75,450.75 286.75,449.25 286.75,447.75 286.75,446.25 286.75,444.75 286.75,443.25 286.75,441.75 286.75,440.25 286.75,438.75 286.75,437.25 286.75,435.75 286.75,434.25 286.75,432.75 286.75,431.25 286.75,429.75 286.75,428.25 286.75,426.75 286.75,425.25 286.75,423.75 286.75,422.25 286.75,420.75 286.75,419.25 286.75,417.75 286.75,416.25 286.75,414.75 286.75,413.25 286.75,411.75 286.75,410.25 286.75,408.75 286.75,407.25 286.75,405.75 286.75,404.25 286.75,402.75 286.75,401.25 286.75,399.75 286.75,398.25 286.75,396.75 286.75,395.25 286.75,393.75 286.75,392.25 286.75,390.75 286.75,389.25 286.75,387.75 286.75,386.25 286.75,384.75 286.75,383.25 286.75,381.75 286.75,380.25 286.75,378.75 286.75,377.25 286.75,375.75 286.75,374.25 286.75,372.75 286.75,371.25 288.25,371.25 289.75,371.25 291.25,371.25 292.75,371.25 294.25,371.25 295.75,371.25 297.25,371.25 298.75,371.25 300.25,371.25 301.75,371.25 303.25,371.25 304.75,371.25 306.25,371.25 307.75,371.25 309.25,371.25 310.75,371.25 312.25,371.25 313.75,371.25 315.25,371.25 316.75,371.25 318.25,371.25 319.75,371.25 321.25,371.25 322.75,371.25 324.25,371.25 325.75,371.25 327.25,371.25 328.75,371.25 330.25,371.25 331.75,371.25 333.25,371.25 334.75,371.25 336.25,371.25 337.75,371.25 339.25,371.25 340.75,371.25 342.25,371.25 343.75,371.25 345.25,371.25 346.75,371.25 348.25,371.25 349.75,371.25 351.25,371.25 352.75,371.25 354.25,371.25 355.75,371.25 357.25,371.25 358.75,371.25 360.25,371.25 361.75,371.25 363.25,371.25 364.75,371.25 366.25,371.25 367.75,371.25 369.25,371.25 370.75,371.25 372.25,371.25 373.75,371.25 375.25,371.25 376.75,371.25 378.25,371.25 379.75,371.25 381.25,371.25 382.75,371.25 384.25,371.25 385.75,371.25 387.25,371.25 388.75,371.25 390.25,371.25 391.75,371.25 393.25,371.25 394.75,371.25 396.25,371.25 397.75,371.25 399.25,371.25 400.75,371.25 402.25,371.25 403.75,371.25 405.25,371.25 406.75,371.25 408.25,371.25 409.75,371.25 411.25,371.25 412.75,371.25 414.25,371.25 415.75,371.25 417.25,371.25 418.75,371.25 420.25,371.25 421.75,371.25 423.25,371.25 424.75,371.25 426.25,371.25 427.75,371.25 429.25,371.25 430.75,371.25 430.75,369.75 430.75,368.25 430.75,366.75 430.75,365.25 430.75,363.75 430.75,362.25 430.75,360.75 430.75,359.25 430.75,357.75 430.75,356.25 430.75,354.75 430.75,353.25 430.75,351.75 430.75,350.25 430.75,348.75 430.75,347.25 430.75,345.75 430.75,344.25 430.75,342.75 430.75,341.25 429.25,341.25 427.75,341.25"/>
+<circle class="fill-ink" cx="283.75" cy="461.25" r="4.5"/>
+<circle class="fill-ink" cx="427.75" cy="341.25" r="4.5"/>
+<text class="tb" x="514" y="296">The same trip in every panel:</text>
+<text class="ts" x="514" y="318">31.2 km across a grid of</text>
+<text class="ts" x="514" y="335">16,384 intersections, fastest</text>
+<text class="ts" x="514" y="352">route 28.1 minutes (green).</text>
+<text class="ts" x="514" y="369"></text>
+<text class="ts" x="514" y="386">Shaded: nodes settled.</text>
+<text class="ts" x="514" y="403">Gray lines: highways.</text>
+<text class="ts" x="514" y="420">Dashed: the overlay’s cells.</text>
+<text class="ts" x="514" y="437"></text>
+<text class="ts" x="514" y="454">All five find the same</text>
+<text class="ts" x="514" y="471">fastest time; they differ</text>
+<text class="ts" x="514" y="488">only in the work.</text>
+<text class="ts" x="10" y="516">Drawn from code/91-hld-maps/figures.ts. Each shaded square is 2 × 2 intersections; the hierarchy’s nodes are drawn one by one.</text>
+</svg>
+</div>
+<figcaption>A* aims the search; a bidirectional search grows two smaller discs; the overlay crosses whole cells in one hop; the hierarchy climbs to the highways from both ends and meets in the middle.</figcaption>
+</figure>
+
+<p>All three still grow with the size of the map. What makes routing fast in practice is preprocessing, which uses the fact that road networks have a hierarchy: a long trip leaves the local streets quickly, joins larger roads, and comes back down near the end. A <dfn>contraction hierarchy</dfn> makes that hierarchy explicit. Preprocessing removes the nodes one at a time, least important first; whenever removing a node would break a fastest path between two of its neighbors, it adds a shortcut edge between them with the path’s time. A query then searches from both ends using only edges that lead to more important nodes, and the two searches meet near the top.</p>
+<pre data-lang="ts" data-title="Contraction: remove the least important node, keep its fastest paths as shortcuts">
+const order = new NodeHeap(n);
+  for (let v = 0; v < n; v += 1) order.push(priority(v), v);
+  const rank = new Int32Array(n);
+  const upFrom: number[] = [], upTo: number[] = [], upTime: number[] = [], upMid: number[] = [];
+  let shortcuts = 0, next = 0;
+  while (order.size > 0) {
+    const v = order.pop();
+    if (contracted[v]) continue;
+    const p = priority(v);                       // lazy update: priorities go stale as neighbors go
+    if (order.size > 0 && p > order.topKey()) { order.push(p, v); continue; }
+    for (const [a, b, w] of needed(v)) {
+      addOrLower(a, b, w, v); addOrLower(b, a, w, v);
+      shortcuts += 1;
+    }
+    const vs = nbr[v] as number[], ws = wt[v] as number[], ms = via[v] as number[];
+    for (let i = 0; i < vs.length; i += 1) {
+      const u = vs[i] as number;
+      if (contracted[u]) continue;
+      upFrom.push(v); upTo.push(u); upTime.push(ws[i] as number); upMid.push(ms[i] as number);
+      deletedNeighbors[u] += 1;
+    }
+    contracted[v] = 1;
+    rank[v] = next++;
+  }
+</pre>
+<p>Importance here is the number of shortcuts a node’s removal would add minus the edges it removes, a standard choice, and checking whether a shortcut is needed means a small search for another path of the same time that avoids the node. For the test city, preprocessing added 32,885 shortcuts to the 29,145 road segments and took 1.3 seconds in one run. A query then settled 164 nodes on average, 1.9% of Dijkstra, and unpacking each shortcut into the two edges it stands for gave back real roads with exactly the fastest time.</p>
+
+<figure class="fig wide" id="fig-growth">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f915t f915d">
+<title id="f915t">Work for one route as the map grows</title>
+<desc id="f915d">Average nodes settled over 100 random trips, on square grids of 4,096 to 65,536 intersections. 4,096 intersections: Dijkstra 2,273, overlay 750, hierarchy 102; 16,384 intersections: Dijkstra 8,223, overlay 1,968, hierarchy 162; 36,864 intersections: Dijkstra 20,976, overlay 4,632, hierarchy 234; 65,536 intersections: Dijkstra 34,131, overlay 7,375, hierarchy 295.</desc>
+<line class="grid" x1="70" y1="250.0" x2="520" y2="250.0"/>
+<text class="ts end" x="62" y="254.0">0</text>
+<line class="grid" x1="70" y1="213.3" x2="520" y2="213.3"/>
+<text class="ts end" x="62" y="217.3">6,000</text>
+<line class="grid" x1="70" y1="176.7" x2="520" y2="176.7"/>
+<text class="ts end" x="62" y="180.7">12,000</text>
+<line class="grid" x1="70" y1="140.0" x2="520" y2="140.0"/>
+<text class="ts end" x="62" y="144.0">18,000</text>
+<line class="grid" x1="70" y1="103.3" x2="520" y2="103.3"/>
+<text class="ts end" x="62" y="107.3">24,000</text>
+<line class="grid" x1="70" y1="66.7" x2="520" y2="66.7"/>
+<text class="ts end" x="62" y="70.7">30,000</text>
+<line class="grid" x1="70" y1="30.0" x2="520" y2="30.0"/>
+<text class="ts end" x="62" y="34.0">36,000</text>
+<text class="ts mid" x="96.3" y="268">4,096</text>
+<text class="ts mid" x="175.3" y="268">16,384</text>
+<text class="ts mid" x="307.0" y="268">36,864</text>
+<text class="ts mid" x="491.3" y="268">65,536</text>
+<text class="ts mid" x="295.0" y="288">intersections in the grid</text>
+<text class="ts" x="10" y="16">nodes settled per route, average of 100 trips</text>
+<polyline class="line" style="stroke:var(--sig);" points="96.3,236.1 175.3,199.7 307.0,121.8 491.3,41.4"/>
+<circle class="dot" style="fill:var(--sig)" cx="96.3" cy="236.1" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="175.3" cy="199.7" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="307.0" cy="121.8" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="491.3" cy="41.4" r="3.5"/>
+<text class="ts tb" x="501.3" y="45.4">Dijkstra: 34,131</text>
+<polyline class="line" style="stroke:var(--ink-3);stroke-dasharray:6 4;" points="96.3,245.4 175.3,238.0 307.0,221.7 491.3,204.9"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="96.3" cy="245.4" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="175.3" cy="238.0" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="307.0" cy="221.7" r="3.5"/>
+<circle class="dot" style="fill:var(--ink-3)" cx="491.3" cy="204.9" r="3.5"/>
+<text class="ts" x="501.3" y="208.9">overlay, one level of cells: 7,375</text>
+<polyline class="line" style="stroke:var(--store);" points="96.3,249.4 175.3,249.0 307.0,248.6 491.3,248.2"/>
+<circle class="dot" style="fill:var(--store)" cx="96.3" cy="249.4" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="175.3" cy="249.0" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="307.0" cy="248.6" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="491.3" cy="248.2" r="3.5"/>
+<text class="ts tb" x="501.3" y="252.2">contraction hierarchy: 295</text>
+<rect class="hit" x="66.3314" y="30" width="60" height="220" data-tip="4,096 intersections|Dijkstra 2,273 settled|overlay 750|hierarchy 102|hierarchy built in 0.3 s (one run)"/>
+<rect class="hit" x="145.326" y="30" width="60" height="220" data-tip="16,384 intersections|Dijkstra 8,223 settled|overlay 1,968|hierarchy 162|hierarchy built in 1.3 s (one run)"/>
+<rect class="hit" x="276.983" y="30" width="60" height="220" data-tip="36,864 intersections|Dijkstra 20,976 settled|overlay 4,632|hierarchy 234|hierarchy built in 2.7 s (one run)"/>
+<rect class="hit" x="461.303" y="30" width="60" height="220" data-tip="65,536 intersections|Dijkstra 34,131 settled|overlay 7,375|hierarchy 295|hierarchy built in 5.5 s (one run)"/>
+</svg>
+</div>
+<figcaption>Dijkstra’s work grows with the map; so does an overlay with a single level of cells, divided by a constant. The hierarchy’s grows so slowly it barely leaves the axis.</figcaption>
+</figure>
+
+<p>The gap widens with the map. On grids from 4,096 to 65,536 intersections, sixteen times larger, Dijkstra’s work grew fifteen times, from 2,273 to 34,131 nodes, and the hierarchy’s less than three times, from 102 to 295. The published comparison on a real network says the same at continental scale: on the road graph of Western Europe, 18.0 million intersections, a survey by Bast and colleagues reports Dijkstra settling 9.3 million nodes in 2.2 seconds, and a contraction hierarchy settling 280 in 110 microseconds after five minutes of preprocessing.</p>
+
+<h2 id="traffic">Step 6c: Live traffic</h2>
+<p>Traffic data comes from the phones. A position from GPS is off by several meters, and roads run side by side, so the first step is <dfn>map matching</dfn>: finding the sequence of road segments a car most likely drove, given a sequence of noisy positions and the shape of the network, usually by weighing each candidate segment’s distance from the fix against how plausible the move from the previous one is. Then the traffic service averages speeds per segment over the last few minutes, a windowed aggregation (<x-ref to="batch-and-stream-processing#windows"></x-ref>). One car might be a van stopping at every door, so a segment needs several before its speed is used; below that, the typical speed stands in. Dropping the first and last minutes of each trip keeps homes out of the data.</p>
+<p>Then the speeds have to reach the router, and here preprocessing turns against the design. The shortcuts of a contraction hierarchy carry times computed from the old speeds. The test slowed 3 km of one highway to a sixth of its speed, a jam, and asked the hierarchy built before it for 100 trips past it: it gave a wrong time for all 100, routes through a jam it did not know about. Rebuilding fixes that, but it took 1.3 seconds for 16,384 intersections and 5.5 seconds for 65,536 in one run, and on the order of minutes for a continent. Speeds change everywhere every minute.</p>
+<p><dfn>Customizable route planning</dfn> splits the preprocessing in two so that weights can change cheaply. The slow part depends only on the shape of the network: cut the map into cells, and note each cell’s boundary nodes, those with a road leading out. The fast part, customization, uses the current weights: for each cell, compute the fastest time across it between every pair of its boundary nodes, staying inside. A query searches the cells of its start and destination in full and crosses every other cell in one hop between boundary nodes.</p>
+<pre data-lang="ts" data-title="The overlay query: end cells in full, other cells by their precomputed hops">
+const c = this.cell[u] as number;
+      const inside = c === cs || c === ct;
+      for (let e = g.first[u] as number; e < (g.first[u + 1] as number); e += 1) {
+        const v = g.head[e] as number;
+        if (inside || this.cell[v] !== c) relax(v, d + (g.time[e] as number)); // roads leaving the cell always count
+      }
+      if (!inside) {
+        const nodes = this.boundary[c] as number[], k = nodes.length, i = this.slot[u] as number;
+        const table = this.clique[c] as Float64Array;
+        for (let j = 0; j < k; j += 1) if (j !== i) relax(nodes[j] as number, d + (table[i * k + j] as number));
+      }
+    }
+</pre>
+<p>With cells of 16 by 16 intersections, the test city has 64 cells and 147,160 precomputed hops. A query settled 2,010 nodes on average, 24% of Dijkstra: more than the hierarchy, because the end cells are searched in full and the boundaries are crossed node by node. When the highway jammed, only the one cell it runs through needed customizing again, and after that the overlay was right on all 100 trips past the jam. Customizing one cell took about 2.1 ms in one run, the same on every size of map, because a cell does not grow when the map does; customizing all of them took between 47 and 690 ms.</p>
+<table>
+<thead><tr><th></th><th>Dijkstra and A*</th><th>Contraction hierarchy</th><th>Cell overlay</th></tr></thead>
+<tbody>
+<tr><th>Preprocessing</th><td>None</td><td>Minutes for a continent, for one set of weights</td><td>Partition once; customization in under a second</td></tr>
+<tr><th>Work per query, test city</th><td>8,457 and 2,935 nodes</td><td>164 nodes</td><td>2,010 nodes, with one level of cells</td></tr>
+<tr><th>After a traffic change</th><td>Nothing to do</td><td>Wrong until rebuilt</td><td>Customize the changed cells again</td></tr>
+<tr><th>Another vehicle or “avoid tolls”</th><td>Change the weights</td><td>A separate hierarchy</td><td>A separate customization</td></tr>
+</tbody>
+</table>
+<p>A single level of cells divides the work by a constant, as the growth chart above shows. Production systems stack levels, cells of cells, so that a long trip crosses a few large cells. The same survey reports this method answering a query on Western Europe in 1.65 ms after settling 2,766 nodes, with a new set of weights applied in about 370 ms on a 12-core machine. The two are not rivals: OSRM, below, offers both, the overlay by default and the hierarchy for large tables of travel times between many points, where its cheap queries matter most and traffic matters less.</p>
+
+<h2 id="eta">Step 6d: Predicting the travel time</h2>
+<p>The arrival time is a forecast. A car leaving now reaches the far end of a 36 km route half an hour from now, when the traffic there will be different. The chapter tests four ways of forecasting on a simulated commute into a city: 36 one-kilometer segments, town streets at both ends and a motorway between, each segment slowing around its own rush hour, with the jam starting near the city and spreading outward. Mornings differ in how bad the rush is, and a quarter of them have a crash that cuts 3 km to 15 km/h for 20 to 60 minutes. Speeds observed at departure carry 5% of measurement noise. Over 300 mornings with departures every ten minutes from 06:00 to 10:00, each forecast was compared with the time the drive took.</p>
+<p>The four forecasts, made at departure, drive the route in steps of 100 m at a predicted speed. Free flow uses the speed limit; “traffic now” uses each segment’s current speed for the whole trip; “typical” looks up each segment’s usual speed at the time the car will reach it; the last combines them, as in <code>code/91-hld-maps/eta.ts</code>:</p>
+<div class="formula">speed(segment, t) = typical(segment, t) × (live(segment) ÷ typical(segment, now))<sup>w</sup>, with w = e<sup>−(t − now) ÷ 15 min</sup></div>
+<table>
+<thead><tr><th>Forecast</th><th>Mean error</th><th>90th percentile</th><th>Mean error with a crash on the way</th></tr></thead>
+<tbody>
+<tr><th>Free flow: the speed limit everywhere</th><td>17.6%</td><td>40.7%</td><td>33.6%</td></tr>
+<tr><th>Traffic now, for the whole trip</th><td>11.9%</td><td>29.8%</td><td>22.7%</td></tr>
+<tr><th>Typical for the time each segment is reached</th><td>5.6%</td><td>17.0%</td><td>12.3%</td></tr>
+<tr><th>Now, fading to typical further ahead</th><td>4.5%</td><td>14.5%</td><td>10.8%</td></tr>
+</tbody>
+</table>
+
+<figure class="fig wide" id="fig-eta">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 320" role="img" aria-labelledby="f916t f916d">
+<title id="f916t">One morning: the travel time as driven, and as predicted at departure</title>
+<desc id="f916d">Travel time on a 36 km route into a city for departures every 5 minutes from 06:00 to 10:00, on a morning with heavier traffic than usual and a crash on km 27 to 29 from 07:40 to 08:37. For example, leaving at 07:00: driven 60.8 min, traffic now 35.4, typical 43.4, now fading to typical 44.2; leaving at 07:40: driven 55 min, traffic now 86.8, typical 41.8, now fading to typical 43.8. Free flow would always say 26.4 minutes.</desc>
+<line class="grid" x1="60" y1="262.0" x2="560" y2="262.0"/>
+<text class="ts end" x="52" y="266.0">0</text>
+<line class="grid" x1="60" y1="223.3" x2="560" y2="223.3"/>
+<text class="ts end" x="52" y="227.3">15</text>
+<line class="grid" x1="60" y1="184.7" x2="560" y2="184.7"/>
+<text class="ts end" x="52" y="188.7">30</text>
+<line class="grid" x1="60" y1="146.0" x2="560" y2="146.0"/>
+<text class="ts end" x="52" y="150.0">45</text>
+<line class="grid" x1="60" y1="107.3" x2="560" y2="107.3"/>
+<text class="ts end" x="52" y="111.3">60</text>
+<line class="grid" x1="60" y1="68.7" x2="560" y2="68.7"/>
+<text class="ts end" x="52" y="72.7">75</text>
+<line class="grid" x1="60" y1="30.0" x2="560" y2="30.0"/>
+<text class="ts end" x="52" y="34.0">90</text>
+<text class="ts mid" x="60.0" y="280">06:00</text>
+<text class="ts mid" x="122.5" y="280">06:30</text>
+<text class="ts mid" x="185.0" y="280">07:00</text>
+<text class="ts mid" x="247.5" y="280">07:30</text>
+<text class="ts mid" x="310.0" y="280">08:00</text>
+<text class="ts mid" x="372.5" y="280">08:30</text>
+<text class="ts mid" x="435.0" y="280">09:00</text>
+<text class="ts mid" x="497.5" y="280">09:30</text>
+<text class="ts mid" x="560.0" y="280">10:00</text>
+<text class="ts mid" x="310.0" y="300">departure time</text>
+<text class="ts" x="10" y="16">travel time, minutes</text>
+<rect class="n sunk" style="stroke:none;opacity:.8" x="270.1" y="30" width="118.9" height="232"/>
+<text class="ts mid" x="329.6" y="254">crash, 07:40 to 08:37</text>
+<path class="e none" style="stroke:var(--ink-3);stroke-dasharray:2 3" d="M60 193.9H560"/>
+<polyline class="line" style="stroke:var(--ink);stroke-width:2.6;" points="60.0,191.9 70.4,190.9 80.8,189.8 91.2,188.0 101.7,185.7 112.1,182.3 122.5,177.2 132.9,169.2 143.3,154.2 153.8,125.6 164.2,108.9 174.6,104.8 185.0,105.3 195.4,108.1 205.8,110.9 216.2,110.7 226.7,113.3 237.1,114.8 247.5,116.4 257.9,118.2 268.3,120.2 278.8,122.5 289.2,125.1 299.6,130.3 310.0,140.8 320.4,151.7 330.8,160.4 341.2,163.8 351.7,167.4 362.1,170.5 372.5,173.6 382.9,176.4 393.3,179.3 403.8,181.6 414.2,183.9 424.6,185.7 435.0,187.2 445.4,188.8 455.8,189.8 466.2,190.9 476.7,191.6 487.1,192.1 497.5,192.7 507.9,192.9 518.3,193.2 528.8,193.4 539.2,193.7 549.6,193.7 560.0,193.7"/>
+<polyline class="line" style="stroke:var(--fault);stroke-dasharray:2 3;" points="60.0,192.9 70.4,194.2 80.8,192.1 91.2,192.1 101.7,192.4 112.1,192.1 122.5,190.1 132.9,187.8 143.3,188.0 153.8,183.1 164.2,180.5 174.6,177.2 185.0,170.7 195.4,163.5 205.8,148.1 216.2,138.0 226.7,114.3 237.1,95.0 247.5,65.8 257.9,46.0 268.3,38.2 278.8,39.0 289.2,50.4 299.6,63.3 310.0,76.9 320.4,88.5 330.8,96.8 341.2,107.6 351.7,115.8 362.1,126.2 372.5,131.0 382.9,137.2 393.3,167.1 403.8,172.3 414.2,175.6 424.6,179.8 435.0,182.6 445.4,185.4 455.8,186.2 466.2,188.3 476.7,189.6 487.1,192.1 497.5,192.1 507.9,192.4 518.3,193.2 528.8,192.7 539.2,192.4 549.6,193.9 560.0,193.9"/>
+<polyline class="line" style="stroke:var(--ink-3);stroke-dasharray:7 4;" points="60.0,192.4 70.4,191.6 80.8,190.9 91.2,189.6 101.7,188.3 112.1,186.2 122.5,183.4 132.9,179.8 143.3,175.1 153.8,169.2 164.2,162.2 174.6,155.3 185.0,150.1 195.4,147.0 205.8,145.7 216.2,145.7 226.7,146.5 237.1,148.1 247.5,149.9 257.9,151.9 268.3,154.2 278.8,156.8 289.2,159.1 299.6,161.7 310.0,164.3 320.4,166.9 330.8,169.2 341.2,171.8 351.7,174.1 362.1,176.7 372.5,178.7 382.9,181.1 393.3,182.9 403.8,184.7 414.2,186.2 424.6,187.8 435.0,189.0 445.4,190.1 455.8,190.9 466.2,191.6 476.7,192.1 487.1,192.7 497.5,192.9 507.9,193.2 518.3,193.4 528.8,193.7 539.2,193.7 549.6,193.7 560.0,193.9"/>
+<polyline class="line" style="stroke:var(--sig);" points="60.0,192.1 70.4,192.1 80.8,190.3 91.2,189.3 101.7,188.0 112.1,186.5 122.5,182.9 132.9,178.7 143.3,175.1 153.8,167.4 164.2,160.4 174.6,153.7 185.0,148.1 195.4,144.7 205.8,142.4 216.2,143.4 226.7,143.7 237.1,144.5 247.5,146.0 257.9,147.8 268.3,149.1 278.8,151.4 289.2,153.2 299.6,155.8 310.0,158.4 320.4,161.0 330.8,163.0 341.2,166.1 351.7,168.7 362.1,171.8 372.5,173.8 382.9,175.9 393.3,180.5 403.8,182.6 414.2,184.2 424.6,186.0 435.0,187.8 445.4,189.0 455.8,189.3 466.2,190.6 476.7,191.6 487.1,192.9 497.5,192.9 507.9,193.2 518.3,193.2 528.8,193.4 539.2,193.2 549.6,193.9 560.0,193.9"/>
+<text class="ts" x="568" y="197.9">free flow: 26.4</text>
+<text class="ts tb end" x="139.2" y="99.6">as driven</text>
+<text class="ts end" x="251.7" y="40.3">traffic now</text>
+<text class="ts" x="568" y="116.5">typical (dashed)</text>
+<text class="ts" x="568" y="132.5">now, fading to</text>
+<text class="ts" x="568" y="146.5">typical (thin, blue)</text>
+<rect class="hit" x="54.8" y="30" width="10.4" height="232" data-tip="leave at 06:00|as driven 27.2 min|traffic now 26.8|typical for the time 27|now, fading to typical 27.1"/>
+<rect class="hit" x="65.2167" y="30" width="10.4" height="232" data-tip="leave at 06:05|as driven 27.6 min|traffic now 26.3|typical for the time 27.3|now, fading to typical 27.1"/>
+<rect class="hit" x="75.6333" y="30" width="10.4" height="232" data-tip="leave at 06:10|as driven 28 min|traffic now 27.1|typical for the time 27.6|now, fading to typical 27.8"/>
+<rect class="hit" x="86.05" y="30" width="10.4" height="232" data-tip="leave at 06:15|as driven 28.7 min|traffic now 27.1|typical for the time 28.1|now, fading to typical 28.2"/>
+<rect class="hit" x="96.4667" y="30" width="10.4" height="232" data-tip="leave at 06:20|as driven 29.6 min|traffic now 27|typical for the time 28.6|now, fading to typical 28.7"/>
+<rect class="hit" x="106.883" y="30" width="10.4" height="232" data-tip="leave at 06:25|as driven 30.9 min|traffic now 27.1|typical for the time 29.4|now, fading to typical 29.3"/>
+<rect class="hit" x="117.3" y="30" width="10.4" height="232" data-tip="leave at 06:30|as driven 32.9 min|traffic now 27.9|typical for the time 30.5|now, fading to typical 30.7"/>
+<rect class="hit" x="127.717" y="30" width="10.4" height="232" data-tip="leave at 06:35|as driven 36 min|traffic now 28.8|typical for the time 31.9|now, fading to typical 32.3"/>
+<rect class="hit" x="138.133" y="30" width="10.4" height="232" data-tip="leave at 06:40|as driven 41.8 min|traffic now 28.7|typical for the time 33.7|now, fading to typical 33.7"/>
+<rect class="hit" x="148.55" y="30" width="10.4" height="232" data-tip="leave at 06:45|as driven 52.9 min|traffic now 30.6|typical for the time 36|now, fading to typical 36.7"/>
+<rect class="hit" x="158.967" y="30" width="10.4" height="232" data-tip="leave at 06:50|as driven 59.4 min|traffic now 31.6|typical for the time 38.7|now, fading to typical 39.4"/>
+<rect class="hit" x="169.383" y="30" width="10.4" height="232" data-tip="leave at 06:55|as driven 61 min|traffic now 32.9|typical for the time 41.4|now, fading to typical 42"/>
+<rect class="hit" x="179.8" y="30" width="10.4" height="232" data-tip="leave at 07:00|as driven 60.8 min|traffic now 35.4|typical for the time 43.4|now, fading to typical 44.2"/>
+<rect class="hit" x="190.217" y="30" width="10.4" height="232" data-tip="leave at 07:05|as driven 59.7 min|traffic now 38.2|typical for the time 44.6|now, fading to typical 45.5"/>
+<rect class="hit" x="200.633" y="30" width="10.4" height="232" data-tip="leave at 07:10|as driven 58.6 min|traffic now 44.2|typical for the time 45.1|now, fading to typical 46.4"/>
+<rect class="hit" x="211.05" y="30" width="10.4" height="232" data-tip="leave at 07:15|as driven 58.7 min|traffic now 48.1|typical for the time 45.1|now, fading to typical 46"/>
+<rect class="hit" x="221.467" y="30" width="10.4" height="232" data-tip="leave at 07:20|as driven 57.7 min|traffic now 57.3|typical for the time 44.8|now, fading to typical 45.9"/>
+<rect class="hit" x="231.883" y="30" width="10.4" height="232" data-tip="leave at 07:25|as driven 57.1 min|traffic now 64.8|typical for the time 44.2|now, fading to typical 45.6"/>
+<rect class="hit" x="242.3" y="30" width="10.4" height="232" data-tip="leave at 07:30|as driven 56.5 min|traffic now 76.1|typical for the time 43.5|now, fading to typical 45"/>
+<rect class="hit" x="252.717" y="30" width="10.4" height="232" data-tip="leave at 07:35|as driven 55.8 min|traffic now 83.8|typical for the time 42.7|now, fading to typical 44.3"/>
+<rect class="hit" x="263.133" y="30" width="10.4" height="232" data-tip="leave at 07:40|as driven 55 min|traffic now 86.8|typical for the time 41.8|now, fading to typical 43.8"/>
+<rect class="hit" x="273.55" y="30" width="10.4" height="232" data-tip="leave at 07:45|as driven 54.1 min|traffic now 86.5|typical for the time 40.8|now, fading to typical 42.9"/>
+<rect class="hit" x="283.967" y="30" width="10.4" height="232" data-tip="leave at 07:50|as driven 53.1 min|traffic now 82.1|typical for the time 39.9|now, fading to typical 42.2"/>
+<rect class="hit" x="294.383" y="30" width="10.4" height="232" data-tip="leave at 07:55|as driven 51.1 min|traffic now 77.1|typical for the time 38.9|now, fading to typical 41.2"/>
+<rect class="hit" x="304.8" y="30" width="10.4" height="232" data-tip="leave at 08:00|as driven 47 min|traffic now 71.8|typical for the time 37.9|now, fading to typical 40.2"/>
+<rect class="hit" x="315.217" y="30" width="10.4" height="232" data-tip="leave at 08:05|as driven 42.8 min|traffic now 67.3|typical for the time 36.9|now, fading to typical 39.2"/>
+<rect class="hit" x="325.633" y="30" width="10.4" height="232" data-tip="leave at 08:10|as driven 39.4 min|traffic now 64.1|typical for the time 36|now, fading to typical 38.4"/>
+<rect class="hit" x="336.05" y="30" width="10.4" height="232" data-tip="leave at 08:15|as driven 38.1 min|traffic now 59.9|typical for the time 35|now, fading to typical 37.2"/>
+<rect class="hit" x="346.467" y="30" width="10.4" height="232" data-tip="leave at 08:20|as driven 36.7 min|traffic now 56.7|typical for the time 34.1|now, fading to typical 36.2"/>
+<rect class="hit" x="356.883" y="30" width="10.4" height="232" data-tip="leave at 08:25|as driven 35.5 min|traffic now 52.7|typical for the time 33.1|now, fading to typical 35"/>
+<rect class="hit" x="367.3" y="30" width="10.4" height="232" data-tip="leave at 08:30|as driven 34.3 min|traffic now 50.8|typical for the time 32.3|now, fading to typical 34.2"/>
+<rect class="hit" x="377.717" y="30" width="10.4" height="232" data-tip="leave at 08:35|as driven 33.2 min|traffic now 48.4|typical for the time 31.4|now, fading to typical 33.4"/>
+<rect class="hit" x="388.133" y="30" width="10.4" height="232" data-tip="leave at 08:40|as driven 32.1 min|traffic now 36.8|typical for the time 30.7|now, fading to typical 31.6"/>
+<rect class="hit" x="398.55" y="30" width="10.4" height="232" data-tip="leave at 08:45|as driven 31.2 min|traffic now 34.8|typical for the time 30|now, fading to typical 30.8"/>
+<rect class="hit" x="408.967" y="30" width="10.4" height="232" data-tip="leave at 08:50|as driven 30.3 min|traffic now 33.5|typical for the time 29.4|now, fading to typical 30.2"/>
+<rect class="hit" x="419.383" y="30" width="10.4" height="232" data-tip="leave at 08:55|as driven 29.6 min|traffic now 31.9|typical for the time 28.8|now, fading to typical 29.5"/>
+<rect class="hit" x="429.8" y="30" width="10.4" height="232" data-tip="leave at 09:00|as driven 29 min|traffic now 30.8|typical for the time 28.3|now, fading to typical 28.8"/>
+<rect class="hit" x="440.217" y="30" width="10.4" height="232" data-tip="leave at 09:05|as driven 28.4 min|traffic now 29.7|typical for the time 27.9|now, fading to typical 28.3"/>
+<rect class="hit" x="450.633" y="30" width="10.4" height="232" data-tip="leave at 09:10|as driven 28 min|traffic now 29.4|typical for the time 27.6|now, fading to typical 28.2"/>
+<rect class="hit" x="461.05" y="30" width="10.4" height="232" data-tip="leave at 09:15|as driven 27.6 min|traffic now 28.6|typical for the time 27.3|now, fading to typical 27.7"/>
+<rect class="hit" x="471.467" y="30" width="10.4" height="232" data-tip="leave at 09:20|as driven 27.3 min|traffic now 28.1|typical for the time 27.1|now, fading to typical 27.3"/>
+<rect class="hit" x="481.883" y="30" width="10.4" height="232" data-tip="leave at 09:25|as driven 27.1 min|traffic now 27.1|typical for the time 26.9|now, fading to typical 26.8"/>
+<rect class="hit" x="492.3" y="30" width="10.4" height="232" data-tip="leave at 09:30|as driven 26.9 min|traffic now 27.1|typical for the time 26.8|now, fading to typical 26.8"/>
+<rect class="hit" x="502.717" y="30" width="10.4" height="232" data-tip="leave at 09:35|as driven 26.8 min|traffic now 27|typical for the time 26.7|now, fading to typical 26.7"/>
+<rect class="hit" x="513.133" y="30" width="10.4" height="232" data-tip="leave at 09:40|as driven 26.7 min|traffic now 26.7|typical for the time 26.6|now, fading to typical 26.7"/>
+<rect class="hit" x="523.55" y="30" width="10.4" height="232" data-tip="leave at 09:45|as driven 26.6 min|traffic now 26.9|typical for the time 26.5|now, fading to typical 26.6"/>
+<rect class="hit" x="533.967" y="30" width="10.4" height="232" data-tip="leave at 09:50|as driven 26.5 min|traffic now 27|typical for the time 26.5|now, fading to typical 26.7"/>
+<rect class="hit" x="544.383" y="30" width="10.4" height="232" data-tip="leave at 09:55|as driven 26.5 min|traffic now 26.4|typical for the time 26.5|now, fading to typical 26.4"/>
+<rect class="hit" x="554.8" y="30" width="10.4" height="232" data-tip="leave at 10:00|as driven 26.5 min|traffic now 26.4|typical for the time 26.4|now, fading to typical 26.4"/>
+</svg>
+</div>
+<figcaption>Taking today’s speeds as permanent overestimates once a jam has peaked and underestimates while one builds. The typical pattern knows the shape of a morning; adding what is happening now corrects it for today.</figcaption>
+</figure>
+
+<p>The surprise is that today’s live speeds, used for the whole trip, did worse than history. A jam near the city at 07:40 will have cleared by the time a car leaving now gets there, and the road ahead that is clear now will be jammed when it arrives. The typical pattern, looked up for the time the car will reach each segment, knows the shape of a morning. Live data is best used for what it knows: today’s difference from typical, trusted fully for the next few minutes and fading toward typical after that. The crash shows the limit of any forecast: one that starts after departure cannot be foreseen, and the error on those mornings stays twice the average.</p>
+<p>The same applies to choosing the route: a search that uses each segment’s speed at the time the car reaches it can avoid a jam that is still building. During the trip, the forecast is recomputed for the remaining route with every batch of positions, and a background search proposes a new route only if it saves several minutes, so that routes do not flip back and forth.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A CDN location</th><td>A slower first screen</td><td>Traffic moves to the next location; tiles are the same everywhere</td></tr>
+<tr><th>A routing server</th><td>A retried request</td><td>Every server holds its whole region; the load balancer uses another</td></tr>
+<tr><th>The traffic pipeline falls behind or stops</th><td>Arrival times less accurate; “traffic unavailable” on the map</td><td>Speeds older than a few minutes are ignored, and routing falls back to typical speeds</td></tr>
+<tr><th>A bad map build, such as a missing bridge</th><td>Long detours in one area</td><td>New builds go to a few servers first and are compared on a fixed set of test routes; the previous version stays ready (<x-ref to="deployment-strategies"></x-ref>)</td></tr>
+<tr><th>The location service is overloaded</th><td>Arrival time updates pause</td><td>Phones keep their positions and send later with backoff; the route is already on the phone</td></tr>
+<tr><th>The phone loses its signal or GPS</th><td>Navigation continues</td><td>The phone holds the route and the tiles around it, and estimates its position along the route in tunnels</td></tr>
+</tbody>
+</table>
+<p>At ten times the users, everything grows by adding copies: routing servers, stream partitions, CDN capacity. The graph does not grow, since the roads do not. What changes the design is other services asking for tables of travel times, hundreds of drivers by hundreds of riders (<x-ref to="hld-ride-hailing"></x-ref>), done as one many-to-many search on the hierarchy. At a hundred times, shipping the traffic snapshot to every routing server each minute becomes the bottleneck, so it is sent as changes, cell by cell, and each server customizes only what changed.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li>Bing Maps’ tile system (Microsoft’s documentation, updated 22 May 2024) makes the map 256 × 2<sup>level</sup> pixels wide and names tiles by quadkeys; OpenStreetMap’s standard tiles are 256-pixel PNG images addressed as zoom/x/y (its wiki, May 2026).</li>
+  <li>Protomaps publishes a daily build of an OpenStreetMap basemap for the whole planet as a single file of about 120 GB with zoom levels 0 to 15 (its documentation, as of October 2026).</li>
+  <li>Bing Maps moved its directions to a new routing engine built on customizable route planning from Microsoft Research, announced on 5 January 2012, and reported processing requests twice as fast as before.</li>
+  <li>The open-source router OSRM offers both contraction hierarchies and a multi-level overlay it calls multi-level Dijkstra, and its README (as of October 2026) recommends the overlay by default “except for special use cases such as very large distance matrices”.</li>
+  <li>Google and DeepMind wrote on 3 September 2020 that Google Maps combines live traffic with historical patterns, that its arrival times had been accurate for over 97% of trips, and that a graph neural network over “supersegments” of adjacent roads improved accuracy by up to 50% in cities such as Berlin, Sydney and Tokyo.</li>
+  <li>Google’s Routes API (documentation updated 5 October 2026) lets a caller choose between ignoring traffic, the fastest response; using traffic with performance optimizations; and using traffic without them, the slowest response.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Walking, cycling, trucks with height limits</th><td>Another set of weights for each profile, and another customization of the overlay</td><td>The graph and its cells</td></tr>
+<tr><th>“Avoid tolls” and “avoid motorways”</th><td>Weights for those options; with a hierarchy, one per combination, with an overlay, a customization</td><td>The query</td></tr>
+<tr><th>Public transport</th><td>A timetable, where a connection exists only at its departure times; algorithms built for timetables</td><td>Walking at both ends uses the road graph</td></tr>
+<tr><th>Offline maps</th><td>Download the tiles and the routing data of a region; the router runs on the phone</td><td>Tiles, which are already self-contained files</td></tr>
+<tr><th>Travel times between 500 drivers and 500 riders</th><td>A many-to-many search on the hierarchy, not 250,000 separate routes</td><td>The graph</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Say early that this is three systems, and spend the deep dives where the difficulty is. Tiles take five minutes: the pyramid, versioned files on a CDN, vector against raster. Routing takes fifteen: why Dijkstra is too slow for a continent, what A* and a bidirectional search buy, and how a contraction hierarchy works. Then ask what happens when traffic changes the weights, and answer with cells and customization, and finish with how the arrival time is forecast from live and typical speeds.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Running Dijkstra over the whole map for each request</th><td>Seconds per route on a continent, millions of nodes settled</td><td>Preprocess: a hierarchy, or an overlay of cells</td></tr>
+<tr><th>Preprocessing once and then adding traffic to the weights</th><td>A hierarchy that ignores the jam: wrong on 100 of 100 trips past it, in the test</td><td>Customizable cells, or rebuild on a schedule and accept stale traffic</td></tr>
+<tr><th>Timing the whole trip with the speeds of right now</th><td>11.9% mean error against 4.5%, in the test</td><td>Typical speeds for when each segment is reached, corrected by today’s difference</td></tr>
+<tr><th>Rendering image tiles of the whole world at every zoom</th><td>Hundreds of terabytes, almost all never viewed</td><td>Vector tiles to about zoom 15, or render on first request and cache</td></tr>
+<tr><th>Rerouting whenever a slightly faster route appears</th><td>Routes that flip back and forth</td><td>Propose a new route only for a clear saving</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="cdn-and-edge#cache-key"></x-ref>: tiles as the ideal cacheable object.</li>
+  <li><x-ref to="specialized-databases#geospatial"></x-ref>: cells and coordinates, from the storage side.</li>
+  <li><x-ref to="event-streaming"></x-ref>: the stream of positions, partitioned by area.</li>
+  <li><x-ref to="batch-and-stream-processing#windows"></x-ref>: speeds as windowed averages.</li>
+  <li><x-ref to="hld-proximity"></x-ref>: what is near a point, on the same map.</li>
+  <li><x-ref to="hld-ride-hailing"></x-ref>: the biggest customer of travel times.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A maps service is three systems: static tiles served from the edge, a search over an in-memory road graph, and a stream of positions turned into speeds.</li>
+  <li>Tiles form a pyramid with four times as many at each zoom level. Version them in the URL and cache them forever; prefer vector tiles, which stop at about zoom 15.</li>
+  <li>Dijkstra settles about half the map for a typical trip. A* and a bidirectional search help by constant factors; preprocessing helps by orders of magnitude.</li>
+  <li>A contraction hierarchy settled 164 nodes where Dijkstra settled 8,457, and its work hardly grows with the map, but it is built for one set of weights.</li>
+  <li>Traffic changes weights every minute. Cells with precomputed crossings let a change be absorbed by recomputing one cell, in milliseconds.</li>
+  <li>An arrival time is a forecast: use typical speeds for when each segment will be reached, corrected by today’s difference, which fades with distance ahead.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>How many tiles are there at zoom 10, and why does the deepest zoom level dominate storage?</summary><p>4<sup>10</sup>, about 1.05 million. Each level has four times as many tiles as the one above, so the levels above the deepest one together hold about a third as many as it does: the deepest level is about three quarters of the total.</p></details>
+<details><summary>Why do tile URLs contain a version number?</summary><p>So that a tile, once published, never changes. Every cache can keep it for as long as it likes, and a new map build is published under a new version instead of invalidating millions of cached files. The app switches versions by a configuration change.</p></details>
+<details><summary>Why does A* help less for the fastest route than for the shortest?</summary><p>Its estimate of the time still to go must never be too high, so it assumes a highway all the way. In town that is far below the real time, and a weak estimate steers the search only a little. For distance, the straight line is a much closer bound.</p></details>
+<details><summary>What is a shortcut in a contraction hierarchy, and when is one added?</summary><p>An edge between two neighbors of a node being removed, carrying the time of the path through it. It is added only if no other path between them is as fast, which a small search checks. With shortcuts in place, a query never descends to unimportant nodes mid-route.</p></details>
+<details><summary>A jam appears on a highway. What must a contraction hierarchy do, and what must a cell overlay do?</summary><p>The hierarchy’s shortcuts carry times computed before the jam, so it gives wrong answers until it is rebuilt, which takes minutes for a continent. The overlay recomputes the crossing times of the cell the highway runs through, which took about 2 ms in the test, and is correct again.</p></details>
+<details><summary>Why did using the current speeds for the whole trip do worse than using typical speeds for the time of day?</summary><p>The car reaches the far segments later, when their traffic has changed: a jam at its worst now may have eased, and an empty road may have jammed. Typical speeds for the time of arrival capture that; live speeds are best used to adjust them for the next few minutes.</p></details>
+<details><summary>A trip’s positions arrive twice because the phone retried a batch. What happens?</summary><p>Nothing harmful. Each position is keyed by trip and time, so the repeat overwrites itself, and the traffic service, which averages speeds per segment, sees each car once per time. The reply, an updated arrival time, is the same either way.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Hannah Bast, Daniel Delling, Andrew Goldberg and others, <a href="https://arxiv.org/abs/1504.05140">Route Planning in Transportation Networks</a>, in <cite>Algorithm Engineering</cite>, Springer, 2016 (arXiv 2015). The survey of routing methods, with the Western Europe comparison quoted here.</li>
+  <li>Robert Geisberger, Peter Sanders, Dominik Schultes and Daniel Delling, <a href="https://doi.org/10.1007/978-3-540-68552-4_24">Contraction Hierarchies: Faster and Simpler Hierarchical Routing in Road Networks</a>, WEA 2008, Springer. The original paper.</li>
+  <li>Daniel Delling, Andrew Goldberg, Thomas Pajor and Renato Werneck, <a href="https://www.microsoft.com/en-us/research/publication/customizable-route-planning/">Customizable Route Planning</a>, SEA 2011, Microsoft Research. Cells, overlays and customization in seconds.</li>
+  <li>Microsoft, <a href="https://learn.microsoft.com/en-us/bingmaps/articles/bing-maps-tile-system">Bing Maps Tile System</a>, Microsoft Learn, updated 22 May 2024. Map size by level, ground resolution and quadkeys.</li>
+  <li>OpenStreetMap wiki, <a href="https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames">Slippy map tilenames</a>, edited 26 May 2026. Tile numbering and the formulas from longitude and latitude.</li>
+  <li>Mapbox, <a href="https://github.com/mapbox/vector-tile-spec">Vector Tile Specification</a>, version 2.1. The vector tile format.</li>
+  <li>Protomaps, <a href="https://docs.protomaps.com/basemaps/downloads">Basemap downloads</a>, documentation, consulted October 2026. The size of a planet-wide vector tile build.</li>
+  <li>Bing Maps Blog, <a href="https://blogs.bing.com/maps/2012/01/05/bing-maps-new-routing-engine">Bing Maps’ new routing engine</a>, 5 January 2012.</li>
+  <li>Project OSRM, <a href="https://github.com/Project-OSRM/osrm-backend">osrm-backend</a>, README, consulted October 2026. Contraction hierarchies and multi-level Dijkstra.</li>
+  <li>Google DeepMind, <a href="https://deepmind.google/discover/blog/traffic-prediction-with-advanced-graph-neural-networks/">Traffic prediction with advanced Graph Neural Networks</a>, 3 September 2020.</li>
+  <li>Google, <a href="https://developers.google.com/maps/documentation/routes/config_trade_offs">Set the level of traffic data</a>, Routes API documentation, updated 5 October 2026.</li>
+</ol>
+</section>

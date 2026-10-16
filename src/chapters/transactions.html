@@ -1,0 +1,479 @@
+<!--meta
+{ "description": "Database transactions explained: ACID, the concurrency anomalies (dirty reads, lost updates, phantoms, write skew), isolation levels in PostgreSQL and MySQL, MVCC, pessimistic and optimistic locking, deadlocks, and practical rules for application code.",
+  "lede": "Two things go wrong when a program changes data: it can stop halfway, and it can run at the same time as another program changing the same data. A transaction is the database’s answer to both. This chapter explains what a transaction guarantees, what it does not guarantee unless you ask, and how to write code that stays correct when many requests run at once.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Two ways for data to go wrong</h2>
+<p>Suppose the photo app sells prints, and a customer pays from an account balance. Moving 50 units from the customer’s account to the seller’s takes two changes:</p>
+<pre data-lang="sql">
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+UPDATE accounts SET balance = balance + 50 WHERE id = 2;
+</pre>
+<p>Consider what can interrupt this.</p>
+<ul>
+  <li><b>A failure in the middle.</b> The process crashes, the network drops, or the server loses power after the first statement. The customer has paid and the seller has not been credited. Fifty units have vanished.</li>
+  <li><b>Another request at the same time.</b> While this runs, a report adds up all balances. If it reads account 1 after the debit and account 2 before the credit, its total is short by 50, though nothing is wrong.</li>
+</ul>
+<p>Application code cannot solve either problem by being careful. It cannot run cleanup code after a power failure, and it cannot see what other requests are doing. A <dfn>transaction</dfn> hands both problems to the database. It is a group of operations that the database treats as a single unit:</p>
+<pre data-lang="sql">
+BEGIN;
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+UPDATE accounts SET balance = balance + 50 WHERE id = 2;
+COMMIT;
+</pre>
+<p>Everything between <code>BEGIN</code> and <code>COMMIT</code> takes effect together or not at all. If anything fails before the commit, or the application issues <code>ROLLBACK</code>, the database undoes all of it.</p>
+
+<h2 id="acid">ACID</h2>
+<p>The guarantees of a transaction are summarized by four words whose initials spell ACID. They are worth knowing precisely, because two of them mean something narrower than they sound.</p>
+<table>
+<thead><tr><th>Property</th><th>Guarantee</th><th>What it protects against</th></tr></thead>
+<tbody>
+<tr><th>Atomicity</th><td>All of the transaction’s changes happen, or none do</td><td>Failures partway through</td></tr>
+<tr><th>Consistency</th><td>The declared rules (constraints, foreign keys, uniqueness) hold before and after</td><td>Changes that would break a rule</td></tr>
+<tr><th>Isolation</th><td>Transactions running at the same time do not interfere, to a degree you choose</td><td>Concurrent access</td></tr>
+<tr><th>Durability</th><td>Once the database says “committed”, the change survives a crash</td><td>Losing acknowledged work</td></tr>
+</tbody>
+</table>
+<p><b>Atomicity</b> here has nothing to do with concurrency. It means abortability: an incomplete transaction leaves no trace. <b>Durability</b> is implemented by writing every change to a log on disk before acknowledging the commit, which the next chapter describes. On a single server it means surviving a restart, and it does not mean surviving the loss of the disk, which is what <x-ref to="replication"></x-ref> is for.</p>
+<p><b>Consistency</b> is the odd one. It depends on rules you declare. The database will stop a foreign key from pointing nowhere, and it has no idea that balances should not go negative unless you add a constraint saying so. Many rules of a business cannot be expressed as constraints, and for those the correctness is the application’s to maintain, using the other three properties as tools.</p>
+<p><b>Isolation</b> is where the difficulty is. Full isolation is expensive, so databases offer weaker levels and use one of them by default. The rest of this chapter is mostly about what those weaker levels let through.</p>
+
+<h2 id="anomalies">What can go wrong between concurrent transactions</h2>
+<p>A concurrency bug is called an <dfn>anomaly</dfn>. There are five worth knowing by name. All of them are invisible in testing with one user and appear under load, at a rate that grows with traffic.</p>
+<table>
+<thead><tr><th>Anomaly</th><th>What happens</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>Dirty read</th><td>A transaction reads changes another has made and not yet committed</td><td>A report sees the debit from a transfer that is then rolled back</td></tr>
+<tr><th>Non-repeatable read</th><td>Reading the same row twice in one transaction gives different answers, because another transaction committed in between</td><td>A check passes on the first read, and the code acts on a value that has since changed</td></tr>
+<tr><th>Phantom read</th><td>Running the same query twice returns a different set of rows, because another transaction inserted or deleted some</td><td>“No booking overlaps this slot” is true, and then a booking appears</td></tr>
+<tr><th>Lost update</th><td>Two transactions read a value, each computes a new one, and the second write overwrites the first</td><td>Two likes arrive together and the counter rises by one</td></tr>
+<tr><th>Write skew</th><td>Two transactions read the same data, each makes a decision that was valid on what it read, and they write different rows</td><td>Two doctors each see two on call and both go off call</td></tr>
+</tbody>
+</table>
+
+<figure class="fig wide" id="fig-anomalies">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f171t f171d">
+<title id="f171t">A lost update and a write skew, shown as timelines of two concurrent requests</title>
+<desc id="f171d">Lost update: requests A and B both read a like count of 100. A writes 101. Then B also writes 101, so two likes increased the count by one. Write skew: two doctors, Ana and Ben, are on call and at least one must remain. Requests A and B each count two doctors on call and conclude it is safe to remove one. A removes Ana and B removes Ben, leaving nobody on call.</desc>
+<g data-scene="lost">
+<text class="tl" x="10" y="18">Lost update</text>
+<text class="ts mid" x="63.0" y="42">Request A</text>
+<text class="ts mid" x="181.0" y="42">likes on photo 871</text>
+<text class="ts mid" x="299.0" y="42">Request B</text>
+<rect class="n store" x="128" y="52" width="106" height="30" rx="5"/>
+<text class="ts mid" x="181" y="71.5">100</text>
+<g data-s="1">
+<rect class="n" x="10" y="92" width="106" height="30" rx="5"/>
+<text class="ts mid" x="63" y="111.5">read: 100</text>
+<path class="e dash" d="M128 76 116 100"/>
+</g>
+<g data-s="2">
+<rect class="n" x="246" y="132" width="106" height="30" rx="5"/>
+<text class="ts mid" x="299" y="151.5">read: 100</text>
+<path class="e dash" d="M234 76 246 140"/>
+</g>
+<g data-s="3">
+<rect class="n" x="10" y="172" width="106" height="30" rx="5"/>
+<text class="ts mid" x="63" y="191.5">write 101</text>
+<rect class="n store" x="128" y="172" width="106" height="30" rx="5"/>
+<text class="ts mid" x="181" y="191.5">101</text>
+<path class="e" d="M116 187H128"/>
+</g>
+<g data-s="4">
+<rect class="n" x="246" y="212" width="106" height="30" rx="5"/>
+<text class="ts mid" x="299" y="231.5">write 101</text>
+<rect class="n fault" x="128" y="212" width="106" height="30" rx="5"/>
+<text class="ts mid" x="181" y="231.5">101</text>
+<path class="e" d="M246 227H234"/>
+<text class="ts" x="10" y="266">Two people liked the photo.</text>
+<text class="ts" x="10" y="282">The count rose by one.</text>
+</g>
+</g>
+<path class="e none dash" d="M362 8V286"/>
+<g data-scene="skew">
+<text class="tl" x="378" y="18">Write skew</text>
+<text class="ts mid" x="431.0" y="42">Request A</text>
+<text class="ts mid" x="549.0" y="42">doctors on call</text>
+<text class="ts mid" x="667.0" y="42">Request B</text>
+<rect class="n store" x="496" y="52" width="106" height="30" rx="5"/>
+<text class="ts mid" x="549" y="71.5">Ana, Ben</text>
+<g data-s="1">
+<rect class="n" x="378" y="92" width="106" height="30" rx="5"/>
+<text class="ts mid" x="431" y="111.5">count: 2, fine</text>
+<path class="e dash" d="M496 76 484 100"/>
+</g>
+<g data-s="2">
+<rect class="n" x="614" y="132" width="106" height="30" rx="5"/>
+<text class="ts mid" x="667" y="151.5">count: 2, fine</text>
+<path class="e dash" d="M602 76 614 140"/>
+</g>
+<g data-s="3">
+<rect class="n" x="378" y="172" width="106" height="30" rx="5"/>
+<text class="ts mid" x="431" y="191.5">take Ana off</text>
+<rect class="n store" x="496" y="172" width="106" height="30" rx="5"/>
+<text class="ts mid" x="549" y="191.5">Ben</text>
+<path class="e" d="M484 187H496"/>
+</g>
+<g data-s="4">
+<rect class="n" x="614" y="212" width="106" height="30" rx="5"/>
+<text class="ts mid" x="667" y="231.5">take Ben off</text>
+<rect class="n fault" x="496" y="212" width="106" height="30" rx="5"/>
+<text class="ts mid" x="549" y="231.5">nobody</text>
+<path class="e" d="M614 227H602"/>
+<text class="ts" x="378" y="266">Each request checked the rule and passed.</text>
+<text class="ts" x="378" y="282">Together they broke it.</text>
+</g>
+</g>
+
+</svg>
+</div>
+<ol class="steps" data-scene="lost" data-label="Lost update">
+  <li data-msg="read: 100" data-state="Stored count: 100; A read: 100; B read: nothing yet; Likes given: 0">Request A reads the like count: 100.</li>
+  <li data-msg="read: 100" data-state="Stored count: 100; A read: 100; B read: 100; Likes given: 0">Before A has written anything, request B reads the same count: 100.</li>
+  <li data-msg="write 101" data-state="Stored count: 101; A read: 100; B read: 100; Likes given: 1">A adds one to what it read and writes 101.</li>
+  <li data-msg="write 101" data-state="Stored count: 101; A read: 100; B read: 100; Likes given: 2">B also adds one to what it read and writes 101, replacing A’s update. Two people liked the photo and the count rose by one.</li>
+</ol>
+<ol class="steps" data-scene="skew" data-label="Write skew">
+  <li data-msg="count: 2" data-state="On call: Ana, Ben; A counted: 2; B counted: nothing yet">The rule is that at least one doctor stays on call. Request A counts the doctors on call: two, so one may leave.</li>
+  <li data-msg="count: 2" data-state="On call: Ana, Ben; A counted: 2; B counted: 2">Request B makes the same check at the same moment and gets the same answer.</li>
+  <li data-msg="take Ana off" data-state="On call: Ben; A counted: 2; B counted: 2">A takes Ana off call. Ben remains, so as far as A can tell the rule still holds.</li>
+  <li data-msg="take Ben off" data-state="On call: nobody; A counted: 2; B counted: 2">B takes Ben off call. Each request checked the rule and passed, and together they left nobody on call.</li>
+</ol>
+<figcaption>Time runs downward. In both cases each request did something reasonable given what it had read, and what it had read was already out of date.</figcaption>
+</figure>
+
+<p>The last two are the ones that reach production, because they survive the isolation level most applications run at. Both follow one pattern: <em>read, decide in application code, write</em>. Whenever a decision is made on data read earlier in a transaction, ask what happens if that data changes before the write.</p>
+
+<h2 id="levels">Isolation levels</h2>
+<p>The SQL standard defines four <dfn>isolation levels</dfn>, each ruling out more anomalies than the one before. What each level means in practice varies by database, so the table shows the two most common ones.</p>
+<table>
+<thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th><th>Lost update</th><th>Write skew</th></tr></thead>
+<tbody>
+<tr><th>Read uncommitted</th><td>Possible</td><td>Possible</td><td>Possible</td><td>Possible</td><td>Possible</td></tr>
+<tr><th>Read committed</th><td>Prevented</td><td>Possible</td><td>Possible</td><td>Possible</td><td>Possible</td></tr>
+<tr><th>Repeatable read in PostgreSQL</th><td>Prevented</td><td>Prevented</td><td>Prevented</td><td>Prevented: the second writer is aborted</td><td>Possible</td></tr>
+<tr><th>Repeatable read in MySQL InnoDB</th><td>Prevented</td><td>Prevented</td><td>Mostly prevented</td><td>Possible with plain reads</td><td>Possible</td></tr>
+<tr><th>Serializable</th><td>Prevented</td><td>Prevented</td><td>Prevented</td><td>Prevented</td><td>Prevented</td></tr>
+</tbody>
+</table>
+<p><dfn>Serializable</dfn> is the level that means what people assume “isolation” means: the result is the same as if the transactions had run one after another in some order. Everything weaker is a trade of correctness for speed.</p>
+<p>The fact that matters most is the default. PostgreSQL, Oracle and SQL Server default to <dfn>read committed</dfn>. MySQL’s InnoDB defaults to repeatable read. Under read committed, each statement sees the data as committed at the moment that statement began, so two statements in the same transaction can see different states. Every anomaly in the table except dirty reads is possible. Most applications run this way without their authors having chosen it.</p>
+<aside class="sn"><b>The names are unreliable</b>Isolation level names promise less than they seem to. PostgreSQL’s “repeatable read” is a stronger thing usually called snapshot isolation. Oracle’s “serializable” is snapshot isolation too, and permits write skew. PostgreSQL accepts “read uncommitted” and gives you read committed. Independent testing, notably by the Jepsen project, has repeatedly found databases that do not deliver the level they document. Check the documentation of the system you use.</aside>
+<p>You can raise the level for one transaction when the work calls for it:</p>
+<pre data-lang="sql">
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+-- reads and writes
+COMMIT;
+</pre>
+<p>Stronger levels are not free. Under repeatable read and serializable, the database prevents anomalies by aborting one of the conflicting transactions with a serialization error. The application must be ready to run the whole transaction again, which a later section shows.</p>
+
+<h2 id="mvcc">How isolation is implemented</h2>
+<p>There are two basic mechanisms, and modern databases combine them.</p>
+<p><b>Locks.</b> A transaction marks the rows it uses so that others must wait. A <dfn>shared lock</dfn> lets others read and blocks writers. An <dfn>exclusive lock</dfn> blocks everyone else. Locking everything a transaction reads and writes until it commits gives serializability and terrible concurrency: readers block writers, writers block readers, and one slow report stalls the system.</p>
+<p><b>Multi-version concurrency control</b> (MVCC). Instead of changing a row in place, a write creates a new version of it and keeps the old one. Each transaction is given a <dfn>snapshot</dfn>, a consistent view of the database as of one moment, and reads whichever version of each row belongs to that snapshot.</p>
+
+<figure class="fig wide" id="fig-mvcc">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 174" role="img" aria-labelledby="f172t f172d">
+<title id="f172t">Two versions of a row under multi-version concurrency control, and which reader sees which</title>
+<desc id="f172d">A row has two versions. Version 1, with 100 likes, was created by transaction 90 and replaced by transaction 105. Version 2, with 101 likes, was created by transaction 105. A reader whose snapshot was taken at transaction 100 sees version 1. A reader whose snapshot was taken at transaction 110 sees version 2.</desc>
+<text class="tl" x="10" y="18">Versions of one row, kept side by side</text>
+<rect class="n sunk" x="10" y="32" width="84" height="26" rx="0"/>
+<text class="ts tb" x="17" y="49">version</text>
+<rect class="n sunk" x="94" y="32" width="70" height="26" rx="0"/>
+<text class="ts tb" x="101" y="49">likes</text>
+<rect class="n sunk" x="164" y="32" width="110" height="26" rx="0"/>
+<text class="ts tb" x="171" y="49">created by</text>
+<rect class="n sunk" x="274" y="32" width="110" height="26" rx="0"/>
+<text class="ts tb" x="281" y="49">replaced by</text>
+<g data-s="1">
+<rect class="n" x="10" y="58" width="84" height="26" rx="0"/>
+<text class="ts" x="17" y="75">v1</text>
+<rect class="n" x="94" y="58" width="70" height="26" rx="0"/>
+<text class="ts" x="101" y="75">100</text>
+<rect class="n" x="164" y="58" width="110" height="26" rx="0"/>
+<text class="ts" x="171" y="75">transaction 90</text>
+</g>
+<g data-s="2">
+<rect class="n" x="274" y="58" width="110" height="26" rx="0"/>
+<text class="ts" x="281" y="75">transaction 105</text>
+<rect class="n store" x="10" y="84" width="84" height="26" rx="0"/>
+<text class="ts" x="17" y="101">v2</text>
+<rect class="n store" x="94" y="84" width="70" height="26" rx="0"/>
+<text class="ts" x="101" y="101">101</text>
+<rect class="n store" x="164" y="84" width="110" height="26" rx="0"/>
+<text class="ts" x="171" y="101">transaction 105</text>
+<rect class="n store" x="274" y="84" width="110" height="26" rx="0"/>
+<text class="ts" x="281" y="101">not yet</text>
+</g>
+<g data-s="3">
+<rect class="n" x="450" y="30" width="260" height="34" rx="5"/>
+<text class="ts mid" x="580" y="51.5">Reader whose snapshot was taken at 100</text>
+</g>
+<g data-s="4">
+<rect class="n" x="450" y="84" width="260" height="34" rx="5"/>
+<text class="ts mid" x="580" y="105.5">Reader whose snapshot was taken at 110</text>
+</g>
+<g data-s="3">
+<path class="e dash" d="M450 47 C420 47 410 71 384 71"/>
+<text class="ts mid" x="418" y="40">sees v1</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M450 101 C420 101 410 97 384 97"/>
+<text class="ts mid" x="418" y="118">sees v2</text>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="142">A write creates a new version and leaves the old one in place. Each reader sees the versions that were committed when its</text>
+<text class="ts" x="10" y="159">snapshot was taken, so readers never wait for writers. Version 1 can be removed once no open transaction could still need it.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Version 1: 100, current; Version 2: none">Transaction 90 created the row. Its first version, v1, says 100 likes.</li>
+  <li data-state="Version 1: 100, replaced by transaction 105; Version 2: 101, current">Transaction 105 changes the count. It does not overwrite v1. It writes a new version, v2, and marks v1 as replaced.</li>
+  <li>A reader whose snapshot was taken at 100, before transaction 105, still sees v1.</li>
+  <li>A reader whose snapshot was taken at 110 sees v2.</li>
+  <li data-state="Version 1: removed once no reader needs it; Version 2: 101, current">So readers never wait for writers. Once no reader can need v1 any more, it is removed.</li>
+</ol>
+<figcaption>MVCC keeps old versions so that every reader gets a stable view without blocking anyone.</figcaption>
+</figure>
+
+<p>The great benefit is that readers do not block writers and writers do not block readers. A long report and a stream of updates can run together, each seeing a consistent picture. Writers still conflict with other writers of the same row, and for that the database uses row locks.</p>
+<p>MVCC has a cost that causes real incidents. Old versions accumulate and must be cleaned up, a process PostgreSQL calls <dfn>vacuum</dfn>. Cleanup can only remove versions that no open transaction could still need. One transaction left open for hours, perhaps by a forgotten console session or a stuck job, forces the database to keep every version created since it began. Tables and indexes swell and queries slow down. This is one reason for the rule below about keeping transactions short.</p>
+
+<h2 id="fixing">Preventing lost updates</h2>
+<p>The lost update is the anomaly you will meet most, so it is worth knowing every remedy. Take the simplest case, a like counter, and then a harder one, booking a seat.</p>
+
+<h3 id="atomic-ops">Let the database do the arithmetic</h3>
+<p>The bug comes from reading a value into the application, changing it there, and writing it back. If the change can be expressed in one statement, the database performs it atomically and there is no gap for another transaction to slip into:</p>
+<pre data-lang="sql">
+UPDATE photos SET like_count = like_count + 1 WHERE id = 871;
+</pre>
+<p>The same idea handles many “check then act” cases, by putting the check in the <code>WHERE</code> clause:</p>
+<pre data-lang="sql">
+UPDATE seats SET booked_by = 42 WHERE id = 7 AND booked_by IS NULL;
+-- One row updated: the seat is yours. Zero rows: someone else got there first.
+</pre>
+<p>This is the first thing to reach for. It is correct at every isolation level, needs no explicit transaction and holds a lock for the shortest possible time.</p>
+
+<h3 id="pessimistic">Pessimistic locking</h3>
+<p>When the decision needs real application logic between the read and the write, you can lock the row as you read it. <code>SELECT … FOR UPDATE</code> takes an exclusive lock, and any other transaction that tries to lock or change the same row waits until this one finishes.</p>
+<pre data-lang="ts" data-title="Lock, check, write">
+await db.transaction(async (tx) => {
+  const seat = await tx.queryOne(
+    "SELECT id, booked_by, price FROM seats WHERE id = $1 FOR UPDATE", [seatId]);   // others wait here
+
+  if (seat.booked_by !== null) throw new SeatTaken();
+  if (!(await canAfford(tx, userId, seat.price))) throw new InsufficientFunds();
+
+  await tx.query("UPDATE seats SET booked_by = $1 WHERE id = $2", [userId, seatId]);
+});
+</pre>
+<p>This is called <dfn>pessimistic</dfn> because it assumes a conflict will happen and pays the cost of locking every time. It suits short operations on data that many requests contend for.</p>
+
+<h3 id="optimistic">Optimistic concurrency control</h3>
+<p>The alternative assumes conflicts are rare. Take no lock. When writing, check that the row has not changed since it was read, and if it has, give up and let the caller decide what to do. The usual way to detect a change is a version number on the row.</p>
+<pre data-lang="ts" data-title="Read with a version, write only if the version is unchanged">
+const doc = await db.queryOne("SELECT id, body, version FROM documents WHERE id = $1", [id]);
+
+// ... the user edits for five minutes. No lock is held and no transaction is open ...
+
+const result = await db.query(
+  "UPDATE documents SET body = $1, version = version + 1 WHERE id = $2 AND version = $3",
+  [newBody, id, doc.version]);
+
+if (result.rowCount === 0) throw new EditConflict();   // someone saved first: reload, merge, try again
+</pre>
+<p>This is the only approach that works when a person is in the loop, since you cannot hold a database lock while someone thinks. It is the same mechanism as the <code>ETag</code> and <code>If-Match</code> headers from <x-ref to="http-and-tls#headers"></x-ref>, and the two are often connected directly: the version number becomes the <code>ETag</code>.</p>
+<table>
+<thead><tr><th></th><th>Pessimistic</th><th>Optimistic</th></tr></thead>
+<tbody>
+<tr><th>Assumes</th><td>Conflicts are likely</td><td>Conflicts are rare</td></tr>
+<tr><th>On conflict</th><td>The second request waits</td><td>The second request fails and must retry or report</td></tr>
+<tr><th>Cost when there is no conflict</th><td>A lock is taken and held</td><td>Nearly nothing</td></tr>
+<tr><th>Cost under heavy contention</th><td>Requests queue, and throughput is limited by the lock</td><td>Many attempts are wasted and retried</td></tr>
+<tr><th>Works across a user’s think time</th><td>No</td><td>Yes</td></tr>
+<tr><th>Typical use</th><td>Inventory, seats, balances under load</td><td>Editing documents, settings, profiles</td></tr>
+</tbody>
+</table>
+
+<h3 id="serializable-retry">Serializable isolation with retries</h3>
+<p>The remedies above each protect one row that you identified in advance. Write skew does not have such a row: the two doctors updated different rows. PostgreSQL’s serializable level tracks what each transaction read and aborts one of any set whose combined effect could not have come from running them one at a time. You write plain read-then-write code and wrap it in a retry loop.</p>
+<pre data-lang="ts" data-title="Retrying a transaction that the database aborted">
+async function withRetry<T>(work: (tx: Tx) => Promise<T>, attempts = 5): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await db.transaction(work, { isolation: "serializable" });
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      const retryable = code === "40001" || code === "40P01";   // serialization failure, deadlock
+      if (!retryable || i === attempts - 1) throw err;
+      await sleep(Math.random() * 20 * 2 ** i);                 // back off, with jitter
+    }
+  }
+}
+</pre>
+<p>The function passed in will run more than once, so it must not do anything outside the database that cannot be repeated, such as sending an email. Serializable isolation costs some throughput and causes retries under contention. For the small number of transactions that enforce a rule spanning several rows, that is a reasonable price for not having to reason about every interleaving.</p>
+
+<h2 id="constraints">Let constraints do the work</h2>
+<p>The most dependable concurrency control is a rule the database enforces itself, because it holds no matter what application code does.</p>
+<ul>
+  <li><b>Unique constraints.</b> “Check that the username is free, then insert” is a race. Insert, and let the unique index reject the duplicate. <code>INSERT … ON CONFLICT DO NOTHING</code> turns that rejection into a normal result.</li>
+  <li><b>Check constraints.</b> <code>CHECK (balance &gt;= 0)</code> makes an overdraft impossible, whichever code path attempts it.</li>
+  <li><b>Exclusion constraints.</b> PostgreSQL can refuse two rows whose ranges overlap, which solves double booking declaratively:</li>
+</ul>
+<pre data-lang="sql" data-title="No two bookings of the same room may overlap in time">
+ALTER TABLE bookings ADD CONSTRAINT no_double_booking
+  EXCLUDE USING gist (room_id WITH =, during WITH &&);
+</pre>
+<p>Row locks are also the basis of a useful pattern for work queues. Many workers ask for a pending job, and each must get a different one without waiting for the others:</p>
+<pre data-lang="sql" data-title="Claim one job, skipping any that another worker has locked">
+BEGIN;
+SELECT id, payload FROM jobs
+WHERE status = 'pending'
+ORDER BY run_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+-- do the work, then mark the job that was returned:
+UPDATE jobs SET status = 'done' WHERE id = 9001;
+COMMIT;
+</pre>
+<p><x-ref to="scheduling-and-workflows"></x-ref> builds on this.</p>
+
+<h2 id="deadlocks">Deadlocks</h2>
+<p>Locks introduce a failure of their own. A <dfn>deadlock</dfn> is a cycle of transactions each waiting for a lock that another holds.</p>
+
+<figure class="fig wide" id="fig-deadlock">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-labelledby="f173t f173d">
+<title id="f173t">A deadlock between two transfers running in opposite directions</title>
+<desc id="f173d">Transaction 1 holds the lock on account A and waits for account B. Transaction 2 holds the lock on account B and waits for account A. The two waits form a cycle.</desc>
+<rect class="n sig" x="40" y="70" width="150" height="44" rx="6"/>
+<text class="tb mid" x="115" y="88">Transaction 1</text>
+<text class="ts mid" x="115" y="105">transfers A to B</text>
+<rect class="n sig" x="530" y="70" width="150" height="44" rx="6"/>
+<text class="tb mid" x="605" y="88">Transaction 2</text>
+<text class="ts mid" x="605" y="105">transfers B to A</text>
+<rect class="n store" x="290" y="14" width="140" height="40" rx="6"/>
+<text class="tb mid" x="360" y="38.5">Account A</text>
+<rect class="n store" x="290" y="130" width="140" height="40" rx="6"/>
+<text class="tb mid" x="360" y="154.5">Account B</text>
+<g data-s="1">
+<path class="e" d="M190 80 290 40"/>
+<text class="ts mid" x="232" y="50">holds lock</text>
+</g>
+<g data-s="2">
+<path class="e" d="M530 104 430 144"/>
+<text class="ts mid" x="490" y="140">holds lock</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M190 104 290 144"/>
+<text class="ts mid" x="228" y="140">waits for</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M530 80 430 40"/>
+<text class="ts mid" x="490" y="50">waits for</text>
+<text class="ts" x="10" y="196">Each transaction holds the lock the other needs. Neither can proceed, and neither will give up on its own.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Lock on A: transaction 1; Lock on B: free; Waiting: nobody">Transaction 1 moves money from A to B. It locks account A first.</li>
+  <li data-state="Lock on A: transaction 1; Lock on B: transaction 2; Waiting: nobody">At the same moment transaction 2, which moves money from B to A, locks account B.</li>
+  <li data-state="Lock on A: transaction 1; Lock on B: transaction 2; Waiting: transaction 1, for B">Transaction 1 now needs account B. It is locked, so transaction 1 waits.</li>
+  <li data-state="Lock on A: transaction 1; Lock on B: transaction 2; Waiting: each for the other">Transaction 2 needs account A, which transaction 1 holds. Each waits for the other, and neither will ever proceed. The database has to notice the cycle and abort one of them.</li>
+</ol>
+<figcaption>Two transfers in opposite directions, each having locked its first account.</figcaption>
+</figure>
+
+<p>Databases detect the cycle after a short wait and resolve it by aborting one transaction with an error. That transaction should be retried, which the function above already does for PostgreSQL’s deadlock code. Deadlocks cannot be eliminated entirely, and they can be made rare:</p>
+<ul>
+  <li><b>Lock rows in a consistent order.</b> If every transfer locks the account with the lower ID first, a cycle cannot form.</li>
+  <li><b>Keep transactions short</b>, so locks are held briefly.</li>
+  <li><b>Touch as few rows as possible</b> and make sure the query that finds them uses an index. Without one, the database may examine and lock far more rows than you meant.</li>
+</ul>
+
+<h2 id="practice">Rules for application code</h2>
+<ol>
+  <li><b>Keep transactions short.</b> A transaction holds locks, pins old row versions and occupies a connection from the pool. Milliseconds are fine. Seconds are a problem.</li>
+  <li><b>Never call another service inside a transaction.</b> An HTTP call to a payment provider that takes two seconds, or hangs, holds everything above for that long. Do the remote work before or after, and see the next section for how to keep the two in step.</li>
+  <li><b>Never hold a transaction open across user interaction.</b> Use optimistic concurrency.</li>
+  <li><b>Expect to retry.</b> Serialization failures and deadlocks are normal results. Make the transaction’s body safe to run again.</li>
+  <li><b>Know your isolation level</b> and what it allows. For each read-decide-write sequence, choose a remedy from this chapter deliberately.</li>
+  <li><b>Prefer one statement to several</b>, and constraints to checks in code.</li>
+  <li><b>Watch for transactions left open.</b> “Idle in transaction” sessions are worth alerting on. Most databases can be configured to end them after a timeout.</li>
+</ol>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Object-relational mappers and web frameworks often open a transaction at the start of each request and commit at the end. That is convenient and it means the transaction stays open while the request renders templates, calls other services and waits on anything slow. Under load this exhausts the connection pool. Scope transactions to the few statements that need to be atomic.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> Booking, payment and inventory questions exist to test this chapter. When two users can compete for one thing, say how you prevent the double sale: “a conditional update that only succeeds if the seat is still free”, or “a unique constraint on seat and event”, or “a row lock around the check”. Then say what the loser sees. Naming the anomaly you are preventing shows you know why the mechanism is there.</p></div>
+
+<h2 id="beyond">Where transactions stop</h2>
+<p>Everything in this chapter applies inside one database. A transaction cannot include a call to a payment provider, a message put on a queue, a write to a second database or an update to a cache. When an operation spans two systems, one of them can succeed and the other fail, and no <code>ROLLBACK</code> covers both.</p>
+<p>This boundary shapes a great deal of system design. Splitting one database into several services turns what were transactions into coordination problems, which is a strong argument against splitting early (<x-ref to="monoliths-and-microservices"></x-ref>). The techniques for crossing the boundary safely are two-phase commit, sagas and the outbox pattern, covered in <x-ref to="distributed-transactions"></x-ref>, and making operations safe to repeat, covered in <x-ref to="idempotency-and-delivery"></x-ref>.</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Read, modify in code, write back</b>, with no lock, version check or atomic statement.</li>
+  <li><b>Checking uniqueness in code</b> instead of with a constraint.</li>
+  <li><b>Assuming the default isolation level is serializable.</b> It almost never is.</li>
+  <li><b>Remote calls inside a transaction.</b></li>
+  <li><b>No retry on serialization failures and deadlocks</b>, so users see errors for conditions the database expects you to handle.</li>
+  <li><b>Retrying a transaction whose body has outside effects</b>, such as sending a message each time.</li>
+  <li><b>Long-running or forgotten transactions</b> that block cleanup and hold locks.</li>
+  <li><b>Locking rows in different orders</b> in different code paths.</li>
+  <li><b>Treating a multi-system operation as if it were atomic.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="storage-engines"></x-ref>: the write-ahead log that makes atomicity and durability possible.</li>
+  <li><x-ref to="indexes-and-queries"></x-ref>: indexes determine which rows a statement touches and therefore locks.</li>
+  <li><x-ref to="replication"></x-ref>: what “committed” means when there are several copies.</li>
+  <li><x-ref to="consistency-models"></x-ref>: the corresponding guarantees for data spread across machines.</li>
+  <li><x-ref to="distributed-transactions"></x-ref>: atomicity across more than one system.</li>
+  <li><x-ref to="concurrency-in-code"></x-ref>: the same races inside one process, and the same remedies.</li>
+  <li><x-ref to="hld-ticket-booking"></x-ref> and <x-ref to="hld-payments"></x-ref>: designs that depend on getting this right.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A transaction makes a group of changes atomic and durable, and isolates them from concurrent transactions to a chosen degree.</li>
+  <li>The default isolation level in most databases is read committed, which allows lost updates, phantoms and write skew.</li>
+  <li>The pattern to watch for is read, decide in the application, write.</li>
+  <li>Fix lost updates with an atomic statement first, then a row lock, a version check, or serializable isolation with retries.</li>
+  <li>MVCC lets readers and writers proceed without blocking each other by keeping several versions of each row. Long transactions prevent cleanup.</li>
+  <li>Constraints enforce rules under any concurrency. Use them in preference to checks in code.</li>
+  <li>Keep transactions short, never make remote calls inside them, and be ready to retry.</li>
+  <li>A transaction ends at the edge of one database. Work that spans systems needs different techniques.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Two requests read a product’s stock of 1, both see that it is available, and both write an order. Which anomaly is this, and what is the simplest fix?</summary><p>A lost update, or more generally a check-then-act race. The simplest fix is a conditional update that decrements the stock only if it is still positive, such as <code>UPDATE products SET stock = stock - 1 WHERE id = … AND stock &gt; 0</code>, and treating “zero rows updated” as sold out.</p></details>
+<details><summary>What does “atomicity” guarantee, and what does it not?</summary><p>It guarantees that a transaction’s changes are applied completely or not at all, so a failure cannot leave half of them in place. It says nothing about other transactions running at the same time. That is isolation.</p></details>
+<details><summary>Why can you not use <code>SELECT … FOR UPDATE</code> to protect a form that a user is editing?</summary><p>The lock would have to be held, and a transaction kept open, for as long as the user takes. That ties up a connection, blocks others, prevents cleanup of old row versions, and never ends if the user walks away. Use a version number and reject the save if the version has changed.</p></details>
+<details><summary>A rule says a meeting room cannot have overlapping bookings. Two requests each check for overlaps, find none, and insert. Which isolation level would have prevented the double booking, and what else would?</summary><p>Serializable, which detects that each transaction’s read would have been affected by the other’s write and aborts one. The alternative is a constraint: an exclusion constraint on room and time range makes the database reject the second insert at any isolation level.</p></details>
+<details><summary>How does MVCC let a long report run without blocking updates?</summary><p>Updates create new versions of rows and leave the old versions in place. The report reads from a snapshot taken when it started, so it keeps seeing the old versions and never needs to wait for, or block, the writers.</p></details>
+<details><summary>Your code opens a transaction, charges a card through a payment provider, then inserts an order. Name two problems.</summary><p>The transaction and its locks and connection are held for the full duration of a remote call that may be slow or hang. And the two actions are not atomic together: if the insert fails after the charge succeeds, rolling back the database does not refund the card. The charge needs to be outside the transaction and coordinated by other means.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 7, “Transactions”. The clearest account of the anomalies and levels.</li>
+  <li>Hal Berenson and others, <a href="https://arxiv.org/abs/cs/0701157">A Critique of ANSI SQL Isolation Levels</a>, 1995. Defines snapshot isolation, lost update and write skew.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/transaction-iso.html">Transaction Isolation</a> and <a href="https://www.postgresql.org/docs/current/explicit-locking.html">Explicit Locking</a>.</li>
+  <li>MySQL documentation, <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html">InnoDB Transaction Isolation Levels</a>.</li>
+  <li>Martin Kleppmann, <a href="https://github.com/ept/hermitage">Hermitage</a>. Tests showing what each isolation level of each major database actually prevents.</li>
+  <li>Jepsen, <a href="https://jepsen.io/consistency">Consistency Models</a>. A map of the guarantees and how they relate.</li>
+  <li>Dan Ports and Kevin Grittner, <a href="https://arxiv.org/abs/1208.4179">Serializable Snapshot Isolation in PostgreSQL</a>, VLDB 2012.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">Routine Vacuuming</a>.</li>
+</ol>
+</section>

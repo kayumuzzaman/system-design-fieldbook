@@ -1,0 +1,462 @@
+<!--meta
+{ "description": "Consensus explained for system designers: why agreement is hard, majority quorums, the Raft algorithm with terms, elections and log replication, how a partitioned leader is prevented from doing harm, Paxos and its relatives, fencing tokens, and where consensus appears in real systems.",
+  "lede": "Many problems in distributed systems reduce to one: getting several machines to agree on something, and stay agreed, while some of them crash and messages go missing. That is consensus. You will rarely implement it, and you will depend on it constantly, so this chapter explains how it works, what it costs, and how to use the systems built on it.",
+  "updated": "2026-10-16" }
+-->
+
+<h2 id="problem">Agreement, despite everything</h2>
+<p>Earlier chapters kept arriving at a decision that several machines had to make identically. Which replica is the leader? Has this transaction committed? In what order did these writes happen? Who holds the lock? If two machines answer differently, the result is split brain, lost data or a double booking.</p>
+<p><dfn>Consensus</dfn> is the problem of getting a group of machines to agree on a value so that the agreement holds even though some machines fail and the network misbehaves. A correct consensus algorithm guarantees:</p>
+<ul>
+  <li><b>Agreement.</b> No two machines decide differently.</li>
+  <li><b>Validity.</b> The value decided is one that some machine proposed.</li>
+  <li><b>Durability of the decision.</b> Once decided, it does not change.</li>
+  <li><b>Termination.</b> Eventually a decision is reached, as long as enough machines are working and able to communicate.</li>
+</ul>
+<p>Agreeing on a single value sounds limited. In practice the machines agree on a sequence of values, one after another, which gives them an identical ordered <dfn>log</dfn>. If every machine starts in the same state and applies the same operations in the same order, they all end in the same state. This technique is called <dfn>state machine replication</dfn>, and it turns consensus into a general tool: put any operations in the log, such as database writes, configuration changes or lock grants, and every replica stays identical.</p>
+
+<h2 id="hard">Why it is hard</h2>
+<p><x-ref to="distributed-fundamentals#timeouts"></x-ref> established that a slow machine cannot be told from a dead one. That is the root of the difficulty. If a leader stops responding, the others must choose a new one. If it was only slow, there are now two machines that each believe they lead.</p>
+<p>A famous result from 1985, known by its authors’ initials as FLP, proves that no deterministic algorithm can guarantee consensus in a system where messages can be delayed without limit and even one machine may crash. That sounds like the end of the matter. The way through is to separate two kinds of guarantee:</p>
+<ul>
+  <li><dfn>Safety</dfn>: nothing bad ever happens. Two machines never decide differently.</li>
+  <li><dfn>Liveness</dfn>: something good eventually happens. A decision is reached.</li>
+</ul>
+<p>Practical algorithms keep safety always, whatever the network does. They give up liveness only while the network is misbehaving: during a bad partition they may fail to make progress, and they never produce a wrong answer. When the network settles, they continue. For a system holding locks or money, that is the right way round. An answer that is late is recoverable, and two contradictory answers are not.</p>
+
+<h2 id="majority">The idea that makes it possible: majorities</h2>
+<p>The mechanism underneath every practical consensus algorithm is the <dfn>majority quorum</dfn>. A decision counts only when more than half of the machines have accepted it. Two facts follow.</p>
+<ul>
+  <li><b>Any two majorities share at least one machine.</b> So two conflicting decisions cannot both gather a majority, since the shared machine would have had to accept both. And any later majority includes at least one machine that knows about every earlier decision.</li>
+  <li><b>A minority cannot decide anything.</b> During a partition, at most one side has a majority. The other side waits. This is what makes split brain impossible.</li>
+</ul>
+<table>
+<thead><tr><th>Machines in the group</th><th>Majority needed</th><th>Failures tolerated</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>1</td><td>0</td></tr>
+<tr><td>2</td><td>2</td><td>0</td></tr>
+<tr><td>3</td><td>2</td><td>1</td></tr>
+<tr><td>4</td><td>3</td><td>1</td></tr>
+<tr><td>5</td><td>3</td><td>2</td></tr>
+<tr><td>7</td><td>4</td><td>3</td></tr>
+</tbody>
+</table>
+<p>The table explains the sizes you see in practice. Two machines are worse than one, since both are needed and either can fail. Four tolerate no more failures than three and need a larger majority. Groups are therefore odd, and nearly always three or five: three to survive one failure, five to survive a failure during maintenance of another machine. Larger groups make every decision wait on more machines.</p>
+
+<h2 id="raft">Raft, step by step</h2>
+<p><dfn>Raft</dfn>, published in 2014, is the consensus algorithm most systems use today, and it was designed to be understandable. It works by electing a leader and having that leader manage a replicated log.</p>
+
+<h3 id="terms">Roles and terms</h3>
+<p>Each server is in one of three roles. A <dfn>follower</dfn> accepts instructions. A <dfn>leader</dfn> handles all client requests and tells followers what to add to their logs. A <dfn>candidate</dfn> is a follower trying to become leader.</p>
+
+<figure class="fig wide" id="fig-states">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 212" role="img" aria-labelledby="f281t f281d">
+<title id="f281t">The three roles of a Raft server and the transitions between them</title>
+<desc id="f281d">A follower that hears no heartbeat before its timeout becomes a candidate. A candidate that wins votes from a majority becomes the leader. A candidate that sees an existing leader or a higher term returns to being a follower. A leader that sees a higher term steps down to follower at once.</desc>
+<rect class="n" x="20" y="76" width="150" height="60" rx="6"/>
+<text class="tb mid" x="95" y="102">Follower</text>
+<text class="ts mid" x="95" y="119">obeys the leader</text>
+<rect class="n async" x="285" y="76" width="150" height="60" rx="6"/>
+<text class="tb mid" x="360" y="102">Candidate</text>
+<text class="ts mid" x="360" y="119">asks for votes</text>
+<rect class="n sig" x="550" y="76" width="150" height="60" rx="6"/>
+<text class="tb mid" x="625" y="102">Leader</text>
+<text class="ts mid" x="625" y="119">accepts writes</text>
+<g data-s="1">
+<path class="e" d="M95 76 C95 30 360 30 360 76"/>
+<text class="ts mid" x="228" y="32">hears no heartbeat before its timeout</text>
+</g>
+<g data-s="3">
+<path class="e" d="M285 106H170"/>
+<text class="ts mid" x="228" y="98">sees a leader</text>
+<text class="ts mid" x="228" y="124">or higher term</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M435 106H550"/>
+<text class="ts mid" x="492" y="98">wins a majority</text>
+</g>
+<g data-s="4">
+<path class="e" d="M625 136 C625 186 95 186 95 136"/>
+<text class="ts mid" x="360" y="196">sees a higher term: steps down at once</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="timeout">Every server starts as a follower. If it hears no heartbeat from a leader before its timeout runs out, it becomes a candidate.</li>
+  <li>The candidate asks the other servers for their votes. If a majority vote for it, it becomes the leader.</li>
+  <li>If instead it sees that another server is already leader, or sees a higher term, it goes back to being a follower.</li>
+  <li data-msg="higher term">A leader that sees a higher term knows it has been replaced, and steps down at once.</li>
+</ol>
+<figcaption>Raft’s roles. Every server starts as a follower. A candidate whose election produces no winner waits a random time and tries again in a new term.</figcaption>
+</figure>
+
+<p>Time is divided into numbered <dfn>terms</dfn>. Each term begins with an election and has at most one leader. The term number is Raft’s logical clock, in the sense of <x-ref to="distributed-fundamentals#logical"></x-ref>: every message carries it, a server that sees a higher term than its own adopts it immediately, and a server that receives a message from a lower term rejects it. This one rule is how an out-of-date leader finds out that it has been replaced.</p>
+
+<h3 id="election">Electing a leader</h3>
+<ol>
+  <li>The leader sends a heartbeat to every follower several times a second.</li>
+  <li>Each follower runs a timer, set to a random duration, typically between 150 and 300 ms. Every heartbeat resets it.</li>
+  <li>If a follower’s timer runs out, it assumes the leader is gone. It increases its term, becomes a candidate, votes for itself and asks the others for their votes.</li>
+  <li>Each server grants at most one vote per term, to the first candidate that asks, provided that candidate’s log is at least as complete as its own.</li>
+  <li>A candidate that collects votes from a majority becomes leader and starts sending heartbeats.</li>
+</ol>
+<p>The random timers keep elections from colliding. Usually one follower times out first and wins before any other becomes a candidate. If two do become candidates together and split the votes, neither reaches a majority, both time out after different random delays, and one of them wins the next term.</p>
+<p>The condition on votes is what protects data. A candidate whose log is missing committed entries cannot win, because a majority holds those entries and each of those servers will refuse it. The new leader is therefore guaranteed to have everything that was ever committed.</p>
+
+<h3 id="log">Replicating the log</h3>
+<p>With a leader in place, a write proceeds as follows.</p>
+<ol>
+  <li>The client sends the write to the leader.</li>
+  <li>The leader appends it to its own log and sends it to all followers.</li>
+  <li>Each follower appends it and acknowledges.</li>
+  <li>When a majority, counting the leader, has stored the entry, it is <dfn>committed</dfn>. The leader applies it to its state and replies to the client.</li>
+  <li>The leader tells followers the entry is committed in its next message, and they apply it too.</li>
+</ol>
+
+<figure class="fig wide" id="fig-log">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 258" role="img" aria-labelledby="f282t f282d">
+<title id="f282t">The logs of five Raft servers, showing which entries are committed</title>
+<desc id="f282d">Five servers each hold a log of entries labeled with the term in which they were created. Servers 1 and 2 hold eight entries. Server 3 holds seven. Server 4 holds five and server 5 holds two. Entries one to seven are stored on at least three of the five servers and are committed. Entry eight is on two servers only and is not yet committed.</desc>
+<text class="ts mid" x="157.0" y="34">1</text>
+<text class="ts mid" x="215.0" y="34">2</text>
+<text class="ts mid" x="273.0" y="34">3</text>
+<text class="ts mid" x="331.0" y="34">4</text>
+<text class="ts mid" x="389.0" y="34">5</text>
+<text class="ts mid" x="447.0" y="34">6</text>
+<text class="ts mid" x="505.0" y="34">7</text>
+<text class="ts mid" x="563.0" y="34">8</text>
+<text class="ts" x="10" y="34">log position</text>
+<text class="ts tb" x="10" y="61">Server 1, leader</text>
+<rect class="n sig" x="130" y="44" width="52" height="26" rx="3"/><text class="ts mid" x="156.0" y="61">term 1</text>
+<rect class="n sig" x="188" y="44" width="52" height="26" rx="3"/><text class="ts mid" x="214.0" y="61">term 1</text>
+<rect class="n sig" x="246" y="44" width="52" height="26" rx="3"/><text class="ts mid" x="272.0" y="61">term 1</text>
+<rect class="n sig" x="304" y="44" width="52" height="26" rx="3"/><text class="ts mid" x="330.0" y="61">term 2</text>
+<rect class="n sig" x="362" y="44" width="52" height="26" rx="3"/><text class="ts mid" x="388.0" y="61">term 2</text>
+<rect class="n sig" x="420" y="44" width="52" height="26" rx="3"/><text class="ts mid" x="446.0" y="61">term 3</text>
+<rect class="n sig" x="478" y="44" width="52" height="26" rx="3"/><text class="ts mid" x="504.0" y="61">term 3</text>
+<rect class="n async" x="536" y="44" width="52" height="26" rx="3"/><text class="ts mid" x="562.0" y="61">term 3</text>
+<text class="ts" x="10" y="93">Server 2</text>
+<rect class="n sig" x="130" y="76" width="52" height="26" rx="3"/><text class="ts mid" x="156.0" y="93">term 1</text>
+<rect class="n sig" x="188" y="76" width="52" height="26" rx="3"/><text class="ts mid" x="214.0" y="93">term 1</text>
+<rect class="n sig" x="246" y="76" width="52" height="26" rx="3"/><text class="ts mid" x="272.0" y="93">term 1</text>
+<rect class="n sig" x="304" y="76" width="52" height="26" rx="3"/><text class="ts mid" x="330.0" y="93">term 2</text>
+<rect class="n sig" x="362" y="76" width="52" height="26" rx="3"/><text class="ts mid" x="388.0" y="93">term 2</text>
+<rect class="n sig" x="420" y="76" width="52" height="26" rx="3"/><text class="ts mid" x="446.0" y="93">term 3</text>
+<rect class="n sig" x="478" y="76" width="52" height="26" rx="3"/><text class="ts mid" x="504.0" y="93">term 3</text>
+<rect class="n async" x="536" y="76" width="52" height="26" rx="3"/><text class="ts mid" x="562.0" y="93">term 3</text>
+<text class="ts" x="10" y="125">Server 3</text>
+<rect class="n sig" x="130" y="108" width="52" height="26" rx="3"/><text class="ts mid" x="156.0" y="125">term 1</text>
+<rect class="n sig" x="188" y="108" width="52" height="26" rx="3"/><text class="ts mid" x="214.0" y="125">term 1</text>
+<rect class="n sig" x="246" y="108" width="52" height="26" rx="3"/><text class="ts mid" x="272.0" y="125">term 1</text>
+<rect class="n sig" x="304" y="108" width="52" height="26" rx="3"/><text class="ts mid" x="330.0" y="125">term 2</text>
+<rect class="n sig" x="362" y="108" width="52" height="26" rx="3"/><text class="ts mid" x="388.0" y="125">term 2</text>
+<rect class="n sig" x="420" y="108" width="52" height="26" rx="3"/><text class="ts mid" x="446.0" y="125">term 3</text>
+<rect class="n sig" x="478" y="108" width="52" height="26" rx="3"/><text class="ts mid" x="504.0" y="125">term 3</text>
+<rect class="n ghost" x="536" y="108" width="52" height="26" rx="3"/>
+<text class="ts" x="10" y="157">Server 4</text>
+<rect class="n sig" x="130" y="140" width="52" height="26" rx="3"/><text class="ts mid" x="156.0" y="157">term 1</text>
+<rect class="n sig" x="188" y="140" width="52" height="26" rx="3"/><text class="ts mid" x="214.0" y="157">term 1</text>
+<rect class="n sig" x="246" y="140" width="52" height="26" rx="3"/><text class="ts mid" x="272.0" y="157">term 1</text>
+<rect class="n sig" x="304" y="140" width="52" height="26" rx="3"/><text class="ts mid" x="330.0" y="157">term 2</text>
+<rect class="n sig" x="362" y="140" width="52" height="26" rx="3"/><text class="ts mid" x="388.0" y="157">term 2</text>
+<rect class="n ghost" x="420" y="140" width="52" height="26" rx="3"/>
+<rect class="n ghost" x="478" y="140" width="52" height="26" rx="3"/>
+<rect class="n ghost" x="536" y="140" width="52" height="26" rx="3"/>
+<text class="ts" x="10" y="189">Server 5</text>
+<rect class="n sig" x="130" y="172" width="52" height="26" rx="3"/><text class="ts mid" x="156.0" y="189">term 1</text>
+<rect class="n sig" x="188" y="172" width="52" height="26" rx="3"/><text class="ts mid" x="214.0" y="189">term 1</text>
+<rect class="n ghost" x="246" y="172" width="52" height="26" rx="3"/>
+<rect class="n ghost" x="304" y="172" width="52" height="26" rx="3"/>
+<rect class="n ghost" x="362" y="172" width="52" height="26" rx="3"/>
+<rect class="n ghost" x="420" y="172" width="52" height="26" rx="3"/>
+<rect class="n ghost" x="478" y="172" width="52" height="26" rx="3"/>
+<rect class="n ghost" x="536" y="172" width="52" height="26" rx="3"/>
+<path class="e none dash" d="M533 20V204"/>
+<text class="ts end" x="525" y="16">committed: on at least 3 of 5</text>
+<text class="ts" x="541" y="16">not yet</text>
+<text class="ts" x="10" y="228">Entries up to position 7 are on a majority, so they are committed and will survive any leader change. Entry 8 is on two</text>
+<text class="ts" x="10" y="244">servers only. Servers 4 and 5 are behind and will be sent what they lack.</text>
+
+</svg>
+</div>
+<figcaption>A Raft log in progress. Commitment is a property of an entry being on a majority, and it does not wait for the slowest servers.</figcaption>
+</figure>
+
+<p>The leader does not wait for every follower, only for a majority, so one slow or failed server does not hold up writes. A follower that falls behind, or returns after a crash, is brought up to date by the leader, which finds the last position where their logs agree and sends everything after it. Raft maintains a strong property that makes this simple: if two logs contain an entry with the same position and term, the logs are identical up to that point.</p>
+
+<h3 id="raft-partition">What happens in a partition</h3>
+
+<figure class="fig wide" id="fig-partition">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f283t f283d">
+<title id="f283t">A five-server Raft group split by a network partition</title>
+<desc id="f283d">A partition separates server 1, the leader in term 1, and server 2 from servers 3, 4 and 5. A write sent to server 1 reaches only two servers and cannot be committed. The three servers on the other side time out and elect server 3 as leader for term 2, and writes there reach three servers and are committed. When the network heals, server 1 sees the higher term, steps down and discards its uncommitted entries.</desc>
+<g data-s="1">
+<rect class="grp" x="10" y="14" width="290" height="146" rx="8"/>
+<text class="ts" x="20" y="30">Minority side: 2 of 5</text>
+<rect class="grp" x="330" y="14" width="380" height="146" rx="8"/>
+<text class="ts" x="340" y="30">Majority side: 3 of 5</text>
+</g>
+<rect class="n fault" x="30" y="46" width="120" height="48" rx="6"/>
+<text class="tb mid" x="90" y="66">Server 1</text>
+<text class="ts mid" x="90" y="83">leader, term 1</text>
+<rect class="n" x="165" y="46" width="120" height="48" rx="6"/>
+<text class="tb mid" x="225" y="66">Server 2</text>
+<text class="ts mid" x="225" y="83">follower</text>
+<rect class="n sig" x="350" y="46" width="110" height="48" rx="6"/>
+<text class="tb mid" x="405" y="66">Server 3</text>
+<g class="hide" data-s="3">
+<text class="ts mid" x="405" y="83">leader, term 2</text>
+</g>
+<rect class="n" x="470" y="46" width="110" height="48" rx="6"/>
+<text class="tb mid" x="525" y="66">Server 4</text>
+<text class="ts mid" x="525" y="83">follower</text>
+<rect class="n" x="590" y="46" width="110" height="48" rx="6"/>
+<text class="tb mid" x="645" y="66">Server 5</text>
+<text class="ts mid" x="645" y="83">follower</text>
+<g data-s="2">
+<text class="ts" x="30" y="116">A write here reaches 2 servers.</text>
+<text class="ts" x="30" y="132">It can never be committed.</text>
+</g>
+<g data-s="3">
+<text class="ts" x="350" y="116">After a timeout these three elect a new leader.</text>
+<text class="ts" x="350" y="132">Writes here reach 3 servers and are committed.</text>
+</g>
+<g data-s="1">
+<path class="x" d="M307 78l16 24M323 78l-16 24"/>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="184">When the network heals, server 1 sees term 2, steps down and discards its uncommitted entries. No client was ever told</text>
+<text class="ts" x="10" y="200">those writes had succeeded, so nothing acknowledged is lost.</text>
+</g>
+
+<text class="ts mid" x="405" y="83" data-s="1" data-e="2">follower</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Leaders: server 1, term 1; Can commit: nobody yet">A network fault splits five servers. Server 1, the leader, ends up on the side with two servers. The other three are together.</li>
+  <li data-state="Leaders: server 1, term 1; Can commit: not server 1, it reaches 2 of 5">Server 1 still believes it is the leader. A write sent to it reaches only 2 of the 5 servers, which is not a majority, so it can never be committed.</li>
+  <li data-state="Leaders: server 1, term 1, and server 3, term 2; Can commit: server 3, it reaches 3 of 5">The three on the other side hear no heartbeat. After a timeout they elect server 3 as leader for term 2. Writes sent there reach 3 of 5 servers and are committed.</li>
+  <li data-state="Leaders: server 3, term 2; Can commit: server 3">When the network heals, server 1 sees term 2, steps down and discards its uncommitted writes. Nobody was ever told those writes had succeeded, so nothing acknowledged is lost.</li>
+</ol>
+<figcaption>Split brain prevented. Two servers believed they were leader for a while. Only one of them could get anything committed.</figcaption>
+</figure>
+
+<p>This is the scenario that broke the simpler failover schemes in <x-ref to="replication#failover"></x-ref>, and Raft’s rules handle it without special cases. The old leader keeps running and cannot commit, because it cannot reach a majority. Its clients receive timeouts, not false confirmations. The majority side elects a new leader with a higher term. When the partition heals, the first message the old leader receives carries that higher term, and it becomes a follower. Its uncommitted entries are overwritten with the new leader’s log. Nothing that was acknowledged to any client is lost.</p>
+
+<h2 id="family">Paxos and the rest of the family</h2>
+<p>Raft is not the only algorithm, or the first. <dfn>Paxos</dfn>, devised by Leslie Lamport around 1990, was the first proven solution, and it has a reputation for being hard to understand and harder to implement correctly. Google’s Chubby and Spanner use it. ZooKeeper uses a related protocol called Zab. Viewstamped Replication, from 1988, is closer to Raft than to Paxos in structure.</p>
+<p>For a system designer these are equivalent in what they provide: a replicated log with a single leader at a time, committed by majorities, safe under any failure of a minority. They differ in details that matter to implementers. Raft’s contribution was a complete, clearly specified design, and it is the reason there are now good open-source implementations in every major language.</p>
+
+<h2 id="cost">What consensus costs</h2>
+<ul>
+  <li><b>Latency on every write.</b> A write is not acknowledged until a majority has stored it durably. With three replicas in three availability zones, that adds a millisecond or two. With replicas on three continents it adds the round-trip time to the second-nearest replica, often over a hundred milliseconds.</li>
+  <li><b>A single leader.</b> All writes go through one machine per group. Systems that need more write capacity run many independent groups, one for each partition of the data, which is how CockroachDB, TiDB and YugabyteDB are built (<x-ref to="partitioning#dynamic"></x-ref>).</li>
+  <li><b>Unavailability without a majority.</b> If two of three machines are down or unreachable, the group stops accepting writes. This is the CP choice of <x-ref to="consistency-models#cap"></x-ref>.</li>
+  <li><b>Reads are not free either.</b> A leader that has been partitioned away may not know it yet, so a truly up-to-date read requires the leader to confirm with a majority that it still leads, or to rely on a time-bounded lease.</li>
+  <li><b>Leader changes cause a pause.</b> After a leader fails, nothing is committed until a follower times out and wins an election. That is typically a second or so, depending on the configured timeouts.</li>
+  <li><b>Sensitivity to slow disks.</b> Each server must write to disk before acknowledging. A consensus cluster on slow or contended storage produces spurious elections.</li>
+</ul>
+
+<h2 id="where">Where you meet consensus</h2>
+<p>You will almost never write a consensus algorithm, and should not. It is among the easiest things in computing to get subtly wrong. You use it through systems that embed it.</p>
+<table>
+<thead><tr><th>System</th><th>Uses consensus for</th></tr></thead>
+<tbody>
+<tr><th>etcd</th><td>A small, strongly consistent key-value store built on Raft. It holds all of Kubernetes’ cluster state.</td></tr>
+<tr><th>ZooKeeper, Consul</th><td>Coordination services: configuration, leader election, locks, service discovery</td></tr>
+<tr><th>Apache Kafka</th><td>Cluster metadata. Since version 4.0 in 2025, Kafka uses its own Raft implementation and no longer needs ZooKeeper.</td></tr>
+<tr><th>CockroachDB, TiDB, YugabyteDB</th><td>Replicating each range of data with its own Raft group</td></tr>
+<tr><th>Google Spanner</th><td>Replicating each partition with Paxos</td></tr>
+<tr><th>MongoDB</th><td>Electing the primary of a replica set, with a protocol modeled on Raft</td></tr>
+</tbody>
+</table>
+<p>The coordination services in the first two rows are the usual way for an application to borrow consensus. They are not general databases. They are meant to hold a small amount of critical data, megabytes to a few gigabytes, such as who the leader is, which nodes are alive and where each partition lives. <x-ref to="membership-and-coordination"></x-ref> covers how to use them.</p>
+
+<h2 id="fencing">Fencing: when a leader does not know it was replaced</h2>
+<p>Consensus guarantees that the group agrees on who the leader or lock holder is. It cannot guarantee that the previous holder knows. <x-ref to="distributed-fundamentals#pauses"></x-ref> showed a node that checked its lease, was paused, and acted on the stale check. The algorithm was correct throughout, and two nodes still wrote.</p>
+<p>The protection has to be at the resource being written to. Each time the lock or leadership is granted, the coordination service issues a <dfn>fencing token</dfn>, a number that only ever increases. The holder sends its token with every write. The storage system remembers the highest token it has seen and rejects anything lower.</p>
+
+<figure class="fig wide" id="fig-fencing">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 208" role="img" aria-labelledby="f284t f284d">
+<title id="f284t">A fencing token preventing a write from a stale lock holder</title>
+<desc id="f284d">Client 1 takes a lock and receives token 33, then is paused and its lease expires. Client 2 takes the lock and receives token 34, and writes with it. Storage accepts the write and records 34 as the highest token seen. Client 1 wakes and writes with token 33, and storage rejects it because 33 is less than 34.</desc>
+<rect class="n sunk" x="10" y="14" width="44" height="26" rx="0"/>
+<text class="ts tb" x="17" y="31">step</text>
+<rect class="n sunk" x="54" y="14" width="170" height="26" rx="0"/>
+<text class="ts tb" x="61" y="31">Client 1</text>
+<rect class="n sunk" x="224" y="14" width="140" height="26" rx="0"/>
+<text class="ts tb" x="231" y="31">Client 2</text>
+<rect class="n sunk" x="364" y="14" width="170" height="26" rx="0"/>
+<text class="ts tb" x="371" y="31">Lock service</text>
+<rect class="n sunk" x="534" y="14" width="176" height="26" rx="0"/>
+<text class="ts tb" x="541" y="31">Storage</text>
+<g data-s="1">
+<rect class="n" x="10" y="40" width="44" height="26" rx="0"/>
+<text class="ts" x="17" y="57">1</text>
+<rect class="n" x="54" y="40" width="170" height="26" rx="0"/>
+<text class="ts" x="61" y="57">takes the lock</text>
+<rect class="n" x="224" y="40" width="140" height="26" rx="0"/>
+<text class="ts" x="231" y="57"></text>
+<rect class="n" x="364" y="40" width="170" height="26" rx="0"/>
+<text class="ts" x="371" y="57">grants it with token 33</text>
+<rect class="n" x="534" y="40" width="176" height="26" rx="0"/>
+<text class="ts" x="541" y="57"></text>
+</g>
+<g data-s="2">
+<rect class="n" x="10" y="66" width="44" height="26" rx="0"/>
+<text class="ts" x="17" y="83">2</text>
+<rect class="n" x="54" y="66" width="170" height="26" rx="0"/>
+<text class="ts" x="61" y="83">paused</text>
+<rect class="n" x="224" y="66" width="140" height="26" rx="0"/>
+<text class="ts" x="231" y="83"></text>
+<rect class="n" x="364" y="66" width="170" height="26" rx="0"/>
+<text class="ts" x="371" y="83">lease expires</text>
+<rect class="n" x="534" y="66" width="176" height="26" rx="0"/>
+<text class="ts" x="541" y="83"></text>
+</g>
+<g data-s="3">
+<rect class="n" x="10" y="92" width="44" height="26" rx="0"/>
+<text class="ts" x="17" y="109">3</text>
+<rect class="n" x="54" y="92" width="170" height="26" rx="0"/>
+<text class="ts" x="61" y="109"></text>
+<rect class="n" x="224" y="92" width="140" height="26" rx="0"/>
+<text class="ts" x="231" y="109">takes the lock</text>
+<rect class="n" x="364" y="92" width="170" height="26" rx="0"/>
+<text class="ts" x="371" y="109">grants it with token 34</text>
+<rect class="n" x="534" y="92" width="176" height="26" rx="0"/>
+<text class="ts" x="541" y="109"></text>
+</g>
+<g data-s="4">
+<rect class="n" x="10" y="118" width="44" height="26" rx="0"/>
+<text class="ts" x="17" y="135">4</text>
+<rect class="n" x="54" y="118" width="170" height="26" rx="0"/>
+<text class="ts" x="61" y="135"></text>
+<rect class="n" x="224" y="118" width="140" height="26" rx="0"/>
+<text class="ts" x="231" y="135">writes, token 34</text>
+<rect class="n" x="364" y="118" width="170" height="26" rx="0"/>
+<text class="ts" x="371" y="135"></text>
+<rect class="n" x="534" y="118" width="176" height="26" rx="0"/>
+<text class="ts" x="541" y="135">accepts; highest seen is 34</text>
+</g>
+<g data-s="5">
+<rect class="n" x="10" y="144" width="44" height="26" rx="0"/>
+<text class="ts" x="17" y="161">5</text>
+<rect class="n" x="54" y="144" width="170" height="26" rx="0"/>
+<text class="ts" x="61" y="161">wakes, writes, token 33</text>
+<rect class="n" x="224" y="144" width="140" height="26" rx="0"/>
+<text class="ts" x="231" y="161"></text>
+<rect class="n" x="364" y="144" width="170" height="26" rx="0"/>
+<text class="ts" x="371" y="161"></text>
+<rect class="n store" x="534" y="144" width="176" height="26" rx="0"/>
+<text class="ts" x="541" y="161">rejects: 33 is less than 34</text>
+<text class="ts" x="10" y="192">Client 1 never learns that it was paused. The storage system does not need it to: an old token is refused.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Lock holder: client 1, token 33; Highest token storage has seen: none">Client 1 takes the lock. The lock service grants it together with a token, 33, a number that grows with every grant.</li>
+  <li data-state="Lock holder: nobody, the lease expired; Highest token storage has seen: none">Client 1 is paused. While it is frozen, its lease expires.</li>
+  <li data-state="Lock holder: client 2, token 34; Highest token storage has seen: none">Client 2 takes the lock and receives the next token, 34.</li>
+  <li data-state="Lock holder: client 2, token 34; Highest token storage has seen: 34">Client 2 writes to storage and includes its token. Storage accepts the write and remembers that 34 is the highest token it has seen.</li>
+  <li data-state="Lock holder: client 2, token 34; Highest token storage has seen: 34; Write with token 33: rejected">Client 1 wakes up, unaware of the pause, and writes with token 33. Storage rejects it, because 33 is less than 34. The stale lock holder is stopped by the storage system, not by its own good behavior.</li>
+</ol>
+<figcaption>The lock service decides who holds the lock. The storage system enforces the decision, because the former holder cannot be relied on to.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Enforcing a fencing token at the resource">
+async function writeWithToken(key: string, body: string, token: number): Promise<void> {
+  const result = await db.query(
+    `UPDATE documents
+        SET body = $1, fencing_token = $2
+      WHERE key = $3 AND fencing_token <= $2`,       // accept only the current or a newer holder
+    [body, token, key]);
+
+  if (result.rowCount === 0) throw new StaleLockHolder();
+}
+</pre>
+<p>Raft’s term number is a fencing token for its own messages, which is why an old leader’s instructions are ignored. The same idea must be extended to anything outside the consensus group that the leader touches. A distributed lock without fencing provides efficiency, by usually preventing duplicate work, and does not provide correctness. Where fencing at the resource is impossible, the remaining option is to make certain the old holder has stopped, by cutting its power or its network access.</p>
+
+<h2 id="byzantine">A note on Byzantine consensus</h2>
+<p>Everything above assumes machines that fail by stopping and never by lying. Agreement among machines that may send false or contradictory messages is <dfn>Byzantine fault tolerant</dfn> consensus. It needs more than two thirds of the machines to be honest, where the algorithms above need only a majority to be alive, and many more messages. Blockchains are the best-known use, since their participants do not trust each other. Inside one organization’s infrastructure, where every machine runs software you deployed, it is almost never worth the cost.</p>
+
+<h2 id="practice">Using consensus well</h2>
+<ul>
+  <li><b>Use three or five members</b>, placed in separate failure domains: three availability zones is the standard arrangement.</li>
+  <li><b>Keep the group within one region</b> unless you need to survive the loss of a region, and accept the write latency if you do.</li>
+  <li><b>Put little in it.</b> Use the consensus store for decisions and metadata, and keep bulk data elsewhere.</li>
+  <li><b>Give it fast, dedicated disks</b> and watch the time its disk writes take.</li>
+  <li><b>Monitor leader changes.</b> Frequent elections mean timeouts are too tight for the hardware or the network.</li>
+  <li><b>Expect clients to see errors during an election</b>, and retry.</li>
+  <li><b>Fence</b> anything a leader does outside the group.</li>
+</ul>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Building leader election from parts that look sufficient: “each instance writes its ID to a database row with a timestamp, and whoever wrote most recently is the leader”. Such schemes work until a pause, a clock skew or a partition produces two leaders. Use a coordination service that implements consensus, and add fencing tokens.</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> You are not expected to derive Raft. You are expected to know when consensus is needed and what it implies: “leader election goes through etcd, which needs a majority of three nodes, so we lose availability and not correctness if two zones fail”. If you propose a lock, mention fencing. If asked how failover avoids split brain, the answer is “a majority must agree on the new leader, and a higher term or token makes the old one’s writes get rejected”.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Two-node or four-node groups</b>, expecting more fault tolerance than they give.</li>
+  <li><b>Home-made leader election</b> based on timestamps or a shared database row.</li>
+  <li><b>Locks without fencing tokens</b>, trusted for correctness.</li>
+  <li><b>Using the consensus store as a general database</b> or a message queue.</li>
+  <li><b>Spreading one group across distant regions</b> without accounting for write latency.</li>
+  <li><b>All members in one availability zone</b>, so one failure removes the majority.</li>
+  <li><b>Assuming a leader’s read is current</b> without a majority check or a lease.</li>
+  <li><b>Election timeouts tuned so tightly</b> that a slow disk causes leadership to change repeatedly.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="replication"></x-ref>: consensus is what makes failover safe.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: timeouts, pauses and logical clocks, which the algorithm is built around.</li>
+  <li><x-ref to="consistency-models"></x-ref>: consensus is how linearizable systems are implemented.</li>
+  <li><x-ref to="distributed-transactions"></x-ref>: agreeing to commit across several groups.</li>
+  <li><x-ref to="membership-and-coordination"></x-ref>: locks, leases and discovery built on consensus stores.</li>
+  <li><x-ref to="containers-and-orchestration"></x-ref>: Kubernetes keeps its state in etcd.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Consensus lets a group of machines agree on a sequence of operations despite crashes and lost messages. Applying the same log everywhere keeps replicas identical.</li>
+  <li>Practical algorithms are always safe and make progress whenever a majority can communicate.</li>
+  <li>Majorities are the core idea: any two overlap, and a minority can decide nothing. Use three or five members.</li>
+  <li>Raft elects one leader per numbered term, replicates a log, and commits an entry when a majority has stored it.</li>
+  <li>A partitioned leader cannot commit, and steps down when it sees a higher term. Acknowledged writes are never lost.</li>
+  <li>The cost is a majority round trip on every write, a single leader per group, and no writes without a majority.</li>
+  <li>Use consensus through etcd, ZooKeeper or a database that embeds it. Do not write your own.</li>
+  <li>A leader or lock holder can be replaced without knowing. Fencing tokens checked at the resource make that harmless.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does a four-member consensus group tolerate no more failures than a three-member one?</summary><p>A majority of four is three, so only one member can be lost, the same as with three members where the majority is two. The fourth member adds cost and another thing that can fail without adding tolerance.</p></details>
+<details><summary>In Raft, how does a leader that was cut off by a partition learn that it is no longer the leader?</summary><p>Every message carries a term number. The other side elected a new leader in a higher term. When the old leader next exchanges a message with any server that has seen the higher term, it adopts that term and becomes a follower. Until then it could not commit anything, having no majority.</p></details>
+<details><summary>A client writes to a Raft leader, which appends the entry and crashes before any follower receives it. Is the write lost, and was the client misled?</summary><p>The entry is lost, since it existed only on the failed leader. The client was not misled: the leader replies only after a majority has stored the entry, so the client received no confirmation and should retry.</p></details>
+<details><summary>Why can a candidate with an out-of-date log not win an election?</summary><p>Servers refuse to vote for a candidate whose log is less complete than their own. Every committed entry is on a majority of servers, and any majority of voters includes at least one of them, so a candidate missing a committed entry cannot gather enough votes.</p></details>
+<details><summary>What do “safety” and “liveness” mean, and which does a consensus algorithm sacrifice when the network is badly partitioned?</summary><p>Safety means nothing incorrect happens, such as two different decisions. Liveness means progress is eventually made. Under a severe partition the algorithm may stop making progress, giving up liveness for a while, and it never gives up safety.</p></details>
+<details><summary>A service uses a lock from a coordination service before writing to object storage that has no way to check tokens. What risk remains?</summary><p>A holder that is paused past its lease expiry can resume and write after another instance has taken the lock, and the storage will accept both writes. Without fencing at the resource the lock only reduces the chance of duplicate work. To be safe, the resource must reject stale holders, for example with a conditional write on a version, or the old holder must be forcibly stopped.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Diego Ongaro and John Ousterhout, <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a>, USENIX ATC 2014. The Raft paper. The site <a href="https://raft.github.io/">raft.github.io</a> has an interactive visualization.</li>
+  <li>Leslie Lamport, <a href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple</a>, 2001.</li>
+  <li>Michael Fischer, Nancy Lynch and Michael Paterson, <a href="https://groups.csail.mit.edu/tds/papers/Lynch/jacm85.pdf">Impossibility of Distributed Consensus with One Faulty Process</a>, Journal of the ACM, 1985. The FLP result.</li>
+  <li>Martin Kleppmann, <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">How to do distributed locking</a>, 2016. The argument for fencing tokens.</li>
+  <li>Mike Burrows, <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a>, OSDI 2006.</li>
+  <li>etcd documentation, <a href="https://etcd.io/docs/">etcd.io/docs</a>. Includes guidance on cluster size, hardware and storage limits.</li>
+  <li>Apache Kafka, <a href="https://kafka.apache.org/blog/2025/03/18/apache-kafka-4.0.0-release-announcement/">Apache Kafka 4.0.0 Release Announcement</a>, March 2025. The first release to run without ZooKeeper.</li>
+  <li>Heidi Howard and Richard Mortier, <a href="https://arxiv.org/abs/2004.05074">Paxos vs Raft: Have we reached consensus on distributed consensus?</a>, 2020.</li>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 9.</li>
+</ol>
+</section>

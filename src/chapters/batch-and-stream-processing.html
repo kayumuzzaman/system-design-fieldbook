@@ -1,0 +1,649 @@
+<!--meta
+{ "description": "Batch and stream processing for system design: bounded and unbounded data, MapReduce and its successors, stateful stream processing, event time and processing time, tumbling, hopping and session windows, watermarks and late data, checkpoints and exactly-once state, stream joins, and the lambda and kappa architectures.",
+  "lede": "Sooner or later every product wants numbers computed from everything that has happened: uploads per country, the most viewed photos this hour, revenue per day, features for a model. There are two ways to compute them. Batch processing waits until a set of data is complete and processes it in one run. Stream processing computes continuously as each event arrives. This chapter explains both, and the ideas about time that make streaming harder than it first appears.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="two-ways">Bounded and unbounded data</h2>
+<p>The photo app records an event every time someone views a photo. Two requests arrive from the product team.</p>
+<ul>
+  <li>A report, each morning, of yesterday’s views by country.</li>
+  <li>A “trending now” list on the home page, showing the most viewed photos of the last hour.</li>
+</ul>
+<p>The first works on a <dfn>bounded</dfn> dataset. Yesterday is over, its events are all in, and the job can read them from start to finish and stop. The second works on an <dfn>unbounded</dfn> one. The stream of views never ends, and the answer must be kept up to date as it flows.</p>
+<table>
+<thead><tr><th></th><th>Batch processing</th><th>Stream processing</th></tr></thead>
+<tbody>
+<tr><th>Input</th><td>A complete, fixed dataset</td><td>Events as they arrive, without end</td></tr>
+<tr><th>Runs</th><td>On a schedule, then exits</td><td>Continuously</td></tr>
+<tr><th>Results are</th><td>Complete, and hours old</td><td>Seconds old, and possibly revised later</td></tr>
+<tr><th>If it fails</th><td>Run it again</td><td>It must recover its position and its state</td></tr>
+<tr><th>Hard part</th><td>Volume</td><td>Time, state and never stopping</td></tr>
+</tbody>
+</table>
+<p>Batch is simpler in every respect but one: you wait. The choice between them is a question of how fresh the answer must be, and what that freshness is worth.</p>
+
+<h2 id="batch">Batch processing</h2>
+<p>The problem batch systems solve is size. Yesterday’s views might be 500 million records, too many for one machine to process in reasonable time. The work has to be split across hundreds of machines, some of which will fail during the run.</p>
+<p>Google’s MapReduce paper of 2004 showed that a large class of jobs can be expressed as two functions, with the framework handling distribution and failure. The programmer writes:</p>
+<ul>
+  <li>a <b>map</b> function, applied to every input record independently, which emits key-value pairs,</li>
+  <li>a <b>reduce</b> function, which receives all the values for one key and combines them.</li>
+</ul>
+<p>Between them the framework performs the <dfn>shuffle</dfn>: it brings every pair with the same key to the same machine.</p>
+
+<figure class="fig wide" id="fig-mapreduce">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f381t f381d">
+<title id="f381t">Counting views per country with map, shuffle and reduce</title>
+<desc id="f381d">Three chunks of input hold the countries of nine views. A map task for each chunk emits a pair of country and one for every view. The shuffle groups the pairs by country: Germany has three ones, Japan two and the United States four. Reduce tasks add each list to give Germany 3, Japan 2 and the United States 4.</desc>
+<g data-s="1">
+<text class="tb" x="10" y="18">Input, in chunks</text>
+</g>
+<g data-s="2">
+<text class="tb" x="170" y="18">Map: emit (key, 1)</text>
+</g>
+<g data-s="3">
+<text class="tb" x="370" y="18">Shuffle: group by key</text>
+</g>
+<g data-s="4">
+<text class="tb" x="570" y="18">Reduce: add up</text>
+</g>
+<g data-s="1">
+<rect class="n" x="10" y="34" width="120" height="40" rx="6"/>
+<text class="ts mid" x="70" y="58.5">views: DE, US, DE</text>
+</g>
+<g data-s="2">
+<rect class="n sig" x="170" y="34" width="160" height="40" rx="6"/>
+<text class="ts mid" x="250" y="58.5">DE:1, US:1, DE:1</text>
+<path class="e sig" d="M130 54H170"/>
+</g>
+<g data-s="1">
+<rect class="n" x="10" y="90" width="120" height="40" rx="6"/>
+<text class="ts mid" x="70" y="114.5">views: US, JP, US</text>
+</g>
+<g data-s="2">
+<rect class="n sig" x="170" y="90" width="160" height="40" rx="6"/>
+<text class="ts mid" x="250" y="114.5">US:1, JP:1, US:1</text>
+<path class="e sig" d="M130 110H170"/>
+</g>
+<g data-s="1">
+<rect class="n" x="10" y="146" width="120" height="40" rx="6"/>
+<text class="ts mid" x="70" y="170.5">views: DE, JP, US</text>
+</g>
+<g data-s="2">
+<rect class="n sig" x="170" y="146" width="160" height="40" rx="6"/>
+<text class="ts mid" x="250" y="170.5">DE:1, JP:1, US:1</text>
+<path class="e sig" d="M130 166H170"/>
+</g>
+<g data-s="3">
+<rect class="n store" x="370" y="34" width="160" height="40" rx="6"/>
+<text class="ts mid" x="450" y="58.5">DE: [1, 1, 1]</text>
+</g>
+<g data-s="4">
+<rect class="n store" x="570" y="34" width="140" height="40" rx="6"/>
+<text class="tb mid" x="640" y="58.5">DE: 3</text>
+<path class="e" d="M530 54H570"/>
+</g>
+<g data-s="3">
+<path class="e none" d="M330 54C350 54 350 54 370 54"/>
+<path class="e none" d="M330 166C350 166 350 54 370 54"/>
+<rect class="n async" x="370" y="90" width="160" height="40" rx="6"/>
+<text class="ts mid" x="450" y="114.5">JP: [1, 1]</text>
+</g>
+<g data-s="4">
+<rect class="n async" x="570" y="90" width="140" height="40" rx="6"/>
+<text class="tb mid" x="640" y="114.5">JP: 2</text>
+<path class="e" d="M530 110H570"/>
+</g>
+<g data-s="3">
+<path class="e none" d="M330 110C350 110 350 110 370 110"/>
+<path class="e none" d="M330 166C350 166 350 110 370 110"/>
+<rect class="n" x="370" y="146" width="160" height="40" rx="6"/>
+<text class="ts mid" x="450" y="170.5">US: [1, 1, 1, 1]</text>
+</g>
+<g data-s="4">
+<rect class="n" x="570" y="146" width="140" height="40" rx="6"/>
+<text class="tb mid" x="640" y="170.5">US: 4</text>
+<path class="e" d="M530 166H570"/>
+</g>
+<g data-s="3">
+<path class="e none" d="M330 54C350 54 350 166 370 166"/>
+<path class="e none" d="M330 110C350 110 350 166 370 166"/>
+<path class="e none" d="M330 166C350 166 350 166 370 166"/>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="214">Each map task works on one chunk on one machine. The shuffle sends every pair with the same key to the same reducer.</text>
+<text class="ts" x="10" y="230">Any task can be rerun on another machine if its machine fails, because it reads fixed input and has no side effects.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li>The input is a large file of page views, split into chunks that sit on different machines.</li>
+  <li data-msg="(country, 1)">A map task runs on each chunk, on the machine that holds it. For every view it emits a pair: the country, and the number 1.</li>
+  <li data-msg="(country, 1)">The shuffle sends every pair with the same key to the same place and groups them.</li>
+  <li data-msg="total">A reduce task adds up the list for each key. Reduces run in parallel as well, one for each key.</li>
+  <li>Any task can be run again on another machine if its machine fails, because it reads fixed input and changes nothing else.</li>
+</ol>
+<figcaption>Views per country. Maps run in parallel on separate chunks, and reduces run in parallel on separate keys.</figcaption>
+</figure>
+
+<p>Three properties made this scale, and they remain the foundation of batch systems.</p>
+<ul>
+  <li><b>Tasks are independent.</b> A map task needs only its own chunk. A thousand of them can run at once.</li>
+  <li><b>Tasks are deterministic and have no side effects.</b> They read fixed input and write output files. If a machine dies, the framework reruns its tasks elsewhere and gets the same result. This is idempotency (<x-ref to="idempotency-and-delivery#natural"></x-ref>) as an architectural principle.</li>
+  <li><b>Code goes to the data.</b> Tasks are scheduled where the input already is, instead of moving terabytes across the network.</li>
+</ul>
+
+<h3 id="after-mapreduce">What replaced MapReduce</h3>
+<p>MapReduce itself is rarely written by hand now. Its successors keep the model and remove its limitations.</p>
+<ul>
+  <li><b>Dataflow engines.</b> Apache Spark represents a job as a graph of many operations, keeps intermediate data in memory where it can, and offers tables and SQL instead of raw map and reduce functions. Version 4.2 was released in July 2026.</li>
+  <li><b>Distributed SQL engines.</b> Trino, and the engines inside BigQuery, Snowflake and similar warehouses, plan and run ordinary SQL across many machines. For most analytical questions a SQL query is the batch job.</li>
+  <li><b>Columnar files.</b> Data is stored in formats such as Parquet, which keep each column together, so that a query reads only the columns it needs (<x-ref to="storage-engines#column"></x-ref>).</li>
+</ul>
+<p>The practical concerns of batch work are the same whichever engine runs it.</p>
+<ul>
+  <li><b>The shuffle is the expensive step.</b> Grouping and joining move data between machines. Filter early, and avoid shuffling data you will discard.</li>
+  <li><b>Skew.</b> If one key has far more records than the others, such as one celebrity’s photos, the task handling that key runs long after the rest have finished. It is the hot key problem of <x-ref to="partitioning#hot-keys"></x-ref> in another setting.</li>
+  <li><b>Write output atomically.</b> Write to a temporary location and switch it into place when complete, so that readers never see half a result and a rerun replaces the output instead of adding to it.</li>
+  <li><b>Partition by date.</b> Storing each day separately lets a job process or reprocess one day without touching the rest.</li>
+</ul>
+
+<h2 id="stream">Stream processing</h2>
+<p>A stream processor reads events from a log (<x-ref to="event-streaming"></x-ref>), applies a chain of operations to each, and writes results out, without ever finishing. The operations are of two kinds.</p>
+<ul>
+  <li><b>Stateless</b> operations look at one event at a time: filter out bot traffic, convert a format, add a field. They need no memory, and they scale and recover trivially.</li>
+  <li><b>Stateful</b> operations combine events: count views per photo, keep a running total, join a view to the profile of the viewer. They must remember something between events, and that memory is the source of nearly all the difficulty.</li>
+</ul>
+<p>The state is partitioned by key, like the log it is computed from. All events for photo 871 go to the same worker, which holds the count for photo 871 locally, in memory or on local disk. Keeping state next to the computation is what lets a stream processor handle hundreds of thousands of events a second, where a database lookup for each event would not.</p>
+<p>The widely used engines differ mostly in packaging.</p>
+<table>
+<thead><tr><th>Engine</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Apache Flink</th><td>A dedicated stream processor that handles one event at a time, with strong support for event time and large state. Version 2.3 was released in June 2026.</td></tr>
+<tr><th>Kafka Streams</th><td>A library that runs inside your own service and keeps its state in Kafka topics. Nothing extra to deploy.</td></tr>
+<tr><th>Spark Structured Streaming</th><td>Streaming as a series of small batches on the Spark engine, with a lower-latency mode added in version 4.1</td></tr>
+<tr><th>Apache Beam, Google Dataflow</th><td>One programming model for batch and streaming, run on several engines</td></tr>
+<tr><th>Streaming SQL and streaming databases</th><td>Define a continuously updated result as a SQL query</td></tr>
+</tbody>
+</table>
+
+<h2 id="time">Two kinds of time</h2>
+<p>To count “views in the last hour”, you must decide which hour a view belongs to. There are two candidates.</p>
+<ul>
+  <li><dfn>Event time</dfn>: when the view happened, according to the device it happened on.</li>
+  <li><dfn>Processing time</dfn>: when the event reached the system that is counting.</li>
+</ul>
+<p>In a perfect world they would be equal. In practice an event crosses a mobile network, a load balancer, a log and a consumer that may be lagging. Most arrive within a second or two. Some arrive much later: a phone in a tunnel buffers its events and sends them when it has signal again, twenty minutes after they happened.</p>
+
+<figure class="fig wide" id="fig-time">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 296" role="img" aria-labelledby="f382t f382d">
+<title id="f382t">Event time against arrival time for 44 simulated events, with a watermark</title>
+<desc id="f382d">A scatter chart. The horizontal axis is when the server received each event and the vertical axis is when it happened. A dashed diagonal marks events that would have arrived instantly. Most dots lie just to the right of it, and a few lie far to the right, having arrived many seconds late. A green stepped line shows the watermark, defined as the newest event time seen so far minus 8 seconds. Three of the 44 events arrived after the watermark had passed their time and are marked as late.</desc>
+<line class="axis" x1="64" y1="250" x2="470" y2="250"/>
+<text class="ts end" x="56" y="254.0">0 s</text>
+<line class="grid" x1="64" y1="173.333" x2="470" y2="173.333"/>
+<text class="ts end" x="56" y="177.33333333333334">20 s</text>
+<line class="grid" x1="64" y1="96.6667" x2="470" y2="96.6667"/>
+<text class="ts end" x="56" y="100.66666666666669">40 s</text>
+<line class="grid" x1="64" y1="20" x2="470" y2="20"/>
+<text class="ts end" x="56" y="24.0">60 s</text>
+<text class="ts mid" x="64.0" y="268">0 s</text>
+<text class="ts mid" x="165.5" y="268">20 s</text>
+<text class="ts mid" x="267.0" y="268">40 s</text>
+<text class="ts mid" x="368.5" y="268">60 s</text>
+<text class="ts mid" x="470.0" y="268">80 s</text>
+<text class="ts mid" x="267.0" y="288">when the server received it</text>
+<text class="ts mid" transform="translate(14 135) rotate(-90)">when it happened</text>
+<path class="e none dash" d="M64 250L368.5 20"/>
+<path class="line" style="stroke:var(--store)" d="M74.6 250.0 L98.6 250.0 L98.6 250.0 L108.5 250.0 L108.5 250.0 L125.0 250.0 L125.0 235.3 L126.3 235.3 L126.3 235.2 L140.7 235.2 L140.7 230.2 L162.5 230.2 L162.5 213.7 L165.6 213.7 L165.6 205.0 L208.0 205.0 L208.0 189.3 L211.4 189.3 L211.4 175.1 L225.8 175.1 L225.8 163.4 L244.3 163.4 L244.3 146.5 L245.4 146.5 L245.4 145.0 L255.0 145.0 L255.0 139.3 L260.7 139.3 L260.7 134.0 L264.6 134.0 L264.6 132.1 L277.1 132.1 L277.1 122.2 L280.7 122.2 L280.7 119.4 L291.9 119.4 L291.9 111.2 L302.7 111.2 L302.7 103.6 L312.8 103.6 L312.8 101.3 L322.1 101.3 L322.1 87.5 L352.1 87.5 L352.1 78.3 L354.0 78.3 L354.0 67.3 L354.1 67.3 L354.1 62.6 L451.9 62.6 L451.9 58.8 L470.0 58.8"/>
+<circle class="dot " cx="74.6" cy="242.9" r="4"/>
+<circle class="dot " cx="98.6" cy="226.5" r="4"/>
+<circle class="dot " cx="106.5" cy="227.1" r="4"/>
+<circle class="dot " cx="108.5" cy="224.1" r="4"/>
+<circle class="dot " cx="124.6" cy="226.4" r="4"/>
+<circle class="dot " cx="125.0" cy="204.6" r="4"/>
+<circle class="dot " cx="126.3" cy="204.5" r="4"/>
+<circle class="dot " cx="126.4" cy="207.3" r="4"/>
+<circle class="dot " cx="130.7" cy="205.8" r="4"/>
+<circle class="dot " cx="135.9" cy="204.7" r="4"/>
+<circle class="dot " cx="140.7" cy="199.6" r="4"/>
+<circle class="dot " cx="140.9" cy="200.1" r="4"/>
+<circle class="dot " cx="143.0" cy="199.7" r="4"/>
+<circle class="dot fill-fault" cx="147.0" cy="237.7" r="4"/>
+<circle class="dot " cx="154.5" cy="200.3" r="4"/>
+<circle class="dot " cx="162.5" cy="183.0" r="4"/>
+<circle class="dot " cx="165.6" cy="174.3" r="4"/>
+<circle class="dot fill-fault" cx="181.1" cy="237.0" r="4"/>
+<circle class="dot " cx="208.0" cy="158.7" r="4"/>
+<circle class="dot " cx="211.4" cy="144.4" r="4"/>
+<circle class="dot " cx="211.7" cy="147.3" r="4"/>
+<circle class="dot " cx="214.0" cy="144.8" r="4"/>
+<circle class="dot fill-fault" cx="222.1" cy="203.2" r="4"/>
+<circle class="dot " cx="225.8" cy="132.7" r="4"/>
+<circle class="dot " cx="244.3" cy="115.8" r="4"/>
+<circle class="dot " cx="245.4" cy="114.3" r="4"/>
+<circle class="dot " cx="249.0" cy="114.8" r="4"/>
+<circle class="dot " cx="255.0" cy="108.6" r="4"/>
+<circle class="dot " cx="260.7" cy="103.3" r="4"/>
+<circle class="dot " cx="260.9" cy="105.5" r="4"/>
+<circle class="dot " cx="264.6" cy="101.4" r="4"/>
+<circle class="dot " cx="267.3" cy="105.9" r="4"/>
+<circle class="dot " cx="277.1" cy="91.5" r="4"/>
+<circle class="dot " cx="280.7" cy="88.8" r="4"/>
+<circle class="dot " cx="283.4" cy="92.2" r="4"/>
+<circle class="dot " cx="291.9" cy="80.5" r="4"/>
+<circle class="dot " cx="302.7" cy="72.9" r="4"/>
+<circle class="dot " cx="312.8" cy="70.6" r="4"/>
+<circle class="dot " cx="322.1" cy="56.8" r="4"/>
+<circle class="dot " cx="352.1" cy="47.7" r="4"/>
+<circle class="dot " cx="354.0" cy="36.6" r="4"/>
+<circle class="dot " cx="354.1" cy="32.0" r="4"/>
+<circle class="dot " cx="361.4" cy="36.8" r="4"/>
+<circle class="dot " cx="451.9" cy="28.2" r="4"/>
+<text class="ts" x="492" y="34">Each dot is one event.</text>
+<text class="ts" x="492" y="50">On the dashed diagonal it would</text>
+<text class="ts" x="492" y="66">have arrived the instant it happened.</text>
+<text class="ts" x="492" y="82">Dots to the right arrived later.</text>
+<text class="ts" x="492" y="118">The green line is the watermark:</text>
+<text class="ts" x="492" y="134">the newest event time seen so far,</text>
+<text class="ts" x="492" y="150">minus 8 seconds.</text>
+<text class="ts" x="492" y="186">3 of 44 events arrived after the</text>
+<text class="ts" x="492" y="202">watermark had passed their time.</text>
+<text class="ts" x="492" y="218">They are late (red).</text>
+
+<circle class="hit" cx="74.6" cy="242.9" r="9" data-tip="Happened at 1.9 s|received at 2.1 s|0.2 s in transit"/>
+<circle class="hit" cx="98.6" cy="226.5" r="9" data-tip="Happened at 6.1 s|received at 6.8 s|0.7 s in transit"/>
+<circle class="hit" cx="106.5" cy="227.1" r="9" data-tip="Happened at 6.0 s|received at 8.4 s|2.4 s in transit"/>
+<circle class="hit" cx="108.5" cy="224.1" r="9" data-tip="Happened at 6.8 s|received at 8.8 s|2.0 s in transit"/>
+<circle class="hit" cx="124.6" cy="226.4" r="9" data-tip="Happened at 6.2 s|received at 11.9 s|5.8 s in transit"/>
+<circle class="hit" cx="125.0" cy="204.6" r="9" data-tip="Happened at 11.8 s|received at 12.0 s|0.2 s in transit"/>
+<circle class="hit" cx="126.3" cy="204.5" r="9" data-tip="Happened at 11.9 s|received at 12.3 s|0.4 s in transit"/>
+<circle class="hit" cx="126.4" cy="207.3" r="9" data-tip="Happened at 11.1 s|received at 12.3 s|1.2 s in transit"/>
+<circle class="hit" cx="130.7" cy="205.8" r="9" data-tip="Happened at 11.5 s|received at 13.1 s|1.6 s in transit"/>
+<circle class="hit" cx="135.9" cy="204.7" r="9" data-tip="Happened at 11.8 s|received at 14.2 s|2.4 s in transit"/>
+<circle class="hit" cx="140.7" cy="199.6" r="9" data-tip="Happened at 13.1 s|received at 15.1 s|2.0 s in transit"/>
+<circle class="hit" cx="140.9" cy="200.1" r="9" data-tip="Happened at 13.0 s|received at 15.2 s|2.1 s in transit"/>
+<circle class="hit" cx="143.0" cy="199.7" r="9" data-tip="Happened at 13.1 s|received at 15.6 s|2.4 s in transit"/>
+<circle class="hit" cx="147.0" cy="237.7" r="9" data-tip="Happened at 3.2 s|received at 16.4 s|13.1 s in transit|late: the watermark had already passed"/>
+<circle class="hit" cx="154.5" cy="200.3" r="9" data-tip="Happened at 13.0 s|received at 17.8 s|4.9 s in transit"/>
+<circle class="hit" cx="162.5" cy="183.0" r="9" data-tip="Happened at 17.5 s|received at 19.4 s|1.9 s in transit"/>
+<circle class="hit" cx="165.6" cy="174.3" r="9" data-tip="Happened at 19.7 s|received at 20.0 s|0.3 s in transit"/>
+<circle class="hit" cx="181.1" cy="237.0" r="9" data-tip="Happened at 3.4 s|received at 23.1 s|19.7 s in transit|late: the watermark had already passed"/>
+<circle class="hit" cx="208.0" cy="158.7" r="9" data-tip="Happened at 23.8 s|received at 28.4 s|4.6 s in transit"/>
+<circle class="hit" cx="211.4" cy="144.4" r="9" data-tip="Happened at 27.5 s|received at 29.0 s|1.5 s in transit"/>
+<circle class="hit" cx="211.7" cy="147.3" r="9" data-tip="Happened at 26.8 s|received at 29.1 s|2.3 s in transit"/>
+<circle class="hit" cx="214.0" cy="144.8" r="9" data-tip="Happened at 27.4 s|received at 29.6 s|2.1 s in transit"/>
+<circle class="hit" cx="222.1" cy="203.2" r="9" data-tip="Happened at 12.2 s|received at 31.2 s|18.9 s in transit|late: the watermark had already passed"/>
+<circle class="hit" cx="225.8" cy="132.7" r="9" data-tip="Happened at 30.6 s|received at 31.9 s|1.3 s in transit"/>
+<circle class="hit" cx="244.3" cy="115.8" r="9" data-tip="Happened at 35.0 s|received at 35.5 s|0.5 s in transit"/>
+<circle class="hit" cx="245.4" cy="114.3" r="9" data-tip="Happened at 35.4 s|received at 35.7 s|0.3 s in transit"/>
+<circle class="hit" cx="249.0" cy="114.8" r="9" data-tip="Happened at 35.3 s|received at 36.5 s|1.2 s in transit"/>
+<circle class="hit" cx="255.0" cy="108.6" r="9" data-tip="Happened at 36.9 s|received at 37.6 s|0.7 s in transit"/>
+<circle class="hit" cx="260.7" cy="103.3" r="9" data-tip="Happened at 38.3 s|received at 38.8 s|0.5 s in transit"/>
+<circle class="hit" cx="260.9" cy="105.5" r="9" data-tip="Happened at 37.7 s|received at 38.8 s|1.1 s in transit"/>
+<circle class="hit" cx="264.6" cy="101.4" r="9" data-tip="Happened at 38.8 s|received at 39.5 s|0.8 s in transit"/>
+<circle class="hit" cx="267.3" cy="105.9" r="9" data-tip="Happened at 37.6 s|received at 40.1 s|2.5 s in transit"/>
+<circle class="hit" cx="277.1" cy="91.5" r="9" data-tip="Happened at 41.3 s|received at 42.0 s|0.6 s in transit"/>
+<circle class="hit" cx="280.7" cy="88.8" r="9" data-tip="Happened at 42.1 s|received at 42.7 s|0.6 s in transit"/>
+<circle class="hit" cx="283.4" cy="92.2" r="9" data-tip="Happened at 41.2 s|received at 43.2 s|2.1 s in transit"/>
+<circle class="hit" cx="291.9" cy="80.5" r="9" data-tip="Happened at 44.2 s|received at 44.9 s|0.7 s in transit"/>
+<circle class="hit" cx="302.7" cy="72.9" r="9" data-tip="Happened at 46.2 s|received at 47.0 s|0.8 s in transit"/>
+<circle class="hit" cx="312.8" cy="70.6" r="9" data-tip="Happened at 46.8 s|received at 49.0 s|2.2 s in transit"/>
+<circle class="hit" cx="322.1" cy="56.8" r="9" data-tip="Happened at 50.4 s|received at 50.9 s|0.5 s in transit"/>
+<circle class="hit" cx="352.1" cy="47.7" r="9" data-tip="Happened at 52.8 s|received at 56.8 s|4.0 s in transit"/>
+<circle class="hit" cx="354.0" cy="36.6" r="9" data-tip="Happened at 55.7 s|received at 57.1 s|1.5 s in transit"/>
+<circle class="hit" cx="354.1" cy="32.0" r="9" data-tip="Happened at 56.9 s|received at 57.2 s|0.3 s in transit"/>
+<circle class="hit" cx="361.4" cy="36.8" r="9" data-tip="Happened at 55.6 s|received at 58.6 s|3.0 s in transit"/>
+<circle class="hit" cx="451.9" cy="28.2" r="9" data-tip="Happened at 57.9 s|received at 76.4 s|18.6 s in transit"/>
+</svg>
+</div>
+<figcaption>A simulated minute of events. Delay is small for most and large for a few, and the system cannot know in advance which are still to come.</figcaption>
+</figure>
+
+<p>Counting by processing time is easy and wrong in a specific way. Events are credited to the moment they were processed, not when they occurred. If a consumer is down for ten minutes and then catches up, ten minutes of events are all counted in one minute, and the chart shows a gap followed by a spike that never happened. Rerunning the job gives different numbers each time.</p>
+<p>Counting by event time gives the true picture, and the same answer whenever the job is run. Its cost is the subject of the next two sections: because events arrive out of order and late, the system can never be certain that it has seen everything for a given period.</p>
+<p>Use event time for anything that describes what users did. Use processing time only for measuring the system itself, such as how many events a consumer handled in the last minute.</p>
+
+<h2 id="windows">Windows</h2>
+<p>An unbounded stream has no total. To compute anything, it is cut into finite pieces called <dfn>windows</dfn>, and results are produced for each.</p>
+
+<figure class="fig wide" id="fig-windows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 286" role="img" aria-labelledby="f383t f383d">
+<title id="f383t">Ten events grouped by tumbling, hopping and session windows</title>
+<desc id="f383d">Ten events occur over three minutes at 5, 12, 20, 48, 70, 75, 130, 138, 150 and 171 seconds. Tumbling one-minute windows contain 4, 2 and 4 events. Hopping windows two minutes long, starting every minute, contain 6 and 6 events, with each event in two windows. Session windows with a gap of 30 seconds form two sessions: one of 6 events from 5 to 75 seconds, and one of 4 events from 130 to 171 seconds.</desc>
+<text class="tb" x="10" y="24">Events</text>
+<line class="axis" x1="110" y1="20" x2="700" y2="20"/>
+<circle class="dot" cx="126.4" cy="20" r="5"/>
+<circle class="dot" cx="149.3" cy="20" r="5"/>
+<circle class="dot" cx="175.6" cy="20" r="5"/>
+<circle class="dot" cx="267.3" cy="20" r="5"/>
+<circle class="dot" cx="339.4" cy="20" r="5"/>
+<circle class="dot" cx="355.8" cy="20" r="5"/>
+<circle class="dot" cx="536.1" cy="20" r="5"/>
+<circle class="dot" cx="562.3" cy="20" r="5"/>
+<circle class="dot" cx="601.7" cy="20" r="5"/>
+<circle class="dot" cx="670.5" cy="20" r="5"/>
+<line class="axis" x1="110" y1="14" x2="110" y2="26"/>
+<text class="ts mid" x="110.0" y="44">0 s</text>
+<line class="axis" x1="306.667" y1="14" x2="306.667" y2="26"/>
+<text class="ts mid" x="306.66666666666663" y="44">60 s</text>
+<line class="axis" x1="503.333" y1="14" x2="503.333" y2="26"/>
+<text class="ts mid" x="503.3333333333333" y="44">120 s</text>
+<line class="axis" x1="700" y1="14" x2="700" y2="26"/>
+<text class="ts mid" x="700.0" y="44">180 s</text>
+<text class="tb" x="10" y="82">Tumbling</text>
+<text class="ts" x="10" y="98">1 minute</text>
+<rect class="n sig" x="112.0" y="66" width="192.7" height="26" rx="4"/>
+<text class="ts mid" x="208.3" y="84">4 events</text>
+<rect class="n sig" x="308.7" y="66" width="192.7" height="26" rx="4"/>
+<text class="ts mid" x="405.0" y="84">2 events</text>
+<rect class="n sig" x="505.3" y="66" width="192.7" height="26" rx="4"/>
+<text class="ts mid" x="601.7" y="84">4 events</text>
+<text class="tb" x="10" y="140">Hopping</text>
+<text class="ts" x="10" y="156">2 min, every 1</text>
+<rect class="n store" x="112.0" y="120" width="389.3" height="26" rx="4"/>
+<text class="ts mid" x="306.7" y="138">6 events</text>
+<rect class="n store" x="308.7" y="150" width="389.3" height="26" rx="4"/>
+<text class="ts mid" x="503.3" y="168">6 events</text>
+<text class="tb" x="10" y="206">Session</text>
+<text class="ts" x="10" y="222">gap of 30 s</text>
+<rect class="n async" x="118.6" y="190" width="245.1" height="26" rx="4"/>
+<text class="ts mid" x="241.1" y="208">6 events: one visit</text>
+<rect class="n async" x="528.3" y="190" width="150.1" height="26" rx="4"/>
+<text class="ts mid" x="603.3" y="208">4 events: another visit</text>
+<text class="ts" x="10" y="256">Tumbling windows do not overlap, so each event is counted once. Hopping windows overlap, so each event is in two of these.</text>
+<text class="ts" x="10" y="272">Session windows have no fixed length: one ends when nothing happens for 30 seconds.</text>
+
+</svg>
+</div>
+<figcaption>The same events under three kinds of window. The kind of window is part of the question being asked.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Window</th><th>Shape</th><th>Answers questions like</th></tr></thead>
+<tbody>
+<tr><th>Tumbling</th><td>Fixed length, end to end, no overlap</td><td>Views in each minute. Revenue in each hour.</td></tr>
+<tr><th>Hopping, or sliding</th><td>Fixed length, starting at regular intervals shorter than the length, so they overlap</td><td>Views in the last hour, refreshed every minute</td></tr>
+<tr><th>Session</th><td>Variable length, closed by a period of inactivity</td><td>How long was each visit? How many photos in one sitting?</td></tr>
+</tbody>
+</table>
+<p>The “trending now” list is a hopping window: the top photos of the last 60 minutes, recomputed every minute. Each event falls into 60 overlapping windows, which is why processors implement it by keeping a count for each minute and adding up the most recent 60, instead of storing each event 60 times.</p>
+
+<h2 id="watermarks">Watermarks and late data</h2>
+<p>A window by event time raises a question with no perfect answer: when is it finished? The window for 10:00 to 10:01 cannot be closed at 10:01:00, because events from that minute are still in transit. Wait ten seconds and most will have arrived. Wait an hour and nearly all will. Wait forever and the result is never published.</p>
+<p>A <dfn>watermark</dfn> is the processor’s running estimate of how far event time has progressed. A watermark of 10:00:52 is the claim “I do not expect to see any more events from before 10:00:52”. When the watermark passes the end of a window, the window is closed and its result is emitted.</p>
+<p>The common way to produce a watermark is the one drawn in <x-fig to="fig-time"></x-fig>: take the newest event time seen so far and subtract an allowance for disorder. The allowance is a dial.</p>
+<ul>
+  <li><b>A small allowance</b> gives fast results and misclassifies more events as late.</li>
+  <li><b>A large allowance</b> captures more events and delays every result by that much.</li>
+</ul>
+<p>Whatever the setting, some events will arrive after their window has closed. These are <dfn>late data</dfn>, and there are three things to do with them.</p>
+<ul>
+  <li><b>Drop them.</b> Acceptable for a trending list. Count how many are dropped.</li>
+  <li><b>Update the result.</b> Keep the window’s state for a further period and emit a corrected result when a late event arrives. Whatever consumes the results must then accept revisions.</li>
+  <li><b>Divert them.</b> Send late events to a separate output, to be folded in by a later batch job.</li>
+</ul>
+<p>The mechanism is compact enough to show whole.</p>
+<pre data-lang="ts" data-title="Counting views per photo in tumbling windows of event time">
+interface ViewEvent { photoId: number; eventTime: number; }      // eventTime: when it happened, in ms
+
+type Emit = (windowStart: number, counts: Map<number, number>) => void;
+
+class TumblingWindowCounter {
+  private open = new Map<number, Map<number, number>>();         // window start -> photo -> count
+  private watermark = -Infinity;
+
+  constructor(private sizeMs: number, private maxDelayMs: number, private emit: Emit) {}
+
+  add(event: ViewEvent): "counted" | "late" {
+    const start = Math.floor(event.eventTime / this.sizeMs) * this.sizeMs;
+    if (start + this.sizeMs <= this.watermark) return "late";    // that window has already been closed
+
+    const counts = this.open.get(start) ?? new Map<number, number>();
+    counts.set(event.photoId, (counts.get(event.photoId) ?? 0) + 1);
+    this.open.set(start, counts);
+
+    this.advance(event.eventTime - this.maxDelayMs);
+    return "counted";
+  }
+
+  // The watermark is a claim: "nothing older than this is still on its way".
+  private advance(candidate: number): void {
+    if (candidate <= this.watermark) return;                     // watermarks never move backward
+    this.watermark = candidate;
+    for (const start of [...this.open.keys()].sort((a, b) => a - b)) {
+      if (start + this.sizeMs > this.watermark) break;
+      this.emit(start, this.open.get(start)!);                   // the window is complete: publish it
+      this.open.delete(start);
+    }
+  }
+}
+</pre>
+<p>With one-minute windows and a ten-second allowance, an event stamped 0:58 that arrives after one stamped 1:01 is still counted in the first minute, because the watermark has only reached 0:51. Once an event stamped 1:12 arrives, the watermark reaches 1:02, the first window is published, and an event stamped 0:55 arriving after that is reported as late.</p>
+<p>Notice that this code never reads a clock. Time advances only as events arrive, which is why a stream job replaying last week’s data produces the same windows as it did live. It also means that if events stop arriving, the watermark stops, and the last windows stay open. Real processors handle idle sources explicitly.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Trusting the device’s clock without limits. Event time comes from phones and browsers, and some have clocks that are wrong by hours or years. One event stamped a year in the future drags a naive watermark forward and makes every later event late. Reject or clamp timestamps that are far from the server’s receive time, and record both times on every event.</p></div>
+
+<h2 id="state">State and recovery</h2>
+<p>A stream job that has been counting for three weeks holds three weeks of accumulated state in the memory and local disks of its workers. When a worker crashes, that state must come back, exactly as it was, or the counts are wrong from then on.</p>
+<p>The standard solution is the <dfn>checkpoint</dfn>. Periodically the processor saves a consistent snapshot of the whole job to durable storage: the offset each input had been read to, and the state of every operator at exactly that point.</p>
+
+<figure class="fig wide" id="fig-checkpoint">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 246" role="img" aria-labelledby="f384t f384d">
+<title id="f384t">A checkpoint capturing the input offset and the state of every operator</title>
+<desc id="f384d">A log at offset 1,042 feeds an operator that counts per photo, which feeds an operator that keeps the top ten per hour, which feeds a sink. Checkpoint 57, held in durable storage, contains offset 1,042 together with both operators' state as of that offset. Checkpoints are taken every few seconds without stopping the job. After a crash, every operator is reset to the checkpoint and the log is read again from offset 1,042.</desc>
+<rect class="n async" x="10" y="40" width="110" height="50" rx="6"/>
+<text class="tb mid" x="65" y="61">Log</text>
+<text class="ts mid" x="65" y="78">offset 1,042</text>
+<rect class="n" x="170" y="40" width="130" height="50" rx="6"/>
+<text class="ts tb mid" x="235" y="61">Count per photo</text>
+<text class="ts mid" x="235" y="78">state: 3 million counts</text>
+<rect class="n" x="350" y="40" width="130" height="50" rx="6"/>
+<text class="ts tb mid" x="415" y="61">Top 10 per hour</text>
+<text class="ts mid" x="415" y="78">state: this hour’s list</text>
+<rect class="n" x="530" y="40" width="180" height="50" rx="6"/>
+<text class="ts tb mid" x="620" y="61">Sink</text>
+<text class="ts mid" x="620" y="78">writes results</text>
+<g data-s="1">
+<path class="e async" d="M120 65H170"/>
+<path class="e" d="M300 65H350"/>
+<path class="e" d="M480 65H530"/>
+</g>
+<g data-s="2">
+<rect class="n store" x="170" y="140" width="310" height="46" rx="6"/>
+<text class="ts tb mid" x="325" y="159">Checkpoint 57, in durable storage</text>
+<text class="ts mid" x="325" y="176">offset 1,042 + both operators’ state at that point</text>
+<path class="e store dash" d="M65 90C65 150 120 163 170 163"/>
+<path class="e store dash" d="M235 90V140"/>
+<path class="e store dash" d="M415 90V140"/>
+<text class="ts" x="500" y="150">Taken every few seconds,</text>
+<text class="ts" x="500" y="166">without stopping the job</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="216">After a crash, every operator is reset to checkpoint 57 and the log is read again from offset 1,042. Each event after that point</text>
+<text class="ts" x="10" y="232">is processed again, but onto state that had not yet counted it, so every event affects the state exactly once.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="events">Events flow from the log through two operators to a sink. Each operator keeps state: three million counts in one, and this hour’s top ten in the other.</li>
+  <li data-msg="state">Every few seconds, without stopping the job, a checkpoint is saved to durable storage: the offset in the log, and both operators’ state exactly as it stood at that offset.</li>
+  <li>After a crash, every operator is reset to the last checkpoint and the log is read again from that offset. Later events are processed a second time, onto state that had not yet counted them, so each event affects the state once.</li>
+</ol>
+<figcaption>A checkpoint ties a position in the input to the state that results from everything before it. Restoring both together is what makes recovery exact.</figcaption>
+</figure>
+
+<p>Recovery resets every operator to the last checkpoint and rewinds the input to the saved offset. Events after that offset are processed a second time, but onto state that does not yet include them. So each event is reflected in the state <dfn>exactly once</dfn>, even though some were processed twice. This depends on the input being replayable, which is one more reason stream processors are fed from logs and not from queues. Flink takes these snapshots without pausing the job, using an algorithm derived from Chandy and Lamport’s work on distributed snapshots.</p>
+<p>That guarantee covers the processor’s internal state. Output is a separate matter. Results emitted after the last checkpoint and before the crash will be emitted again on recovery. To make the effect on the outside world exactly-once as well, the sink must cooperate, in one of two ways (<x-ref to="idempotency-and-delivery#exactly-once-systems"></x-ref>).</p>
+<ul>
+  <li><b>Idempotent writes.</b> Each result is written under a deterministic key, such as photo and window start, so that writing it twice changes nothing.</li>
+  <li><b>Transactional writes.</b> Output is committed atomically with the checkpoint, so that either both happen or neither does. Kafka’s transactions provide this for output to Kafka (<x-ref to="event-streaming#semantics"></x-ref>).</li>
+</ul>
+<p>State also has to be bounded. A count for each photo for each minute, kept forever, will grow without limit. Windows are discarded once they close and their lateness allowance has passed, and other state is given a time to live. Unbounded state is the most common reason a stream job that ran well for a month falls over in the second.</p>
+
+<h2 id="joins">Joining streams</h2>
+<p>Events are often useless alone. A view event carries a photo ID and a user ID, and the report wants the photo’s category and the user’s country. Joins in a stream come in three forms.</p>
+<table>
+<thead><tr><th>Join</th><th>Example</th><th>How it works</th></tr></thead>
+<tbody>
+<tr><th>Stream with table</th><td>Add the viewer’s country to each view</td><td>The processor keeps a local copy of the users table, updated from a change stream (<x-ref to="change-data-capture"></x-ref>), and looks up each event in it</td></tr>
+<tr><th>Stream with stream</th><td>Match each ad impression to a click within ten minutes</td><td>Both sides are buffered for the length of a window, and matches are emitted as they are found</td></tr>
+<tr><th>Table with table</th><td>Keep a joined view of photos and their owners current</td><td>Both tables are kept as state, and the result is updated when either side changes</td></tr>
+</tbody>
+</table>
+<p>The stream-with-table join has a subtlety that matters for correctness. If a user moves from Germany to France, should yesterday’s views, when reprocessed, be attributed to Germany or France? Joining against the table as it is now gives a different answer on each rerun. Joining against the table as it was at the event’s time is repeatable and needs a history of the table to be kept.</p>
+
+<h2 id="architectures">Lambda and kappa</h2>
+<p>For years, stream processors could not be trusted to be correct. They lost state on failure and handled late data poorly. Batch was correct and slow. The <dfn>lambda architecture</dfn>, proposed by Nathan Marz around 2011, ran both.</p>
+
+<figure class="fig wide" id="fig-lambda-kappa">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 238" role="img" aria-labelledby="f385t f385d">
+<title id="f385t">The lambda architecture compared with the kappa architecture</title>
+<desc id="f385d">On the left, in the lambda architecture, events feed a batch layer that recomputes over all history and is correct but hours old, and a speed layer that processes recent events and is approximate but live. A serving layer merges the two. Two codebases must compute the same thing. On the right, in the kappa architecture, a log that keeps history feeds a single stream job. To change the logic, a second version of the job replays the whole log beside the first, and serving switches to it when it has caught up.</desc>
+<text class="tb" x="10" y="18">Lambda: two pipelines, merged when read</text>
+<rect class="n async" x="10" y="84" width="80" height="44" rx="6"/>
+<text class="tb mid" x="50" y="110.5">Events</text>
+<rect class="n" x="130" y="40" width="120" height="50" rx="6"/>
+<text class="ts tb mid" x="190" y="52.5">Batch layer</text>
+<text class="ts mid" x="190" y="69.5">all history</text>
+<text class="ts mid" x="190" y="86.5">correct, hours old</text>
+<rect class="n" x="130" y="122" width="120" height="50" rx="6"/>
+<text class="ts tb mid" x="190" y="134.5">Speed layer</text>
+<text class="ts mid" x="190" y="151.5">recent events</text>
+<text class="ts mid" x="190" y="168.5">approximate, live</text>
+<rect class="n store" x="280" y="84" width="66" height="44" rx="6"/>
+<text class="ts tb mid" x="313" y="102">Serve</text>
+<text class="ts mid" x="313" y="119">merges</text>
+<path class="e async" d="M90 98C110 98 110 65 130 65"/>
+<path class="e async" d="M90 114C110 114 110 147 130 147"/>
+<path class="e" d="M250 65C268 65 262 98 280 98"/>
+<path class="e" d="M250 147C268 147 262 114 280 114"/>
+<text class="ts" x="10" y="200">Two codebases must compute the same</text>
+<text class="ts" x="10" y="216">thing and are kept in agreement by hand.</text>
+<path class="e none dash" d="M360 8V232"/>
+<text class="tb" x="380" y="18">Kappa: one streaming pipeline over a replayable log</text>
+<rect class="n async" x="380" y="84" width="90" height="44" rx="6"/>
+<text class="ts tb mid" x="425" y="102">Log</text>
+<text class="ts mid" x="425" y="119">keeps history</text>
+<rect class="n" x="510" y="50" width="110" height="44" rx="6"/>
+<text class="ts tb mid" x="565" y="76.5">Stream job v1</text>
+<rect class="n ghost" x="510" y="118" width="110" height="44" rx="6"/>
+<text class="ts tb mid" x="565" y="136">Stream job v2</text>
+<text class="ts mid" x="565" y="153">replaying from start</text>
+<rect class="n store" x="650" y="84" width="60" height="44" rx="6"/>
+<text class="ts tb mid" x="680" y="110.5">Serve</text>
+<path class="e async" d="M470 98C490 98 490 72 510 72"/>
+<path class="e async dash" d="M470 114C490 114 490 140 510 140"/>
+<path class="e" d="M620 72C636 72 634 98 650 98"/>
+<path class="e dash" d="M620 140C636 140 634 114 650 114"/>
+<text class="ts" x="380" y="200">To change the logic, run the new version over the</text>
+<text class="ts" x="380" y="216">whole log beside the old one, then switch.</text>
+
+</svg>
+</div>
+<figcaption>Lambda gets correctness and freshness from two systems. Kappa gets both from one, by making the stream replayable.</figcaption>
+</figure>
+
+<p>In lambda, a batch layer periodically recomputes results from all the raw data, a speed layer computes approximate results for the recent period the batch has not reached, and a serving layer combines them. It works, and its cost is plain: the same logic written twice, in two systems, that must agree.</p>
+<p>The <dfn>kappa architecture</dfn>, proposed by Jay Kreps in 2014, observed that if the log keeps history and the stream processor is correct, the batch layer is unnecessary. Recomputation is the same streaming job, started again from the beginning of the log. When the logic changes, the new version is run alongside the old, and reads are switched over once it has caught up.</p>
+<p>Modern practice sits between the two. Stream processors now have exact state and proper handling of event time, so one streaming pipeline is commonly the main path. Long history lives in cheap object storage in table formats that both streaming and batch engines can read, and engines increasingly run the same code in either mode. One piece of lambda survives almost everywhere money or billing is involved: a periodic batch job that recomputes totals from raw data and compares them with what the stream produced. That is <dfn>reconciliation</dfn> (<x-ref to="distributed-transactions#reconciliation"></x-ref>), and <x-ref to="hld-ad-click-aggregation"></x-ref> builds a design around it.</p>
+
+<h2 id="operating">Running stream jobs</h2>
+<ul>
+  <li><b>Lag is the health metric.</b> A job whose consumer lag grows is falling behind and its results are getting staler (<x-ref to="event-streaming#offsets"></x-ref>).</li>
+  <li><b>Backpressure is built in.</b> When a downstream operator is slow, upstream operators slow down and the job reads less from the log. Nothing is dropped. The delay shows up as lag.</li>
+  <li><b>Scaling changes the partitioning of state.</b> Adding workers means moving keyed state between them, which requires stopping at a checkpoint and restarting with a new layout.</li>
+  <li><b>Hot keys limit parallelism.</b> All events for one key go to one worker. If one key is a large share of the traffic, more workers do not help. Split the aggregation into two stages: first by key plus a random suffix, then combine.</li>
+  <li><b>Changing the code of a running job is delicate.</b> New code must be able to read the state the old code saved. Plan state schemas for evolution, as you would events.</li>
+  <li><b>Reprocessing is a normal operation.</b> Bugs are found and logic changes. Keep the raw events long enough to recompute, and design outputs so that a recomputation overwrites instead of duplicating.</li>
+</ul>
+
+<h2 id="choosing">Choosing an approach</h2>
+<table>
+<thead><tr><th>How fresh must the answer be?</th><th>Reasonable choice</th></tr></thead>
+<tbody>
+<tr><th>Tomorrow, or hourly</th><td>A scheduled batch job or SQL query in the warehouse</td></tr>
+<tr><th>A few minutes</th><td>Frequent small batches, or an incrementally refreshed materialized view</td></tr>
+<tr><th>Seconds</th><td>Stream processing</td></tr>
+<tr><th>Immediately, for one user’s own action</th><td>Neither. Compute it in the request, or update a counter in the write path.</td></tr>
+</tbody>
+</table>
+<p>Start with the simplest thing that meets the requirement. A SQL query on a schedule answers most questions, can be written in an afternoon and can be rerun at will. A stream job is a service that runs forever, holds state and needs operating. Reach for it when the product needs results within seconds, or when the reaction itself must be continuous, as with fraud checks, alerting and live dashboards.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> If you propose a streaming aggregation, three follow-ups are predictable. Which time? “Event time, with watermarks.” What about late events? “An allowance of a few minutes, then they go to a side output that a nightly batch reconciles.” What if the job crashes? “It restarts from a checkpoint and replays the log from the saved offset, and the sink writes are idempotent on key and window.” Having those three answers ready covers most of the depth interviewers look for here.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Building a stream job where a scheduled query would do</th><td>A permanent service to operate, for no benefit to users</td><td>Ask how fresh the result needs to be, first</td></tr>
+<tr><th>Windowing by processing time</th><td>Gaps and spikes after any delay, and different results on every rerun</td><td>Event time with watermarks</td></tr>
+<tr><th>Ignoring late data</th><td>Counts that are quietly too low</td><td>Decide: drop and measure, revise, or divert</td></tr>
+<tr><th>Trusting client timestamps without bounds</th><td>One bad clock corrupts the watermark</td><td>Validate against receive time</td></tr>
+<tr><th>State that grows forever</th><td>The job slows and finally fails, weeks in</td><td>Expire windows and give other state a time to live</td></tr>
+<tr><th>Sinks that are not idempotent</th><td>Duplicated output after every recovery</td><td>Deterministic keys, or transactional output</td></tr>
+<tr><th>Batch output appended instead of replaced</th><td>A rerun doubles the numbers</td><td>Overwrite a partition atomically</td></tr>
+<tr><th>Not keeping raw events</th><td>A bug in the logic cannot be corrected for the past</td><td>Retain the input long enough to reprocess</td></tr>
+<tr><th>Two implementations of the same logic</th><td>Batch and stream numbers that disagree</td><td>One codebase where possible, and reconciliation where not</td></tr>
+<tr><th>Ignoring skew</th><td>One task or worker holds up everything</td><td>Find the hot keys and split their work</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="event-streaming"></x-ref>: the replayable log that stream processing depends on.</li>
+  <li><x-ref to="change-data-capture"></x-ref>: tables as streams, and the pipelines that feed analytics.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: what exactly-once does and does not cover.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: why clocks on different machines cannot be trusted to agree.</li>
+  <li><x-ref to="probabilistic-structures"></x-ref>: mergeable sketches for counts and percentiles over streams.</li>
+  <li><x-ref to="specialized-databases"></x-ref>: time-series stores for the results.</li>
+  <li><x-ref to="scheduling-and-workflows"></x-ref>: running batch jobs on a schedule and in order.</li>
+  <li><x-ref to="hld-ad-click-aggregation"></x-ref>: a streaming aggregation designed end to end.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Batch processes a complete dataset and is simple, repeatable and hours behind. Streaming processes events as they arrive and is seconds behind, at the cost of state and continuous operation.</li>
+  <li>Batch systems scale by splitting work into independent, deterministic tasks that can be rerun. The shuffle is the expensive step.</li>
+  <li>Event time is when something happened. Processing time is when the system saw it. Use event time for anything about user behavior.</li>
+  <li>Windows cut an endless stream into finite pieces: tumbling, hopping or session.</li>
+  <li>A watermark estimates how far event time has progressed and decides when a window closes. It trades completeness against delay, and some data will always be late.</li>
+  <li>Checkpoints save input offsets together with operator state. Recovery replays from the checkpoint, giving exactly-once state.</li>
+  <li>Exactly-once output needs idempotent or transactional sinks.</li>
+  <li>Prefer one pipeline over two. Keep raw data, and reconcile important totals with a batch job.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A stream consumer is down for 15 minutes and then catches up. A per-minute chart built on processing time shows a gap and then a tall spike. What would the same chart show with event time, and why?</summary><p>A normal, even line. With event time each event is assigned to the minute in which it happened, however late it was processed, so the 15 minutes of events fill in their own minutes. With processing time they are all credited to the minute in which the consumer caught up.</p></details>
+<details><summary>What does a watermark of 10:05:00 mean, and what happens to an event stamped 10:03:40 that arrives after it?</summary><p>It is the processor’s assertion that it expects no more events with a time before 10:05:00. Windows that end at or before that time are closed and their results emitted. The event stamped 10:03:40 is late: its window has closed. Depending on policy it is dropped, used to emit a corrected result, or sent to a side output.</p></details>
+<details><summary>You need “the top photos of the last 24 hours, updated every 5 minutes”. Which kind of window is that, and how many windows does each event belong to?</summary><p>A hopping window, 24 hours long, advancing every 5 minutes. Each event belongs to 288 windows, since 24 hours contains 288 five-minute steps. Implementations avoid storing it 288 times by keeping a count for each 5-minute slice and summing the most recent 288 slices.</p></details>
+<details><summary>A stream job crashes and restarts from a checkpoint taken 30 seconds earlier. Why are its internal counts still correct, and why might its output contain duplicates?</summary><p>The checkpoint holds the input offset and the operator state from the same instant. On restart the state is restored and the input replayed from that offset, so the events of the last 30 seconds are applied once to state that did not yet include them. Any results emitted during those 30 seconds were already sent, and are sent again. The sink must be idempotent or transactional to hide that.</p></details>
+<details><summary>Why can a map task in a batch job be safely rerun on another machine after a failure?</summary><p>It reads a fixed chunk of input, performs a deterministic computation and writes its output to files, with no other side effects. Running it again produces the same output, which replaces whatever the failed attempt left. That property is what lets batch frameworks treat machine failure as routine.</p></details>
+<details><summary>What does the kappa architecture remove from the lambda architecture, and what does it need in order to do so?</summary><p>It removes the separate batch layer and the need to implement the logic twice. It needs a log that retains enough history to recompute from, and a stream processor that produces correct results, with exact state and event-time handling. Recomputing is done by replaying the log through a new instance of the streaming job.</p></details>
+<details><summary>The team wants a daily revenue report and proposes a Flink job. What do you ask?</summary><p>How fresh the report needs to be. If it is read once a day, a scheduled SQL query in the warehouse is simpler, cheaper, trivially rerunnable and easier to verify. A stream job is justified only if someone needs the figure within seconds or minutes, or if the same pipeline also drives something continuous.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Jeffrey Dean and Sanjay Ghemawat, <a href="https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/">MapReduce: Simplified Data Processing on Large Clusters</a>, OSDI 2004.</li>
+  <li>Tyler Akidau and others, <a href="https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf">The Dataflow Model: A Practical Approach to Balancing Correctness, Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data Processing</a>, VLDB 2015. Event time, windows, watermarks and triggers.</li>
+  <li>Tyler Akidau, <a href="https://cloud.google.com/blog/products/data-analytics/streaming-101-the-world-beyond-batch">Streaming 101: The world beyond batch</a>, 2015, republished by Google Cloud. The most readable introduction to event time and windowing.</li>
+  <li>Jay Kreps, <a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/">Questioning the Lambda Architecture</a>, O’Reilly, 2014. The proposal later named kappa.</li>
+  <li>Paris Carbone and others, <a href="https://arxiv.org/abs/1506.08603">Lightweight Asynchronous Snapshots for Distributed Dataflows</a>, 2015. The checkpoint algorithm used by Flink.</li>
+  <li>Apache Flink, <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/">Stateful Stream Processing</a> and <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/">Timely Stream Processing</a>.</li>
+  <li>Matei Zaharia and others, <a href="https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/zaharia">Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing</a>, NSDI 2012. The paper behind Spark.</li>
+  <li>Apache Spark, <a href="https://spark.apache.org/releases/spark-release-4.1.0.html">Spark Release 4.1.0</a>. The real-time mode for Structured Streaming.</li>
+</ol>
+</section>

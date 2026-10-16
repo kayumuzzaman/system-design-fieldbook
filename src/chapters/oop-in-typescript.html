@@ -1,0 +1,717 @@
+<!--meta
+{ "description": "Object-oriented design in TypeScript for low-level design: classes and objects, invariants and encapsulation, private fields, interfaces and structural typing, polymorphism and discriminated unions, inheritance and the fragile base class problem, composition over inheritance, coupling and cohesion, with tested code that runs on Node.js without a build step.",
+  "lede": "The first eight parts of this book drew systems as boxes: a service, a queue, a database. From here on the subject is the inside of one box. Low-level design is the work of deciding which objects exist in a program, what each one knows, what each one can do, and which of the others it is allowed to talk to. This chapter introduces the four ideas that every later chapter in this part relies on, in the TypeScript that the rest of the book uses.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">Inside one box</h2>
+<p>The photo app’s high-level design has a box labeled “photos service”. Someone has to write it. The first version will be a few hundred lines and will work. Two years later it is forty thousand lines, six people change it every week, and the question that decides whether they can do so safely is one the box never showed: how is the code inside it divided up?</p>
+<p>Object-oriented design is one answer to that question, and the most common one. It divides a program into objects. An object is a small bundle of data together with the functions that are allowed to work on that data. A <dfn>class</dfn> is the description from which objects of one kind are made: it names the data each object holds and the operations each object offers. <code>Album</code> is a class. The album called “Lisbon” that Ana created on Tuesday is an object.</p>
+<p>Four ideas do nearly all the work, and this chapter takes them in turn.</p>
+<table>
+<thead><tr><th>Idea</th><th>In one sentence</th><th>What it buys</th></tr></thead>
+<tbody>
+<tr><th>Encapsulation</th><td>An object’s data can be changed only through its own operations</td><td>Rules about the data are enforced in one place</td></tr>
+<tr><th>Abstraction</th><td>Callers depend on what something does, not on how</td><td>The “how” can change without the callers changing</td></tr>
+<tr><th>Polymorphism</th><td>One call does different things for different kinds of object</td><td>New kinds can be added without editing the callers</td></tr>
+<tr><th>Composition</th><td>Objects are built by combining other objects</td><td>Behavior can be mixed and reused without deep class hierarchies</td></tr>
+</tbody>
+</table>
+<p>TypeScript does not force this style. A great deal of good TypeScript is plain data and functions, and this chapter says where that is the better choice. Classes earn their place when there is state with rules attached to it.</p>
+
+<h2 id="typescript">The TypeScript in this part</h2>
+<p>All the code from here to the end of Part X follows one convention, so that every example can be run exactly as printed.</p>
+<ul>
+  <li><b>It runs on Node.js with no build step.</b> Current versions of Node.js run a <code>.ts</code> file directly by deleting the type annotations and running what is left. Node.js does not check the types when it does this. Checking is a separate step, done by the TypeScript compiler or by your editor.</li>
+  <li><b>It is checked in strict mode</b>, which has been the compiler’s default since TypeScript 6.0 in March 2026.</li>
+  <li><b>It uses only syntax that can be deleted.</b> Two older TypeScript features generate code instead of merely describing it, and Node.js refuses both: <code>enum</code>, and the constructor shorthand <code>constructor(private limit: number)</code>. This part uses unions of string literals in place of enums, and declares fields in full.</li>
+</ul>
+<p>The listings are excerpts of complete files. Those files, and the tests that produced every result these chapters quote, are in the <code>code</code> folder of the book’s source. Its <code>README</code> gives the two commands that check and run all of them.</p>
+<p>Some examples in earlier parts use the constructor shorthand because it is shorter. They are correct TypeScript, and they need a tool such as <code>tsx</code> or a compile step to run.</p>
+<aside class="sn"><b>The compiler was rewritten</b>TypeScript 7.0, released in the summer of 2026, is the same language with a compiler ported from JavaScript to Go. Reported full builds are typically eight to twelve times faster. Nothing in this book depends on which of the two you use.</aside>
+
+<h2 id="encapsulation">Encapsulation</h2>
+<p>An album in the photo app has two rules. It holds at most a thousand photos. And if it has any photos, exactly one of them is its cover. A rule like this, which must be true whenever anyone looks, is called an <dfn>invariant</dfn>.</p>
+<p>Here is an album as a plain record with open fields, followed by one that protects its invariants.</p>
+<pre data-lang="ts" data-title="An album with open fields, and one that keeps its own rules">
+export type Photo = { readonly id: string; readonly bytes: number };
+
+// Before: every field is open. Any caller can leave the album in a state that makes no sense.
+export class OpenAlbum {
+  photos: Photo[] = [];
+  coverId: string | null = null;
+}
+
+// After: the fields are private, and every change goes through a method that keeps the rules.
+export class Album {
+  private readonly photos = new Map<string, Photo>();
+  private coverId: string | null = null;
+  readonly limit: number;
+
+  constructor(limit = 1000) {
+    this.limit = limit;
+  }
+
+  add(photo: Photo): void {
+    if (this.photos.size >= this.limit) throw new Error(`an album holds at most ${this.limit} photos`);
+    this.photos.set(photo.id, photo);
+    this.coverId ??= photo.id; // rule: an album with photos always has a cover
+  }
+
+  remove(id: string): void {
+    if (!this.photos.delete(id)) return;
+    if (this.coverId === id) this.coverId = this.photos.keys().next().value ?? null; // rule: the cover is one of the photos
+  }
+
+  setCover(id: string): void {
+    if (!this.photos.has(id)) throw new Error("the cover must be a photo in the album");
+    this.coverId = id;
+  }
+
+  get cover(): Photo | null {
+    return this.coverId === null ? null : this.photos.get(this.coverId) ?? null;
+  }
+
+  get size(): number {
+    return this.photos.size;
+  }
+
+  list(): readonly Photo[] {
+    return [...this.photos.values()]; // a copy: callers get the photos, not the album's own collection
+  }
+}
+</pre>
+<p>The first class cannot keep its rules, because it has no say in what happens to its fields. In a test, a caller emptied the list of photos with one assignment and the cover went on pointing at a photo that no longer existed. Nothing failed at that moment.</p>
+
+<figure class="fig wide" id="fig-encapsulation">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 352" role="img" aria-labelledby="f561t f561d">
+<title id="f561t">An album with open fields and an album that guards its rule</title>
+<desc id="f561d">Two sequences between calling code and an album. In the first, the album’s fields are public. One caller adds a photo and makes it the cover. Another empties the list of photos directly, and the cover now refers to a photo that is gone. The damage is found much later, somewhere else. In the second, the fields are private. Removing the photo through the album’s method also clears the cover, and an attempt to set a cover that is not in the album is refused at once.</desc>
+<text class="tb" x="10" y="16">Open fields: anyone can write anything</text>
+<g data-scene="open">
+<text class="tb mid" x="150" y="36">Calling code</text>
+<line class="axis" x1="150" y1="44" x2="150" y2="142"/>
+<text class="tb mid" x="560" y="36">The album</text>
+<line class="axis" x1="560" y1="44" x2="560" y2="142"/>
+<g data-s="1">
+<path class="e sig" d="M151 72H559"/>
+<text class="ts mid" x="355.0" y="66">1. photos.push(p1);  coverId = "p1"</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M151 100H559"/>
+<text class="ts mid" x="355.0" y="94">2. photos.length = 0</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n fault" x="158" y="114" width="201" height="22" rx="4"/>
+<text class="ts mid" x="258.5" y="129">3. later: the cover is missing</text>
+</g>
+</g>
+<path class="e none dash" d="M10 158H710"/>
+<text class="tb" x="10" y="178">Private fields: every change goes through a method</text>
+<g data-scene="guarded">
+<text class="tb mid" x="150" y="198">Calling code</text>
+<line class="axis" x1="150" y1="206" x2="150" y2="332"/>
+<text class="tb mid" x="560" y="198">The album</text>
+<line class="axis" x1="560" y1="206" x2="560" y2="332"/>
+<g data-s="1">
+<path class="e sig" d="M151 234H559"/>
+<text class="ts mid" x="355.0" y="228">1. add(p1)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M151 262H559"/>
+<text class="ts mid" x="355.0" y="256">2. remove("p1")</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M151 290H559"/>
+<text class="ts mid" x="355.0" y="284">3. setCover("p9")</text>
+</g>
+<g data-s="4">
+<path class="e" d="M559 318H151"/>
+<text class="ts mid" x="355.0" y="312">4. Error: the cover must be a photo in the album</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="open" data-label="Open fields">
+  <li data-msg="write two fields" data-state="Photos: p1; Cover: p1; Rule “the cover is one of the photos”: holds">One part of the program adds a photo and makes it the cover by writing to the album’s fields.</li>
+  <li data-msg="write one field" data-state="Photos: none; Cover: p1; Rule “the cover is one of the photos”: broken">Another part empties the list directly. Nothing in the album runs, so nothing notices that the cover was one of those photos.</li>
+  <li data-msg="none">Much later, the code that draws the cover finds nothing. The error appears far from the line that caused it, which is what makes such bugs slow to find.</li>
+</ol>
+<ol class="steps" data-scene="guarded" data-label="Private fields">
+  <li data-state="Photos: p1; Cover: p1; Rule “the cover is one of the photos”: holds">The caller asks the album to add a photo. The album stores it and, because it had no cover, makes this one the cover.</li>
+  <li data-state="Photos: none; Cover: none; Rule “the cover is one of the photos”: holds">The caller asks the album to remove it. The same method that deletes the photo sees that it was the cover and clears that too.</li>
+  <li data-state="Photos: none; Cover: none; Rule “the cover is one of the photos”: holds">A caller tries to set a cover that is not in the album.</li>
+  <li data-msg="Error" data-state="Photos: none; Cover: none; Rule “the cover is one of the photos”: holds">The album refuses. The mistake is reported at the line that made it, and the album’s state has not changed.</li>
+</ol>
+<figcaption>Encapsulation is not about hiding data for its own sake. It puts the rule and the data in one place, so that the rule can be checked every time the data changes.</figcaption>
+</figure>
+
+<p><dfn>Encapsulation</dfn> is the practice of keeping an object’s data private and allowing changes only through operations that the object itself defines, so that the object can guarantee its own invariants. Four habits in the second class are worth copying.</p>
+<ul>
+  <li><b>Fields are private by default.</b> Make something public only when a caller needs it, and then prefer a method or a read-only getter to the field itself.</li>
+  <li><b>Every method leaves the object valid.</b> <code>remove</code> does two things because the rule connects two fields. A caller cannot do one and forget the other.</li>
+  <li><b>Bad requests fail immediately.</b> <code>setCover</code> throws at the line that made the mistake, not three screens later.</li>
+  <li><b>What goes out is a copy or a read-only view.</b> <code>list</code> returns a new array. Handing out the internal collection would give every caller a back door.</li>
+</ul>
+<h3 id="private">Two kinds of private</h3>
+<p>TypeScript offers two ways to hide a field, and they differ in when the hiding is enforced.</p>
+<table>
+<thead><tr><th></th><th><code>private secret</code></th><th><code>#hidden</code></th></tr></thead>
+<tbody>
+<tr><th>Enforced by</th><td>The type checker, before the program runs</td><td>The JavaScript engine, while it runs</td></tr>
+<tr><th>At run time</th><td>An ordinary property. In a test it appeared in <code>Object.keys</code> and in <code>JSON.stringify</code>, and could be read by code that sidestepped the types</td><td>Unreachable from outside the class. It appeared in neither</td></tr>
+<tr><th>Use it when</th><td>The goal is a clear design, which is nearly always. This book uses it</td><td>The value must not leak even to code that ignores the types, such as a secret key</td></tr>
+</tbody>
+</table>
+<p>Add <code>readonly</code> to any field that is set once in the constructor and never again. A field that cannot change is a field nobody has to reason about.</p>
+
+<h2 id="abstraction">Abstraction and interfaces</h2>
+<p>The photos service has to keep image files somewhere. On a developer’s laptop that is a folder. In tests it is memory. In production it is object storage (<x-ref to="object-and-file-storage"></x-ref>). The code that handles an upload should not care which.</p>
+<p>An <dfn>interface</dfn> in TypeScript is a named description of what an object can do: its methods, their parameters and what they return, with no code. <dfn>Abstraction</dfn> is designing so that callers depend on such a description and not on any particular class that fulfills it.</p>
+<pre data-lang="ts" data-title="An interface, one implementation, and a class that depends only on the interface">
+// What any place that keeps photo files must be able to do. Nothing here says how.
+export interface PhotoStore {
+  save(id: string, bytes: Uint8Array): Promise<void>;
+  load(id: string): Promise<Uint8Array | null>;
+  delete(id: string): Promise<void>;
+}
+
+export class MemoryStore implements PhotoStore {
+  private readonly files = new Map<string, Uint8Array>();
+
+  async save(id: string, bytes: Uint8Array): Promise<void> {
+    this.files.set(id, bytes);
+  }
+  async load(id: string): Promise<Uint8Array | null> {
+    return this.files.get(id) ?? null;
+  }
+  async delete(id: string): Promise<void> {
+    this.files.delete(id);
+  }
+}
+
+// The library is written against the interface. It cannot tell which store it was given.
+export class Library {
+  private readonly store: PhotoStore;
+  private readonly maxBytes: number;
+
+  constructor(store: PhotoStore, maxBytes = 20_000_000) {
+    this.store = store;
+    this.maxBytes = maxBytes;
+  }
+
+  async upload(id: string, bytes: Uint8Array): Promise<void> {
+    if (bytes.length === 0) throw new Error("the file is empty");
+    if (bytes.length > this.maxBytes) throw new Error("the file is too large");
+    await this.store.save(id, bytes);
+  }
+
+  async download(id: string): Promise<Uint8Array> {
+    const bytes = await this.store.load(id);
+    if (bytes === null) throw new Error(`no photo ${id}`);
+    return bytes;
+  }
+}
+</pre>
+<p><code>Library</code> was tested against three stores: the one above, a <code>DiskStore</code> that writes files into a folder, and a bare object with three functions. It behaved identically with each, and it could not have told them apart. That is the point. The decision “where do files live?” has been moved out of the code that uses files and into the one line that constructs the library.</p>
+<p>The third store shows something particular to TypeScript. In Java or C#, a class is a <code>PhotoStore</code> only if it says <code>implements PhotoStore</code>. TypeScript uses <dfn>structural typing</dfn>: a value has a type if it has the right shape, whatever it is called and wherever it came from. The word <code>implements</code> is optional. Write it anyway on classes, because it makes the compiler report a missing method at the class, where the mistake is, and not at some distant call.</p>
+<table>
+<thead><tr><th>Tool</th><th>What it is</th><th>Reach for it when</th></tr></thead>
+<tbody>
+<tr><th><code>interface</code></th><td>A shape with no code. A class may implement several</td><td>You are describing what a collaborator must be able to do</td></tr>
+<tr><th><code>type</code></th><td>A name for any type, including unions such as <code>"email" | "push"</code></td><td>You are describing data, or one of several alternatives</td></tr>
+<tr><th><code>abstract class</code></th><td>A class with some methods left unwritten. A class may extend only one</td><td>Several implementations share real code as well as a shape</td></tr>
+</tbody>
+</table>
+<p>Keep interfaces small and name them for the role they play to the caller. <code>PhotoStore</code> has three methods because <code>Library</code> needs three. An interface that lists everything a storage product can do is a description of the product, not of what this code needs from it.</p>
+
+<h2 id="polymorphism">Polymorphism</h2>
+<p>When Chi shares an album, the people she shares it with are told, by email and by a push message to their phones. The obvious first version is a function that checks which channel it was asked for.</p>
+<pre data-lang="ts" data-title="Notifications: one function that knows every channel, then one class for each">
+export type User = { name: string; email: string; deviceToken?: string };
+type Sent = (line: string) => void; // stands in for a mail server or a push service
+
+// Before: one function that knows every channel. Each new channel means editing it again.
+export function notifyBefore(channel: "email" | "push", to: User, text: string, sent: Sent): void {
+  if (channel === "email") {
+    sent(`email to ${to.email}: ${text}`);
+  } else if (channel === "push") {
+    if (to.deviceToken) sent(`push to ${to.deviceToken}: ${text.slice(0, 40)}`);
+  }
+}
+
+// After: one interface, one class for each channel.
+export interface Notifier {
+  send(to: User, text: string): void;
+}
+
+export class EmailNotifier implements Notifier {
+  private readonly sent: Sent;
+  constructor(sent: Sent) {
+    this.sent = sent;
+  }
+  send(to: User, text: string): void {
+    this.sent(`email to ${to.email}: ${text}`);
+  }
+}
+
+export class PushNotifier implements Notifier {
+  private readonly sent: Sent;
+  constructor(sent: Sent) {
+    this.sent = sent;
+  }
+  send(to: User, text: string): void {
+    if (to.deviceToken) this.sent(`push to ${to.deviceToken}: ${text.slice(0, 40)}`); // a push message is short
+  }
+}
+
+// The caller holds a list of notifiers and treats them all alike.
+export class NotificationCenter {
+  private readonly channels: Notifier[];
+  constructor(channels: Notifier[]) {
+    this.channels = channels;
+  }
+  announce(to: User, text: string): void {
+    for (const channel of this.channels) channel.send(to, text); // which send runs is decided here, at run time
+  }
+}
+</pre>
+<p><dfn>Polymorphism</dfn> is the ability of one call, written once, to run different code depending on the kind of object it is made on. <code>NotificationCenter</code> contains a single call to <code>send</code>. Which <code>send</code> runs is decided by the object, while the program is running.</p>
+
+<figure class="fig wide" id="fig-dispatch">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f562t f562d">
+<title id="f562t">One line of calling code, a different method each time</title>
+<desc id="f562d">On the left, the notification center holds a list of notifiers and runs the line channel.send for each. In the middle is the Notifier interface, which is all the center knows about. On the right are the classes that implement it: EmailNotifier and PushNotifier, and an SmsNotifier added later. The same call reaches a different send method depending on which object is in the list.</desc>
+<rect class="n" x="10" y="70" width="210" height="80" rx="4"/>
+<text class="tb mid" x="115" y="89">NotificationCenter</text>
+<line class="sep" x1="10" y1="98" x2="220" y2="98"/>
+<text class="ts" x="18" y="114">− channels: Notifier[]</text>
+<line class="sep" x1="10" y1="124" x2="220" y2="124"/>
+<text class="ts" x="18" y="140">+ announce(to, text)</text>
+<text class="ts mono" x="10" y="168">for (const channel of this.channels)</text>
+<text class="ts mono" x="32" y="184">channel.send(to, text);</text>
+<rect class="n sig" x="300" y="84" width="140" height="68" rx="4"/>
+<text class="ts mid" x="370" y="100">«interface»</text>
+<text class="tb mid" x="370" y="117">Notifier</text>
+<line class="sep sig" x1="300" y1="126" x2="440" y2="126"/>
+<text class="ts" x="308" y="142">+ send(to, text)</text>
+<rect class="n" x="530" y="14" width="180" height="54" rx="4"/>
+<text class="tb mid" x="620" y="33">EmailNotifier</text>
+<line class="sep" x1="530" y1="42" x2="710" y2="42"/>
+<text class="ts" x="538" y="58">+ send(to, text)</text>
+<rect class="n" x="530" y="94" width="180" height="54" rx="4"/>
+<text class="tb mid" x="620" y="113">PushNotifier</text>
+<line class="sep" x1="530" y1="122" x2="710" y2="122"/>
+<text class="ts" x="538" y="138">+ send(to, text)</text>
+<g data-s="1">
+<path class="e sig" d="M221 118H298"/>
+</g>
+<g data-s="2">
+<path class="e store" d="M441 110C480 110 490 41 528 41"/>
+</g>
+<g data-s="3">
+<path class="e store" d="M441 126C480 126 490 121 528 121"/>
+</g>
+<g class="hide" data-s="4">
+<rect class="n async" x="530" y="174" width="180" height="54" rx="4"/>
+<text class="tb mid" x="620" y="193">SmsNotifier</text>
+<line class="sep async" x1="530" y1="202" x2="710" y2="202"/>
+<text class="ts" x="538" y="218">+ send(to, text)</text>
+<path class="e async" d="M441 146C480 146 490 201 528 201"/>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="channel.send(to, text)" data-state="The center’s code mentions: Notifier; The send that ran: none yet">The center reaches the line that calls send on a channel. The only type that line names is the interface.</li>
+  <li data-msg="send" data-state="The center’s code mentions: Notifier; The send that ran: EmailNotifier.send">The first object in the list was created as an EmailNotifier, so its send runs. The choice is made by the object, at run time.</li>
+  <li data-msg="send" data-state="The center’s code mentions: Notifier; The send that ran: PushNotifier.send">The loop comes round to the same line. The second object is a PushNotifier, so this time a different method runs.</li>
+  <li data-msg="send" data-state="The center’s code mentions: Notifier, still; The send that ran: SmsNotifier.send">Months later a text-message channel is added: one new class, and one more object in the list. The center’s code is not opened.</li>
+</ol>
+<figcaption>Polymorphism moves the decision “which kind is this?” out of the caller and into the objects. The caller stops needing a list of every kind.</figcaption>
+</figure>
+
+<p>The two versions produced the same three messages in a test, so nothing was gained in behavior. What changed is where a new channel has to be written. In the first version, adding text messages means opening a function that already works and adding a branch, and doing the same in every other function that switches on the channel. In the second it means adding a class.</p>
+
+<h3 id="unions">The other tool: a union of plain data</h3>
+<p>Classes are not the only way to model “one of several kinds”. TypeScript has a second, which is often better for data that only needs to be read.</p>
+<pre data-lang="ts" data-title="A discriminated union and a function that handles every case">
+// The other way to model "one of several kinds": a union of plain data, and functions that switch on it.
+export type AlbumEvent =
+  | { kind: "shared"; album: string; by: string }
+  | { kind: "comment"; photo: string; by: string; text: string }
+  | { kind: "removed"; album: string; by: string };
+
+export function describe(event: AlbumEvent): string {
+  switch (event.kind) {
+    case "shared":
+      return `${event.by} shared the album ${event.album} with you`;
+    case "comment":
+      return `${event.by} commented: ${event.text}`;
+    case "removed":
+      return `${event.by} removed you from ${event.album}`;
+    default: {
+      const missed: never = event; // a compile error here means a kind was added and not handled
+      throw new Error(`unhandled event: ${JSON.stringify(missed)}`);
+    }
+  }
+}
+</pre>
+<p>A <dfn>discriminated union</dfn> is a type made of several object shapes that share one field, here <code>kind</code>, whose value says which shape this is. Inside each <code>case</code> the compiler knows exactly which fields exist. The <code>never</code> line makes the compiler reject the program if a fourth kind is added to the type and this function is not updated.</p>
+<p>The two tools are mirror images, and choosing between them is a real design decision.</p>
+<table>
+<thead><tr><th></th><th>Classes behind an interface</th><th>A union and functions</th></tr></thead>
+<tbody>
+<tr><th>Adding a new kind</th><td>Easy: one new class, nothing else is touched</td><td>Every function that switches on the kind must be updated, and the compiler lists them</td></tr>
+<tr><th>Adding a new operation</th><td>Every class must gain a method</td><td>Easy: one new function</td></tr>
+<tr><th>Fits</th><td>Things that <em>do</em> something and may hold state or resources: stores, notifiers, payment providers</td><td>Things that <em>are</em> something: events, messages, results, the nodes of a tree</td></tr>
+</tbody>
+</table>
+
+<h2 id="inheritance">Inheritance</h2>
+<p><dfn>Inheritance</dfn> lets one class be defined as an extension of another: the new class, the subclass, starts with all the fields and methods of the existing one, the base class, and may add to them or replace some. In TypeScript the keyword is <code>extends</code>, a replaced method is marked <code>override</code>, and the base class’s version is reached through <code>super</code>.</p>
+<p>It looks like the natural way to reuse code. It is also the feature of object-oriented languages that causes the most trouble, and one small example shows why. A <code>Bag</code> collects items. The task is to make a bag that also counts how many items were ever added to it.</p>
+<pre data-lang="ts" data-title="A bag, a counting bag by inheritance, and one by composition">
+export class Bag<T> {
+  protected readonly items: T[] = [];
+
+  add(item: T): void {
+    this.items.push(item);
+  }
+  addAll(items: T[]): void {
+    for (const item of items) this.add(item); // a detail of how Bag works: addAll is built on add
+  }
+  get size(): number {
+    return this.items.length;
+  }
+}
+
+// By inheritance: a bag that also counts every item ever added.
+export class CountingBag<T> extends Bag<T> {
+  added = 0;
+
+  override add(item: T): void {
+    this.added += 1;
+    super.add(item);
+  }
+  override addAll(items: T[]): void {
+    this.added += items.length;
+    super.addAll(items); // which calls this.add for each item, so each is counted a second time
+  }
+}
+
+// By composition: an object that has a bag, and forwards to it.
+export class CountedBag<T> {
+  added = 0;
+  private readonly bag = new Bag<T>();
+
+  add(item: T): void {
+    this.added += 1;
+    this.bag.add(item);
+  }
+  addAll(items: T[]): void {
+    this.added += items.length;
+    this.bag.addAll(items); // whatever the bag does inside stays inside
+  }
+  get size(): number {
+    return this.bag.size;
+  }
+}
+</pre>
+<p>Both counting classes look correct. After <code>addAll(["a", "b", "c"])</code>, the inherited one reported six items added to a bag that held three. The composed one reported three.</p>
+
+<figure class="fig wide" id="fig-fragile">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 206" role="img" aria-labelledby="f563t f563d">
+<title id="f563t">A subclass counting each added item twice</title>
+<desc id="f563d">A sequence between a caller, a CountingBag and the Bag class it extends. The caller adds three items with addAll. CountingBag adds three to its counter and calls the base class’s addAll. The base class implements addAll by calling this.add for each item, and because the object is a CountingBag, each of those calls runs the subclass’s add, which counts the item again. The counter ends at six for a bag of three items.</desc>
+<text class="tb mid" x="90" y="20">Caller</text>
+<line class="axis" x1="90" y1="28" x2="90" y2="178"/>
+<text class="tb mid" x="350" y="20">CountingBag: the subclass</text>
+<line class="axis" x1="350" y1="28" x2="350" y2="178"/>
+<text class="tb mid" x="610" y="20">Bag: the base class</text>
+<line class="axis" x1="610" y1="28" x2="610" y2="178"/>
+<g data-s="1">
+<path class="e sig" d="M91 54H349"/>
+<text class="ts mid" x="220.0" y="48">1. addAll([a, b, c])</text>
+</g>
+<g data-s="2">
+<path class="e" d="M351 82H609"/>
+<text class="ts mid" x="480.0" y="76">2. super.addAll([a, b, c])</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M609 110H351"/>
+<text class="ts mid" x="480.0" y="104">3. this.add(item), three times</text>
+</g>
+<g data-s="4">
+<path class="e" d="M351 138H609"/>
+<text class="ts mid" x="480.0" y="132">4. super.add(item), three times</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="a, b, c" data-state="added: 3; Items in the bag: 0">The caller adds three items in one call. The subclass’s addAll runs first and adds three to its counter.</li>
+  <li>It then hands the work to the base class, as an override should.</li>
+  <li data-msg="add, add, add" data-state="added: 6; Items in the bag: 0">The base class builds addAll out of add. But “this” is a CountingBag, so each call lands in the subclass’s add, which counts the item a second time.</li>
+  <li data-msg="a, b, c" data-state="added: 6; Items in the bag: 3">Each of those passes the item on to the base class, which stores it. Three items are in the bag, and the counter says six.</li>
+</ol>
+<figcaption>Neither class is wrong by itself. The subclass depended on a detail the base class never promised: whether addAll is built on add.</figcaption>
+</figure>
+
+<p>This is the <dfn>fragile base class problem</dfn>: a subclass depends on how its base class is implemented, not only on what the base class promises, so a change inside the base class, or a detail of it that nobody documented, can break a subclass that was never touched. The remedy for the example could be to stop counting in <code>addAll</code>. That fixes it until someone rewrites <code>Bag.addAll</code> to push the items directly, at which point the count is wrong in the other direction.</p>
+<p>The underlying cause is that inheritance is a closer relationship than it appears. A caller of a class sees its public methods. A subclass is tangled up with the base class’s internal calls as well.</p>
+<table>
+<thead><tr><th>Inheritance is reasonable when</th><th>It is a warning sign when</th></tr></thead>
+<tbody>
+<tr><td>The subclass is a special kind of the base class, and can be used anywhere the base class can (<x-ref to="solid-principles"></x-ref> makes this precise)</td><td>The reason is “that class already has a method I need”</td></tr>
+<tr><td>The base class was written to be extended, and says which methods may be overridden and what they may assume</td><td>The base class comes from someone else’s library and says nothing about extension</td></tr>
+<tr><td>The hierarchy is shallow: one level, occasionally two</td><td>You need to trace four classes to find out what a call does</td></tr>
+<tr><td>A framework requires it</td><td>The same variation is being added along two or more axes at once</td></tr>
+</tbody>
+</table>
+
+<h2 id="composition">Composition over inheritance</h2>
+<p><dfn>Composition</dfn> means building an object out of other objects that it holds and calls, instead of out of a base class that it extends. <code>CountedBag</code> does not claim to be a kind of bag. It has a bag, and passes work to it. It sees only the bag’s public methods, so nothing the bag does internally can reach back into it.</p>
+<p>The advice “prefer composition to inheritance” comes from the book that named the design patterns, and three decades of practice have only strengthened it. Its second advantage appears when behavior varies in more than one way at once. Suppose notifications must sometimes be retried when sending fails, and sometimes be logged, for either channel.</p>
+
+<figure class="fig wide" id="fig-compose">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 274" role="img" aria-labelledby="f564t f564d">
+<title id="f564t">Combining behaviors by inheritance and by composition</title>
+<desc id="f564d">On the left, inheritance: under each of two channel classes sit three further subclasses, for retrying, for logging and for both, eight classes in all, and each new channel or behavior multiplies the count. On the right, composition: two channel classes and two small wrapper classes that each hold any Notifier, four classes in all, combined when the objects are created.</desc>
+<text class="tb" x="10" y="18">By inheritance: a class for every combination</text>
+<rect class="n sig" x="110" y="30" width="120" height="42" rx="4"/>
+<text class="ts mid" x="170" y="46">«interface»</text>
+<text class="tb mid" x="170" y="63">Notifier</text>
+<rect class="n" x="10" y="104" width="150" height="28" rx="4"/>
+<text class="tb mid" x="85" y="123">EmailNotifier</text>
+<path class="e implements" d="M85 103L170 74"/>
+<rect class="n" x="24" y="150" width="136" height="24" rx="4"/>
+<text class="ts mid" x="92" y="166">RetryingEmail</text>
+<rect class="n" x="24" y="180" width="136" height="24" rx="4"/>
+<text class="ts mid" x="92" y="196">LoggingEmail</text>
+<rect class="n" x="24" y="210" width="136" height="24" rx="4"/>
+<text class="ts mid" x="92" y="226">RetryingLoggingEmail</text>
+<path class="e inherit" d="M17 222V134"/>
+<path class="e none" d="M17 162H24"/>
+<path class="e none" d="M17 192H24"/>
+<path class="e none" d="M17 222H24"/>
+<rect class="n" x="180" y="104" width="150" height="28" rx="4"/>
+<text class="tb mid" x="255" y="123">PushNotifier</text>
+<path class="e implements" d="M255 103L170 74"/>
+<rect class="n" x="194" y="150" width="136" height="24" rx="4"/>
+<text class="ts mid" x="262" y="166">RetryingPush</text>
+<rect class="n" x="194" y="180" width="136" height="24" rx="4"/>
+<text class="ts mid" x="262" y="196">LoggingPush</text>
+<rect class="n" x="194" y="210" width="136" height="24" rx="4"/>
+<text class="ts mid" x="262" y="226">RetryingLoggingPush</text>
+<path class="e inherit" d="M187 222V134"/>
+<path class="e none" d="M187 162H194"/>
+<path class="e none" d="M187 192H194"/>
+<path class="e none" d="M187 222H194"/>
+<text class="ts mid" x="170" y="264">8 classes. A third channel makes 12.</text>
+<path class="e none dash" d="M355 10V266"/>
+<text class="tb" x="380" y="18">By composition: small parts, combined when created</text>
+<rect class="n sig" x="480" y="30" width="120" height="42" rx="4"/>
+<text class="ts mid" x="540" y="46">«interface»</text>
+<text class="tb mid" x="540" y="63">Notifier</text>
+<rect class="n" x="380" y="104" width="110" height="28" rx="4"/>
+<text class="tb mid" x="435" y="123">EmailNotifier</text>
+<rect class="n" x="380" y="140" width="110" height="28" rx="4"/>
+<text class="tb mid" x="435" y="159">PushNotifier</text>
+<rect class="n" x="570" y="104" width="140" height="54" rx="4"/>
+<text class="tb mid" x="640" y="123">Retrying</text>
+<line class="sep" x1="570" y1="132" x2="710" y2="132"/>
+<text class="ts" x="578" y="148">− inner: Notifier</text>
+<rect class="n" x="570" y="166" width="140" height="54" rx="4"/>
+<text class="tb mid" x="640" y="185">Logging</text>
+<line class="sep" x1="570" y1="194" x2="710" y2="194"/>
+<text class="ts" x="578" y="210">− inner: Notifier</text>
+<path class="e implements" d="M435 103L520 74"/>
+<path class="e implements" d="M640 103L560 74"/>
+<text class="ts mono" x="380" y="244">new Logging(new Retrying(new EmailNotifier()))</text>
+<text class="ts" x="380" y="264">4 classes. A third channel makes 5.</text>
+</svg>
+</div>
+<figcaption>Inheritance fixes a combination when the class is written. Composition lets the combination be chosen when the object is built.</figcaption>
+</figure>
+
+<p>With inheritance each combination is its own class, written in advance. With composition there is one small class for each idea, and they are combined when the objects are created. The calculator shows how quickly the two diverge.</p>
+
+<div class="widget" data-widget="combos">
+<h4>Classes needed for every combination</h4>
+<p>How many classes it takes when each optional behavior can be on or off for each kind.</p>
+<div class="controls">
+  <label>Kinds, such as channels<input type="number" name="kinds" value="3" min="1" max="50" step="1"></label>
+  <label>Optional behaviors, such as retrying and logging<input type="number" name="extras" value="2" min="0" max="16" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 82" role="img" aria-label="Two rows of small squares, one square for each class: the number needed with a subclass for every combination, and the number needed with one class for each part."><text x="10" y="18" class="ts">One for each combination</text><rect x="160" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="169.5" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="179" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="188.5" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="198" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="207.5" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="217" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="226.5" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="236" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="245.5" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="255" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><rect x="264.5" y="10" width="7.5" height="8" rx="1.5" class="bar fault"></rect><text x="280" y="18" class="ts tb">12 classes</text><text x="10" y="50" class="ts">One for each part</text><rect x="160" y="42" width="7.5" height="8" rx="1.5" class="bar store"></rect><rect x="169.5" y="42" width="7.5" height="8" rx="1.5" class="bar store"></rect><rect x="179" y="42" width="7.5" height="8" rx="1.5" class="bar store"></rect><rect x="188.5" y="42" width="7.5" height="8" rx="1.5" class="bar store"></rect><rect x="198" y="42" width="7.5" height="8" rx="1.5" class="bar store"></rect><text x="213.5" y="50" class="ts tb">5 classes</text><text x="10" y="72" class="ts">Each square is a class someone has to write, name, test and keep in step with the others.</text></svg>
+<dl class="results">
+  <div><dt>With a subclass for each combination</dt><dd data-out="inherit">12</dd></div>
+  <div><dt>With one class for each part</dt><dd data-out="compose">5</dd></div>
+  <div><dt>After one more behavior, by inheritance</dt><dd data-out="next">24</dd></div>
+  <div><dt>After one more behavior, by composition</dt><dd data-out="nextc">6</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">3 kinds and 2 optional behaviors give 12 combinations. With a subclass for each, that is 12 classes, and one more behavior doubles it to 24. With one class for each kind and one wrapper for each behavior it is 5, and one more behavior makes 6.</p>
+</div>
+
+<p>The wrapper classes on the right of <x-fig to="fig-compose"></x-fig> have a name, the decorator pattern, and <x-ref to="structural-patterns"></x-ref> builds them. For now the shape is what matters: an object that implements an interface and holds another object of the same interface.</p>
+<p>Composition has a price. There are more objects, someone has to assemble them, and a call passes through several small classes instead of one. For a design that varies along a single axis and always will, a base class and two subclasses is less code and easier to read. The rule is a default, not a ban.</p>
+
+<h2 id="relationships">How objects relate</h2>
+<p>Once a program is a set of objects, its design is mostly the set of connections between them. Four kinds are worth telling apart, because they differ in how tightly they bind.</p>
+<table>
+<thead><tr><th>Relationship</th><th>In code</th><th>Example</th><th>How tight</th></tr></thead>
+<tbody>
+<tr><th>Uses</th><td>Receives it as a parameter, calls it, and lets go</td><td>A function that is passed a <code>User</code> to read its email address</td><td>Loosest</td></tr>
+<tr><th>Has</th><td>Keeps a reference in a field. The other object exists independently</td><td><code>NotificationCenter</code> has notifiers. <code>Library</code> has a store</td><td>Moderate</td></tr>
+<tr><th>Owns</th><td>Creates and controls it. The part has no life outside the whole</td><td>An <code>Album</code> owns its internal map of photos</td><td>Tight, and contained</td></tr>
+<tr><th>Is a kind of</th><td><code>extends</code></td><td><code>CountingBag</code> is a kind of <code>Bag</code></td><td>Tightest</td></tr>
+</tbody>
+</table>
+<p>Two words describe the quality of the whole arrangement, and every principle and pattern in the next five chapters is a technique for improving one of them.</p>
+<ul>
+  <li><dfn>Coupling</dfn> is how much one part of a program must know about another to work. The less each part knows, the more freely either can change. <code>Library</code> knows three method names about its store, which is low coupling. A class that reaches into another’s fields is as coupled as it can be.</li>
+  <li><dfn>Cohesion</dfn> is how closely the things inside one part belong together. <code>Album</code> is cohesive: every field and method concerns one album’s photos and cover. A class called <code>Utils</code> with forty unrelated functions is not.</li>
+</ul>
+<p>The aim is low coupling between classes and high cohesion within each. A quick test for both: can you say what a class is for in one sentence, without the word “and”?</p>
+
+<h2 id="design">The chapter’s classes in one picture</h2>
+<p>Low-level designs are usually sketched before they are typed. The standard sketch is a class diagram: a box for each class, and a line for each relationship.</p>
+
+<figure class="fig wide" id="fig-model">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 318" role="img" aria-labelledby="f565t f565d">
+<title id="f565t">The classes in this chapter, drawn as a class diagram</title>
+<desc id="f565d">A class diagram. Album has private photos and coverId and public operations add, remove and setCover, and is composed of Photo objects. Library has a private store and operations upload and download, and uses the PhotoStore interface, which MemoryStore and DiskStore implement. NotificationCenter holds a list of Notifier, an interface implemented by EmailNotifier and PushNotifier.</desc>
+<rect class="n" x="10" y="14" width="190" height="128" rx="4"/>
+<text class="tb mid" x="105" y="33">Album</text>
+<line class="sep" x1="10" y1="42" x2="200" y2="42"/>
+<text class="ts" x="18" y="58">− photos: Map&lt;string, Photo&gt;</text>
+<text class="ts" x="18" y="74">− coverId: string | null</text>
+<line class="sep" x1="10" y1="84" x2="200" y2="84"/>
+<text class="ts" x="18" y="100">+ add(photo)</text>
+<text class="ts" x="18" y="116">+ remove(id)</text>
+<text class="ts" x="18" y="132">+ setCover(id)</text>
+<rect class="n" x="10" y="206" width="190" height="70" rx="4"/>
+<text class="tb mid" x="105" y="225">Photo</text>
+<line class="sep" x1="10" y1="234" x2="200" y2="234"/>
+<text class="ts" x="18" y="250">+ id: string</text>
+<text class="ts" x="18" y="266">+ bytes: number</text>
+<path class="e owns" d="M105 142 L105 206"/>
+<text class="ts mid" x="163" y="178">holds 0 to 1,000</text>
+<rect class="n" x="250" y="14" width="180" height="96" rx="4"/>
+<text class="tb mid" x="340" y="33">Library</text>
+<line class="sep" x1="250" y1="42" x2="430" y2="42"/>
+<text class="ts" x="258" y="58">− store: PhotoStore</text>
+<line class="sep" x1="250" y1="68" x2="430" y2="68"/>
+<text class="ts" x="258" y="84">+ upload(id, bytes)</text>
+<text class="ts" x="258" y="100">+ download(id)</text>
+<rect class="n sig" x="250" y="150" width="180" height="100" rx="4"/>
+<text class="ts mid" x="340" y="166">«interface»</text>
+<text class="tb mid" x="340" y="183">PhotoStore</text>
+<line class="sep sig" x1="250" y1="192" x2="430" y2="192"/>
+<text class="ts" x="258" y="208">+ save(id, bytes)</text>
+<text class="ts" x="258" y="224">+ load(id)</text>
+<text class="ts" x="258" y="240">+ delete(id)</text>
+<path class="e assoc" d="M340 110 L340 150"/>
+<text class="ts mid" x="362" y="134">uses</text>
+<rect class="n" x="236" y="266" width="100" height="28" rx="4"/>
+<text class="tb mid" x="286" y="285">MemoryStore</text>
+<rect class="n" x="346" y="266" width="100" height="28" rx="4"/>
+<text class="tb mid" x="396" y="285">DiskStore</text>
+<path class="e implements" d="M286 266 L304 250"/>
+<path class="e implements" d="M396 266 L376 250"/>
+<rect class="n" x="490" y="14" width="220" height="80" rx="4"/>
+<text class="tb mid" x="600" y="33">NotificationCenter</text>
+<line class="sep" x1="490" y1="42" x2="710" y2="42"/>
+<text class="ts" x="498" y="58">− channels: Notifier[]</text>
+<line class="sep" x1="490" y1="68" x2="710" y2="68"/>
+<text class="ts" x="498" y="84">+ announce(to, text)</text>
+<rect class="n sig" x="520" y="134" width="160" height="68" rx="4"/>
+<text class="ts mid" x="600" y="150">«interface»</text>
+<text class="tb mid" x="600" y="167">Notifier</text>
+<line class="sep sig" x1="520" y1="176" x2="680" y2="176"/>
+<text class="ts" x="528" y="192">+ send(to, text)</text>
+<path class="e assoc" d="M600 94 L600 134"/>
+<text class="ts mid" x="634" y="118">has many</text>
+<rect class="n" x="480" y="236" width="110" height="28" rx="4"/>
+<text class="tb mid" x="535" y="255">EmailNotifier</text>
+<rect class="n" x="600" y="236" width="110" height="28" rx="4"/>
+<text class="tb mid" x="655" y="255">PushNotifier</text>
+<path class="e implements" d="M535 236 L568 202"/>
+<path class="e implements" d="M655 236 L632 202"/>
+<text class="ts" x="10" y="308">A dashed line with a hollow triangle means “implements”. A filled diamond means “owns”. An open arrow means “refers to”.</text>
+</svg>
+</div>
+<figcaption>Each box is a class: its name, what it holds, what it can do. <x-ref to="uml-diagrams"></x-ref> explains the notation in full.</figcaption>
+</figure>
+
+<p>Reading it against the code is a good exercise. Notice what the diagram makes obvious that the code hides across five files: nothing points <em>at</em> <code>MemoryStore</code> or <code>EmailNotifier</code>. Every arrow from a class that does real work ends at an interface. That is what lets any of the concrete classes be replaced.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> A low-level design round asks you to produce something like this picture, and then code for part of it, in about 45 minutes. Interviewers look for the four ideas of this chapter more than for named patterns: private state with rules enforced in methods, interfaces at the points where behavior varies, no switching on type where an object could decide, and shallow hierarchies. <x-ref to="lld-method"></x-ref> gives a step-by-step method.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Public fields with rules that callers are expected to remember</th><td>Objects in impossible states, found far from the cause</td><td>Private fields, and methods that keep the invariants</td></tr>
+<tr><th>A getter and a setter for every field</th><td>The fields are public again, with extra typing</td><td>Methods named for what the caller wants done: <code>remove</code>, not <code>setPhotos</code></td></tr>
+<tr><th>Returning internal collections</th><td>Callers change the object behind its back</td><td>A copy or a read-only view</td></tr>
+<tr><th>Depending on a concrete class where an interface would do</th><td>Tests need the real database, and swapping an implementation means editing every caller</td><td>A small interface, named for the role</td></tr>
+<tr><th>Chains of <code>if</code> on a type or kind, repeated in several places</th><td>Each new kind means finding and editing all of them</td><td>Polymorphism, or a union with an exhaustive <code>switch</code></td></tr>
+<tr><th>Inheriting to reuse a method</th><td>The subclass is tied to the base class’s internals and breaks when they change</td><td>Hold the other object and call it</td></tr>
+<tr><th>Deep hierarchies</th><td>Nobody can say what a call does without reading every level</td><td>One level of inheritance, and composition for the rest</td></tr>
+<tr><th>A class for everything</th><td>Ceremony around what is only data or a single function</td><td>Plain types and functions, until there is state with rules</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="what-is-system-design"></x-ref>: where low-level design sits beside high-level design.</li>
+  <li><x-ref to="solid-principles"></x-ref>: five principles that sharpen the ideas in this chapter.</li>
+  <li><x-ref to="uml-diagrams"></x-ref>: the notation for drawing classes and their relationships.</li>
+  <li><x-ref to="structural-patterns"></x-ref>: the decorator and other ways of composing objects.</li>
+  <li><x-ref to="behavioral-patterns"></x-ref>: the strategy pattern, which is polymorphism given a name.</li>
+  <li><x-ref to="domain-modeling"></x-ref>: invariants at the scale of a whole business model.</li>
+  <li><x-ref to="errors-and-testing"></x-ref>: why code written against interfaces is easy to test.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Low-level design decides which objects exist, what each knows and does, and which others it may talk to.</li>
+  <li>Encapsulation keeps data private so that the object can enforce its own rules in one place. Every method leaves the object valid.</li>
+  <li>TypeScript’s <code>private</code> is checked before the program runs and is an ordinary property afterward. <code>#field</code> is private at run time.</li>
+  <li>Depend on small interfaces named for a role. TypeScript matches types by shape, so anything with the right methods fits.</li>
+  <li>Polymorphism lets callers stop asking what kind something is. Use classes behind an interface for things that act, and discriminated unions for data.</li>
+  <li>Inheritance ties a subclass to the internals of its base class. Keep hierarchies shallow and extend only classes designed for it.</li>
+  <li>Prefer composition: hold other objects and call their public methods. It keeps combinations from multiplying.</li>
+  <li>Judge any design by coupling between parts, which should be low, and cohesion within each, which should be high.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A <code>Cart</code> class has a public <code>items</code> array and a public <code>total</code> number. What can go wrong, and how would you redesign it?</summary><p>The total is supposed to equal the sum of the items, and nothing enforces it: any caller can push an item without updating the total, or set the total directly. Make both private, offer <code>add</code> and <code>remove</code> methods that update them together, or better, compute the total from the items in a getter so that it cannot disagree. Return a copy of the items from any method that exposes them.</p></details>
+<details><summary>A field is declared <code>private apiKey: string</code>. A colleague says it is therefore safe from other code in the process. Is that right?</summary><p>No. The <code>private</code> keyword is enforced by the type checker only. At run time the field is an ordinary property: it shows up in <code>Object.keys</code> and <code>JSON.stringify</code>, and any code that bypasses the types can read it. A <code>#apiKey</code> field is private at run time. The keyword is still the right default for expressing a design, because its purpose is to guide the people writing the code.</p></details>
+<details><summary>Why can an object literal with <code>save</code>, <code>load</code> and <code>delete</code> functions be passed where a <code>PhotoStore</code> is expected, although it never mentions the interface?</summary><p>TypeScript uses structural typing. A value is acceptable if it has the members the type requires, with compatible types. Names and declarations of intent do not enter into it. This is why test doubles are easy to write in TypeScript, and it is also why writing <code>implements</code> on a class is worthwhile: it asks the compiler to check the shape at the class itself.</p></details>
+<details><summary>You are modeling the events a photo can produce: uploaded, shared, commented, deleted. New operations on events are added often (formatting, filtering, counting), and new kinds rarely. Classes or a discriminated union?</summary><p>A discriminated union. Each new operation is one new function with a <code>switch</code> over the kinds, and nothing else changes. With classes, each new operation would mean adding a method to every class. When a kind is eventually added, the <code>never</code> check makes the compiler point at every function that must handle it.</p></details>
+<details><summary><code>CountingBag</code> overrides <code>add</code> and <code>addAll</code> to count items, and reports six after three items are added with <code>addAll</code>. Trace why.</summary><p>The subclass’s <code>addAll</code> adds three to the counter and calls <code>super.addAll</code>. The base class implements <code>addAll</code> by calling <code>this.add</code> for each item. Because the object is a <code>CountingBag</code>, <code>this.add</code> is the overridden method, which adds one to the counter each time before storing the item. Three plus three is six. The subclass relied on an undocumented detail of the base class.</p></details>
+<details><summary>Notifications come in 3 channels, and each can optionally be retried, logged and rate-limited. How many classes with a subclass for each combination, and how many with composition?</summary><p>Three optional behaviors give 2<sup>3</sup> = 8 combinations for each channel, so 24 classes by inheritance. With composition there are three channel classes and three wrappers, six in all. A fourth behavior doubles the first number to 48 and raises the second to 7.</p></details>
+<details><summary>What is the difference between coupling and cohesion, and what does a class named <code>PhotoManager</code> with methods for uploading, resizing, emailing and billing suggest about each?</summary><p>Coupling is how much a part must know about other parts. Cohesion is how well the contents of one part belong together. That class has low cohesion: four unrelated jobs under one name. It will also be highly coupled, because storage, image processing, mail and payments all meet inside it, and a change in any of them is a change to this class.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Erich Gamma, Richard Helm, Ralph Johnson and John Vlissides, <cite>Design Patterns: Elements of Reusable Object-Oriented Software</cite>, Addison-Wesley, 1994. The source of “favor object composition over class inheritance” and “program to an interface, not an implementation”.</li>
+  <li>Joshua Bloch, <cite>Effective Java</cite>, 3rd edition, Addison-Wesley, 2018. Item 18, “Favor composition over inheritance”, is the origin of the counting collection example.</li>
+  <li>Sandi Metz, <cite>Practical Object-Oriented Design</cite>, 2nd edition, Addison-Wesley, 2018. The clearest book-length treatment of messages, roles and dependencies.</li>
+  <li>The TypeScript Handbook, <a href="https://www.typescriptlang.org/docs/handbook/2/classes.html">Classes</a> and <a href="https://www.typescriptlang.org/docs/handbook/2/narrowing.html">Narrowing</a>, which covers discriminated unions and exhaustiveness checks.</li>
+  <li>Node.js, <a href="https://nodejs.org/api/typescript.html">Modules: TypeScript</a>. What Node.js runs directly and which syntax it rejects.</li>
+  <li>Visual Studio Magazine, <a href="https://www.visualstudiomagazine.com/articles/2026/03/23/typescript-6-0-ships-as-final-javascript-based-release-clears-path-for-go-native-7-0.aspx">TypeScript 6.0 Ships as Final JavaScript-Based Release, Clears Path for Go-Native 7.0</a>, March 2026, and InfoQ, <a href="https://infoq.com/news/2026/08/typescript-7-released/">TypeScript 7 released</a>, August 2026.</li>
+</ol>
+</section>

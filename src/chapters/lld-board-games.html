@@ -1,0 +1,1228 @@
+<!--meta
+{ "description": "A low-level design of tic-tac-toe and chess in TypeScript, tested and measured: one immutable game interface that both games implement, so the match, undo and the computer player are written once; a win check in constant time with line counters; chess movement as data and the rules that need the whole position, from pins and castling to en passant and repetition; a move generator checked against published perft counts; and negamax with alpha-beta for either game.",
+  "lede": "A board game is a small world with strict rules, which makes it a favorite low-level design question. The first sketch usually gives every chess piece its own class. This chapter starts from the other end: one interface that tic-tac-toe and chess both fit, so the match, undo and the computer opponent are written once, and a position that owns the rules no single piece can judge. Every result comes from the tested code, including a move generator that matches the published counts for five standard positions.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the classes for a two-player board game: tic-tac-toe first, then chess. Players take turns. The program accepts legal moves and refuses the rest, knows when the game is over and why, lets a player take a move back, and offers a computer opponent.</p></div>
+<p><x-ref to="lld-method#shapes"></x-ref> describes a game as “polymorphic pieces, a board that validates moves, and a turn-taking state machine.” All three appear here, though not where a first sketch puts them. The polymorphism that pays is between games: one interface lets the same match, undo and computer player serve both. The board that validates moves becomes a position that knows more than the board, because chess’s hard rules depend on the game’s history. The state machine is small: a game is ongoing until it is won or drawn.</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>Which games?</th><td>Tic-tac-toe on a square board of any size, won by a full row, column or diagonal. Chess under the FIDE Laws, every kind of move included</td></tr>
+<tr><th>Who plays?</th><td>Two players, each a person or the computer. The core does not know which</td></tr>
+<tr><th>What can a player do?</th><td>Make a move, or take the last one back. Resigning, draw offers and clocks are follow-ups</td></tr>
+<tr><th>How is a move written?</th><td>A square number for tic-tac-toe. For chess, two squares and any promotion piece, as chess programs write it: <code>e2e4</code>, <code>e7e8q</code></td></tr>
+<tr><th>When does a game end?</th><td>Tic-tac-toe: a full line or a full board. Chess: checkmate, stalemate, fifty moves without a capture or pawn move, the same position three times, or too little material to mate</td></tr>
+</tbody>
+</table>
+<p>One answer hides a decision. Under the FIDE Laws, three repetitions or fifty moves let a player claim a draw, and only five repetitions or 75 moves end the game on their own. With nobody to make the claim, this design ends the game at the first threshold, and every result carries its reason.</p>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+<table>
+<thead><tr><th>Concept</th><th>Kind</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Game state: a tic-tac-toe board, a chess position</th><td>Value</td><td>All that decides what may happen next. A move produces a new state</td></tr>
+<tr><th>Move</th><td>Value</td><td>A square, or two squares and a promotion piece</td></tr>
+<tr><th>Outcome</th><td>Value</td><td>Ongoing, a win with its winner, or a draw, each with a reason</td></tr>
+<tr><th>Match</th><td>Entity</td><td>One game being played: its states, its moves, and undo</td></tr>
+<tr><th>Player</th><td>Interface</td><td>Chooses a move: a person through a screen, a search, or chance</td></tr>
+<tr><th>Piece</th><td>Value</td><td>A color and a kind. How it moves is a row in a table</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th></tr></thead>
+<tbody>
+<tr><th>Only legal moves change the game</th><td>The state’s <code>play</code>, which throws <code>IllegalMove</code> for anything else</td></tr>
+<tr><th>Players alternate</th><td>The state. <code>toMove</code> changes only in <code>play</code></td></tr>
+<tr><th>No move leaves the mover’s own king attacked</th><td><code>Position.legalMoves</code></td></tr>
+<tr><th>Nothing is played after the game is over</th><td>The state, and <code>Match</code> before it asks</td></tr>
+<tr><th>Undo restores exactly the earlier state</th><td><code>Match</code>, by keeping every state instead of reversing moves</td></tr>
+<tr><th>Castling rights only shrink; an en passant capture is possible for one move only</th><td><code>Position.apply</code></td></tr>
+</tbody>
+</table>
+<p>The first invariant decides who owns <code>play</code>: only the state can tell a legal move from an illegal one, so the match, the players and the user interface all ask it, and none repeats a rule.</p>
+
+<h2 id="classes">Step 4: The classes</h2>
+
+<figure class="fig wide" id="fig-classes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 498" role="img" aria-labelledby="f731t f731d">
+<title id="f731t">The classes for two board games</title>
+<desc id="f731d">A class diagram. The interface Game of M and G offers toMove, legalMoves, play, which returns the next state, outcome and describe. Match keeps a list of states and moves, with play and undo. The interface Player has choose; SearchPlayer and RandomPlayer implement it, and SearchPlayer uses search, negamax with alpha-beta for any Game. TicTacToe and Position implement Game. TicTacToe keeps its cells and a counter for each line. Position keeps the board, the turn, castling rights, the en passant square, the halfmove count and the positions seen, and offers pseudoLegalMoves, legalMoves, isAttacked, apply and fromFen. It owns up to 32 Pieces, each a color and a kind, and uses the MOVEMENT table. Move is a value: from, to, an optional promotion and a flag.</desc>
+<rect class="n" x="10" y="14" width="190" height="144" rx="4"/>
+<text class="tb mid" x="105" y="33">Match&lt;M, G&gt;</text>
+<line class="sep" x1="10" y1="42" x2="200" y2="42"/>
+<text class="ts" x="18" y="58">− states: G[]</text>
+<text class="ts" x="18" y="74">− moves: string[]</text>
+<line class="sep" x1="10" y1="84" x2="200" y2="84"/>
+<text class="ts" x="18" y="100">+ current: G</text>
+<text class="ts" x="18" y="116">+ history: string[]</text>
+<text class="ts" x="18" y="132">+ play(move: M): Outcome</text>
+<text class="ts" x="18" y="148">+ undo()</text>
+<rect class="n sig" x="232" y="14" width="216" height="142" rx="4"/>
+<text class="ts mid" x="340" y="30">«interface»</text>
+<text class="tb mid" x="340" y="47">Game&lt;M, G&gt;</text>
+<line class="sep sig" x1="232" y1="56" x2="448" y2="56"/>
+<text class="ts" x="240" y="72">+ toMove: string</text>
+<line class="sep sig" x1="232" y1="82" x2="448" y2="82"/>
+<text class="ts" x="240" y="98">+ legalMoves(): M[]</text>
+<text class="ts" x="240" y="114">+ play(move: M): G</text>
+<text class="ts" x="240" y="130">+ outcome(): Outcome</text>
+<text class="ts" x="240" y="146">+ describe(move: M): string</text>
+<path class="e assoc" d="M200 57.2 L232 56.6"/>
+<text class="ts mid" x="216" y="49.9">1..*</text>
+<rect class="n" x="480" y="14" width="230" height="68" rx="4"/>
+<text class="ts mid" x="595" y="30">«interface»</text>
+<text class="tb mid" x="595" y="47">Player&lt;M, G&gt;</text>
+<line class="sep" x1="480" y1="56" x2="710" y2="56"/>
+<text class="ts" x="488" y="72">+ choose(game: G): M</text>
+<rect class="n" x="480" y="112" width="120" height="70" rx="4"/>
+<text class="tb mid" x="540" y="131">SearchPlayer</text>
+<line class="sep" x1="480" y1="140" x2="600" y2="140"/>
+<text class="ts" x="488" y="156">− depth</text>
+<text class="ts" x="488" y="172">− evaluate</text>
+<rect class="n" x="610" y="112" width="100" height="54" rx="4"/>
+<text class="tb mid" x="660" y="131">RandomPlayer</text>
+<line class="sep" x1="610" y1="140" x2="710" y2="140"/>
+<text class="ts" x="618" y="156">− random</text>
+<path class="e implements" d="M540 112 L540 82"/>
+<path class="e implements" d="M660 112 L660 82"/>
+<rect class="n" x="480" y="206" width="230" height="84" rx="4"/>
+<text class="ts mid" x="595" y="222">«function»</text>
+<text class="tb mid" x="595" y="239">search</text>
+<line class="sep" x1="480" y1="248" x2="710" y2="248"/>
+<text class="ts" x="488" y="264">negamax with alpha-beta,</text>
+<text class="ts" x="488" y="280">for any Game</text>
+<path class="e uses" d="M540 182 L537.5 206"/>
+<path class="e uses" d="M480 235.4 L462 235.4 L462 127.6 L448 127.6"/>
+<rect class="n" x="10" y="176" width="190" height="70" rx="4"/>
+<text class="tb mid" x="105" y="195">Outcome</text>
+<line class="sep" x1="10" y1="204" x2="200" y2="204"/>
+<text class="ts" x="18" y="220">ongoing | win | draw</text>
+<text class="ts" x="18" y="236">winner?, reason</text>
+<rect class="n" x="10" y="272" width="190" height="144" rx="4"/>
+<text class="tb mid" x="105" y="291">TicTacToe</text>
+<line class="sep" x1="10" y1="300" x2="200" y2="300"/>
+<text class="ts" x="18" y="316">n: number</text>
+<text class="ts" x="18" y="332">− cells: (Mark | null)[]</text>
+<text class="ts" x="18" y="348">− rows, cols: number[]</text>
+<text class="ts" x="18" y="364">− diagonals: [number, number]</text>
+<line class="sep" x1="10" y1="374" x2="200" y2="374"/>
+<text class="ts" x="18" y="390">+ static start(n)</text>
+<text class="ts" x="18" y="406">+ key(): string</text>
+<rect class="n store" x="232" y="272" width="216" height="176" rx="4"/>
+<text class="tb mid" x="340" y="291">Position</text>
+<line class="sep store" x1="232" y1="300" x2="448" y2="300"/>
+<text class="ts" x="240" y="316">board: (Piece | null)[]</text>
+<text class="ts" x="240" y="332">turn, castling, enPassant</text>
+<text class="ts" x="240" y="348">halfmoves, seen</text>
+<line class="sep store" x1="232" y1="358" x2="448" y2="358"/>
+<text class="ts" x="240" y="374">+ pseudoLegalMoves(): Move[]</text>
+<text class="ts" x="240" y="390">+ legalMoves(): Move[]</text>
+<text class="ts" x="240" y="406">+ isAttacked(square, by)</text>
+<text class="ts" x="240" y="422">+ apply(move): Position</text>
+<text class="ts" x="240" y="438">+ static fromFen(fen)</text>
+<path class="e implements" d="M105 272 L105 260 L286 260 L286 156"/>
+<path class="e implements" d="M361.6 272 L361.6 156"/>
+<rect class="n" x="480" y="300" width="104" height="70" rx="4"/>
+<text class="tb mid" x="532" y="319">Piece</text>
+<line class="sep" x1="480" y1="328" x2="584" y2="328"/>
+<text class="ts" x="488" y="344">color</text>
+<text class="ts" x="488" y="360">kind</text>
+<rect class="n" x="606" y="300" width="104" height="86" rx="4"/>
+<text class="tb mid" x="658" y="319">Move</text>
+<line class="sep" x1="606" y1="328" x2="710" y2="328"/>
+<text class="ts" x="614" y="344">from, to</text>
+<text class="ts" x="614" y="360">promotion?</text>
+<text class="ts" x="614" y="376">flag?</text>
+<path class="e owns" d="M448 335.008 L480 335"/>
+<text class="ts end" x="477" y="352">0..32</text>
+<rect class="n" x="480" y="404" width="230" height="86" rx="4"/>
+<text class="tb mid" x="595" y="423">MOVEMENT</text>
+<line class="sep" x1="480" y1="432" x2="710" y2="432"/>
+<text class="ts" x="488" y="448">knight: eight jumps, once</text>
+<text class="ts" x="488" y="464">bishop: diagonals, slides</text>
+<text class="ts" x="488" y="480">rook, queen, king: …</text>
+<path class="e uses" d="M448 421.6 L480 447"/>
+</svg>
+</div>
+<figcaption>One interface carries the design. The games know their own rules; the match, the players and the search are written once against the interface and work for both.</figcaption>
+</figure>
+
+<p>The interface has two type parameters: <code>M</code>, the type of a move, a number for tic-tac-toe and a <code>Move</code> for chess; and <code>G</code>, the implementing class itself, so that <code>play</code> on a <code>Position</code> returns a <code>Position</code> and not a vague <code>Game</code>. That is what <code>G extends Game&lt;M, G&gt;</code> says.</p>
+<p>The states are values in the sense of <x-ref to="domain-modeling#values"></x-ref>: <code>play</code> returns a new state and leaves the old one as it was. Undo becomes dropping the last state. A search tries a move and walks away, with nothing to reverse on an early return. States can be shared between a match, a search and threads with no locks. The price is a copy on every move, weighed later in the chapter.</p>
+
+<h2 id="varies">Step 5: What varies</h2>
+<table>
+<thead><tr><th>What varies</th><th>Where it is decided</th></tr></thead>
+<tbody>
+<tr><th>The game</th><td>The <code>Game</code> the match starts with: <code>TicTacToe.start(4)</code>, <code>Position.fromFen(…)</code></td></tr>
+<tr><th>Who chooses each side’s moves</th><td>The <code>Player</code> for that side: a person, <code>SearchPlayer</code>, <code>RandomPlayer</code></td></tr>
+<tr><th>How the computer judges a position it cannot search to the end</th><td>The <code>evaluate</code> function given to the search: zero for tic-tac-toe, a count of material for chess</td></tr>
+<tr><th>How each chess piece moves</th><td>Its row in <code>MOVEMENT</code>. The pawn has its own code</td></tr>
+</tbody>
+</table>
+
+<h3 id="pieces">Pieces: a class each, or a row of data</h3>
+<p>The usual first sketch is an abstract <code>Piece</code> with a subclass for each kind, each listing its own moves: polymorphism as <x-ref to="oop-in-typescript#polymorphism"></x-ref> describes it. Chess makes its costs visible.</p>
+<table>
+<thead><tr><th></th><th>A class for each piece</th><th>Movement as data</th></tr></thead>
+<tbody>
+<tr><th>Knight, bishop, rook, queen and king</th><td>Five <code>moves</code> methods, each nearly the same loop</td><td>Two facts each: the directions, and whether the piece slides. One loop</td></tr>
+<tr><th>Check, castling, en passant</th><td><code>moves</code> needs the whole position, or these rules live elsewhere anyway</td><td>In <code>Position</code>, which has everything they need</td></tr>
+<tr><th>What a piece object holds</th><td>Behavior, and often its square and a “has moved” flag that must be kept in step with the board</td><td>A color and a kind, nothing that can go out of date</td></tr>
+</tbody>
+</table>
+<p>The second row decides it. Whether a move is legal is a fact about the whole position: a bishop that can reach nine squares may have no legal move, because a distant rook pins it to its king. So this design keeps polymorphism where behavior differs in code, between the two games and for the pawn, and uses data where it differs only in data, as in <x-ref to="oop-in-typescript#unions"></x-ref>. If an interviewer prefers classes, a <code>Piece</code> class with the directions as fields and a <code>Pawn</code> subclass keeps both. Either way pieces hold nothing that changes, so all positions share the same few piece objects, a flyweight (<x-ref to="structural-patterns#flyweight"></x-ref>).</p>
+
+<h2 id="code">Step 6: The code</h2>
+<h3 id="contract">The contract, and a match for any game</h3>
+<pre data-lang="ts" data-title="Game, and Match with its history and undo">
+export interface Game<M, G extends Game<M, G>> {
+  readonly toMove: string;          // whose turn it is, such as "X" or "white"
+  legalMoves(): M[];
+  play(move: M): G;                 // the state after the move; throws IllegalMove if it is not allowed
+  outcome(): Outcome;
+  describe(move: M): string;        // for history and error messages
+}
+
+export class IllegalMove extends Error {}
+
+// A match: a game in progress, its history, and undo. It works for any game that fits the interface.
+export class Match<M, G extends Game<M, G>> {
+  private readonly states: G[];
+  private readonly moves: string[] = [];
+
+  constructor(start: G) {
+    this.states = [start];
+  }
+
+  get current(): G {
+    return this.states[this.states.length - 1] as G;
+  }
+  get history(): readonly string[] {
+    return this.moves;
+  }
+
+  play(move: M): Outcome {
+    const now = this.current.outcome();
+    if (now.kind !== "ongoing") throw new IllegalMove("the game is over");
+    const next = this.current.play(move); // the game decides what is legal; the match only keeps the record
+    this.moves.push(this.current.describe(move));
+    this.states.push(next);
+    return next.outcome();
+  }
+
+  undo(): void {
+    if (this.states.length === 1) throw new Error("nothing to undo");
+    this.states.pop();
+    this.moves.pop();
+  }
+}
+</pre>
+<p><code>outcome</code> returns ongoing, a win with its winner, or a draw, each with a reason. <code>Match</code> knows nothing about either game: it refuses a move once the game is over, lets the state judge the move, and keeps the record. A <code>Player</code> is one method, <code>choose(game)</code>.</p>
+
+<h3 id="tictactoe">Tic-tac-toe: a win check that does not read the board</h3>
+<p>The obvious win check scans all 2n + 2 lines of an n by n board after every move. But a move can only complete a line through its own square: its row, its column, and a diagonal or two. So each line keeps a running count, plus one for every X and minus one for every O. A line at n holds n X; one at −n holds n O.</p>
+<pre data-lang="ts" data-title="TicTacToe.play: at most four counters change">
+play(square: number): TicTacToe {
+    if (this.winner || this.filled === this.n * this.n) throw new IllegalMove("the game is over");
+    if (!Number.isInteger(square) || square < 0 || square >= this.n * this.n) throw new IllegalMove(`no square ${square}`);
+    if (this.cells[square] !== null) throw new IllegalMove(`square ${square} is taken`);
+    const { n } = this;
+    const r = Math.floor(square / n), c = square % n, d = this.toMove === "X" ? 1 : -1;
+    const cells = [...this.cells]; cells[square] = this.toMove;
+    const rows = [...this.rows]; rows[r] = (rows[r] as number) + d;
+    const cols = [...this.cols]; cols[c] = (cols[c] as number) + d;
+    const diagonals: [number, number] = [this.diagonals[0] + (r === c ? d : 0), this.diagonals[1] + (r + c === n - 1 ? d : 0)];
+    const won = [rows[r], cols[c], ...diagonals].some((count) => Math.abs(count as number) === n); // only lines through this square can have changed
+    return new TicTacToe(n, this.toMove === "X" ? "O" : "X", cells, rows, cols, diagonals, won ? this.toMove : null, this.filled + 1);
+  }
+</pre>
+
+<figure class="fig wide" id="fig-lines">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f732t f732d">
+<title id="f732t">A counter for every line: the win check after each move</title>
+<desc id="f732d">A tic-tac-toe board with squares numbered 0 to 8, row by row, and a counter beside each of the three rows, three columns and two diagonals. X adds 1 and O subtracts 1 on every line through the square taken. X takes 4, O takes 0, X takes 2, O takes 1 and X takes 6. At the end the rows read −1, +1, +1, the columns 0, 0, +1 and the diagonals 0, +3: the diagonal from square 2 to square 6 is at +3, so X has won.</desc>
+<rect class="n" x="60" y="58" width="168" height="168" rx="2"/>
+<line class="axis" x1="116" y1="58" x2="116" y2="226"/>
+<line class="axis" x1="60" y1="114" x2="228" y2="114"/>
+<line class="axis" x1="172" y1="58" x2="172" y2="226"/>
+<line class="axis" x1="60" y1="170" x2="228" y2="170"/>
+<text class="ts" x="65" y="71">0</text>
+<text class="ts" x="121" y="71">1</text>
+<text class="ts" x="177" y="71">2</text>
+<text class="ts" x="65" y="127">3</text>
+<text class="ts" x="121" y="127">4</text>
+<text class="ts" x="177" y="127">5</text>
+<text class="ts" x="65" y="183">6</text>
+<text class="ts" x="121" y="183">7</text>
+<text class="ts" x="177" y="183">8</text>
+<text class="ts" x="292" y="90.0">row 0</text>
+<text class="ts mid" x="88.0" y="278">column 0</text>
+<text class="ts" x="292" y="146.0">row 1</text>
+<text class="ts mid" x="144.0" y="278">column 1</text>
+<text class="ts" x="292" y="202.0">row 2</text>
+<text class="ts mid" x="200.0" y="278">column 2</text>
+<text class="ts mid" x="31" y="12">diagonal</text>
+<text class="ts mid" x="257" y="12">diagonal</text>
+<path class="e none dash" d="M54 52L44 42"/>
+<path class="e none dash" d="M234 52L244 42"/>
+<text class="ts" x="372" y="24">X adds 1 and O subtracts 1 on every line through</text>
+<text class="ts" x="372" y="40">its square. A line at +3 holds three X; at −3, three O.</text>
+<g data-s="1">
+<path class="e none " style="stroke-width:3" d="M135.0 133.0L159.0 157.0M159.0 133.0L135.0 157.0"/>
+</g>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n " x="242" y="74.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="90.0">0</text>
+<rect class="n sig" x="242" y="130.0" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="263" y="146.0">+1</text>
+<rect class="n " x="242" y="186.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="202.0">0</text>
+<rect class="n " x="67.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="88.0" y="254">0</text>
+<rect class="n sig" x="123.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="144.0" y="254">+1</text>
+<rect class="n " x="179.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="200.0" y="254">0</text>
+<rect class="n sig" x="10" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="31" y="34">+1</text>
+<rect class="n sig" x="236" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="257" y="34">+1</text>
+<text class="tb" x="372" y="84">1. X takes square 4</text>
+<text class="ts" x="372" y="104">Changes: row 1, column 1 and both diagonals.</text>
+<text class="ts" x="372" y="128">None of them is at ±3: play on.</text>
+</g>
+<g data-s="2">
+<circle class="e none " style="stroke-width:3" cx="91.0" cy="89.0" r="13"/>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n sig" x="242" y="74.0" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="263" y="90.0">−1</text>
+<rect class="n " x="242" y="130.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="146.0">+1</text>
+<rect class="n " x="242" y="186.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="202.0">0</text>
+<rect class="n sig" x="67.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="88.0" y="254">−1</text>
+<rect class="n " x="123.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="144.0" y="254">+1</text>
+<rect class="n " x="179.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="200.0" y="254">0</text>
+<rect class="n sig" x="10" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="31" y="34">0</text>
+<rect class="n " x="236" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid" x="257" y="34">+1</text>
+<text class="tb" x="372" y="84">2. O takes square 0</text>
+<text class="ts" x="372" y="104">Changes: row 0, column 0 and one diagonal.</text>
+<text class="ts" x="372" y="128">None of them is at ±3: play on.</text>
+</g>
+<g data-s="3">
+<path class="e none " style="stroke-width:3" d="M191.0 77.0L215.0 101.0M215.0 77.0L191.0 101.0"/>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n sig" x="242" y="74.0" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="263" y="90.0">0</text>
+<rect class="n " x="242" y="130.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="146.0">+1</text>
+<rect class="n " x="242" y="186.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="202.0">0</text>
+<rect class="n " x="67.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="88.0" y="254">−1</text>
+<rect class="n " x="123.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="144.0" y="254">+1</text>
+<rect class="n sig" x="179.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="200.0" y="254">+1</text>
+<rect class="n " x="10" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid" x="31" y="34">0</text>
+<rect class="n sig" x="236" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="257" y="34">+2</text>
+<text class="tb" x="372" y="84">3. X takes square 2</text>
+<text class="ts" x="372" y="104">Changes: row 0, column 2 and the other diagonal.</text>
+<text class="ts" x="372" y="128">None of them is at ±3: play on.</text>
+</g>
+<g data-s="4">
+<circle class="e none " style="stroke-width:3" cx="147.0" cy="89.0" r="13"/>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n sig" x="242" y="74.0" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="263" y="90.0">−1</text>
+<rect class="n " x="242" y="130.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="146.0">+1</text>
+<rect class="n " x="242" y="186.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="202.0">0</text>
+<rect class="n " x="67.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="88.0" y="254">−1</text>
+<rect class="n sig" x="123.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="144.0" y="254">0</text>
+<rect class="n " x="179.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="200.0" y="254">+1</text>
+<rect class="n " x="10" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid" x="31" y="34">0</text>
+<rect class="n " x="236" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid" x="257" y="34">+2</text>
+<text class="tb" x="372" y="84">4. O takes square 1</text>
+<text class="ts" x="372" y="104">Changes: row 0 and column 1.</text>
+<text class="ts" x="372" y="128">None of them is at ±3: play on.</text>
+</g>
+<g data-s="5">
+<path class="e none " style="stroke-width:3" d="M79.0 189.0L103.0 213.0M103.0 189.0L79.0 213.0"/>
+</g>
+<g class="hide" data-s="5">
+<rect class="n " x="242" y="74.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="90.0">−1</text>
+<rect class="n " x="242" y="130.0" width="42" height="24" rx="4"/>
+<text class="ts mid" x="263" y="146.0">+1</text>
+<rect class="n sig" x="242" y="186.0" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="263" y="202.0">+1</text>
+<rect class="n sig" x="67.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="88.0" y="254">0</text>
+<rect class="n " x="123.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="144.0" y="254">0</text>
+<rect class="n " x="179.0" y="238" width="42" height="24" rx="4"/>
+<text class="ts mid" x="200.0" y="254">+1</text>
+<rect class="n " x="10" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid" x="31" y="34">0</text>
+<rect class="n store" x="236" y="18" width="42" height="24" rx="4"/>
+<text class="ts mid tb" x="257" y="34">+3</text>
+<text class="tb" x="372" y="84">5. X takes square 6</text>
+<text class="ts" x="372" y="104">Changes: row 2, column 0 and the other diagonal.</text>
+<text class="ts tb" x="372" y="128">A diagonal is at +3: X has won.</text>
+</g>
+<g data-s="5">
+<path class="e none store" style="stroke-width:4;opacity:.75" d="M220 66L68 218"/>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Rows: 0 +1 0; Columns: 0 +1 0; Diagonals: +1 +1; Winner: none yet">X takes the center. It lies on four lines, row 1, column 1 and both diagonals, so four counters rise to +1.</li>
+  <li data-msg="none" data-state="Rows: −1 +1 0; Columns: −1 +1 0; Diagonals: 0 +1; Winner: none yet">O takes the corner, square 0. Row 0, column 0 and the diagonal through it fall by one. That diagonal is back to 0: one X and one O.</li>
+  <li data-msg="none" data-state="Rows: 0 +1 0; Columns: −1 +1 +1; Diagonals: 0 +2; Winner: none yet">X takes square 2. The other diagonal reaches +2, two X with nothing against them: a threat O must block.</li>
+  <li data-msg="none" data-state="Rows: −1 +1 0; Columns: −1 0 +1; Diagonals: 0 +2; Winner: none yet">O takes square 1 and blocks column 1 instead. The diagonal from 2 to 6 is untouched, still at +2.</li>
+  <li data-msg="none" data-state="Rows: −1 +1 +1; Columns: 0 0 +1; Diagonals: 0 +3; Winner: X">X takes square 6. Three counters change, and one reaches +3. That is the whole win check: no row, column or diagonal is scanned.</li>
+</ol>
+<figcaption>Each move updates the counters of the lines through its square, at most four, and a win is a counter at plus or minus n. The chapter’s test plays this game and checks the same rule against a full scan of all 5,478 positions.</figcaption>
+</figure>
+
+<p>The test walked the whole game tree from the empty board: 549,946 positions counting repeats, 5,478 of them different, 958 where the game is over, and 255,168 different games, all four matching published counts. On every different position the counters agreed with a plain scan of the eight lines.</p>
+
+<h3 id="movement">Chess: how the pieces move</h3>
+<p>The board is an array of 64 squares, a1 being 0 and h8 63. A helper, <code>step</code>, moves a square by some files and ranks, or returns −1 off the board.</p>
+<pre data-lang="ts" data-title="How each piece moves, as data">
+// How each piece moves, as data: a set of directions, and whether it may keep going in a direction.
+// The pawn is the exception, and has its own code below.
+type Dir = readonly [number, number];
+const ORTHOGONAL: Dir[] = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const DIAGONAL: Dir[] = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+const KNIGHT: Dir[] = [[1, 2], [2, 1], [2, -1], [1, -2], [-1, -2], [-2, -1], [-2, 1], [-1, 2]];
+export const MOVEMENT: Record<Exclude<Kind, "p">, { dirs: Dir[]; slides: boolean }> = {
+  n: { dirs: KNIGHT, slides: false },
+  b: { dirs: DIAGONAL, slides: true },
+  r: { dirs: ORTHOGONAL, slides: true },
+  q: { dirs: [...ORTHOGONAL, ...DIAGONAL], slides: true },
+  k: { dirs: [...ORTHOGONAL, ...DIAGONAL], slides: false },
+};
+</pre>
+<pre data-lang="ts" data-title="One loop for every piece but the pawn">
+// Moves that follow how the pieces move, without asking whether they leave the king in check.
+  pseudoLegalMoves(): Move[] {
+    const moves: Move[] = [];
+    const us = this.turn;
+    for (let from = 0; from < 64; from += 1) {
+      const piece = this.board[from];
+      if (!piece || piece.color !== us) continue;
+      if (piece.kind === "p") { this.pawnMoves(from, moves); continue; }
+      const { dirs, slides } = MOVEMENT[piece.kind];
+      for (const [df, dr] of dirs) {
+        for (let to = step(from, df, dr); to >= 0; to = slides ? step(to, df, dr) : -1) {
+          const there = this.board[to];
+          if (there && there.color === us) break;
+          moves.push({ from, to });
+          if (there) break;
+        }
+      }
+    }
+    this.castlingMoves(moves);
+    return moves;
+  }
+</pre>
+<p>A piece walks each of its directions, once or until something stops it. Its own piece blocks the square; an enemy piece can be taken, and ends the slide. These are the <dfn>pseudo-legal moves</dfn>: the moves the pieces’ movement allows, before asking whether they leave the mover’s own king attacked. The pawn has its own function, because its moves differ in kind: forward to move, diagonal to capture, two squares from its first rank, en passant, and one move for each piece it may become on the last rank. The Laws make promotion part of the move (article 3.7.3.3), so a move to the last rank that names no piece is refused.</p>
+
+<h3 id="legal">Legal moves: the rule no piece knows</h3>
+<pre data-lang="ts" data-title="Legal moves, and play">
+// The rule that no piece knows about: a move may not leave your own king attacked.
+  legalMoves(): Move[] {
+    return this.pseudoLegalMoves().filter((m) => {
+      const next = this.apply(m);
+      return !next.isAttacked(next.kingSquare(this.turn), next.turn);
+    });
+  }
+
+  play(move: Move): Position {
+    const legal = this.legalMoves().find((m) => m.from === move.from && m.to === move.to && (m.promotion ?? null) === (move.promotion ?? null));
+    if (!legal) throw new IllegalMove(`${this.describe(move)} is not legal here`);
+    return this.apply(legal);
+  }
+</pre>
+<p>A move is legal if, in the position after it, the mover’s king is not attacked. <code>isAttacked</code> looks outward from the king’s square: along lines and diagonals for sliding pieces, a knight’s jump away, one step for a king or pawn. The same function decides check and whether castling is safe.</p>
+
+<figure class="fig wide" id="fig-legal">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 344" role="img" aria-labelledby="f733t f733d">
+<title id="f733t">Two moves the pieces allow and the rules refuse</title>
+<desc id="f733d">Two chess boards. On the left, white has a king on e1 and a bishop on e2; black has a rook on e8 and a king on g8. The bishop’s movement reaches nine squares, but any of them opens the e-file to the rook, so none is legal. On the right, white has a king on e1 and rooks on a1 and h1 with both castling rights; black has rooks on a8 and f8 and a king on e8. The squares f1 and g1 are empty, but the rook on f8 attacks f1, which the king must cross, so castling to g1 is refused, while castling to c1 is legal.</desc>
+<text class="tb" x="10" y="18">A pinned bishop</text>
+<text class="ts" x="10" y="34">white to move</text>
+<text class="tb" x="370" y="18">Castling through an attacked square</text>
+<text class="ts" x="370" y="34">white to move, rights K and Q</text>
+<path class="e none dash" d="M356 8V336"/>
+<rect class="n" x="44" y="44" width="208" height="208" rx="1"/>
+<rect class="n sunk" style="stroke:none" x="44" y="226" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="96" y="226" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="148" y="226" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="200" y="226" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="70" y="200" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="122" y="200" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="174" y="200" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="226" y="200" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="44" y="174" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="96" y="174" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="148" y="174" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="200" y="174" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="70" y="148" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="122" y="148" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="174" y="148" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="226" y="148" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="44" y="122" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="96" y="122" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="148" y="122" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="200" y="122" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="70" y="96" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="122" y="96" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="174" y="96" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="226" y="96" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="44" y="70" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="96" y="70" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="148" y="70" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="200" y="70" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="70" y="44" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="122" y="44" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="174" y="44" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="226" y="44" width="26" height="26"/>
+<rect class="n" style="fill:none" x="44" y="44" width="208" height="208" rx="1"/>
+<text class="ts mid" x="57.0" y="266">a</text>
+<text class="ts mid" x="36" y="243.0">1</text>
+<text class="ts mid" x="83.0" y="266">b</text>
+<text class="ts mid" x="36" y="217.0">2</text>
+<text class="ts mid" x="109.0" y="266">c</text>
+<text class="ts mid" x="36" y="191.0">3</text>
+<text class="ts mid" x="135.0" y="266">d</text>
+<text class="ts mid" x="36" y="165.0">4</text>
+<text class="ts mid" x="161.0" y="266">e</text>
+<text class="ts mid" x="36" y="139.0">5</text>
+<text class="ts mid" x="187.0" y="266">f</text>
+<text class="ts mid" x="36" y="113.0">6</text>
+<text class="ts mid" x="213.0" y="266">g</text>
+<text class="ts mid" x="36" y="87.0">7</text>
+<text class="ts mid" x="239.0" y="266">h</text>
+<text class="ts mid" x="36" y="61.0">8</text>
+<circle class="n" style="stroke:var(--ink-2)" cx="161.0" cy="239.0" r="10"/>
+<text class="ts mid tb" x="161.0" y="243.0">K</text>
+<circle class="n" style="stroke:var(--ink-2)" cx="161.0" cy="213.0" r="10"/>
+<text class="ts mid tb" x="161.0" y="217.0">B</text>
+<circle class="n sunk" style="stroke:var(--ink-2)" cx="161.0" cy="57.0" r="10"/>
+<text class="ts mid tb" x="161.0" y="61.0">r</text>
+<circle class="n sunk" style="stroke:var(--ink-2)" cx="213.0" cy="57.0" r="10"/>
+<text class="ts mid tb" x="213.0" y="61.0">k</text>
+<rect class="n" x="404" y="44" width="208" height="208" rx="1"/>
+<rect class="n sunk" style="stroke:none" x="404" y="226" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="456" y="226" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="508" y="226" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="560" y="226" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="430" y="200" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="482" y="200" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="534" y="200" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="586" y="200" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="404" y="174" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="456" y="174" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="508" y="174" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="560" y="174" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="430" y="148" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="482" y="148" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="534" y="148" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="586" y="148" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="404" y="122" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="456" y="122" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="508" y="122" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="560" y="122" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="430" y="96" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="482" y="96" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="534" y="96" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="586" y="96" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="404" y="70" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="456" y="70" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="508" y="70" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="560" y="70" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="430" y="44" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="482" y="44" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="534" y="44" width="26" height="26"/>
+<rect class="n sunk" style="stroke:none" x="586" y="44" width="26" height="26"/>
+<rect class="n" style="fill:none" x="404" y="44" width="208" height="208" rx="1"/>
+<text class="ts mid" x="417.0" y="266">a</text>
+<text class="ts mid" x="396" y="243.0">1</text>
+<text class="ts mid" x="443.0" y="266">b</text>
+<text class="ts mid" x="396" y="217.0">2</text>
+<text class="ts mid" x="469.0" y="266">c</text>
+<text class="ts mid" x="396" y="191.0">3</text>
+<text class="ts mid" x="495.0" y="266">d</text>
+<text class="ts mid" x="396" y="165.0">4</text>
+<text class="ts mid" x="521.0" y="266">e</text>
+<text class="ts mid" x="396" y="139.0">5</text>
+<text class="ts mid" x="547.0" y="266">f</text>
+<text class="ts mid" x="396" y="113.0">6</text>
+<text class="ts mid" x="573.0" y="266">g</text>
+<text class="ts mid" x="396" y="87.0">7</text>
+<text class="ts mid" x="599.0" y="266">h</text>
+<text class="ts mid" x="396" y="61.0">8</text>
+<circle class="n" style="stroke:var(--ink-2)" cx="521.0" cy="239.0" r="10"/>
+<text class="ts mid tb" x="521.0" y="243.0">K</text>
+<circle class="n" style="stroke:var(--ink-2)" cx="417.0" cy="239.0" r="10"/>
+<text class="ts mid tb" x="417.0" y="243.0">R</text>
+<circle class="n" style="stroke:var(--ink-2)" cx="599.0" cy="239.0" r="10"/>
+<text class="ts mid tb" x="599.0" y="243.0">R</text>
+<circle class="n sunk" style="stroke:var(--ink-2)" cx="417.0" cy="57.0" r="10"/>
+<text class="ts mid tb" x="417.0" y="61.0">r</text>
+<circle class="n sunk" style="stroke:var(--ink-2)" cx="547.0" cy="57.0" r="10"/>
+<text class="ts mid tb" x="547.0" y="61.0">r</text>
+<circle class="n sunk" style="stroke:var(--ink-2)" cx="521.0" cy="57.0" r="10"/>
+<text class="ts mid tb" x="521.0" y="61.0">k</text>
+<g data-scene="pin">
+<g data-s="1" data-packet="none">
+<circle class="dot" cx="135.0" cy="239.0" r="5"/>
+<circle class="dot" cx="187.0" cy="239.0" r="5"/>
+<circle class="dot" cx="135.0" cy="187.0" r="5"/>
+<circle class="dot" cx="109.0" cy="161.0" r="5"/>
+<circle class="dot" cx="83.0" cy="135.0" r="5"/>
+<circle class="dot" cx="57.0" cy="109.0" r="5"/>
+<circle class="dot" cx="187.0" cy="187.0" r="5"/>
+<circle class="dot" cx="213.0" cy="161.0" r="5"/>
+<circle class="dot" cx="239.0" cy="135.0" r="5"/>
+</g>
+<g class="hide" data-s="2" data-packet="none">
+<path class="e fault" d="M161.0 69.0V201.0M161.0 225.0V226.0"/>
+<text class="ts" x="260" y="135.0">once the</text>
+<text class="ts" x="260" y="151.0">bishop moves,</text>
+<text class="ts" x="260" y="167.0">the rook</text>
+<text class="ts" x="260" y="183.0">attacks e1</text>
+</g>
+<g data-s="3" data-packet="none">
+<path class="x" d="M129.0 233.0l12 12M141.0 233.0l-12 12"/>
+<path class="x" d="M181.0 233.0l12 12M193.0 233.0l-12 12"/>
+<path class="x" d="M129.0 181.0l12 12M141.0 181.0l-12 12"/>
+<path class="x" d="M103.0 155.0l12 12M115.0 155.0l-12 12"/>
+<path class="x" d="M77.0 129.0l12 12M89.0 129.0l-12 12"/>
+<path class="x" d="M51.0 103.0l12 12M63.0 103.0l-12 12"/>
+<path class="x" d="M181.0 181.0l12 12M193.0 181.0l-12 12"/>
+<path class="x" d="M207.0 155.0l12 12M219.0 155.0l-12 12"/>
+<path class="x" d="M233.0 129.0l12 12M245.0 129.0l-12 12"/>
+</g>
+<g class="hide" data-s="3">
+<text class="ts tb" x="10" y="292">All nine leave the king attacked: 0 legal.</text>
+</g>
+</g>
+<g data-scene="castle">
+<g data-s="1" data-packet="none">
+<rect class="n sig" x="536.0" y="228.0" width="22" height="22" rx="3"/>
+<rect class="n sig" x="562.0" y="228.0" width="22" height="22" rx="3"/>
+</g>
+<g data-s="2" data-packet="none">
+<path class="e fault" d="M547.0 69.0V226.0"/>
+<rect class="n fault" x="536.0" y="228.0" width="22" height="22" rx="3"/>
+</g>
+<g data-s="3" data-packet="none">
+<path class="e none fault dash" style="stroke-width:2" d="M532.0 239.0H567.0"/>
+<path class="x" d="M567.0 233.0l12 12M579.0 233.0l-12 12"/>
+<path class="e store" style="stroke-width:2" d="M510.0 239.0H477.0"/>
+</g>
+<g class="hide" data-s="3">
+<text class="ts tb" x="370" y="292">e1g1 is refused. On the other side e1, d1 and</text>
+<text class="ts tb" x="370" y="308">c1 are safe, so e1c1 is legal.</text>
+</g>
+</g>
+<text class="ts" x="10" y="330">Capital letters are white pieces and small letters black, as in FEN.</text>
+</svg>
+</div>
+<ol class="steps" data-scene="pin" data-label="Pinned bishop">
+  <li data-msg="none" data-state="Bishop: 9 pseudo-legal, legal not yet known">The bishop’s own movement rule gives nine squares along two diagonals: its pseudo-legal moves.</li>
+  <li data-msg="none" data-state="Bishop: 9 pseudo-legal, legal not yet known">Try one. Afterward the e-file is open and the rook on e8 attacks the white king, which no move may allow.</li>
+  <li data-msg="none" data-state="Bishop: 9 pseudo-legal, 0 legal">The same happens after each of the nine. The bishop is pinned: its movement allows nine moves, the rules none. The test checks 9 and 0.</li>
+</ol>
+<ol class="steps" data-scene="castle" data-label="Castling">
+  <li data-msg="none" data-state="e1g1: right held, path empty">Castling short needs the right K, kept while the king and the h1 rook are unmoved, and empty squares between them: f1 and g1 are empty.</li>
+  <li data-msg="none" data-state="e1g1: right held, path empty, f1 attacked">The king may not castle out of, through or into an attacked square. The rook on f8 attacks f1.</li>
+  <li data-msg="none" data-state="e1g1: refused; e1c1: legal">So e1g1 is refused, though nothing stands in the way. On the other side e1, d1 and c1 are safe and b1 is empty, so e1c1 is legal.</li>
+</ol>
+<figcaption>Neither refusal can be decided by the piece that moves. Each depends on an enemy piece elsewhere on the board, which is why legality belongs to the position.</figcaption>
+</figure>
+
+<p>Castling follows article 3.8 of the Laws. The right is lost for good once the king has moved, or the rook in question. It is prevented for now if a square between them is occupied, or if the square the king stands on, crosses or lands on is attacked. The rights are the letters of FEN, <code>KQkq</code>. <code>apply</code> removes them when a king moves, and when anything leaves or lands on a rook’s starting square, which covers a rook captured at home. The tests check castling allowed, refused through f1, lost after <code>h1h2</code>, and lost by both sides when a rook takes a rook on a8. En passant is allowed only on the move right after the double step (article 3.7.3.2): the position records the skipped square, <code>apply</code> clears it after every other move, and the test checks that the capture works at once and is refused once each side has moved again.</p>
+
+<h3 id="draws">Endings, and what counts as the same position</h3>
+<p><code>outcome</code> looks first for a side with no legal moves: checkmated if in check, stalemated if not. Mate comes first because a move that gives mate stands even if it also completes the 75th move (article 9.6.2). <code>halfmoves</code> counts moves by either side since the last capture or pawn move, so 100 is fifty each. The material check knows only the simplest cases: kings alone, or a king with one bishop or knight against a lone king. The Laws’ rule is wider, a dead position from which no series of legal moves can lead to mate, and is a follow-up.</p>
+<p>Repetition is counted in <code>seen</code>, a map from each position’s key to how often it has occurred. No position before a capture or pawn move can occur again, so <code>apply</code> starts the map afresh after one. Article 9.2.3 defines “the same position”: the same player to move, the same pieces on the same squares, and the same possible moves for both players. So a key built from the FEN fields is subtly wrong. FEN records the en passant square after every double step, whether or not any pawn can use it, and with that in the key the position after 1. e4 can never repeat. <code>key()</code> includes the square only when a pawn of the side to move stands beside it. The test plays 1. e4 and moves both knights out and back twice: the position after 1. e4 has occurred three times, and the game is drawn. A second test checks that where a capture was possible, the first occurrence does not count.</p>
+
+<h2 id="perft">Testing the move generator</h2>
+<p>Hand-written tests check the rules their author thought of. A chess move generator needs a test that does not depend on remembering every rule, and the chess programming community has one. <dfn>Perft</dfn>, short for “performance test, move path enumeration”, counts the positions reached after exactly a given number of moves, following every legal move at every step. Counts for standard positions are published, and a single wrong rule changes a number somewhere.</p>
+<pre data-lang="ts" data-title="perft: count the leaves of the tree of legal moves">
+// Counts the positions reached after exactly `depth` moves. Published counts for standard positions make this
+// the usual test of a chess move generator: a single wrong rule changes a number somewhere.
+export function perft(position: Position, depth: number, legal = true): number {
+  const moves = legal ? position.legalMoves() : position.pseudoLegalMoves();
+  if (depth === 1) return moves.length;
+  let total = 0;
+  for (const m of moves) total += perft(position.apply(m), depth - 1, legal);
+  return total;
+}
+</pre>
+<p>The positions are given in <dfn>Forsyth–Edwards Notation</dfn>, or FEN, one line of text that describes a whole chess position: the pieces rank by rank from the eighth, the side to move, the castling rights, the en passant square, the count toward the fifty-move rule, and the move number. David Forsyth devised it in the nineteenth century, and Steven Edwards specified it for computers as part of Portable Game Notation.</p>
+<table>
+<thead><tr><th>Position</th><th>Published counts, depth 1 upward</th><th>Matched to depth</th><th>Time for the deepest, one run</th></tr></thead>
+<tbody>
+<tr><th>Start</th><td>20; 400; 8,902; 197,281</td><td>4</td><td>997 ms</td></tr>
+<tr><th>Kiwipete, by Peter McKenzie</th><td>48; 2,039; 97,862</td><td>3</td><td>382 ms</td></tr>
+<tr><th>Position 3</th><td>14; 191; 2,812; 43,238</td><td>4</td><td>239 ms</td></tr>
+<tr><th>Position 4</th><td>6; 264; 9,467</td><td>3</td><td>44 ms</td></tr>
+<tr><th>Position 5</th><td>44; 1,486; 62,379</td><td>3</td><td>243 ms</td></tr>
+</tbody>
+</table>
+<p>Every count matched. The times are one run on a two-core machine with Node 22, about 200,000 positions a second. The published table goes deeper, Kiwipete to 4,085,603 positions at depth 4; the test stops where it does to finish in seconds. The later positions crowd rare rules together: Kiwipete has all four castling rights and 48 legal moves for white.</p>
+<p>The test also shows what perft catches. Counted with pseudo-legal moves, the start position gives 20, 400 and 8,902, all correct, and then 197,742 at depth 4 instead of 197,281. The 461 extra positions all come from black’s second move, the first that can leave the mover’s own king attacked. The test sorts them: 245 ignore a check, 188 move a pinned piece, and 28 walk the king into an attack. A bug in a rare rule shows the same way. To find it, chess programmers split the count by first move, a variant called divide, compare each part with a trusted program’s, and repeat one move further down.</p>
+
+<h2 id="search">A computer player for either game</h2>
+<p>A <dfn>game tree</dfn> has a position at every node and a move on every edge, from the current position down to positions where the game is over or the search stops. <dfn>Minimax</dfn> gives each position the value of the best result its player can force against an opponent who also plays its best. <dfn>Negamax</dfn> writes minimax once for both players: every value is from the point of view of the side to move, so a position is worth the largest of its children’s values with their signs flipped.</p>
+<pre data-lang="ts" data-title="Negamax with alpha-beta, for any game">
+// Negamax with alpha-beta pruning, for any game that fits the interface. The score is from the point of view of
+// the side to move: positive is good for it. Wins found sooner score higher, so the search prefers the quickest.
+export function search<M, G extends Game<M, G>>(game: G, depth: number, evaluate: (g: G) => number, alpha = -Infinity, beta = Infinity, ply = 0): number {
+  const outcome = game.outcome();
+  if (outcome.kind === "win") return -(WIN - ply); // the side to move has lost
+  if (outcome.kind === "draw") return 0;
+  if (depth === 0) return evaluate(game);
+  let best = -Infinity;
+  for (const move of game.legalMoves()) {
+    const score = -search(game.play(move), depth - 1, evaluate, -beta, -alpha, ply + 1);
+    if (score > best) best = score;
+    if (best > alpha) alpha = best;
+    if (alpha >= beta) break; // the opponent will never allow this line, so the rest need not be looked at
+  }
+  return best;
+}
+</pre>
+<p>A loss scores a large negative number, smaller for each move it took, so the search prefers quicker wins; a draw is zero; when the depth runs out, <code>evaluate</code> guesses. <dfn>Alpha-beta pruning</dfn> computes the same value as minimax while skipping moves that cannot change it: <code>alpha</code> is what the side to move is already sure of, <code>beta</code> the most the opponent will allow, and once a move reaches <code>beta</code>, the opponent would never let the game get here, so the remaining moves are not looked at.</p>
+
+<figure class="fig wide" id="fig-tree">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 342" role="img" aria-labelledby="f734t f734d">
+<title id="f734t">Values coming up a game tree, and the positions alpha-beta never looks at</title>
+<desc id="f734d">Two copies of the same small game tree. At the root, X is to move with squares 0, 1 and 2 empty; row 1 holds O, O, X and row 2 holds X, O, X. X at 0 lets O complete the middle column, worth −1 for X. X at 1 blocks it and leads to a draw, worth 0. X at 2 completes the right-hand column, worth +1, so the root is worth +1. On the left, negamax visits all 10 positions below the root. On the right, alpha-beta with winning moves tried first visits 6: after the win at 2, one reply to each other move is enough to show it is no better, and 4 positions are never examined.</desc>
+<text class="tb" x="10" y="18">Negamax: every position, in the order 0, 1, 2</text>
+<text class="ts" x="10" y="34">values for X: +1 X wins, 0 draw, −1 O wins</text>
+<text class="tb" x="376" y="18">Alpha-beta: winning moves tried first</text>
+<text class="ts" x="376" y="34">dashed positions are never examined</text>
+<path class="e none dash" d="M362 8V334"/>
+<path class="e none" d="M63.5 176L30.5 190"/>
+<path class="e none" d="M63.5 176L96.5 190"/>
+<path class="e none" d="M195.5 176L162.5 190"/>
+<path class="e none" d="M195.5 176L228.5 190"/>
+<path class="e none" d="M195.5 108L294.5 122"/>
+<path class="e none" d="M96.5 244L96.5 258"/>
+<path class="e none" d="M162.5 244L162.5 258"/>
+<path class="e none" d="M228.5 244L228.5 258"/>
+<path class="e none" d="M195.5 108L63.5 122"/>
+<path class="e none" d="M195.5 108L195.5 122"/>
+<path class="e none" d="M495.5 108L396.5 122"/>
+<path class="e none" d="M495.5 176L462.5 190"/>
+<path class="e none dash" d="M495.5 176L528.5 190"/>
+<path class="e none" d="M627.5 176L594.5 190"/>
+<path class="e none dash" d="M627.5 176L660.5 190"/>
+<path class="e none dash" d="M528.5 244L528.5 258"/>
+<path class="e none" d="M594.5 244L594.5 258"/>
+<path class="e none dash" d="M660.5 244L660.5 258"/>
+<path class="e none" d="M495.5 108L495.5 122"/>
+<path class="e none" d="M495.5 108L627.5 122"/>
+<rect class="n" x="14" y="192" width="33" height="33" rx="2"/>
+<line class="axis" x1="25" y1="192" x2="25" y2="225"/>
+<line class="axis" x1="14" y1="203" x2="47" y2="203"/>
+<line class="axis" x1="36" y1="192" x2="36" y2="225"/>
+<line class="axis" x1="14" y1="214" x2="47" y2="214"/>
+<path class="e none" style="stroke-width:1.3" d="M16.3 194.3L22.7 200.7M22.7 194.3L16.3 200.7"/>
+<circle class="e none sig" style="stroke-width:2" cx="30.5" cy="197.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="19.5" cy="208.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="30.5" cy="208.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M38.3 205.3L44.7 211.7M44.7 205.3L38.3 211.7"/>
+<path class="e none" style="stroke-width:1.3" d="M16.3 216.3L22.7 222.7M22.7 216.3L16.3 222.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="30.5" cy="219.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M38.3 216.3L44.7 222.7M44.7 216.3L38.3 222.7"/>
+<rect class="n" x="80" y="192" width="33" height="33" rx="2"/>
+<line class="axis" x1="91" y1="192" x2="91" y2="225"/>
+<line class="axis" x1="80" y1="203" x2="113" y2="203"/>
+<line class="axis" x1="102" y1="192" x2="102" y2="225"/>
+<line class="axis" x1="80" y1="214" x2="113" y2="214"/>
+<path class="e none" style="stroke-width:1.3" d="M82.3 194.3L88.7 200.7M88.7 194.3L82.3 200.7"/>
+<circle class="e none sig" style="stroke-width:2" cx="107.5" cy="197.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="85.5" cy="208.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="96.5" cy="208.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M104.3 205.3L110.7 211.7M110.7 205.3L104.3 211.7"/>
+<path class="e none" style="stroke-width:1.3" d="M82.3 216.3L88.7 222.7M88.7 216.3L82.3 222.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="96.5" cy="219.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M104.3 216.3L110.7 222.7M110.7 216.3L104.3 222.7"/>
+<rect class="n" x="146" y="192" width="33" height="33" rx="2"/>
+<line class="axis" x1="157" y1="192" x2="157" y2="225"/>
+<line class="axis" x1="146" y1="203" x2="179" y2="203"/>
+<line class="axis" x1="168" y1="192" x2="168" y2="225"/>
+<line class="axis" x1="146" y1="214" x2="179" y2="214"/>
+<circle class="e none sig" style="stroke-width:2" cx="151.5" cy="197.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M159.3 194.3L165.7 200.7M165.7 194.3L159.3 200.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="151.5" cy="208.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="162.5" cy="208.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M170.3 205.3L176.7 211.7M176.7 205.3L170.3 211.7"/>
+<path class="e none" style="stroke-width:1.3" d="M148.3 216.3L154.7 222.7M154.7 216.3L148.3 222.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="162.5" cy="219.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M170.3 216.3L176.7 222.7M176.7 216.3L170.3 222.7"/>
+<rect class="n" x="212" y="192" width="33" height="33" rx="2"/>
+<line class="axis" x1="223" y1="192" x2="223" y2="225"/>
+<line class="axis" x1="212" y1="203" x2="245" y2="203"/>
+<line class="axis" x1="234" y1="192" x2="234" y2="225"/>
+<line class="axis" x1="212" y1="214" x2="245" y2="214"/>
+<path class="e none" style="stroke-width:1.3" d="M225.3 194.3L231.7 200.7M231.7 194.3L225.3 200.7"/>
+<circle class="e none sig" style="stroke-width:2" cx="239.5" cy="197.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="217.5" cy="208.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="228.5" cy="208.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M236.3 205.3L242.7 211.7M242.7 205.3L236.3 211.7"/>
+<path class="e none" style="stroke-width:1.3" d="M214.3 216.3L220.7 222.7M220.7 216.3L214.3 222.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="228.5" cy="219.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M236.3 216.3L242.7 222.7M242.7 216.3L236.3 222.7"/>
+<rect class="n" x="278" y="124" width="33" height="33" rx="2"/>
+<line class="axis" x1="289" y1="124" x2="289" y2="157"/>
+<line class="axis" x1="278" y1="135" x2="311" y2="135"/>
+<line class="axis" x1="300" y1="124" x2="300" y2="157"/>
+<line class="axis" x1="278" y1="146" x2="311" y2="146"/>
+<path class="e none sig" style="stroke-width:2" d="M302.3 126.3L308.7 132.7M308.7 126.3L302.3 132.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="283.5" cy="140.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="294.5" cy="140.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M302.3 137.3L308.7 143.7M308.7 137.3L302.3 143.7"/>
+<path class="e none" style="stroke-width:1.3" d="M280.3 148.3L286.7 154.7M286.7 148.3L280.3 154.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="294.5" cy="151.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M302.3 148.3L308.7 154.7M308.7 148.3L302.3 154.7"/>
+<rect class="n" x="80" y="260" width="33" height="33" rx="2"/>
+<line class="axis" x1="91" y1="260" x2="91" y2="293"/>
+<line class="axis" x1="80" y1="271" x2="113" y2="271"/>
+<line class="axis" x1="102" y1="260" x2="102" y2="293"/>
+<line class="axis" x1="80" y1="282" x2="113" y2="282"/>
+<path class="e none" style="stroke-width:1.3" d="M82.3 262.3L88.7 268.7M88.7 262.3L82.3 268.7"/>
+<path class="e none sig" style="stroke-width:2" d="M93.3 262.3L99.7 268.7M99.7 262.3L93.3 268.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="107.5" cy="265.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="85.5" cy="276.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="96.5" cy="276.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M104.3 273.3L110.7 279.7M110.7 273.3L104.3 279.7"/>
+<path class="e none" style="stroke-width:1.3" d="M82.3 284.3L88.7 290.7M88.7 284.3L82.3 290.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="96.5" cy="287.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M104.3 284.3L110.7 290.7M110.7 284.3L104.3 290.7"/>
+<rect class="n" x="146" y="260" width="33" height="33" rx="2"/>
+<line class="axis" x1="157" y1="260" x2="157" y2="293"/>
+<line class="axis" x1="146" y1="271" x2="179" y2="271"/>
+<line class="axis" x1="168" y1="260" x2="168" y2="293"/>
+<line class="axis" x1="146" y1="282" x2="179" y2="282"/>
+<circle class="e none" style="stroke-width:1.3" cx="151.5" cy="265.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M159.3 262.3L165.7 268.7M165.7 262.3L159.3 268.7"/>
+<path class="e none sig" style="stroke-width:2" d="M170.3 262.3L176.7 268.7M176.7 262.3L170.3 268.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="151.5" cy="276.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="162.5" cy="276.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M170.3 273.3L176.7 279.7M176.7 273.3L170.3 279.7"/>
+<path class="e none" style="stroke-width:1.3" d="M148.3 284.3L154.7 290.7M154.7 284.3L148.3 290.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="162.5" cy="287.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M170.3 284.3L176.7 290.7M176.7 284.3L170.3 290.7"/>
+<rect class="n" x="212" y="260" width="33" height="33" rx="2"/>
+<line class="axis" x1="223" y1="260" x2="223" y2="293"/>
+<line class="axis" x1="212" y1="271" x2="245" y2="271"/>
+<line class="axis" x1="234" y1="260" x2="234" y2="293"/>
+<line class="axis" x1="212" y1="282" x2="245" y2="282"/>
+<path class="e none sig" style="stroke-width:2" d="M214.3 262.3L220.7 268.7M220.7 262.3L214.3 268.7"/>
+<path class="e none" style="stroke-width:1.3" d="M225.3 262.3L231.7 268.7M231.7 262.3L225.3 268.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="239.5" cy="265.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="217.5" cy="276.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="228.5" cy="276.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M236.3 273.3L242.7 279.7M242.7 273.3L236.3 279.7"/>
+<path class="e none" style="stroke-width:1.3" d="M214.3 284.3L220.7 290.7M220.7 284.3L214.3 290.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="228.5" cy="287.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M236.3 284.3L242.7 290.7M242.7 284.3L236.3 290.7"/>
+<rect class="n" x="47.0" y="124" width="33" height="33" rx="2"/>
+<line class="axis" x1="58.0" y1="124" x2="58.0" y2="157"/>
+<line class="axis" x1="47.0" y1="135" x2="80.0" y2="135"/>
+<line class="axis" x1="69.0" y1="124" x2="69.0" y2="157"/>
+<line class="axis" x1="47.0" y1="146" x2="80.0" y2="146"/>
+<path class="e none sig" style="stroke-width:2" d="M49.3 126.3L55.7 132.7M55.7 126.3L49.3 132.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="52.5" cy="140.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="63.5" cy="140.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M71.3 137.3L77.7 143.7M77.7 137.3L71.3 143.7"/>
+<path class="e none" style="stroke-width:1.3" d="M49.3 148.3L55.7 154.7M55.7 148.3L49.3 154.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="63.5" cy="151.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M71.3 148.3L77.7 154.7M77.7 148.3L71.3 154.7"/>
+<rect class="n" x="179.0" y="124" width="33" height="33" rx="2"/>
+<line class="axis" x1="190.0" y1="124" x2="190.0" y2="157"/>
+<line class="axis" x1="179.0" y1="135" x2="212.0" y2="135"/>
+<line class="axis" x1="201.0" y1="124" x2="201.0" y2="157"/>
+<line class="axis" x1="179.0" y1="146" x2="212.0" y2="146"/>
+<path class="e none sig" style="stroke-width:2" d="M192.3 126.3L198.7 132.7M198.7 126.3L192.3 132.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="184.5" cy="140.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="195.5" cy="140.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M203.3 137.3L209.7 143.7M209.7 137.3L203.3 143.7"/>
+<path class="e none" style="stroke-width:1.3" d="M181.3 148.3L187.7 154.7M187.7 148.3L181.3 154.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="195.5" cy="151.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M203.3 148.3L209.7 154.7M209.7 148.3L203.3 154.7"/>
+<rect class="n" x="179.0" y="56" width="33" height="33" rx="2"/>
+<line class="axis" x1="190.0" y1="56" x2="190.0" y2="89"/>
+<line class="axis" x1="179.0" y1="67" x2="212.0" y2="67"/>
+<line class="axis" x1="201.0" y1="56" x2="201.0" y2="89"/>
+<line class="axis" x1="179.0" y1="78" x2="212.0" y2="78"/>
+<circle class="e none" style="stroke-width:1.3" cx="184.5" cy="72.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="195.5" cy="72.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M203.3 69.3L209.7 75.7M209.7 69.3L203.3 75.7"/>
+<path class="e none" style="stroke-width:1.3" d="M181.3 80.3L187.7 86.7M187.7 80.3L181.3 86.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="195.5" cy="83.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M203.3 80.3L209.7 86.7M209.7 80.3L203.3 86.7"/>
+<rect class="n" x="380" y="124" width="33" height="33" rx="2"/>
+<line class="axis" x1="391" y1="124" x2="391" y2="157"/>
+<line class="axis" x1="380" y1="135" x2="413" y2="135"/>
+<line class="axis" x1="402" y1="124" x2="402" y2="157"/>
+<line class="axis" x1="380" y1="146" x2="413" y2="146"/>
+<path class="e none sig" style="stroke-width:2" d="M404.3 126.3L410.7 132.7M410.7 126.3L404.3 132.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="385.5" cy="140.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="396.5" cy="140.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M404.3 137.3L410.7 143.7M410.7 137.3L404.3 143.7"/>
+<path class="e none" style="stroke-width:1.3" d="M382.3 148.3L388.7 154.7M388.7 148.3L382.3 154.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="396.5" cy="151.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M404.3 148.3L410.7 154.7M410.7 148.3L404.3 154.7"/>
+<rect class="n" x="446" y="192" width="33" height="33" rx="2"/>
+<line class="axis" x1="457" y1="192" x2="457" y2="225"/>
+<line class="axis" x1="446" y1="203" x2="479" y2="203"/>
+<line class="axis" x1="468" y1="192" x2="468" y2="225"/>
+<line class="axis" x1="446" y1="214" x2="479" y2="214"/>
+<path class="e none" style="stroke-width:1.3" d="M448.3 194.3L454.7 200.7M454.7 194.3L448.3 200.7"/>
+<circle class="e none sig" style="stroke-width:2" cx="462.5" cy="197.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="451.5" cy="208.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="462.5" cy="208.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M470.3 205.3L476.7 211.7M476.7 205.3L470.3 211.7"/>
+<path class="e none" style="stroke-width:1.3" d="M448.3 216.3L454.7 222.7M454.7 216.3L448.3 222.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="462.5" cy="219.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M470.3 216.3L476.7 222.7M476.7 216.3L470.3 222.7"/>
+<rect class="n ghost" x="512" y="192" width="33" height="33" rx="2"/>
+<path class="e none dash" style="stroke-width:1.3" d="M514.3 194.3L520.7 200.7M520.7 194.3L514.3 200.7"/>
+<circle class="e none sig dash" style="stroke-width:2" cx="539.5" cy="197.5" r="3.4"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="517.5" cy="208.5" r="3.4"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="528.5" cy="208.5" r="3.4"/>
+<path class="e none dash" style="stroke-width:1.3" d="M536.3 205.3L542.7 211.7M542.7 205.3L536.3 211.7"/>
+<path class="e none dash" style="stroke-width:1.3" d="M514.3 216.3L520.7 222.7M520.7 216.3L514.3 222.7"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="528.5" cy="219.5" r="3.4"/>
+<path class="e none dash" style="stroke-width:1.3" d="M536.3 216.3L542.7 222.7M542.7 216.3L536.3 222.7"/>
+<rect class="n" x="578" y="192" width="33" height="33" rx="2"/>
+<line class="axis" x1="589" y1="192" x2="589" y2="225"/>
+<line class="axis" x1="578" y1="203" x2="611" y2="203"/>
+<line class="axis" x1="600" y1="192" x2="600" y2="225"/>
+<line class="axis" x1="578" y1="214" x2="611" y2="214"/>
+<circle class="e none sig" style="stroke-width:2" cx="583.5" cy="197.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M591.3 194.3L597.7 200.7M597.7 194.3L591.3 200.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="583.5" cy="208.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="594.5" cy="208.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M602.3 205.3L608.7 211.7M608.7 205.3L602.3 211.7"/>
+<path class="e none" style="stroke-width:1.3" d="M580.3 216.3L586.7 222.7M586.7 216.3L580.3 222.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="594.5" cy="219.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M602.3 216.3L608.7 222.7M608.7 216.3L602.3 222.7"/>
+<rect class="n ghost" x="644" y="192" width="33" height="33" rx="2"/>
+<path class="e none dash" style="stroke-width:1.3" d="M657.3 194.3L663.7 200.7M663.7 194.3L657.3 200.7"/>
+<circle class="e none sig dash" style="stroke-width:2" cx="671.5" cy="197.5" r="3.4"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="649.5" cy="208.5" r="3.4"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="660.5" cy="208.5" r="3.4"/>
+<path class="e none dash" style="stroke-width:1.3" d="M668.3 205.3L674.7 211.7M674.7 205.3L668.3 211.7"/>
+<path class="e none dash" style="stroke-width:1.3" d="M646.3 216.3L652.7 222.7M652.7 216.3L646.3 222.7"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="660.5" cy="219.5" r="3.4"/>
+<path class="e none dash" style="stroke-width:1.3" d="M668.3 216.3L674.7 222.7M674.7 216.3L668.3 222.7"/>
+<rect class="n ghost" x="512" y="260" width="33" height="33" rx="2"/>
+<path class="e none dash" style="stroke-width:1.3" d="M514.3 262.3L520.7 268.7M520.7 262.3L514.3 268.7"/>
+<path class="e none sig dash" style="stroke-width:2" d="M525.3 262.3L531.7 268.7M531.7 262.3L525.3 268.7"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="539.5" cy="265.5" r="3.4"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="517.5" cy="276.5" r="3.4"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="528.5" cy="276.5" r="3.4"/>
+<path class="e none dash" style="stroke-width:1.3" d="M536.3 273.3L542.7 279.7M542.7 273.3L536.3 279.7"/>
+<path class="e none dash" style="stroke-width:1.3" d="M514.3 284.3L520.7 290.7M520.7 284.3L514.3 290.7"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="528.5" cy="287.5" r="3.4"/>
+<path class="e none dash" style="stroke-width:1.3" d="M536.3 284.3L542.7 290.7M542.7 284.3L536.3 290.7"/>
+<rect class="n" x="578" y="260" width="33" height="33" rx="2"/>
+<line class="axis" x1="589" y1="260" x2="589" y2="293"/>
+<line class="axis" x1="578" y1="271" x2="611" y2="271"/>
+<line class="axis" x1="600" y1="260" x2="600" y2="293"/>
+<line class="axis" x1="578" y1="282" x2="611" y2="282"/>
+<circle class="e none" style="stroke-width:1.3" cx="583.5" cy="265.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M591.3 262.3L597.7 268.7M597.7 262.3L591.3 268.7"/>
+<path class="e none sig" style="stroke-width:2" d="M602.3 262.3L608.7 268.7M608.7 262.3L602.3 268.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="583.5" cy="276.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="594.5" cy="276.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M602.3 273.3L608.7 279.7M608.7 273.3L602.3 279.7"/>
+<path class="e none" style="stroke-width:1.3" d="M580.3 284.3L586.7 290.7M586.7 284.3L580.3 290.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="594.5" cy="287.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M602.3 284.3L608.7 290.7M608.7 284.3L602.3 290.7"/>
+<rect class="n ghost" x="644" y="260" width="33" height="33" rx="2"/>
+<path class="e none sig dash" style="stroke-width:2" d="M646.3 262.3L652.7 268.7M652.7 262.3L646.3 268.7"/>
+<path class="e none dash" style="stroke-width:1.3" d="M657.3 262.3L663.7 268.7M663.7 262.3L657.3 268.7"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="671.5" cy="265.5" r="3.4"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="649.5" cy="276.5" r="3.4"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="660.5" cy="276.5" r="3.4"/>
+<path class="e none dash" style="stroke-width:1.3" d="M668.3 273.3L674.7 279.7M674.7 273.3L668.3 279.7"/>
+<path class="e none dash" style="stroke-width:1.3" d="M646.3 284.3L652.7 290.7M652.7 284.3L646.3 290.7"/>
+<circle class="e none dash" style="stroke-width:1.3" cx="660.5" cy="287.5" r="3.4"/>
+<path class="e none dash" style="stroke-width:1.3" d="M668.3 284.3L674.7 290.7M674.7 284.3L668.3 290.7"/>
+<rect class="n" x="479.0" y="124" width="33" height="33" rx="2"/>
+<line class="axis" x1="490.0" y1="124" x2="490.0" y2="157"/>
+<line class="axis" x1="479.0" y1="135" x2="512.0" y2="135"/>
+<line class="axis" x1="501.0" y1="124" x2="501.0" y2="157"/>
+<line class="axis" x1="479.0" y1="146" x2="512.0" y2="146"/>
+<path class="e none sig" style="stroke-width:2" d="M481.3 126.3L487.7 132.7M487.7 126.3L481.3 132.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="484.5" cy="140.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="495.5" cy="140.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M503.3 137.3L509.7 143.7M509.7 137.3L503.3 143.7"/>
+<path class="e none" style="stroke-width:1.3" d="M481.3 148.3L487.7 154.7M487.7 148.3L481.3 154.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="495.5" cy="151.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M503.3 148.3L509.7 154.7M509.7 148.3L503.3 154.7"/>
+<rect class="n" x="611.0" y="124" width="33" height="33" rx="2"/>
+<line class="axis" x1="622.0" y1="124" x2="622.0" y2="157"/>
+<line class="axis" x1="611.0" y1="135" x2="644.0" y2="135"/>
+<line class="axis" x1="633.0" y1="124" x2="633.0" y2="157"/>
+<line class="axis" x1="611.0" y1="146" x2="644.0" y2="146"/>
+<path class="e none sig" style="stroke-width:2" d="M624.3 126.3L630.7 132.7M630.7 126.3L624.3 132.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="616.5" cy="140.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="627.5" cy="140.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M635.3 137.3L641.7 143.7M641.7 137.3L635.3 143.7"/>
+<path class="e none" style="stroke-width:1.3" d="M613.3 148.3L619.7 154.7M619.7 148.3L613.3 154.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="627.5" cy="151.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M635.3 148.3L641.7 154.7M641.7 148.3L635.3 154.7"/>
+<rect class="n" x="479.0" y="56" width="33" height="33" rx="2"/>
+<line class="axis" x1="490.0" y1="56" x2="490.0" y2="89"/>
+<line class="axis" x1="479.0" y1="67" x2="512.0" y2="67"/>
+<line class="axis" x1="501.0" y1="56" x2="501.0" y2="89"/>
+<line class="axis" x1="479.0" y1="78" x2="512.0" y2="78"/>
+<circle class="e none" style="stroke-width:1.3" cx="484.5" cy="72.5" r="3.4"/>
+<circle class="e none" style="stroke-width:1.3" cx="495.5" cy="72.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M503.3 69.3L509.7 75.7M509.7 69.3L503.3 75.7"/>
+<path class="e none" style="stroke-width:1.3" d="M481.3 80.3L487.7 86.7M487.7 80.3L481.3 86.7"/>
+<circle class="e none" style="stroke-width:1.3" cx="495.5" cy="83.5" r="3.4"/>
+<path class="e none" style="stroke-width:1.3" d="M503.3 80.3L509.7 86.7M509.7 80.3L503.3 86.7"/>
+<text class="ts" x="10" y="332">The newest mark in each position is drawn in blue and heavier.</text>
+<g data-scene="negamax">
+<g class="hide" data-s="1" data-packet="none">
+<rect class="n " x="10.0" y="228" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="30.5" y="239">−1</text>
+</g>
+<g class="hide" data-s="2" data-packet="none">
+<rect class="n " x="76.0" y="296" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="96.5" y="307">0</text>
+<rect class="n " x="76.0" y="228" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="96.5" y="239">0</text>
+</g>
+<g class="hide" data-s="3" data-packet="none">
+<rect class="n " x="43.0" y="160" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="63.5" y="171">−1</text>
+</g>
+<g class="hide" data-s="4" data-packet="none">
+<rect class="n " x="142.0" y="296" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="162.5" y="307">+1</text>
+<rect class="n " x="142.0" y="228" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="162.5" y="239">+1</text>
+</g>
+<g class="hide" data-s="5" data-packet="none">
+<rect class="n " x="208.0" y="296" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="228.5" y="307">0</text>
+<rect class="n " x="208.0" y="228" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="228.5" y="239">0</text>
+<rect class="n " x="175.0" y="160" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="195.5" y="171">0</text>
+</g>
+<g class="hide" data-s="6" data-packet="none">
+<rect class="n " x="274.0" y="160" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="294.5" y="171">+1</text>
+</g>
+<g class="hide" data-s="7" data-packet="none">
+<rect class="n store" x="175.0" y="92" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="195.5" y="103">+1</text>
+</g>
+</g>
+<g data-scene="alphabeta">
+<g class="hide" data-s="1" data-packet="none">
+<rect class="n " x="376.0" y="160" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="396.5" y="171">+1</text>
+</g>
+<g class="hide" data-s="2" data-packet="none">
+<rect class="n " x="442.0" y="228" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="462.5" y="239">−1</text>
+<rect class="n " x="475.0" y="160" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="495.5" y="171">≤ −1</text>
+<path class="x" d="M507.0 178.0l10 10M517.0 178.0l-10 10"/>
+</g>
+<g class="hide" data-s="3" data-packet="none">
+<rect class="n " x="574.0" y="296" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="594.5" y="307">+1</text>
+<rect class="n " x="574.0" y="228" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="594.5" y="239">+1</text>
+<rect class="n " x="607.0" y="160" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="627.5" y="171">≤ +1</text>
+<path class="x" d="M639.0 178.0l10 10M649.0 178.0l-10 10"/>
+</g>
+<g class="hide" data-s="4" data-packet="none">
+<rect class="n store" x="475.0" y="92" width="41" height="15" rx="4"/>
+<text class="ts mid tb" x="495.5" y="103">+1</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="negamax" data-label="Negamax">
+  <li data-msg="none" data-state="Looked at: 2 of 10 positions; X’s best so far: none yet">X tries 0. O’s first reply, 1, completes the middle column: a loss for X, −1.</li>
+  <li data-msg="none" data-state="Looked at: 4 of 10 positions; X’s best so far: none yet">O’s other reply, 2, leaves X only square 1, and the board fills with no line: a draw, 0.</li>
+  <li data-msg="none" data-state="Looked at: 4 of 10 positions; X’s best so far: −1 (X at 0)">O will choose the reply worse for X, so X at 0 is worth −1.</li>
+  <li data-msg="none" data-state="Looked at: 7 of 10 positions; X’s best so far: −1 (X at 0)">X at 1 blocks the column. If O then takes 0, X wins: +1.</li>
+  <li data-msg="none" data-state="Looked at: 9 of 10 positions; X’s best so far: 0 (X at 1)">If O takes 2, it is a draw. O prefers that, so X at 1 is worth 0.</li>
+  <li data-msg="none" data-state="Looked at: 10 of 10 positions; X’s best so far: +1 (X at 2)">X at 2 completes the right-hand column at once: +1.</li>
+  <li data-msg="none" data-state="Looked at: 10 of 10 positions; X’s best so far: +1 (X at 2)">The root is worth the best of its moves for X: +1, by playing 2. Negamax gets this by negating the children’s values and taking the largest.</li>
+</ol>
+<ol class="steps" data-scene="alphabeta" data-label="Alpha-beta">
+  <li data-msg="none" data-state="Looked at: 1 of 10 positions; skipped: 0; X’s best so far: +1 (X at 2)">Winning moves come first: X tries 2 and completes the right-hand column, +1.</li>
+  <li data-msg="none" data-state="Looked at: 3 of 10 positions; skipped: 2; X’s best so far: +1 (X at 2)">X at 0: O’s first reply wins for O, so X at 0 is worth −1 at most, worse than the win in hand. O’s other reply is never examined.</li>
+  <li data-msg="none" data-state="Looked at: 6 of 10 positions; skipped: 4; X’s best so far: +1 (X at 2)">X at 1: O’s first reply lets X win, but later. A quicker win scores higher, so X at 1 cannot beat X at 2, and its other branch is skipped.</li>
+  <li data-msg="none" data-state="Looked at: 6 of 10 positions; skipped: 4; X’s best so far: +1 (X at 2)">X plays 2, the same answer from 6 of the 10 positions. In the order 0, 1, 2, alpha-beta would skip nothing here.</li>
+</ol>
+<figcaption>Drawn from the chapter’s search, run through a wrapper that records each position it enters. Same value, same move; with the win tried first, 4 of the 10 positions are skipped.</figcaption>
+</figure>
+
+<p>Searched to the end, the empty board is worth 0: perfect play by both sides is a draw. In 400 games against a player choosing at random, with sides alternating, the search won 366, drew 34 and lost none. Plain minimax from the empty board visits all 549,945 positions below it; this search visited 20,865 with squares tried in order, and 8,829 with winning moves tried first. Nothing in <code>search.ts</code> mentions either game: given chess and a count of material for <code>evaluate</code>, it searched two moves deep and found the test’s two mates, <code>h5f7</code> and <code>a1a8</code>.</p>
+<p>How much alpha-beta saves depends on move order. Tried worst first, it saves nothing. Tried best first in a tree where every position has b moves, it examines b<sup>⌈d/2⌉</sup> + b<sup>⌊d/2⌋</sup> − 1 leaves at depth d instead of b<sup>d</sup>. The count is credited to Michael Levin in 1961; Donald Knuth and Ronald Moore published the classic analysis in 1975. With about 35 moves in an average chess position, six moves deep is 1.84 billion leaves for minimax and 85,749 for alpha-beta at its best.</p>
+
+<div class="widget" data-widget="gametree73">
+<h4>Leaves of a game tree, with and without alpha-beta</h4>
+<p>Every position has the same number of moves; alpha-beta is at its best, with the best move always tried first. Times use the measured rate of about 200,000 positions a second.</p>
+<div class="controls">
+  <label>Moves in each position<input type="number" name="b" value="35" min="2" max="100" step="1"></label>
+  <label>Depth, in moves by either side<input type="number" name="d" value="6" min="1" max="20" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 236" role="img" aria-label="Leaves against depth on a scale of powers of ten: a straight line for minimax, and a lower, zigzag line for alpha-beta at its best, with the chosen depth marked on both and a dashed line to the depth alpha-beta reaches for the same work."><line x1="86" x2="520" y1="196" y2="196" class="axis"></line><text x="78" y="200" class="ts end">1</text><line x1="86" x2="520" y1="153.2" y2="153.2" class="grid"></line><text x="78" y="157.2" class="ts end">10 thousand</text><line x1="86" x2="520" y1="110.4" y2="110.4" class="grid"></line><text x="78" y="114.4" class="ts end">100 million</text><line x1="86" x2="520" y1="67.5" y2="67.5" class="grid"></line><text x="78" y="71.5" class="ts end">1 trillion</text><line x1="86" x2="520" y1="24.7" y2="24.7" class="grid"></line><text x="78" y="28.7" class="ts end">1 × 10¹⁶</text><text x="86" y="212" class="ts mid">1</text><text x="128.6" y="212" class="ts mid">2</text><text x="171.2" y="212" class="ts mid">3</text><text x="213.8" y="212" class="ts mid">4</text><text x="256.4" y="212" class="ts mid">5</text><text x="299" y="212" class="ts mid">6</text><text x="341.6" y="212" class="ts mid">7</text><text x="384.2" y="212" class="ts mid">8</text><text x="426.8" y="212" class="ts mid">9</text><text x="469.4" y="212" class="ts mid">10</text><text x="512" y="212" class="ts mid">11</text><text x="299" y="230" class="ts mid">depth, in moves by either side</text><path d="M86 179.5 L128.6 162.9 L171.2 146.4 L213.8 129.9 L256.4 113.3 L299 96.8 L341.6 80.3 L384.2 63.8 L426.8 47.2 L469.4 30.7 L512 14.2" class="line" style="stroke:var(--fault)"></path><path d="M86 179.5 L128.6 176.3 L171.2 162.8 L213.8 159.7 L256.4 146.3 L299 143.2 L341.6 129.7 L384.2 126.7 L426.8 113.2 L469.4 110.1 L512 96.7" class="line" style="stroke:var(--store)"></path><text x="524" y="18.2" class="ts tb">minimax</text><text x="524" y="92.7" class="ts tb">alpha-beta,</text><text x="524" y="107.7" class="ts tb">best case</text><path d="M299 96.8 L469.4 96.8" class="e none dash"></path><path d="M469.4 96.8 L469.4 110.1" class="e none dash"></path><circle cx="469.4" cy="110.1" r="4.5" class="dot" style="fill:var(--store)"></circle><text x="384.2" y="89.8" class="ts mid">same work: depth 10</text><circle cx="299" cy="96.8" r="5" class="dot" style="fill:var(--fault)"></circle><circle cx="299" cy="143.2" r="5" class="dot" style="fill:var(--store)"></circle></svg>
+<dl class="results">
+  <div><dt>Minimax leaves</dt><dd data-out="mm">1.84 billion</dd></div>
+  <div><dt>Alpha-beta, best case</dt><dd data-out="ab">85,749</dd></div>
+  <div><dt>Fewer by a factor of</dt><dd data-out="ratio">21,438</dd></div>
+  <div><dt>Depth alpha-beta reaches for the same work</dt><dd data-out="deeper">10</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At 6 moves deep, minimax examines 1.84 billion leaves and alpha-beta at its best 85,749. At about 200,000 positions a second, that is 2.55 hours against 429 ms. For the work minimax does here, alpha-beta at its best reaches 10 moves deep.</p>
+</div>
+
+<p>The zigzag is real; chess programmers call it the odd-even effect. From an even depth to the next odd one the count grows by about (b + 1) ÷ 2, and from odd to even by about 2. Two moves deeper costs a factor of b, against b² for minimax, so for the same work alpha-beta at its best searches nearly twice as deep. Programs get near the best case by ordering moves: captures and checks first, and the best move from a shallower search before the rest.</p>
+
+<h2 id="immutable">Immutable states, and their cost</h2>
+<p>Every move here copies the position: 64 squares, a few fields, and the map of positions seen since the last capture or pawn move. Programs built for speed keep one board instead: they make a move on it, search below, and unmake the move, saving on a stack what cannot be worked out backward, such as the castling rights, the en passant square, the fifty-move count and the captured piece.</p>
+<table>
+<thead><tr><th></th><th>Keep every state, as here</th><th>Make and unmake on one board</th></tr></thead>
+<tbody>
+<tr><th>Undo</th><td>Drop the last state</td><td>Reverse the move from what was saved</td></tr>
+<tr><th>Inside a search</th><td>Try a move and discard the result</td><td>Unmake on every way out, including early returns and errors</td></tr>
+<tr><th>Sharing</th><td>Safe between a match, a search and threads</td><td>One board for each thread</td></tr>
+<tr><th>Work for one move</th><td>Copy the whole position</td><td>Change two to four squares and a few fields</td></tr>
+<tr><th>Where its bugs hide</th><td>Few places: nothing is reversed</td><td>In the unmake of a rare move. Perft finds them</td></tr>
+</tbody>
+</table>
+<p>These are the two ways to undo from <x-ref to="behavioral-patterns#command"></x-ref>: a snapshot of each state, or a command that reverses itself. Where people play, the snapshot wins on simplicity; for an engine searching millions of positions a second, the reversal wins on speed. Also, <code>play</code> checks each move against the full list of legal moves, right for moves from a person and wasted inside a search, so perft calls <code>apply</code> directly.</p>
+
+<h2 id="walk">Step 7: Walk it</h2>
+<p>Follow white castling on the king’s side in a match that starts from kings and rooks only, all four rights intact.</p>
+<ol>
+  <li>The interface calls <code>match.play(uci("e1g1"))</code>. The match asks the position for its outcome: there are legal moves and no draw by rule, so the game is ongoing.</li>
+  <li>The position lists its pseudo-legal moves. The king’s row in <code>MOVEMENT</code> gives eight one-step directions. <code>castlingMoves</code> finds the right <code>K</code>, f1 and g1 empty, and none of e1, f1 and g1 attacked, and adds <code>e1g1</code> with the flag <code>castle</code>.</li>
+  <li>Each pseudo-legal move is applied and kept only if white’s king is not attacked afterward. <code>e1g1</code> survives, and <code>play</code> applies it: the king to g1 and, because of the flag, the rook from h1 to f1. White loses both rights, leaving <code>kq</code>, and the fifty-move count rises to 1.</li>
+  <li>The match records <code>e1g1</code> and the new position. Had a black rook stood on f8, step 2 would have found f1 attacked, and the match would have thrown <code>IllegalMove</code> with nothing recorded.</li>
+</ol>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Two people play over the network</th><td>A server holds the match. Each move carries its number, so a repeated or late message is recognized (<x-ref to="idempotency-and-delivery#versions"></x-ref>)</td><td>The game classes</td></tr>
+<tr><th>A chess clock</th><td>A clock beside the match, with the time passed in, as in <x-ref to="lld-rate-limiter"></x-ref>. Running out of time is one more outcome</td><td>The rules of moving</td></tr>
+<tr><th>Tournament rules for draws</th><td><code>outcome</code> reports a claimable draw at three repetitions or fifty moves, and draws on its own at five or 75. A claim is a new action</td><td>The repetition key and the counter</td></tr>
+<tr><th>Connect Four, or gomoku</th><td>A new class that implements <code>Game</code>, with a win check that counts outward from the last move</td><td><code>Match</code>, the players and the search</td></tr>
+<tr><th>A much stronger chess program</th><td>Make and unmake on one board, a hash of each position updated move by move, a table of positions already searched, careful move ordering</td><td>The rules, which perft has pinned down</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Start with the interface the games share, a state with <code>legalMoves</code>, <code>play</code> and <code>outcome</code>, and say that states are immutable so that undo and search are easy. Draw a class per piece if the interviewer expects it, then point out that check, castling and en passant need the whole position, and put legality there. Name perft as the way to test the move generator. If time is left, a search written against the interface plays both games.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Scanning the whole board for a winner after every move</th><td>Work that grows with the board, for a question at most four lines can answer</td><td>A counter for each line, changed by the move</td></tr>
+<tr><th>Listing moves without checking the king</th><td>Pinned pieces move and kings walk into check. Perft at depth 4 was 461 too high</td><td>Keep a pseudo-legal move only if the mover’s king is safe afterward</td></tr>
+<tr><th>Check and castling rules inside the piece classes</th><td>Pieces need the whole game, and the rules spread across seven classes</td><td>Pieces know how they move. The position knows the rules</td></tr>
+<tr><th>The en passant square in the repetition key after every double step</th><td>A repeated position is not seen as one, and a draw is missed</td><td>Count it only when a pawn could make the capture</td></tr>
+<tr><th>Testing a move generator with a few games played by hand</th><td>Rare rules stay untested until a real game finds them</td><td>Perft against published counts for several positions</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="lld-method"></x-ref>: the seven steps, and the shapes of low-level problems.</li>
+  <li><x-ref to="oop-in-typescript#polymorphism"></x-ref> and <x-ref to="oop-in-typescript#unions"></x-ref>: the two ways to model “one of several kinds” that the pieces choose between.</li>
+  <li><x-ref to="domain-modeling#values"></x-ref>: states and moves as values that never change.</li>
+  <li><x-ref to="behavioral-patterns#command"></x-ref>: undo by snapshots or by reversible commands.</li>
+  <li><x-ref to="errors-and-testing#property"></x-ref>: checking code against an independent answer, as the line counters were checked against a full scan.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Put the polymorphism between games: one interface lets one match, one undo and one search serve both. Make its states immutable, so undo is dropping a state and a search cannot damage the game.</li>
+  <li>Check for a win only on the lines through the last move. Line counters agreed with a full scan on all 5,478 tic-tac-toe positions.</li>
+  <li>Describe how pieces move as data, and keep the rules in the position. Pins, check, castling and en passant depend on pieces other than the one moving.</li>
+  <li>A legal move is a pseudo-legal move that leaves the mover’s king safe. Without that filter, perft from the start was right for three moves and wrong at the fourth.</li>
+  <li>Test a move generator with perft. This one matched the published counts for five standard positions.</li>
+  <li>Alpha-beta returns the minimax value from far fewer positions, and move ordering decides how many.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does <code>play</code> return a new state instead of changing the board?</summary><p>So the old state is still there: undo drops the newest state, a search discards what it tried with nothing to reverse, and states are shared without locks. The price is a copy on every move.</p></details>
+<details><summary>A bishop on e2 can reach nine squares, yet it has no legal move. How does the code find that out?</summary><p>Its movement gives nine pseudo-legal moves. <code>legalMoves</code> applies each and asks whether white’s king is then attacked. After every one, a rook on e8 sees down the open e-file to the king on e1, so all nine are dropped.</p></details>
+<details><summary>In a design with a class for each kind of piece, where would the castling rule go, and why is that awkward?</summary><p>Castling needs an unmoved king and rook, empty squares between them, and three squares no enemy piece attacks. <code>King.moves</code> would need the whole position, so the rule ends up in a board or game class anyway.</p></details>
+<details><summary>Your move generator gives 20, 400, 8,902 and then 197,742 from the start position. The published count at depth 4 is 197,281. What is the likely bug?</summary><p>It allows moves that leave the mover’s own king attacked. Black’s second move is the first that can, by ignoring a check, moving a pinned piece or walking into an attack. This chapter’s code gives exactly that count without the king check.</p></details>
+<details><summary>Tic-tac-toe is played on a 100 by 100 board, won by a full line. How much work is the win check after a move, with and without line counters?</summary><p>A full scan reads 202 lines of 100 squares, about 20,000 cells. With counters, the move changes and compares at most four counts, whatever the size.</p></details>
+<details><summary>With 35 moves in every position, how many leaves does alpha-beta examine at depth 4 in its best case, and how many does minimax?</summary><p>35² + 35² − 1 = 2,449 for alpha-beta, against 35⁴ = 1,500,625 for minimax. With the worst move tried first, alpha-beta examines as many as minimax.</p></details>
+<details><summary>After 1. e4, both players move a knight out and back twice. Has the position after 1. e4 now occurred three times?</summary><p>Yes. Positions are the same when the same player is to move, the same pieces stand on the same squares and the same moves are possible. No black pawn can take e4 en passant, so the e3 square that FEN records makes no difference. A key that always includes it misses the draw.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>FIDE, <a href="https://handbook.fide.com/chapter/E012023">Laws of Chess taking effect from 1 January 2023</a>, FIDE Handbook. Articles 3.7.3, 3.8.2, 5.2.2, 9.2, 9.3 and 9.6.</li>
+  <li>Chess Programming Wiki, <a href="https://www.chessprogramming.org/Perft_Results">Perft Results</a>. The five positions, their FEN and the published counts, including Kiwipete by Peter McKenzie.</li>
+  <li>Chess Programming Wiki, <a href="https://www.chessprogramming.org/Perft">Perft</a>. The name, and divide.</li>
+  <li>Chess Programming Wiki, <a href="https://www.chessprogramming.org/Forsyth-Edwards_Notation">Forsyth-Edwards Notation</a>. Fields, history, and the en passant square.</li>
+  <li>Donald E. Knuth and Ronald W. Moore, <a href="https://doi.org/10.1016/0004-3702(75)90019-3">An analysis of alpha-beta pruning</a>, <cite>Artificial Intelligence</cite> 6(4), pp. 293 to 326, 1975.</li>
+  <li>Chess Programming Wiki, <a href="https://www.chessprogramming.org/Alpha-Beta">Alpha-Beta</a>, <a href="https://www.chessprogramming.org/Odd-Even_Effect">Odd-Even Effect</a> and <a href="https://www.chessprogramming.org/Branching_Factor">Branching Factor</a>. The best case, its zigzag, and 35 to 38 moves a position.</li>
+  <li>Wikipedia, <a href="https://en.wikipedia.org/wiki/Game_complexity">Game complexity</a>. 5,478 legal tic-tac-toe positions and 255,168 possible games.</li>
+  <li>Chris Lomont, <a href="https://www.lomont.org/posts/2024/minimaltictactoe/">Minimal Size Tic Tac Toe Trees</a>, 26 July 2024. The full game tree of 549,946 nodes.</li>
+  <li>David Aha, <a href="https://archive.ics.uci.edu/dataset/101/tic+tac+toe+endgame">Tic-Tac-Toe Endgame</a>, UCI Machine Learning Repository, 1991. The 958 possible boards at the end of a game.</li>
+</ol>
+</section>

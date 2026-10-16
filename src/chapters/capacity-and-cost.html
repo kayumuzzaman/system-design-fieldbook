@@ -1,0 +1,688 @@
+<!--meta
+{ "description": "Capacity planning and cost explained for system design: load testing and finding usable capacity, open and closed load models, headroom, sizing a fleet, autoscaling policy and its limits, cloud pricing models, turning an estimate into a monthly bill, data transfer costs, scaling up versus scaling out, and unit economics.",
+  "lede": "Capacity planning answers two questions: how much does the system need to handle its load with room to spare, and what will that cost? Too little, and the system falls over at its busiest moment. Too much, and money is spent on machines that do nothing. This chapter shows how to measure what a system can really do, how much spare to keep and why, and how to read and shape the bill.",
+  "updated": "2026-10-16" }
+-->
+
+<h2 id="why">Enough, and not much more</h2>
+<p><x-ref to="estimation"></x-ref> produced rough numbers from assumptions: requests per second, bytes stored, bits per second. They were good enough to choose an architecture. They are not good enough to decide how many machines to rent, because they rest on guesses such as “one server handles 1,000 requests a second”. Capacity planning replaces the guesses with measurements.</p>
+<p>It has four parts, and the chapter follows them.</p>
+<ol>
+  <li><b>Measure</b> what one unit of the system can do, by testing it.</li>
+  <li><b>Decide</b> how much spare capacity to hold, and for what.</li>
+  <li><b>Follow</b> demand as it changes, by forecast and by autoscaling.</li>
+  <li><b>Price</b> the result, and change the design where the price is wrong.</li>
+</ol>
+<p>The last part is not an afterthought. Cost is a design constraint like latency or availability. A design that meets every technical goal and costs more than the product earns has failed.</p>
+
+<h2 id="load-testing">Measuring capacity: the load test</h2>
+<p>A <dfn>load test</dfn> sends a system controlled, artificial traffic and measures how it responds. The aim is a curve: latency and throughput against load.</p>
+<p>To make this concrete, a small PostgreSQL 16 database was tested for this chapter with <code>pgbench</code>, its standard benchmarking tool, on a machine with two CPU cores. Each transaction updates three rows, reads one and inserts one. Arrivals were scheduled at a fixed rate, whether or not earlier ones had finished, and each rate ran for twelve seconds.</p>
+<table>
+<thead><tr><th>Offered per second</th><th>Completed per second</th><th>Median latency</th><th>99th percentile</th></tr></thead>
+<tbody>
+<tr><th>500</th><td>495</td><td>1.3 ms</td><td>3.7 ms</td></tr>
+<tr><th>1,000</th><td>998</td><td>1.3 ms</td><td>4.4 ms</td></tr>
+<tr><th>2,000</th><td>1,965</td><td>1.5 ms</td><td>10 ms</td></tr>
+<tr><th>3,000</th><td>3,012</td><td>1.9 ms</td><td>20 ms</td></tr>
+<tr><th>3,500</th><td>3,474</td><td>2.5 ms</td><td>32 ms</td></tr>
+<tr><th>4,000</th><td>4,011</td><td>17 ms</td><td>147 ms</td></tr>
+<tr><th>4,300</th><td>4,237</td><td>99 ms</td><td>329 ms</td></tr>
+<tr><th>4,600</th><td>4,503</td><td>126 ms</td><td>248 ms</td></tr>
+<tr><th>5,000</th><td>4,506</td><td>654 ms</td><td>1,194 ms</td></tr>
+<tr><th>5,500</th><td>4,468</td><td>911 ms</td><td>2,164 ms</td></tr>
+</tbody>
+</table>
+
+<figure class="fig wide" id="fig-loadtest">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f491t f491d">
+<title id="f491t">Measured latency of a small database as offered load rises</title>
+<desc id="f491d">A chart of latency in milliseconds on a logarithmic scale against transactions offered per second, from 500 to 5,500, showing the median and the 99th percentile from the table. Both are nearly flat up to 3,000 a second. The 99th percentile crosses the objective of 50 milliseconds between 3,500 and 4,000 a second. The system completes at most about 4,500 a second, and beyond that both lines rise steeply to between one and two seconds. Up to 3,500 a second the 99th percentile stays under 50 milliseconds. At 4,000 it is 147 milliseconds though every transaction still completes. Past 4,500 the system cannot keep up, work queues, and latency grows for as long as the overload lasts.</desc>
+<line class="axis" x1="64" y1="214.0" x2="470" y2="214.0"/>
+<text class="ts end" x="56" y="218.0">1</text>
+<line class="grid" x1="64" y1="161.6" x2="470" y2="161.6"/>
+<text class="ts end" x="56" y="165.55296750917455">10</text>
+<line class="grid" x1="64" y1="109.1" x2="470" y2="109.1"/>
+<text class="ts end" x="56" y="113.10593501834907">100</text>
+<line class="grid" x1="64" y1="56.7" x2="470" y2="56.7"/>
+<text class="ts end" x="56" y="60.658902527523594">1,000</text>
+<text class="ts mid" x="64.0" y="232">0</text>
+<text class="ts mid" x="131.66666666666666" y="232">1,000</text>
+<text class="ts mid" x="199.33333333333331" y="232">2,000</text>
+<text class="ts mid" x="267.0" y="232">3,000</text>
+<text class="ts mid" x="334.66666666666663" y="232">4,000</text>
+<text class="ts mid" x="402.33333333333337" y="232">5,000</text>
+<text class="ts mid" x="470.0" y="232">6,000</text>
+<text class="ts mid" x="267.0" y="252">transactions offered per second</text>
+<text class="ts mid" transform="translate(14 117) rotate(-90)">latency, ms (log scale)</text>
+<path class="e none dash" d="M64 124.9H470"/>
+<text class="ts" x="70" y="118.89406498165093">objective: 99% under 50 ms</text>
+<path class="e none dash" d="M368.5 20V214"/>
+<text class="ts end" x="362.5" y="30">most it can complete: 4,500</text>
+<path class="line" style="stroke:var(--sig)" d="M97.8 208.9 L131.7 208.4 L199.3 205.5 L267.0 199.7 L300.8 193.6 L334.7 149.8 L355.0 109.3 L375.3 103.8 L402.3 66.3 L436.2 58.8"/>
+<circle class="dot fill-sig" cx="97.8" cy="208.9" r="3"/>
+<circle class="dot fill-sig" cx="131.7" cy="208.4" r="3"/>
+<circle class="dot fill-sig" cx="199.3" cy="205.5" r="3"/>
+<circle class="dot fill-sig" cx="267.0" cy="199.7" r="3"/>
+<circle class="dot fill-sig" cx="300.8" cy="193.6" r="3"/>
+<circle class="dot fill-sig" cx="334.7" cy="149.8" r="3"/>
+<circle class="dot fill-sig" cx="355.0" cy="109.3" r="3"/>
+<circle class="dot fill-sig" cx="375.3" cy="103.8" r="3"/>
+<circle class="dot fill-sig" cx="402.3" cy="66.3" r="3"/>
+<circle class="dot fill-sig" cx="436.2" cy="58.8" r="3"/>
+<path class="line" style="stroke:var(--fault)" d="M97.8 184.5 L131.7 180.4 L199.3 160.5 L267.0 145.5 L300.8 135.0 L334.7 100.3 L355.0 82.0 L375.3 88.5 L402.3 52.6 L436.2 39.1"/>
+<circle class="dot fill-fault" cx="97.8" cy="184.5" r="3"/>
+<circle class="dot fill-fault" cx="131.7" cy="180.4" r="3"/>
+<circle class="dot fill-fault" cx="199.3" cy="160.5" r="3"/>
+<circle class="dot fill-fault" cx="267.0" cy="145.5" r="3"/>
+<circle class="dot fill-fault" cx="300.8" cy="135.0" r="3"/>
+<circle class="dot fill-fault" cx="334.7" cy="100.3" r="3"/>
+<circle class="dot fill-fault" cx="355.0" cy="82.0" r="3"/>
+<circle class="dot fill-fault" cx="375.3" cy="88.5" r="3"/>
+<circle class="dot fill-fault" cx="402.3" cy="52.6" r="3"/>
+<circle class="dot fill-fault" cx="436.2" cy="39.1" r="3"/>
+<text class="ts end" x="199.33333333333331" y="150.52858861596323">99th percentile</text>
+<text class="ts mid" x="165.5" y="199.02400929944974">median</text>
+<text class="ts" x="492" y="36">Up to 3,500 a second the</text>
+<text class="ts" x="492" y="52">99th percentile stays under</text>
+<text class="ts" x="492" y="68">50 ms.</text>
+<text class="ts" x="492" y="102">At 4,000 it is 147 ms, though</text>
+<text class="ts" x="492" y="118">every transaction still completes.</text>
+<text class="ts" x="492" y="152">Past 4,500 the system cannot</text>
+<text class="ts" x="492" y="168">keep up. Work queues and</text>
+<text class="ts" x="492" y="184">latency grows for as long as</text>
+<text class="ts" x="492" y="200">the overload lasts.</text>
+<rect class="hit" x="64.0" y="20" width="50.8" height="194" data-tip="500 offered per second|median 1.25 ms|99th percentile 3.65 ms"/>
+<rect class="hit" x="114.8" y="20" width="50.8" height="194" data-tip="1,000 offered per second|median 1.28 ms|99th percentile 4.37 ms"/>
+<rect class="hit" x="165.5" y="20" width="67.7" height="194" data-tip="2,000 offered per second|median 1.45 ms|99th percentile 10.5 ms"/>
+<rect class="hit" x="233.2" y="20" width="50.8" height="194" data-tip="3,000 offered per second|median 1.87 ms|99th percentile 20.2 ms"/>
+<rect class="hit" x="283.9" y="20" width="33.8" height="194" data-tip="3,500 offered per second|median 2.45 ms|99th percentile 32.1 ms"/>
+<rect class="hit" x="317.8" y="20" width="27.1" height="194" data-tip="4,000 offered per second|median 16.7 ms|99th percentile 147 ms"/>
+<rect class="hit" x="344.8" y="20" width="20.3" height="194" data-tip="4,300 offered per second|median 99.1 ms|99th percentile 329 ms"/>
+<rect class="hit" x="365.1" y="20" width="23.7" height="194" data-tip="4,600 offered per second|median 126 ms|99th percentile 248 ms"/>
+<rect class="hit" x="388.8" y="20" width="30.4" height="194" data-tip="5,000 offered per second|median 654 ms|99th percentile 1,194 ms"/>
+<rect class="hit" x="419.2" y="20" width="50.8" height="194" data-tip="5,500 offered per second|median 911 ms|99th percentile 2,164 ms"/>
+</svg>
+</div>
+<figcaption>Measured, not modeled. Single short runs on a shared two-core machine, so individual points are noisy, as the dip at 4,600 shows. The shape is what matters.</figcaption>
+</figure>
+
+<p>The shape is the one <x-ref to="latency-and-throughput#saturation"></x-ref> predicted from queueing theory, and it appears here in a real system. Three regions are visible.</p>
+<ul>
+  <li><b>Flat.</b> Up to about 3,000 a second, more load costs almost nothing. The median barely moves.</li>
+  <li><b>The knee.</b> Between 3,500 and 4,300 the 99th percentile multiplies by ten while throughput rises by a fifth. The system is still completing everything it is given.</li>
+  <li><b>Overload.</b> Beyond about 4,500 a second it cannot keep up. Completed work stays flat, the excess queues, and latency is limited only by how long the test runs. The figures in the last two rows would be larger after a minute and larger again after ten.</li>
+</ul>
+
+<h3 id="knee">Usable capacity is not maximum throughput</h3>
+<p>The largest number in the table’s second column is about 4,500, and it is tempting to call that the capacity. It is not a number you can plan on. At that rate the median transaction takes over a hundred milliseconds and nothing is left for a burst.</p>
+<p>The useful definition includes the objective: <dfn>usable capacity</dfn> is the highest load at which the system still meets its latency target. This function reads it from test results.</p>
+
+<pre data-lang="ts" data-title="usable-capacity.ts">type Row = { offered: number; completed: number; p50: number; p99: number };   // rates per second, latency in ms
+
+/** The highest offered rate at which the system kept up and stayed inside the latency objective. */
+export function usableCapacity(rows: Row[], p99LimitMs: number): number {
+  let best = 0;
+  for (const r of [...rows].sort((a, b) => a.offered - b.offered)) {
+    const keptUp = r.completed >= 0.98 * r.offered;
+    if (!keptUp || r.p99 > p99LimitMs) break;       // stop at the first failure: later passes are luck
+    best = r.offered;
+  }
+  return best;
+}</pre>
+
+<p>With an objective of 99% of transactions under 50 ms, the measured data gives 3,500 a second: 78% of the maximum. With an objective of 10 ms it gives 1,000, under a quarter. The same machine has different capacities for different promises, and a capacity quoted without a latency target means little.</p>
+
+<h3 id="open-closed">Open and closed load</h3>
+<p>The test above scheduled arrivals at a fixed rate. That is an <dfn>open</dfn> model, and it matches the internet: users do not wait for each other. Many load tools default to a <dfn>closed</dfn> model instead, in which a fixed number of simulated clients each send a request, wait for the answer, and only then send the next.</p>
+<p>The same database under a closed test gave these results.</p>
+<table>
+<thead><tr><th>Clients</th><th>1</th><th>2</th><th>4</th><th>8</th><th>16</th><th>32</th><th>64</th></tr></thead>
+<tbody>
+<tr><th>Completed per second</th><td>1,789</td><td>3,172</td><td>4,080</td><td>4,271</td><td>4,721</td><td>3,982</td><td>3,759</td></tr>
+<tr><th>Average latency, ms</th><td>0.56</td><td>0.63</td><td>0.98</td><td>1.9</td><td>3.4</td><td>8.0</td><td>17</td></tr>
+</tbody>
+</table>
+<p>Two lessons are in this table. First, past sixteen clients more concurrency made the database do <em>less</em> work, because the transactions spent their time contending with each other. This is why connection pools are kept small, as <x-ref to="indexes-and-queries#connections"></x-ref> advised.</p>
+<p>Second, and more dangerous: the closed test never shows a latency worse than 17 ms, while the open test of the same system reached two seconds. A closed test slows itself down when the system slows down. Each client politely waits, so the queue that real users would form never appears in the results. A closed test is fine for finding maximum throughput. For latency under load, test with an open model, and measure each request from the moment it was <em>supposed</em> to start.</p>
+
+<h3 id="test-types">Kinds of test</h3>
+<table>
+<thead><tr><th>Test</th><th>Load applied</th><th>Finds</th></tr></thead>
+<tbody>
+<tr><th>Load</th><td>The expected peak</td><td>Whether objectives are met at normal busy levels</td></tr>
+<tr><th>Stress</th><td>Rising until something breaks</td><td>The limit, and what fails first and how</td></tr>
+<tr><th>Spike</th><td>A sudden jump</td><td>How fast scaling reacts, and what happens meanwhile</td></tr>
+<tr><th>Soak</th><td>A steady level for hours or days</td><td>Slow problems: leaks, disks filling, caches growing</td></tr>
+</tbody>
+</table>
+<p>A test is only as good as its resemblance to production. Use realistic data volumes, since a query that is fast on a thousand rows may be slow on a billion. Use a realistic mix of requests, including the expensive ones. Include the dependencies, or know which you have replaced with stand-ins. The stress test deserves particular attention: knowing <em>how</em> the system fails, slowly or all at once, and whether it recovers when the load drops, matters as much as knowing where. <x-ref to="resilience-patterns#testing"></x-ref> continues that thread.</p>
+
+<h2 id="headroom">Headroom</h2>
+<p>Usable capacity for one instance is the starting point. A fleet needs more than the peak divided by that number, and it helps to name what the extra is for.</p>
+
+<figure class="fig wide" id="fig-headroom">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-labelledby="f492t f492d">
+<title id="f492t">What a fleet’s total capacity is held for</title>
+<desc id="f492d">A bar divided into five parts of a fleet’s capacity, as an example. Average load, what is in use most of the time, is 36 percent. The daily peak, the busiest hour of an ordinary day, takes a further 20 percent. Room to stay fast is 16 percent, because latency climbs long before 100 percent. One failure, a zone lost at the peak, is 14 percent. Growth, until more is added, is 14 percent. A fleet running at 36 percent on average is not 64 percent wasted: each remaining slice is held for a named reason, and each can be sized, or handed to an autoscaler, on purpose.</desc>
+<text class="tb" x="10" y="18">What a fleet’s capacity is for</text>
+<rect class="n store" x="10" y="32" width="249" height="40" rx="4"/>
+<text class="ts tb mid" x="134.5" y="57">36%</text>
+<rect class="n sig" x="262" y="32" width="137" height="40" rx="4"/>
+<text class="ts tb mid" x="330.5" y="57">20%</text>
+<rect class="n async" x="402" y="32" width="109" height="40" rx="4"/>
+<text class="ts tb mid" x="456.5" y="57">16%</text>
+<rect class="n fault" x="514" y="32" width="95" height="40" rx="4"/>
+<text class="ts tb mid" x="561.5" y="57">14%</text>
+<rect class="n " x="612" y="32" width="95" height="40" rx="4"/>
+<text class="ts tb mid" x="659.5" y="57">14%</text>
+<text class="ts tb" x="10" y="94">Average load</text>
+<text class="ts" x="10" y="110">what is in use most</text>
+<text class="ts" x="10" y="125">of the time</text>
+<text class="ts tb" x="262.0" y="94">Daily peak</text>
+<text class="ts" x="262.0" y="110">the busiest hour of</text>
+<text class="ts" x="262.0" y="125">an ordinary day</text>
+<text class="ts tb" x="402.0" y="94">Room to stay fast</text>
+<text class="ts" x="402.0" y="110">latency climbs long</text>
+<text class="ts" x="402.0" y="125">before 100%</text>
+<text class="ts tb" x="514.0" y="94">One failure</text>
+<text class="ts" x="514.0" y="110">a zone lost</text>
+<text class="ts" x="514.0" y="125">at the peak</text>
+<text class="ts tb" x="612.0" y="94">Growth</text>
+<text class="ts" x="612.0" y="110">until more</text>
+<text class="ts" x="612.0" y="125">is added</text>
+<text class="ts" x="10" y="160">The proportions are an example. The point is that a fleet running at 36% on average is not 64% wasted:</text>
+<text class="ts" x="10" y="176">each remaining slice is held for a named reason, and each can be sized, or handed to an autoscaler, on purpose.</text>
+</svg>
+</div>
+<figcaption>Spare capacity with a stated purpose is planning. Spare capacity nobody can explain is waste, or luck.</figcaption>
+</figure>
+
+<ul>
+  <li><b>The daily peak.</b> Traffic follows the day. For consumer products the busiest hour is commonly two to four times the average, and a planned event can be far more.</li>
+  <li><b>Room to stay fast.</b> The gap between usable capacity and the maximum, as measured above.</li>
+  <li><b>Failure.</b> The fleet must carry the peak with a node, or a whole zone, missing. With three zones that means each zone running at no more than two thirds, the arithmetic from <x-ref to="multi-region#capacity"></x-ref>.</li>
+  <li><b>Growth and lead time.</b> Capacity must cover the growth expected before more can be added. In a cloud that may be minutes. For hardware you buy, it is months.</li>
+</ul>
+
+<div class="widget" data-widget="fleet">
+<h4>Sizing a fleet</h4>
+<p>How many instances a peak needs, what they cost if always on, and how hard they work on average.</p>
+<div class="controls">
+  <label>Peak requests per second<input type="number" name="peak" value="4000" min="1" step="500"></label>
+  <label>One instance’s limit, requests per second<input type="number" name="per" value="250" min="1" step="50"></label>
+  <label>Target use at peak, %<input type="number" name="util" value="60" min="1" max="100" step="5"></label>
+  <label>Spare instances for failures<input type="number" name="spare" value="2" min="0" step="1"></label>
+  <label>Price per instance-hour, $<input type="number" name="price" value="0.10" min="0" step="0.01"></label>
+  <label>Peak divided by average<input type="number" name="ratio" value="2.5" min="1" step="0.5"></label>
+</div>
+<dl class="results">
+  <div><dt>For the peak</dt><dd data-out="base">27</dd></div>
+  <div><dt>With spares</dt><dd data-out="total">29</dd></div>
+  <div><dt>Per month, always on</dt><dd data-out="monthly">$2,117</dd></div>
+  <div><dt>Average use of the fleet</dt><dd data-out="avgutil">22.1%</dd></div>
+  <div><dt>Per million requests</dt><dd data-out="permillion">$0.50</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At peak, 4,000 requests a second need 27 instances if each is kept to 60% of the 250 it can handle. 2 spares for failures make 29, costing $2,117 a month at $0.10 an hour if they all run all the time. Averaged over the day the fleet works at 22.1% of what it could do, and each million requests costs about $0.50. The gap between the average and the peak is what autoscaling can save.</p>
+</div>
+
+<p>The fourth result is typical and often a surprise. A fleet sized responsibly for its peak spends most of its life mostly idle. That is the opportunity autoscaling addresses, and the reason pay-per-use services such as those in <x-ref to="serverless#cost"></x-ref> can be cheap for uneven workloads.</p>
+
+<h2 id="forecasting">Knowing what is coming</h2>
+<p>Demand has three components, and each is planned for differently.</p>
+<table>
+<thead><tr><th>Component</th><th>Looks like</th><th>Handled by</th></tr></thead>
+<tbody>
+<tr><th>Cycles</th><td>The daily and weekly rhythm, and seasons</td><td>Autoscaling, or scheduled capacity changes</td></tr>
+<tr><th>Trend</th><td>Steady growth in users and in data</td><td>A forecast, reviewed each quarter, that triggers purchases, quota requests and re-architecture in time</td></tr>
+<tr><th>Events</th><td>A launch, a sale, a mention in the news</td><td>Planned capacity added beforehand, load tests at the expected level, and limits for what exceeds it</td></tr>
+</tbody>
+</table>
+<p>Two points are easy to miss. Stored data only grows, so storage planning follows the trend whatever traffic does, and a database that is comfortable today has a date on which it will not be. And cloud accounts have quotas on nearly everything. The capacity may exist at the provider and still be unavailable to you until a limit is raised, which can take days. Check quotas before the event, not during it.</p>
+
+<h2 id="autoscaling">Autoscaling policy</h2>
+<p><x-ref to="containers-and-orchestration#autoscaling"></x-ref> described the mechanism: measure a signal, compare it with a target, add or remove copies. The policy questions are which signal, what target, and how fast in each direction.</p>
+<p>To see the trade-offs, here is one simulated day. Demand follows a wave between 1,600 and 4,000 requests a second, with an unplanned spike of 2,500 more at 13:00. Each instance has a hard limit of 250 a second and a target of 150. New instances take three minutes to become ready, and capacity is removed after ten quiet minutes.</p>
+
+<figure class="fig wide" id="fig-autoscale">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f493t f493d">
+<title id="f493t">Demand and autoscaled capacity over one simulated day</title>
+<desc id="f493d">A chart of requests per second over 24 hours. Demand is a smooth wave from about 3,400 at midnight down to 1,600 at 08:00 and up to 4,000 at 20:00. Autoscaled capacity follows it a step above. A dashed line at 4,050 shows a fixed fleet sized for the peak. At 13:00 demand spikes suddenly to about 5,000, well above capacity, and capacity rises to match a few minutes later, then overshoots. Capacity follows the daily wave using 27 percent fewer instance-hours than the fixed fleet. The spike arrives faster than instances start, and for three minutes demand is above what is running.</desc>
+<line class="axis" x1="64" y1="204.0" x2="470" y2="204.0"/>
+<text class="ts end" x="56" y="208.0">0</text>
+<line class="grid" x1="64" y1="142.7" x2="470" y2="142.7"/>
+<text class="ts end" x="56" y="146.66666666666669">2,000</text>
+<line class="grid" x1="64" y1="81.3" x2="470" y2="81.3"/>
+<text class="ts end" x="56" y="85.33333333333334">4,000</text>
+<line class="grid" x1="64" y1="20.0" x2="470" y2="20.0"/>
+<text class="ts end" x="56" y="24.0">6,000</text>
+<text class="ts mid" x="64.0" y="222">00:00</text>
+<text class="ts mid" x="165.5" y="222">06:00</text>
+<text class="ts mid" x="267.0" y="222">12:00</text>
+<text class="ts mid" x="368.5" y="222">18:00</text>
+<text class="ts mid" x="470.0" y="222">24:00</text>
+<text class="ts mid" transform="translate(14 112) rotate(-90)">requests per second</text>
+<path class="e none dash" d="M64 79.8H470"/>
+<text class="ts" x="80.91666666666666" y="73.8">fixed fleet sized for the peak</text>
+<path class="line" style="stroke:var(--store)" d="M64.0 98.2 L69.6 98.2 L75.3 102.8 L80.9 102.8 L86.6 107.4 L92.2 112.0 L97.8 112.0 L103.5 116.6 L109.1 121.2 L114.8 125.8 L120.4 125.8 L126.0 130.4 L131.7 135.0 L137.3 135.0 L142.9 139.6 L148.6 139.6 L154.2 144.2 L159.9 144.2 L165.5 148.8 L171.1 148.8 L176.8 148.8 L182.4 148.8 L188.1 153.4 L193.7 153.4 L199.3 153.4 L205.0 153.4 L210.6 153.4 L216.2 153.4 L221.9 148.8 L227.5 148.8 L233.2 148.8 L238.8 144.2 L244.4 144.2 L250.1 144.2 L255.7 139.6 L261.4 139.6 L267.0 135.0 L272.6 130.4 L278.3 130.4 L283.9 125.8 L289.6 47.6 L295.2 121.2 L300.8 116.6 L306.5 112.0 L312.1 112.0 L317.8 107.4 L323.4 102.8 L329.0 102.8 L334.7 98.2 L340.3 93.6 L345.9 93.6 L351.6 89.0 L357.2 89.0 L362.9 84.4 L368.5 84.4 L374.1 84.4 L379.8 79.8 L385.4 79.8 L391.1 79.8 L396.7 79.8 L402.3 79.8 L408.0 79.8 L413.6 79.8 L419.2 79.8 L424.9 79.8 L430.5 79.8 L436.2 84.4 L441.8 84.4 L447.4 84.4 L453.1 89.0 L458.7 89.0 L464.4 93.6"/>
+<path class="line" style="stroke:var(--fault)" d="M64.0 99.7 L69.6 102.6 L75.3 105.6 L80.9 108.6 L86.6 111.8 L92.2 114.9 L97.8 118.1 L103.5 121.4 L109.1 124.5 L114.8 127.7 L120.4 130.7 L126.0 133.7 L131.7 136.5 L137.3 139.2 L142.9 141.8 L148.6 144.2 L154.2 146.3 L159.9 148.3 L165.5 150.0 L171.1 151.5 L176.8 152.7 L182.4 153.7 L188.1 154.4 L193.7 154.8 L199.3 154.9 L205.0 154.8 L210.6 154.4 L216.2 153.7 L221.9 152.7 L227.5 151.5 L233.2 150.0 L238.8 148.3 L244.4 146.3 L250.1 144.2 L255.7 141.8 L261.4 139.2 L267.0 136.5 L272.6 133.7 L278.3 130.7 L283.9 51.0 L289.6 124.5 L295.2 121.4 L300.8 118.1 L306.5 114.9 L312.1 111.8 L317.8 108.6 L323.4 105.6 L329.0 102.6 L334.7 99.7 L340.3 97.0 L345.9 94.5 L351.6 92.1 L357.2 90.0 L362.9 88.0 L368.5 86.3 L374.1 84.8 L379.8 83.5 L385.4 82.6 L391.1 81.9 L396.7 81.5 L402.3 81.3 L408.0 81.5 L413.6 81.9 L419.2 82.6 L424.9 83.5 L430.5 84.8 L436.2 86.3 L441.8 88.0 L447.4 90.0 L453.1 92.1 L458.7 94.5 L464.4 97.0"/>
+<text class="ts" x="148.58333333333334" y="164.13333333333333">demand</text>
+<text class="ts" x="334.66666666666663" y="66.0">capacity, autoscaled</text>
+<text class="ts" x="286.73611111111114" y="35.33333333333334">spike</text>
+<text class="ts" x="492" y="36">Capacity follows the daily wave</text>
+<text class="ts" x="492" y="52">a step above it, using 27%</text>
+<text class="ts" x="492" y="68">fewer instance-hours than the</text>
+<text class="ts" x="492" y="84">fixed fleet.</text>
+<text class="ts" x="492" y="118">A sudden spike at 13:00 arrives</text>
+<text class="ts" x="492" y="134">faster than instances start.</text>
+<text class="ts" x="492" y="150">For three minutes demand is</text>
+<text class="ts" x="492" y="166">above what is running.</text>
+<text class="ts" x="492" y="200">Then capacity overshoots.</text>
+
+<rect class="hit" x="64.0" y="20" width="2.8" height="184" data-tip="00:00|demand: 3,400 per second|capacity running: 3,450|50 to spare"/>
+<rect class="hit" x="66.8" y="20" width="5.6" height="184" data-tip="00:20|demand: 3,310 per second|capacity running: 3,450|140 to spare"/>
+<rect class="hit" x="72.5" y="20" width="5.6" height="184" data-tip="00:40|demand: 3,210 per second|capacity running: 3,300|90 to spare"/>
+<rect class="hit" x="78.1" y="20" width="5.6" height="184" data-tip="01:00|demand: 3,110 per second|capacity running: 3,300|190 to spare"/>
+<rect class="hit" x="83.8" y="20" width="5.6" height="184" data-tip="01:20|demand: 3,010 per second|capacity running: 3,150|140 to spare"/>
+<rect class="hit" x="89.4" y="20" width="5.6" height="184" data-tip="01:40|demand: 2,910 per second|capacity running: 3,000|90 to spare"/>
+<rect class="hit" x="95.0" y="20" width="5.6" height="184" data-tip="02:00|demand: 2,800 per second|capacity running: 3,000|200 to spare"/>
+<rect class="hit" x="100.7" y="20" width="5.6" height="184" data-tip="02:20|demand: 2,690 per second|capacity running: 2,850|160 to spare"/>
+<rect class="hit" x="106.3" y="20" width="5.6" height="184" data-tip="02:40|demand: 2,590 per second|capacity running: 2,700|110 to spare"/>
+<rect class="hit" x="112.0" y="20" width="5.6" height="184" data-tip="03:00|demand: 2,490 per second|capacity running: 2,550|60 to spare"/>
+<rect class="hit" x="117.6" y="20" width="5.6" height="184" data-tip="03:20|demand: 2,390 per second|capacity running: 2,550|160 to spare"/>
+<rect class="hit" x="123.2" y="20" width="5.6" height="184" data-tip="03:40|demand: 2,290 per second|capacity running: 2,400|110 to spare"/>
+<rect class="hit" x="128.9" y="20" width="5.6" height="184" data-tip="04:00|demand: 2,200 per second|capacity running: 2,250|50 to spare"/>
+<rect class="hit" x="134.5" y="20" width="5.6" height="184" data-tip="04:20|demand: 2,110 per second|capacity running: 2,250|140 to spare"/>
+<rect class="hit" x="140.1" y="20" width="5.6" height="184" data-tip="04:40|demand: 2,030 per second|capacity running: 2,100|70 to spare"/>
+<rect class="hit" x="145.8" y="20" width="5.6" height="184" data-tip="05:00|demand: 1,950 per second|capacity running: 2,100|150 to spare"/>
+<rect class="hit" x="151.4" y="20" width="5.6" height="184" data-tip="05:20|demand: 1,880 per second|capacity running: 1,950|70 to spare"/>
+<rect class="hit" x="157.1" y="20" width="5.6" height="184" data-tip="05:40|demand: 1,820 per second|capacity running: 1,950|130 to spare"/>
+<rect class="hit" x="162.7" y="20" width="5.6" height="184" data-tip="06:00|demand: 1,760 per second|capacity running: 1,800|40 to spare"/>
+<rect class="hit" x="168.3" y="20" width="5.6" height="184" data-tip="06:20|demand: 1,710 per second|capacity running: 1,800|90 to spare"/>
+<rect class="hit" x="174.0" y="20" width="5.6" height="184" data-tip="06:40|demand: 1,670 per second|capacity running: 1,800|130 to spare"/>
+<rect class="hit" x="179.6" y="20" width="5.6" height="184" data-tip="07:00|demand: 1,640 per second|capacity running: 1,800|160 to spare"/>
+<rect class="hit" x="185.3" y="20" width="5.6" height="184" data-tip="07:20|demand: 1,620 per second|capacity running: 1,650|30 to spare"/>
+<rect class="hit" x="190.9" y="20" width="5.6" height="184" data-tip="07:40|demand: 1,600 per second|capacity running: 1,650|50 to spare"/>
+<rect class="hit" x="196.5" y="20" width="5.6" height="184" data-tip="08:00|demand: 1,600 per second|capacity running: 1,650|50 to spare"/>
+<rect class="hit" x="202.2" y="20" width="5.6" height="184" data-tip="08:20|demand: 1,600 per second|capacity running: 1,650|50 to spare"/>
+<rect class="hit" x="207.8" y="20" width="5.6" height="184" data-tip="08:40|demand: 1,620 per second|capacity running: 1,650|30 to spare"/>
+<rect class="hit" x="213.4" y="20" width="5.6" height="184" data-tip="09:00|demand: 1,640 per second|capacity running: 1,650|10 to spare"/>
+<rect class="hit" x="219.1" y="20" width="5.6" height="184" data-tip="09:20|demand: 1,670 per second|capacity running: 1,800|130 to spare"/>
+<rect class="hit" x="224.7" y="20" width="5.6" height="184" data-tip="09:40|demand: 1,710 per second|capacity running: 1,800|90 to spare"/>
+<rect class="hit" x="230.4" y="20" width="5.6" height="184" data-tip="10:00|demand: 1,760 per second|capacity running: 1,800|40 to spare"/>
+<rect class="hit" x="236.0" y="20" width="5.6" height="184" data-tip="10:20|demand: 1,820 per second|capacity running: 1,950|130 to spare"/>
+<rect class="hit" x="241.6" y="20" width="5.6" height="184" data-tip="10:40|demand: 1,880 per second|capacity running: 1,950|70 to spare"/>
+<rect class="hit" x="247.3" y="20" width="5.6" height="184" data-tip="11:00|demand: 1,950 per second|capacity running: 1,950|0 to spare"/>
+<rect class="hit" x="252.9" y="20" width="5.6" height="184" data-tip="11:20|demand: 2,030 per second|capacity running: 2,100|70 to spare"/>
+<rect class="hit" x="258.6" y="20" width="5.6" height="184" data-tip="11:40|demand: 2,110 per second|capacity running: 2,100|short by 10"/>
+<rect class="hit" x="264.2" y="20" width="5.6" height="184" data-tip="12:00|demand: 2,200 per second|capacity running: 2,250|50 to spare"/>
+<rect class="hit" x="269.8" y="20" width="5.6" height="184" data-tip="12:20|demand: 2,290 per second|capacity running: 2,400|110 to spare"/>
+<rect class="hit" x="275.5" y="20" width="5.6" height="184" data-tip="12:40|demand: 2,390 per second|capacity running: 2,400|10 to spare"/>
+<rect class="hit" x="281.1" y="20" width="5.6" height="184" data-tip="13:00|demand: 4,990 per second|capacity running: 2,550|short by 2,440"/>
+<rect class="hit" x="286.8" y="20" width="5.6" height="184" data-tip="13:20|demand: 2,590 per second|capacity running: 5,100|2,510 to spare"/>
+<rect class="hit" x="292.4" y="20" width="5.6" height="184" data-tip="13:40|demand: 2,690 per second|capacity running: 2,700|10 to spare"/>
+<rect class="hit" x="298.0" y="20" width="5.6" height="184" data-tip="14:00|demand: 2,800 per second|capacity running: 2,850|50 to spare"/>
+<rect class="hit" x="303.7" y="20" width="5.6" height="184" data-tip="14:20|demand: 2,910 per second|capacity running: 3,000|90 to spare"/>
+<rect class="hit" x="309.3" y="20" width="5.6" height="184" data-tip="14:40|demand: 3,010 per second|capacity running: 3,000|short by 10"/>
+<rect class="hit" x="315.0" y="20" width="5.6" height="184" data-tip="15:00|demand: 3,110 per second|capacity running: 3,150|40 to spare"/>
+<rect class="hit" x="320.6" y="20" width="5.6" height="184" data-tip="15:20|demand: 3,210 per second|capacity running: 3,300|90 to spare"/>
+<rect class="hit" x="326.2" y="20" width="5.6" height="184" data-tip="15:40|demand: 3,310 per second|capacity running: 3,300|short by 10"/>
+<rect class="hit" x="331.9" y="20" width="5.6" height="184" data-tip="16:00|demand: 3,400 per second|capacity running: 3,450|50 to spare"/>
+<rect class="hit" x="337.5" y="20" width="5.6" height="184" data-tip="16:20|demand: 3,490 per second|capacity running: 3,600|110 to spare"/>
+<rect class="hit" x="343.1" y="20" width="5.6" height="184" data-tip="16:40|demand: 3,570 per second|capacity running: 3,600|30 to spare"/>
+<rect class="hit" x="348.8" y="20" width="5.6" height="184" data-tip="17:00|demand: 3,650 per second|capacity running: 3,750|100 to spare"/>
+<rect class="hit" x="354.4" y="20" width="5.6" height="184" data-tip="17:20|demand: 3,720 per second|capacity running: 3,750|30 to spare"/>
+<rect class="hit" x="360.1" y="20" width="5.6" height="184" data-tip="17:40|demand: 3,780 per second|capacity running: 3,900|120 to spare"/>
+<rect class="hit" x="365.7" y="20" width="5.6" height="184" data-tip="18:00|demand: 3,840 per second|capacity running: 3,900|60 to spare"/>
+<rect class="hit" x="371.3" y="20" width="5.6" height="184" data-tip="18:20|demand: 3,890 per second|capacity running: 3,900|10 to spare"/>
+<rect class="hit" x="377.0" y="20" width="5.6" height="184" data-tip="18:40|demand: 3,930 per second|capacity running: 4,050|120 to spare"/>
+<rect class="hit" x="382.6" y="20" width="5.6" height="184" data-tip="19:00|demand: 3,960 per second|capacity running: 4,050|90 to spare"/>
+<rect class="hit" x="388.3" y="20" width="5.6" height="184" data-tip="19:20|demand: 3,980 per second|capacity running: 4,050|70 to spare"/>
+<rect class="hit" x="393.9" y="20" width="5.6" height="184" data-tip="19:40|demand: 3,990 per second|capacity running: 4,050|60 to spare"/>
+<rect class="hit" x="399.5" y="20" width="5.6" height="184" data-tip="20:00|demand: 4,000 per second|capacity running: 4,050|50 to spare"/>
+<rect class="hit" x="405.2" y="20" width="5.6" height="184" data-tip="20:20|demand: 3,990 per second|capacity running: 4,050|60 to spare"/>
+<rect class="hit" x="410.8" y="20" width="5.6" height="184" data-tip="20:40|demand: 3,980 per second|capacity running: 4,050|70 to spare"/>
+<rect class="hit" x="416.4" y="20" width="5.6" height="184" data-tip="21:00|demand: 3,960 per second|capacity running: 4,050|90 to spare"/>
+<rect class="hit" x="422.1" y="20" width="5.6" height="184" data-tip="21:20|demand: 3,930 per second|capacity running: 4,050|120 to spare"/>
+<rect class="hit" x="427.7" y="20" width="5.6" height="184" data-tip="21:40|demand: 3,890 per second|capacity running: 4,050|160 to spare"/>
+<rect class="hit" x="433.4" y="20" width="5.6" height="184" data-tip="22:00|demand: 3,840 per second|capacity running: 3,900|60 to spare"/>
+<rect class="hit" x="439.0" y="20" width="5.6" height="184" data-tip="22:20|demand: 3,780 per second|capacity running: 3,900|120 to spare"/>
+<rect class="hit" x="444.6" y="20" width="5.6" height="184" data-tip="22:40|demand: 3,720 per second|capacity running: 3,900|180 to spare"/>
+<rect class="hit" x="450.3" y="20" width="5.6" height="184" data-tip="23:00|demand: 3,650 per second|capacity running: 3,750|100 to spare"/>
+<rect class="hit" x="455.9" y="20" width="5.6" height="184" data-tip="23:20|demand: 3,570 per second|capacity running: 3,750|180 to spare"/>
+<rect class="hit" x="461.6" y="20" width="5.6" height="184" data-tip="23:40|demand: 3,490 per second|capacity running: 3,600|110 to spare"/>
+</svg>
+</div>
+<figcaption>From the simulator below. Autoscaling is good at the wave and late for the spike.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="autoscale-day.ts">type Policy = { usable: number; min: number; max: number; startDelayMin: number; scaleInAfterMin: number };
+type Day = { instanceHours: number; shortMinutes: number; worstShortfall: number; peakInstances: number; series: { demand: number; ready: number }[] };
+
+/** Steps one minute at a time. New instances take startDelayMin to become ready. */
+export function simulateDay(demandAt: (minute: number) => number, p: Policy): Day {
+  let ready = Math.max(p.min, Math.ceil(demandAt(0) / p.usable));
+  const starting: number[] = [];                 // minutes at which pending instances become ready
+  let lowSince = -1, instanceMinutes = 0, shortMinutes = 0, worst = 0, peakInstances = ready;
+  const series: { demand: number; ready: number }[] = [];
+  for (let m = 0; m < 1440; m++) {
+    while (starting.length && starting[0] <= m) { starting.shift(); ready++; }
+    const demand = demandAt(m);
+    const wanted = Math.min(p.max, Math.max(p.min, Math.ceil(demand / p.usable)));
+    const have = ready + starting.length;
+    if (wanted > have) { for (let i = have; i < wanted; i++) starting.push(m + p.startDelayMin); lowSince = -1; }
+    else if (wanted < ready) {
+      if (lowSince < 0) lowSince = m;
+      if (m - lowSince >= p.scaleInAfterMin) { ready = Math.max(wanted, p.min); lowSince = -1; }
+    } else lowSince = -1;
+    const capacity = ready * p.usable;
+    if (demand > capacity) { shortMinutes++; worst = Math.max(worst, demand - capacity); }
+    instanceMinutes += ready + starting.length;  // an instance is paid for while it starts
+    peakInstances = Math.max(peakInstances, ready + starting.length);
+    series.push({ demand, ready });
+  }
+  return { instanceHours: instanceMinutes / 60, shortMinutes, worstShortfall: worst, peakInstances, series };
+}</pre>
+
+<p>The simulation gave three results worth stating as numbers.</p>
+<table>
+<thead><tr><th>Question</th><th>Result</th></tr></thead>
+<tbody>
+<tr><th>Saving on the daily wave, against 27 instances always on</th><td>471 instance-hours instead of 648: 27% fewer</td></tr>
+<tr><th>Minutes over the hard limit during the spike</th><td>Equal to the start-up delay: 1 minute at 1, 3 at 3, 10 at 10. Load reached 118% of the limit</td></tr>
+<tr><th>The same spike with a target of 125 for each instance instead of 150</th><td>No minutes over the limit, for 562 instance-hours: 19% more</td></tr>
+</tbody>
+</table>
+<p>They summarize what autoscaling can and cannot do.</p>
+<p><b>It follows what is slower than its own reaction time.</b> A daily wave changes over hours and is tracked easily. A spike that arrives in seconds is over the limit for exactly as long as new capacity takes to start. Making instances start faster, with smaller images, less work at start-up or instances kept warm in reserve, shortens every such gap.</p>
+<p><b>The target sets what a spike can be absorbed without scaling.</b> At a target of 60% of the limit, the fleet can take a sudden rise of two thirds before it is overloaded. Lowering the target buys room for larger spikes at a steady cost. It is the same headroom decision as before, now expressed as one number.</p>
+<p><b>Scale out quickly and in slowly.</b> Being short of capacity costs users. Having too much for ten minutes costs a little money. The policy should be asymmetric, and it should also be damped, so that a noisy signal does not add and remove instances every minute.</p>
+<p>Three further tools cover what reactive scaling cannot.</p>
+<ul>
+  <li><b>Scheduled scaling.</b> If traffic rises at 08:00 every weekday, add capacity at 07:45.</li>
+  <li><b>Predictive scaling.</b> The platform forecasts from recent history and scales ahead of the forecast.</li>
+  <li><b>Limits and shedding.</b> A maximum protects the budget and downstream systems, and what exceeds capacity is rejected early, as <x-ref to="resilience-patterns#load-shedding"></x-ref> described. Autoscaling and load shedding work as a pair: one for the load you can catch up with, the other for the load you cannot.</li>
+</ul>
+<p>Autoscaling also assumes that what the service depends on can take the extra work. A database, a third-party API or a licensed limit does not grow because the web tier did. Find the first fixed constraint in the path, because that is the system’s real capacity.</p>
+
+<h2 id="pricing">How capacity is priced</h2>
+<p>Cloud providers sell the same machine three ways.</p>
+<table>
+<thead><tr><th>Model</th><th>You promise</th><th>You get</th><th>Suits</th></tr></thead>
+<tbody>
+<tr><th>On demand</th><td>Nothing</td><td>Capacity by the second at the list price</td><td>The variable part of load, and anything new</td></tr>
+<tr><th>Commitment</th><td>To spend a fixed amount each hour for one or three years</td><td>A large discount on that amount, used or not</td><td>The steady base that runs all the time</td></tr>
+<tr><th>Spare capacity, or spot</th><td>To give the machine back on short notice</td><td>The deepest discount, with no guarantee</td><td>Work that can be interrupted and retried: batch jobs, build agents, stateless extras</td></tr>
+</tbody>
+</table>
+<p>As of October 2026, AWS advertises savings of up to 66% and 72% for two of its four kinds of commitment plan, compared with on-demand prices, for terms of one or three years. The largest figures need three years and payment in advance. Discounts for a one-year term with nothing paid up front are much smaller. Spot prices move with supply and are often a fraction of the on-demand price.</p>
+
+<figure class="fig wide" id="fig-pricing">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f494t f494d">
+<title id="f494t">Covering a daily load curve with committed and on-demand capacity</title>
+<desc id="f494d">A chart of instances running over 24 hours, following a wave from about 23 at midnight down to 11 at 08:00 and up to 27 at 20:00. A band up to 15 instances is labeled committed: 15 instances, always paid for. The part of the curve above 15 is labeled on demand. Commit to what runs nearly all the time and take the discount. Pay the full on-demand price only for the part that comes and goes. At night demand dips below the committed line, and part of the commitment is unused.</desc>
+<line class="axis" x1="64" y1="204.0" x2="470" y2="204.0"/>
+<text class="ts end" x="56" y="208.0">0</text>
+<line class="grid" x1="64" y1="142.7" x2="470" y2="142.7"/>
+<text class="ts end" x="56" y="146.66666666666669">10</text>
+<line class="grid" x1="64" y1="81.3" x2="470" y2="81.3"/>
+<text class="ts end" x="56" y="85.33333333333334">20</text>
+<line class="grid" x1="64" y1="20.0" x2="470" y2="20.0"/>
+<text class="ts end" x="56" y="24.0">30</text>
+<text class="ts mid" x="64.0" y="222">00:00</text>
+<text class="ts mid" x="165.5" y="222">06:00</text>
+<text class="ts mid" x="267.0" y="222">12:00</text>
+<text class="ts mid" x="368.5" y="222">18:00</text>
+<text class="ts mid" x="470.0" y="222">24:00</text>
+<text class="ts mid" transform="translate(14 112) rotate(-90)">instances running</text>
+<path d="M64.0 112.0 L64.0 65.0 L72.5 70.7 L80.9 76.8 L89.4 83.1 L97.8 89.5 L106.3 95.9 L114.8 102.2 L123.2 108.3 L131.7 112.0 L140.1 112.0 L148.6 112.0 L157.0 112.0 L165.5 112.0 L174.0 112.0 L182.4 112.0 L190.9 112.0 L199.3 112.0 L207.8 112.0 L216.2 112.0 L224.7 112.0 L233.2 112.0 L241.6 112.0 L250.1 112.0 L258.5 112.0 L267.0 112.0 L275.5 108.3 L283.9 102.2 L292.4 95.9 L300.8 89.5 L309.3 83.1 L317.8 76.8 L326.2 70.7 L334.7 65.0 L343.1 59.6 L351.6 54.8 L360.0 50.6 L368.5 47.0 L377.0 44.2 L385.4 42.1 L393.9 40.9 L402.3 40.4 L410.8 40.9 L419.2 42.1 L427.7 44.2 L436.2 47.0 L444.6 50.6 L453.1 54.8 L461.5 59.6 L470.0 65.0 L470.0 112.0Z" fill="var(--async)" opacity="0.22"/>
+<rect x="64" y="112.0" width="406" height="92.0" fill="var(--store)" opacity="0.22"/>
+<path class="line" d="M64.0 65.0 L72.5 70.7 L80.9 76.8 L89.4 83.1 L97.8 89.5 L106.3 95.9 L114.8 102.2 L123.2 108.3 L131.7 114.0 L140.1 119.4 L148.6 124.2 L157.0 128.4 L165.5 132.0 L174.0 134.8 L182.4 136.9 L190.9 138.2 L199.3 138.6 L207.8 138.2 L216.2 136.9 L224.7 134.8 L233.2 132.0 L241.6 128.4 L250.1 124.2 L258.5 119.4 L267.0 114.0 L275.5 108.3 L283.9 102.2 L292.4 95.9 L300.8 89.5 L309.3 83.1 L317.8 76.8 L326.2 70.7 L334.7 65.0 L343.1 59.6 L351.6 54.8 L360.0 50.6 L368.5 47.0 L377.0 44.2 L385.4 42.1 L393.9 40.9 L402.3 40.4 L410.8 40.9 L419.2 42.1 L427.7 44.2 L436.2 47.0 L444.6 50.6 L453.1 54.8 L461.5 59.6 L470.0 65.0"/>
+<path class="e none dash" d="M64 112.0H470"/>
+<text class="ts mid" x="267.0" y="167.2">committed: 15 instances, always paid for</text>
+<text class="ts mid" x="419.25" y="75.20000000000002">on demand</text>
+<text class="ts" x="492" y="36">Commit to what runs nearly all</text>
+<text class="ts" x="492" y="52">the time and take the discount.</text>
+<text class="ts" x="492" y="90">Pay the full on-demand price</text>
+<text class="ts" x="492" y="106">only for the part that comes</text>
+<text class="ts" x="492" y="122">and goes.</text>
+<text class="ts" x="492" y="160">At night demand dips below</text>
+<text class="ts" x="492" y="176">the committed line, and part</text>
+<text class="ts" x="492" y="192">of the commitment is unused.</text>
+
+<rect class="hit" x="64" y="20" width="8.5" height="184" data-tip="00:00|about 23 instances running|committed: 15, all in use|on demand: 8"/>
+<rect class="hit" x="72.4" y="20" width="16.9" height="184" data-tip="01:00|about 21 instances running|committed: 15, all in use|on demand: 6"/>
+<rect class="hit" x="89.3" y="20" width="16.9" height="184" data-tip="02:00|about 19 instances running|committed: 15, all in use|on demand: 4"/>
+<rect class="hit" x="106.3" y="20" width="16.9" height="184" data-tip="03:00|about 17 instances running|committed: 15, all in use|on demand: 2"/>
+<rect class="hit" x="123.2" y="20" width="16.9" height="184" data-tip="04:00|about 15 instances running|committed: 15, all in use|on demand: 0"/>
+<rect class="hit" x="140.1" y="20" width="16.9" height="184" data-tip="05:00|about 13 instances running|committed: 15, of which 2 unused|on demand: none"/>
+<rect class="hit" x="157.0" y="20" width="16.9" height="184" data-tip="06:00|about 12 instances running|committed: 15, of which 3 unused|on demand: none"/>
+<rect class="hit" x="173.9" y="20" width="16.9" height="184" data-tip="07:00|about 11 instances running|committed: 15, of which 4 unused|on demand: none"/>
+<rect class="hit" x="190.8" y="20" width="16.9" height="184" data-tip="08:00|about 11 instances running|committed: 15, of which 4 unused|on demand: none"/>
+<rect class="hit" x="207.7" y="20" width="16.9" height="184" data-tip="09:00|about 11 instances running|committed: 15, of which 4 unused|on demand: none"/>
+<rect class="hit" x="224.7" y="20" width="16.9" height="184" data-tip="10:00|about 12 instances running|committed: 15, of which 3 unused|on demand: none"/>
+<rect class="hit" x="241.6" y="20" width="16.9" height="184" data-tip="11:00|about 13 instances running|committed: 15, of which 2 unused|on demand: none"/>
+<rect class="hit" x="258.5" y="20" width="16.9" height="184" data-tip="12:00|about 15 instances running|committed: 15, all in use|on demand: 0"/>
+<rect class="hit" x="275.4" y="20" width="16.9" height="184" data-tip="13:00|about 17 instances running|committed: 15, all in use|on demand: 2"/>
+<rect class="hit" x="292.3" y="20" width="16.9" height="184" data-tip="14:00|about 19 instances running|committed: 15, all in use|on demand: 4"/>
+<rect class="hit" x="309.3" y="20" width="16.9" height="184" data-tip="15:00|about 21 instances running|committed: 15, all in use|on demand: 6"/>
+<rect class="hit" x="326.2" y="20" width="16.9" height="184" data-tip="16:00|about 23 instances running|committed: 15, all in use|on demand: 8"/>
+<rect class="hit" x="343.1" y="20" width="16.9" height="184" data-tip="17:00|about 24 instances running|committed: 15, all in use|on demand: 9"/>
+<rect class="hit" x="360.0" y="20" width="16.9" height="184" data-tip="18:00|about 26 instances running|committed: 15, all in use|on demand: 11"/>
+<rect class="hit" x="376.9" y="20" width="16.9" height="184" data-tip="19:00|about 26 instances running|committed: 15, all in use|on demand: 11"/>
+<rect class="hit" x="393.8" y="20" width="16.9" height="184" data-tip="20:00|about 27 instances running|committed: 15, all in use|on demand: 12"/>
+<rect class="hit" x="410.7" y="20" width="16.9" height="184" data-tip="21:00|about 26 instances running|committed: 15, all in use|on demand: 11"/>
+<rect class="hit" x="427.7" y="20" width="16.9" height="184" data-tip="22:00|about 26 instances running|committed: 15, all in use|on demand: 11"/>
+<rect class="hit" x="444.6" y="20" width="16.9" height="184" data-tip="23:00|about 24 instances running|committed: 15, all in use|on demand: 9"/>
+<rect class="hit" x="461.5" y="20" width="8.5" height="184" data-tip="24:00|about 23 instances running|committed: 15, all in use|on demand: 8"/>
+</svg>
+</div>
+<figcaption>The right commitment is usually a little above the lowest point of the day, not at it and not at the peak.</figcaption>
+</figure>
+
+<p>How much to commit can be computed. A commitment is paid for every hour, so it saves money in the hours when it is used and wastes money when it is not.</p>
+
+<pre data-lang="ts" data-title="commitment.ts">/** Monthly cost when `committed` instances are paid for around the clock at a discount and the rest on demand. */
+export function blendedCost(hourly: number[], price: number, committed: number, discount: number): number {
+  let cost = 0;
+  for (const n of hourly) cost += committed * price * (1 - discount) + Math.max(0, n - committed) * price;
+  return cost;
+}</pre>
+
+<p>For a month of the autoscaled wave, running between 11 and 27 instances at $0.10 an hour, with a 30% discount for commitment:</p>
+<table>
+<thead><tr><th>Commitment</th><th>Monthly cost</th></tr></thead>
+<tbody>
+<tr><th>None: autoscaled, all on demand</th><td>$1,380</td></tr>
+<tr><th>11 instances, the daily minimum</th><td>$1,142</td></tr>
+<tr><th>15 instances, the cheapest choice</th><td>$1,116</td></tr>
+<tr><th>27 instances, the daily maximum</th><td>$1,361</td></tr>
+<tr><th>For comparison: 29 instances always on, on demand</th><td>$2,088</td></tr>
+</tbody>
+</table>
+<p>Autoscaling and commitment together cut the bill by 47% against the fixed on-demand fleet. Over-committing gives most of that back. The general rule: commit to the load you are confident will still be there at the end of the term, and no further, because a commitment cannot follow you when an architecture changes.</p>
+
+<h2 id="bill">From an estimate to a bill</h2>
+<p>The estimation chapter produced figures for the photo app with 10 million daily users: 5 TB of new photos a day, 500 million photo views a day at 200 KB each, and a peak of 1,740 feed requests a second. Prices turn those into money. The prices used here are AWS list prices for one region as of 2026, and the arithmetic is the point, not the exact rates.</p>
+<table>
+<thead><tr><th>Line</th><th>Quantity after one year</th><th>Unit price</th><th>Per month</th></tr></thead>
+<tbody>
+<tr><th>Photo storage</th><td>5 TB × 365 = 1.8 PB = 1,800,000 GB</td><td>$0.023 per GB-month</td><td>$41,400</td></tr>
+<tr><th>Delivery to users</th><td>500 million × 200 KB × 30 = 3 PB = 3,000,000 GB</td><td>$0.09 per GB</td><td>$270,000</td></tr>
+<tr><th>Read requests</th><td>500 million × 30 = 15 billion</td><td>$0.0004 per 1,000</td><td>$6,000</td></tr>
+<tr><th>Write requests</th><td>2 million × 30 = 60 million</td><td>$0.005 per 1,000</td><td>$300</td></tr>
+<tr><th>Feed servers</th><td>4 instances × 730 hours</td><td>$0.10 per hour</td><td>$292</td></tr>
+</tbody>
+</table>
+
+<figure class="fig wide" id="fig-bill">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f495t f495d">
+<title id="f495t">The photo app’s monthly bill by line, at list prices</title>
+<desc id="f495d">A bar chart of the photo app’s monthly cost after one year at list prices. Delivery to users, 3 petabytes sent: 270,000 dollars. Storage of 1.8 petabytes of photos: 41,400 dollars. Read requests, 15 billion: 6,000 dollars. Write requests, 60 million: 300 dollars. Feed servers, 4 small instances: 292 dollars. Nearly all of the bill is bytes: sending them and keeping them. The servers that run the application are a rounding error.</desc>
+<text class="tb" x="10" y="18">The photo app after one year, per month, at list prices</text>
+<text class="ts" x="10" y="49">Delivery to users</text>
+<rect class="bar fault" x="170" y="34" width="330.0" height="20" rx="3"/>
+<text class="ts" x="508.0" y="49">$270,000  ·  3 PB sent</text>
+<text class="ts" x="10" y="79">Storage</text>
+<rect class="bar store" x="170" y="64" width="50.6" height="20" rx="3"/>
+<text class="ts" x="228.6" y="79">$41,400  ·  1.8 PB of photos</text>
+<text class="ts" x="10" y="109">Read requests</text>
+<rect class="bar sig" x="170" y="94" width="7.3" height="20" rx="3"/>
+<text class="ts" x="185.33333333333334" y="109">$6,000  ·  15 billion</text>
+<text class="ts" x="10" y="139">Write requests</text>
+<rect class="bar " x="170" y="124" width="2.0" height="20" rx="3"/>
+<text class="ts" x="180" y="139">$300  ·  60 million</text>
+<text class="ts" x="10" y="169">Feed servers</text>
+<rect class="bar " x="170" y="154" width="2.0" height="20" rx="3"/>
+<text class="ts" x="180" y="169">$292  ·  4 small instances</text>
+<text class="ts" x="10" y="204">Nearly all of the bill is bytes: sending them and keeping them. The servers that run the application are a rounding error.</text>
+<text class="ts" x="10" y="220">A design review that argues about instance types and ignores image sizes is looking in the wrong place.</text>
+<rect class="hit" x="6" y="31" width="708" height="26" data-tip="Delivery to users|$270,000 a month|3 PB sent|85% of the $317,992 bill"/>
+<rect class="hit" x="6" y="61" width="708" height="26" data-tip="Storage|$41,400 a month|1.8 PB of photos|13% of the $317,992 bill"/>
+<rect class="hit" x="6" y="91" width="708" height="26" data-tip="Read requests|$6,000 a month|15 billion|1.9% of the $317,992 bill"/>
+<rect class="hit" x="6" y="121" width="708" height="26" data-tip="Write requests|$300 a month|60 million|0.1% of the $317,992 bill"/>
+<rect class="hit" x="6" y="151" width="708" height="26" data-tip="Feed servers|$292 a month|4 small instances|0.1% of the $317,992 bill"/>
+</svg>
+</div>
+<figcaption>List prices overstate the top bar: volume tiers and content delivery networks cost much less per gigabyte. The ranking survives any realistic discount.</figcaption>
+</figure>
+
+<p>The table changes what a designer should care about. The four servers that the estimation chapter spent a paragraph on cost less than one thousandth of the total. Nearly everything is the cost of moving and keeping bytes, so that is where design effort pays.</p>
+<table>
+<thead><tr><th>Change</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><th>Serve images through a CDN at a negotiated rate</th><td>Delivery is priced far below the list rate for direct transfer, and read requests to storage fall with the cache hit ratio. See <x-ref to="cdn-and-edge#hit-ratio"></x-ref></td></tr>
+<tr><th>Smaller images: a modern format, and sizes matched to the screen</th><td>If the average view falls from 200 KB to 120 KB, delivery falls by 40%</td></tr>
+<tr><th>Move photos older than 90 days to an infrequent-access class</th><td>If that is 80% of them, storage falls from $41,400 to $26,280, with fees when old photos are read. See <x-ref to="object-and-file-storage#tiers"></x-ref></td></tr>
+<tr><th>Store fewer or smaller resized versions</th><td>Storage falls in proportion, for the life of the product</td></tr>
+</tbody>
+</table>
+<p>A different product has a different dominant line. For an API with small responses it is compute. For an analytics product it is storage and query processing. For a machine-learning product it is accelerators. The method is the same each time: write the bill as quantities times prices, sort it, and work on the top line.</p>
+
+<h3 id="data-transfer">Data transfer</h3>
+<p>Data transfer is the line most often left out of a design, because moving bytes inside one data center is free and feels free everywhere. In a cloud it is priced by direction and distance. These are typical AWS figures as of 2026, and other providers follow the same pattern.</p>
+<table>
+<thead><tr><th>Path</th><th>Typical price per GB</th></tr></thead>
+<tbody>
+<tr><th>Into the cloud from the internet</th><td>Free</td></tr>
+<tr><th>Within one availability zone</th><td>Free</td></tr>
+<tr><th>Between availability zones of a region</th><td>$0.01 in each direction</td></tr>
+<tr><th>Between regions</th><td>From about $0.02</td></tr>
+<tr><th>Out to the internet</th><td>About $0.09 at first, falling with volume, after a small free allowance</td></tr>
+<tr><th>From storage to the provider’s own CDN</th><td>Free. The CDN then charges for delivery</td></tr>
+</tbody>
+</table>
+<p>Three design consequences follow. Chatty services spread across zones pay for every call: 50 TB a month between two zones, charged both ways, is $1,000. Replicating a busy database or event stream to another region is billed by the gigabyte, as <x-ref to="multi-region#cost"></x-ref> noted. And because leaving costs so much more than arriving, data tends to stay with the provider it was first given to, which is worth remembering when choosing one.</p>
+
+<h3 id="reducing">Where savings usually are</h3>
+<p>In rough order of how often they pay off:</p>
+<ol>
+  <li><b>Turn off what is not used.</b> Forgotten test environments, unattached disks, old snapshots, idle load balancers. It is dull work and reliably the cheapest saving.</li>
+  <li><b>Right-size.</b> Instances chosen by guesswork are often much larger than their measured use requires. The same goes for the resource requests in <x-ref to="containers-and-orchestration#resources"></x-ref>.</li>
+  <li><b>Autoscale and schedule.</b> Development environments need not run at night. Production need not run its peak fleet at 4 a.m.</li>
+  <li><b>Commit to the base.</b> As computed above.</li>
+  <li><b>Tier and expire data.</b> Cheaper classes for cold data, and deletion for data with no remaining purpose, which includes most logs after some weeks, as <x-ref to="observability#cost"></x-ref> argued.</li>
+  <li><b>Change the design.</b> Caching, batching, compression, a cheaper processor architecture, fewer cross-zone calls. These are the largest savings and the most work.</li>
+</ol>
+
+<h2 id="vertical-vs-horizontal">A bigger machine, or more machines?</h2>
+<p><x-ref to="scalability#vertical"></x-ref> introduced the choice between scaling up and scaling out and noted that it is a question of cost. Here is the comparison worked through, with assumed figures.</p>
+<p>A database runs on an instance with 8 cores and is approaching its usable capacity. Two options:</p>
+<table>
+<thead><tr><th></th><th>Move to 16 cores</th><th>Shard across two 8-core instances</th></tr></thead>
+<tbody>
+<tr><th>Extra infrastructure</th><td>About double: say $700 more a month</td><td>About double: say $700 more a month</td></tr>
+<tr><th>Engineering</th><td>A planned switchover: days</td><td>Choosing a shard key, changing queries, migrating data: say three people for three months</td></tr>
+<tr><th>Engineering cost at an assumed $15,000 a person-month</th><td>A few thousand dollars</td><td>$135,000</td></tr>
+<tr><th>Ongoing</th><td>Nothing new</td><td>Cross-shard queries, rebalancing, more to operate, as in <x-ref to="partitioning#harder"></x-ref></td></tr>
+<tr><th>What it buys</th><td>Double the capacity</td><td>Double the capacity, and a path to much more</td></tr>
+</tbody>
+</table>
+<p>Within a family of cloud instances, price is roughly proportional to size, so the larger machine carries no premium. The whole difference is the engineering, and at these figures the sharding project costs as much as sixteen years of the larger instance’s extra rent. Scaling up is the cheaper choice by a wide margin.</p>
+<p>That holds until one of three things is true. The largest available machine is not enough: clouds rent machines with hundreds of cores and terabytes of memory, which is a high ceiling and still a ceiling. Or the requirement is availability and not capacity, since one large machine is one point of failure. Or growth is fast enough that the ceiling will arrive before a sharding project could finish, in which case the project must start while the single machine still has room. The practical policy is to scale up while you can and to know the date on which you no longer can.</p>
+
+<h2 id="unit-economics">Cost for each thing you sell</h2>
+<p>A total bill says little by itself. Whether $300,000 a month is high depends on what it buys. Dividing by a unit of business gives a number that can be judged and tracked: cost per thousand requests, per active user, per tenant, per order.</p>
+<p>For the photo app at list prices the bill is about $318,000 a month for 10 million daily users: a little over three cents per daily user per month. If the product earns less than that from each user, no optimization of instance types will save it, and the conversation has to be about images, delivery and revenue.</p>
+<p>Unit costs are useful in three ways.</p>
+<ul>
+  <li><b>They reveal trends that totals hide.</b> A bill that grows 20% while users grow 30% is getting better. One that grows 20% with flat users is a leak.</li>
+  <li><b>They expose expensive customers.</b> In a multi-tenant product, cost per tenant against revenue per tenant shows who is unprofitable, using the tenant tags from <x-ref to="multi-tenancy#lifecycle"></x-ref>.</li>
+  <li><b>They make design choices comparable.</b> “This feature adds $0.002 to each request” can be weighed. “This feature needs more servers” cannot.</li>
+</ul>
+<p>None of this works unless costs can be attributed. Tag every resource with its service, team and environment from the start, give each team a view of what it spends, set budgets with alerts, and put cost next to latency and errors on the dashboards. Teams that can see what their design costs make cheaper designs.</p>
+
+<div class="note interview"><p><span class="label">In an interview.</span> After estimating load, say what you would measure before trusting the estimate: usable capacity for each instance at the latency target, from an open-model load test. Size the fleet with explicit headroom for the peak and for losing a zone. Name the autoscaling signal, target and limits. If the system moves many bytes, say that delivery and storage will dominate the cost and what you would do about it. One sentence on cost per user or per request shows you are designing a business, not only a system.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Planning from a benchmark.</b> Somebody else’s number, for somebody else’s workload.</li>
+  <li><b>Quoting maximum throughput as capacity.</b> The system can do it, at a latency nobody would accept.</li>
+  <li><b>Closed-model load tests for latency.</b> They hide the queue that real users would be in.</li>
+  <li><b>Testing with toy data.</b> Everything is fast on a thousand rows.</li>
+  <li><b>No headroom for failure.</b> The peak fits exactly, until a zone is lost at the peak.</li>
+  <li><b>Trusting autoscaling for spikes.</b> It is late by its start-up time, every time.</li>
+  <li><b>Autoscaling the front and forgetting the back.</b> The database is the real limit.</li>
+  <li><b>Committing to the peak.</b> Paying around the clock for capacity used four hours a day.</li>
+  <li><b>Ignoring data transfer.</b> Cross-zone chatter and internet egress discovered on the invoice.</li>
+  <li><b>Optimizing the small line.</b> A week spent on instance types when delivery is 85% of the bill.</li>
+  <li><b>Distributing too early.</b> A sharding project where a larger machine would have served for years.</li>
+  <li><b>No attribution.</b> Nobody knows which service or team the money goes to.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="estimation"></x-ref>: the rough numbers this chapter turns into measurements and money.</li>
+  <li><x-ref to="latency-and-throughput"></x-ref>: the saturation curve, here measured on a real system.</li>
+  <li><x-ref to="scalability"></x-ref>: scaling up and out, compared by cost.</li>
+  <li><x-ref to="containers-and-orchestration"></x-ref>: the autoscaler and resource requests that implement these policies.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: load shedding for what capacity cannot cover.</li>
+  <li><x-ref to="serverless"></x-ref>: paying per use instead of for capacity.</li>
+  <li><x-ref to="cdn-and-edge"></x-ref> and <x-ref to="object-and-file-storage"></x-ref>: the two largest lines of a media product’s bill.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Measure capacity with a load test. Usable capacity is the highest load that still meets the latency objective, well below maximum throughput.</li>
+  <li>Test latency with an open model, where arrivals do not wait for earlier requests. A closed model hides queueing.</li>
+  <li>Hold headroom for named reasons: the daily peak, staying fast, losing a zone, and growth until more can be added.</li>
+  <li>Autoscaling follows changes slower than its reaction time. For anything faster, the target utilization is the only cushion, with load shedding behind it.</li>
+  <li>Commit to the steady base at a discount, run the variable part on demand, and use interruptible capacity for work that can be retried.</li>
+  <li>Write the bill as quantities times prices and sort it. For systems that move data, storage and transfer dominate and compute is small.</li>
+  <li>Scaling up is usually far cheaper than distributing, until a ceiling, an availability need or fast growth forces the change.</li>
+  <li>Track cost per unit of business, and make every resource attributable to an owner.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>In the measured load test, the database completed about 4,500 transactions a second at most. Why is 4,500 the wrong number to plan with, and what is the right one for an objective of 99% under 50 ms?</summary><p>At 4,500 a second the median latency is over 100 ms and any extra load queues without limit, so the objective is badly missed. The right number is the highest rate that still met the objective, 3,500 a second, about 78% of the maximum.</p></details>
+<details><summary>A closed-model test with 64 clients reported an average latency of 17 ms. An open-model test of the same system at 5,000 arrivals a second reported a median of 654 ms. Why the difference?</summary><p>In the closed test each client waits for its response before sending again, so when the system slows down the load slows with it and no queue forms. In the open test arrivals keep coming at the set rate, as real users do, so the excess queues and waiting time is counted. The open test shows what users would experience.</p></details>
+<details><summary>Peak load is 9,000 requests a second. One instance has a usable capacity of 300. The service runs in three zones and must survive the loss of one at peak. How many instances?</summary><p>9,000 ÷ 300 = 30 instances must remain after a zone is lost. With three equal zones, two zones must hold 30, so each zone has 15 and the fleet is 45. In normal operation each instance then runs at two thirds of its usable capacity.</p></details>
+<details><summary>An autoscaler takes four minutes to add ready capacity. What does that imply about a traffic spike that doubles load within ten seconds?</summary><p>For about four minutes the fleet has only the capacity it had before the spike. Whether that is an outage depends on the headroom: if instances were at 50% of their limit, doubling just fits. If they were at 70%, the fleet is overloaded until new capacity arrives, and load shedding has to protect it meanwhile.</p></details>
+<details><summary>A service runs between 20 and 50 instances through the day. A commitment gives a 30% discount. Why is committing to 50 instances a mistake, and roughly where is the best commitment?</summary><p>A commitment is paid every hour whether used or not. Committing to 50 pays for 50 around the clock while the average in use is far lower, which can cost more than no commitment. The best level is a little above the daily minimum, where the discount on hours used still outweighs the waste in the few hours below it.</p></details>
+<details><summary>A video product stores 400 TB and sends 2 PB a month to viewers. Using $0.023 per GB-month and $0.09 per GB, which line is larger and by how much?</summary><p>Storage: 400,000 GB × $0.023 = $9,200 a month. Delivery: 2,000,000 GB × $0.09 = $180,000 a month, nearly twenty times larger. Effort belongs on delivery: a CDN, better compression, lower bitrates where acceptable.</p></details>
+<details><summary>Two services in different availability zones exchange 20 TB a month in each direction. What does that cost at $0.01 per GB each way, and how could it be avoided?</summary><p>20,000 GB × $0.01 × 2 directions = $400 a month, for traffic that would be free within one zone. Routing calls to an instance in the same zone where one is healthy, batching, or compressing the payloads reduces it.</p></details>
+<details><summary>A database on an 8-core instance is nearly full. Give two conditions under which sharding now is the right choice despite a 16-core instance being cheaper to adopt.</summary><p>If growth is fast enough that even the largest available instance would be outgrown before a sharding project could be completed, the project has to begin now. Or if the driver is availability or data placement and not capacity, for example the need to survive the loss of the machine without a failover pause, or to keep tenants’ data in different regions.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>PostgreSQL Global Development Group, <a href="https://www.postgresql.org/docs/current/pgbench.html">pgbench</a>, PostgreSQL documentation. The tool and the meaning of its rate limit and schedule lag.</li>
+  <li>Gil Tene, “How NOT to Measure Latency”, conference talk, 2013 onward. The origin of the term coordinated omission for what closed-model tests hide.</li>
+  <li>Bianca Schroeder, Adam Wierman and Mor Harchol-Balter, “Open Versus Closed: A Cautionary Tale”, NSDI 2006.</li>
+  <li>AWS, <a href="https://aws.amazon.com/savingsplans/pricing/">Savings Plans pricing</a>. Maximum discounts and terms, read in October 2026.</li>
+  <li>AWS, <a href="https://aws.amazon.com/s3/pricing/">Amazon S3 pricing</a> and <a href="https://aws.amazon.com/ec2/pricing/on-demand/">EC2 on-demand pricing</a>, including data transfer. Storage classes, request prices and transfer rates.</li>
+  <li>Google, <a href="https://sre.google/sre-book/software-engineering-in-sre/">Software Engineering in SRE</a>, chapter 18 of <cite>Site Reliability Engineering</cite>, 2016. Intent-based capacity planning.</li>
+  <li>FinOps Foundation, <a href="https://www.finops.org/framework/">FinOps Framework</a>. Practices for attributing and managing cloud cost.</li>
+</ol>
+</section>

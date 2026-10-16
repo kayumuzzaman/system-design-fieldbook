@@ -1,0 +1,855 @@
+<!--meta
+{ "description": "A low-level design of a rate limiter in TypeScript, tested and measured: five algorithms behind one interface as pure functions of a state, token bucket and GCRA shown to be the same algorithm, how far each one can exceed its limit, memory for each client and what happens when a limiter forgets clients, several limits that must all agree, rules and HTTP headers, and the race that appears when the state lives in another process.",
+  "lede": "A rate limiter answers one question many thousands of times a second: may this client do this now? The algorithms were covered in the chapter on resilience. This chapter is about the object design around them: one interface that all five algorithms fit, state kept for each client without unbounded memory, several limits combined without charging for refused requests, and the race that appears as soon as the state is shared. Every claim about behavior comes from a test or a measurement of the code shown.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a rate limiter. Given a client and a request, it decides whether the request may proceed, under limits such as 100 requests a minute for each user. It must support several limiting algorithms, and it will be used to protect an HTTP API.</p></div>
+<p><x-ref to="resilience-patterns#rate-limiting"></x-ref> explained why services limit their callers and how the five standard algorithms behave. That chapter treated each algorithm as a small class on its own. This one asks the questions of <x-ref to="lld-method"></x-ref>: what is the contract, which rules must hold, what varies, and where the state lives. In the terms of <x-ref to="lld-method#shapes"></x-ref>, a rate limiter is a data structure with a contract, like the cache of the previous chapter, with a stronger concurrency question attached. The version that runs across many servers is <x-ref to="hld-rate-limiter"></x-ref>.</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>Who is limited?</th><td>Whatever a rule names: a user, an API key, an IP address, or a user on one route. The limiter sees only a string key</td></tr>
+<tr><th>What shape does a limit have?</th><td>A number of requests in a window of time, such as 100 a minute</td></tr>
+<tr><th>Is every request worth one?</th><td>By default. An expensive request may cost more, up to the limit itself</td></tr>
+<tr><th>What happens to a refused request?</th><td>It is turned away at once with a time to retry. Waiting in a queue is a follow-up</td></tr>
+<tr><th>Can several limits apply to one request?</th><td>Yes: for example one for the user and one for the whole service. All must allow it</td></tr>
+<tr><th>One process or many?</th><td>One process first. Then the state moves to a shared store, and the design must survive that move</td></tr>
+<tr><th>Where does the time come from?</th><td>It is passed in. Nothing in the limiter reads a clock</td></tr>
+</tbody>
+</table>
+<p>The last answer is a design decision. A limiter that calls <code>Date.now()</code> can be tested only by waiting or by replacing the clock. One that is given the time is tested with plain numbers, and this chapter’s tests simulate hours of traffic in seconds (<x-ref to="errors-and-testing#testable"></x-ref>).</p>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+<table>
+<thead><tr><th>Concept</th><th>Kind</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Decision</th><td>Value</td><td>Allowed or not, how many requests remain, and how long to wait if refused</td></tr>
+<tr><th>Algorithm</th><td>An interface with five implementations</td><td>The rule for turning a client’s history into a decision</td></tr>
+<tr><th>State</th><td>Value, one for each key</td><td>What an algorithm remembers about one client. Each algorithm has its own shape of state</td></tr>
+<tr><th>Keyed limiter</th><td>Entity</td><td>One algorithm, plus the states of the clients it has seen</td></tr>
+<tr><th>Limit and rule</th><td>Values</td><td>Which key a request counts against, and which limit applies to which requests</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th></tr></thead>
+<tbody>
+<tr><th>No client is allowed more than its algorithm permits</th><td>The algorithm. Each one defines “permits” differently, and the differences are measured below</td></tr>
+<tr><th>A refused request consumes nothing</th><td>The algorithm returns the state unchanged, or only brought up to date, when it refuses</td></tr>
+<tr><th>When several limits apply, a request is charged to all of them or to none</th><td><code>allOf</code></td></tr>
+<tr><th>Memory is bounded, and forgetting a client never hands it a fresh allowance it should not have</th><td><code>KeyedLimiter</code>, by its choice of what to forget</td></tr>
+<tr><th>Time never goes backward for the limiter</th><td><code>KeyedLimiter</code>, which ignores any time earlier than the latest it has seen</td></tr>
+<tr><th>Reading a state, deciding, and storing the result happen as one step</th><td>Whatever holds the states: one synchronous method in memory, one atomic operation in a shared store</td></tr>
+</tbody>
+</table>
+<p>Four of the six concern what surrounds the algorithms, which is where interviewers who have heard the token bucket explained many times listen hardest.</p>
+
+<h2 id="classes">Step 4: The classes</h2>
+
+<figure class="fig wide" id="fig-classes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 424" role="img" aria-labelledby="f711t f711d">
+<title id="f711t">The classes of the rate limiter</title>
+<desc id="f711d">A class diagram. Algorithm of S is an interface with start, which returns the state for a new client, and decide, which takes a state, the time and a cost and returns a decision and the next state. Five algorithms implement it, each with its own state, from one number for GCRA to a list of times for the sliding log. KeyedLimiter has one Algorithm and keeps a state for each key in a private LRU cache. A Limit names a KeyedLimiter and a key, and allOf combines several. On the right are StateStore, for state kept in another process, Rule, and the rateLimited decorator that answers 429.</desc>
+<rect class="n sig" x="10" y="20" width="220" height="128" rx="4"/>
+<text class="tb mid" x="120" y="39">KeyedLimiter&lt;S&gt;</text>
+<line class="sep sig" x1="10" y1="48" x2="230" y2="48"/>
+<text class="ts" x="18" y="64">algorithm: Algorithm&lt;S&gt;</text>
+<text class="ts" x="18" y="80">− states: LruCache&lt;string, S&gt;</text>
+<text class="ts" x="18" y="96">− latest: number</text>
+<line class="sep sig" x1="10" y1="106" x2="230" y2="106"/>
+<text class="ts" x="18" y="122">+ check(key, now, cost)</text>
+<text class="ts" x="18" y="138">+ tryAcquire(key, now, cost)</text>
+<rect class="n store" x="280" y="20" width="260" height="126" rx="4"/>
+<text class="ts mid" x="410" y="36">«interface»</text>
+<text class="tb mid" x="410" y="53">Algorithm&lt;S&gt;</text>
+<line class="sep store" x1="280" y1="62" x2="540" y2="62"/>
+<text class="ts" x="288" y="78">name, limit, windowMs</text>
+<line class="sep store" x1="280" y1="88" x2="540" y2="88"/>
+<text class="ts" x="288" y="104">+ start(now): S</text>
+<text class="ts" x="288" y="120">+ decide(state, now, cost):</text>
+<text class="ts" x="288" y="136">     { decision, next: S }</text>
+<path class="e has" d="M230 58.4 L280 57.8"/>
+<text class="ts mid" x="255" y="51.1">1</text>
+<rect class="n" x="280" y="200" width="260" height="118" rx="4"/>
+<text class="tb mid" x="410" y="219">The five algorithms</text>
+<line class="sep" x1="280" y1="228" x2="540" y2="228"/>
+<text class="ts" x="288" y="244">tokenBucket: { credit, at }</text>
+<text class="ts" x="288" y="260">gcra: { emptyAt }</text>
+<text class="ts" x="288" y="276">fixedWindow: { start, count }</text>
+<text class="ts" x="288" y="292">slidingLog: { times }</text>
+<text class="ts" x="288" y="308">slidingCounter: { start, current, previous }</text>
+<path class="e implements" d="M410 200 L410 146"/>
+<text class="ts" x="418" y="180">each one defines S</text>
+<rect class="n" x="10" y="200" width="220" height="86" rx="4"/>
+<text class="tb mid" x="120" y="219">Limit</text>
+<line class="sep" x1="10" y1="228" x2="230" y2="228"/>
+<text class="ts" x="18" y="244">name</text>
+<text class="ts" x="18" y="260">limiter: KeyedLimiter</text>
+<text class="ts" x="18" y="276">keyOf(request): string</text>
+<path class="e assoc" d="M120 200 L120 148"/>
+<rect class="n" x="10" y="320" width="220" height="84" rx="4"/>
+<text class="ts mid" x="120" y="336">«function»</text>
+<text class="tb mid" x="120" y="353">allOf(limits)</text>
+<line class="sep" x1="10" y1="362" x2="230" y2="362"/>
+<text class="ts" x="18" y="378">checks every Limit, and commits</text>
+<text class="ts" x="18" y="394">only when all of them allow</text>
+<path class="e uses" d="M120 320 L120 286"/>
+<text class="ts mid" x="140" y="307">1..*</text>
+<rect class="n" x="575" y="20" width="135" height="100" rx="4"/>
+<text class="ts mid" x="642.5" y="36">«interface»</text>
+<text class="tb mid" x="642.5" y="53">StateStore&lt;S&gt;</text>
+<line class="sep" x1="575" y1="62" x2="710" y2="62"/>
+<text class="ts" x="583" y="78">+ get(key)</text>
+<text class="ts" x="583" y="94">+ set(key, state)</text>
+<text class="ts" x="583" y="110">+ update(key, change)</text>
+<text class="ts" x="575" y="138">for state kept in another</text>
+<text class="ts" x="575" y="152">process: see atomicAcquire</text>
+<rect class="n" x="575" y="200" width="135" height="86" rx="4"/>
+<text class="tb mid" x="642.5" y="219">Rule</text>
+<line class="sep" x1="575" y1="228" x2="710" y2="228"/>
+<text class="ts" x="583" y="244">name, perMinute</text>
+<text class="ts" x="583" y="260">matches(request)</text>
+<text class="ts" x="583" y="276">keyOf(request)</text>
+<rect class="n" x="575" y="320" width="135" height="84" rx="4"/>
+<text class="ts mid" x="642.5" y="336">«decorator»</text>
+<text class="tb mid" x="642.5" y="353">rateLimited</text>
+<line class="sep" x1="575" y1="362" x2="710" y2="362"/>
+<text class="ts" x="583" y="378">wraps a handler,</text>
+<text class="ts" x="583" y="394">answers 429</text>
+<path class="e uses" d="M642.5 320 L642.5 286"/>
+<text class="ts" x="280" y="348">Algorithms hold no clock and no storage.</text>
+<text class="ts" x="280" y="364">They take a state and return the next one,</text>
+<text class="ts" x="280" y="380">so where states live is a separate choice.</text>
+</svg>
+</div>
+<figcaption>The algorithm is a pure function from a state to a decision and a new state. Everything that has to do with time, memory, sharing and HTTP sits around it.</figcaption>
+</figure>
+
+<p>The central decision is visible in the shape of <code>Algorithm</code>. It does not store anything. It has two functions: <code>start</code>, which returns the state for a client seen for the first time, and <code>decide</code>, which takes a state, the time and a cost, and returns a decision together with the state that should follow. The resilience chapter’s <code>SlidingWindowCounter</code> was one object per client that decided and updated in a single call. Splitting the two has three consequences, each used later.</p>
+<ul>
+  <li><b>Storage is someone else’s concern.</b> A state is a small value, so it can live in a map, a bounded cache or another process.</li>
+  <li><b>Asking is separate from charging.</b> A caller can find out what an algorithm would decide without changing anything, and store the new state only if it wants to. Combining several limits correctly depends on this.</li>
+  <li><b>Tests are arithmetic:</b> a list of times in, decisions out.</li>
+</ul>
+<p>Each algorithm is a strategy in the sense of <x-ref to="behavioral-patterns#strategy"></x-ref>, chosen when a <code>KeyedLimiter</code> is built. The HTTP layer is a decorator (<x-ref to="structural-patterns#decorator"></x-ref>): it wraps any handler and either passes the request through or answers for it.</p>
+
+<h2 id="varies">Step 5: What varies</h2>
+<table>
+<thead><tr><th>What varies</th><th>Where it is decided</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>The algorithm</th><td>Which <code>Algorithm</code> a limiter is built with</td><td>Token bucket for an API, sliding log for login attempts</td></tr>
+<tr><th>Where states live</th><td>The limiter’s map, or a <code>StateStore</code></td><td>Process memory for one server, Redis for twenty</td></tr>
+<tr><th>Who a request counts against</th><td>A rule’s <code>keyOf</code></td><td>The IP address for login, the user everywhere else</td></tr>
+<tr><th>Which limit applies</th><td>The first rule that matches</td><td>Uploads 20 a minute, everything else 600</td></tr>
+<tr><th>How a refusal is reported</th><td>The decorator</td><td>Status 429 with <code>Retry-After</code>, or a message on a socket</td></tr>
+</tbody>
+</table>
+
+<h2 id="code">Step 6: The code</h2>
+<h3 id="algorithms">The algorithms</h3>
+<pre data-lang="ts" data-title="The interface, and the token bucket">
+// Each algorithm is a pair of pure functions: the state a new client starts with, and a decision that returns
+// the next state. Nothing here reads a clock or stores anything. Times are milliseconds.
+export interface Decision {
+  allowed: boolean;
+  remaining: number;    // requests that could still be made now
+  retryAfterMs: number; // 0 if allowed; otherwise the wait before one request would be allowed
+  resetMs: number;      // the wait, if nothing more arrives, until the whole allowance is back
+}
+export interface Algorithm<S> {
+  readonly name: string;
+  readonly limit: number;
+  readonly windowMs: number;
+  start(now: number): S;
+  decide(state: S, now: number, cost: number): { decision: Decision; next: S };
+}
+
+// Token bucket, counted in integers: one token is `windowMs` units of credit, and `limit` units arrive each millisecond.
+export const tokenBucket = (limit: number, windowMs: number): Algorithm<{ credit: number; at: number }> => ({
+  name: "token bucket", limit, windowMs,
+  start: (now) => ({ credit: limit * windowMs, at: now }),
+  decide(state, now, cost) {
+    const credit = Math.min(limit * windowMs, state.credit + (now - state.at) * limit);
+    const need = cost * windowMs;
+    const full = (left: number) => Math.ceil((limit * windowMs - left) / limit);
+    if (credit >= need) return { decision: { allowed: true, remaining: Math.floor((credit - need) / windowMs), retryAfterMs: 0, resetMs: full(credit - need) }, next: { credit: credit - need, at: now } };
+    return { decision: { allowed: false, remaining: Math.floor(credit / windowMs), retryAfterMs: Math.ceil((need - credit) / limit), resetMs: full(credit) }, next: { credit, at: now } };
+  },
+});
+</pre>
+<p>The bucket counts in integers. A natural version would add <code>limit ÷ windowMs</code> tokens for every millisecond, which for 3 a second is 0.003 recurring, and fractions that cannot be stored exactly accumulate small errors over millions of updates. Here one token is worth <code>windowMs</code> units of credit, and <code>limit</code> units arrive each millisecond, so every quantity is a whole number. The refusal also says how long to wait: the missing credit divided by the rate at which it returns, rounded up.</p>
+<p>The second algorithm is the leaky bucket in its form as a meter, known as the <dfn>generic cell rate algorithm</dfn>, or GCRA. It comes from Asynchronous Transfer Mode (ATM) networks, where it policed the rate of fixed-size cells, and is specified in ITU-T Recommendation I.371. It stores a single number: the time at which the client’s bucket would next be empty if nothing more arrived. Each request pushes that time later by one interval, and a request is allowed if the result is no more than one window ahead of now.</p>
+<pre data-lang="ts" data-title="GCRA: one number for each client">
+// GCRA, the leaky bucket as a meter. It stores one number: the time at which the bucket would next be empty.
+export const gcra = (limit: number, windowMs: number): Algorithm<{ emptyAt: number }> => {
+  const interval = windowMs / limit; // the time one request takes to leak away
+  return {
+    name: "GCRA", limit, windowMs,
+    start: (now) => ({ emptyAt: now }),
+    decide(state, now, cost) {
+      const emptyAt = Math.max(state.emptyAt, now) + cost * interval;
+      if (emptyAt - now <= windowMs) return { decision: { allowed: true, remaining: Math.floor((windowMs - (emptyAt - now)) / interval), retryAfterMs: 0, resetMs: Math.ceil(emptyAt - now) }, next: { emptyAt } };
+      return { decision: { allowed: false, remaining: Math.max(0, Math.floor((windowMs - (state.emptyAt - now)) / interval)), retryAfterMs: Math.ceil(emptyAt - now - windowMs), resetMs: Math.ceil(Math.max(0, state.emptyAt - now)) }, next: state };
+    },
+  };
+};
+</pre>
+<p>Written this way, it is the token bucket in disguise. The distance from now to <code>emptyAt</code> is the credit the bucket has used, measured in time instead of tokens. The test confirms it: on three runs of 50,000 requests at random intervals, with limits of 10 a second, 100 a minute and 5 a second, the two returned identical decisions, including the remaining count and the time to wait. GCRA is worth knowing because it stores one number instead of two, which matters when millions of states sit in a shared store.</p>
+<p>The other three follow the same interface, and are as described in <x-ref to="resilience-patterns#fixed-window"></x-ref> and the sections after it. The state of each is one line of the class diagram: a window start and a count, a list of times, or a window start and two counts.</p>
+
+<h3 id="compared">Five algorithms, one stream of requests</h3>
+<p>With the algorithms behind one interface, comparing them is a loop. The chapter’s code sends the same twenty requests from one client through each of them, with a limit of 4 a second, and the figure is drawn from what it printed.</p>
+
+<figure class="fig wide" id="fig-raster">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f712t f712d">
+<title id="f712t">The same twenty requests, judged by each algorithm</title>
+<desc id="f712d">Twenty requests from one client, with a limit of 4 a second, judged by each of the five algorithms. Six arrive between 0.80 and 0.95 seconds, six between 1.00 and 1.15 seconds, and then one every 0.2 seconds until 2.8 seconds. Token bucket allows 12 of 20. GCRA allows 12 of 20. Fixed window allows 12 of 20. Sliding log allows 9 of 20. Sliding counter allows 10 of 20. Token bucket and GCRA make identical decisions. The fixed window allows four in each burst, because its count restarts at one second.</desc>
+<text class="tb" x="10" y="18">Limit 4 a second. Each mark is one request:</text>
+<text class="ts" x="282" y="18">a tall bar was allowed, a cross was refused.</text>
+<line class="axis" x1="218.0" y1="34" x2="218.0" y2="214" style="stroke-dasharray:4 3"/>
+<text class="ts mid" x="218.0" y="230">1 s</text>
+<line class="axis" x1="478.0" y1="34" x2="478.0" y2="214" style="stroke-dasharray:4 3"/>
+<text class="ts mid" x="478.0" y="230">2 s</text>
+<text class="ts mid" x="348.0" y="230">fixed windows start at each whole second</text>
+<text class="tb" x="10" y="58">Token bucket</text>
+<text class="ts" x="10" y="72">12 of 20 allowed</text>
+<rect class="bar" x="163.8" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="171.6" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="179.4" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="187.2" y="48" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M194.2 56l6 6M200.2 56l-6 6"/>
+<path class="x" d="M202.0 56l6 6M208.0 56l-6 6"/>
+<path class="x" d="M215.0 56l6 6M221.0 56l-6 6"/>
+<path class="x" d="M222.8 56l6 6M228.8 56l-6 6"/>
+<rect class="bar" x="231.4" y="48" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M238.4 56l6 6M244.4 56l-6 6"/>
+<path class="x" d="M246.2 56l6 6M252.2 56l-6 6"/>
+<path class="x" d="M254.0 56l6 6M260.0 56l-6 6"/>
+<rect class="bar" x="319.8" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="371.8" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="423.8" y="48" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M475.0 56l6 6M481.0 56l-6 6"/>
+<rect class="bar" x="527.8" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="579.8" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="631.8" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="683.8" y="48" width="4.4" height="22" rx="1.5"/>
+<rect class="hit" x="0" y="44" width="720" height="34" data-tip="token bucket|12 of 20 allowed|pattern 11110000100011101111"/>
+<text class="tb" x="10" y="92">GCRA</text>
+<text class="ts" x="10" y="106">12 of 20 allowed</text>
+<rect class="bar" x="163.8" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="171.6" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="179.4" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="187.2" y="82" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M194.2 90l6 6M200.2 90l-6 6"/>
+<path class="x" d="M202.0 90l6 6M208.0 90l-6 6"/>
+<path class="x" d="M215.0 90l6 6M221.0 90l-6 6"/>
+<path class="x" d="M222.8 90l6 6M228.8 90l-6 6"/>
+<rect class="bar" x="231.4" y="82" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M238.4 90l6 6M244.4 90l-6 6"/>
+<path class="x" d="M246.2 90l6 6M252.2 90l-6 6"/>
+<path class="x" d="M254.0 90l6 6M260.0 90l-6 6"/>
+<rect class="bar" x="319.8" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="371.8" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="423.8" y="82" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M475.0 90l6 6M481.0 90l-6 6"/>
+<rect class="bar" x="527.8" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="579.8" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="631.8" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="683.8" y="82" width="4.4" height="22" rx="1.5"/>
+<rect class="hit" x="0" y="78" width="720" height="34" data-tip="GCRA|12 of 20 allowed|pattern 11110000100011101111"/>
+<text class="tb" x="10" y="126">Fixed window</text>
+<text class="ts" x="10" y="140">12 of 20 allowed</text>
+<rect class="bar" x="163.8" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="171.6" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="179.4" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="187.2" y="116" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M194.2 124l6 6M200.2 124l-6 6"/>
+<path class="x" d="M202.0 124l6 6M208.0 124l-6 6"/>
+<rect class="bar" x="215.8" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="223.6" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="231.4" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="239.2" y="116" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M246.2 124l6 6M252.2 124l-6 6"/>
+<path class="x" d="M254.0 124l6 6M260.0 124l-6 6"/>
+<path class="x" d="M319.0 124l6 6M325.0 124l-6 6"/>
+<path class="x" d="M371.0 124l6 6M377.0 124l-6 6"/>
+<path class="x" d="M423.0 124l6 6M429.0 124l-6 6"/>
+<rect class="bar" x="475.8" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="527.8" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="579.8" y="116" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="631.8" y="116" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M683.0 124l6 6M689.0 124l-6 6"/>
+<rect class="hit" x="0" y="112" width="720" height="34" data-tip="fixed window|12 of 20 allowed|pattern 11110011110000011110"/>
+<text class="tb" x="10" y="160">Sliding log</text>
+<text class="ts" x="10" y="174">9 of 20 allowed</text>
+<rect class="bar" x="163.8" y="150" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="171.6" y="150" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="179.4" y="150" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="187.2" y="150" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M194.2 158l6 6M200.2 158l-6 6"/>
+<path class="x" d="M202.0 158l6 6M208.0 158l-6 6"/>
+<path class="x" d="M215.0 158l6 6M221.0 158l-6 6"/>
+<path class="x" d="M222.8 158l6 6M228.8 158l-6 6"/>
+<path class="x" d="M230.6 158l6 6M236.6 158l-6 6"/>
+<path class="x" d="M238.4 158l6 6M244.4 158l-6 6"/>
+<path class="x" d="M246.2 158l6 6M252.2 158l-6 6"/>
+<path class="x" d="M254.0 158l6 6M260.0 158l-6 6"/>
+<path class="x" d="M319.0 158l6 6M325.0 158l-6 6"/>
+<path class="x" d="M371.0 158l6 6M377.0 158l-6 6"/>
+<rect class="bar" x="423.8" y="150" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="475.8" y="150" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="527.8" y="150" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="579.8" y="150" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M631.0 158l6 6M637.0 158l-6 6"/>
+<rect class="bar" x="683.8" y="150" width="4.4" height="22" rx="1.5"/>
+<rect class="hit" x="0" y="146" width="720" height="34" data-tip="sliding log|9 of 20 allowed|pattern 11110000000000111101"/>
+<text class="tb" x="10" y="194">Sliding counter</text>
+<text class="ts" x="10" y="208">10 of 20 allowed</text>
+<rect class="bar" x="163.8" y="184" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="171.6" y="184" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="179.4" y="184" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="187.2" y="184" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M194.2 192l6 6M200.2 192l-6 6"/>
+<path class="x" d="M202.0 192l6 6M208.0 192l-6 6"/>
+<path class="x" d="M215.0 192l6 6M221.0 192l-6 6"/>
+<path class="x" d="M222.8 192l6 6M228.8 192l-6 6"/>
+<path class="x" d="M230.6 192l6 6M236.6 192l-6 6"/>
+<path class="x" d="M238.4 192l6 6M244.4 192l-6 6"/>
+<path class="x" d="M246.2 192l6 6M252.2 192l-6 6"/>
+<path class="x" d="M254.0 192l6 6M260.0 192l-6 6"/>
+<rect class="bar" x="319.8" y="184" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="371.8" y="184" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="423.8" y="184" width="4.4" height="22" rx="1.5"/>
+<rect class="bar" x="475.8" y="184" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M527.0 192l6 6M533.0 192l-6 6"/>
+<rect class="bar" x="579.8" y="184" width="4.4" height="22" rx="1.5"/>
+<path class="x" d="M631.0 192l6 6M637.0 192l-6 6"/>
+<rect class="bar" x="683.8" y="184" width="4.4" height="22" rx="1.5"/>
+<rect class="hit" x="0" y="180" width="720" height="34" data-tip="sliding counter|10 of 20 allowed|pattern 11110000000011110101"/>
+<text class="ts" x="10" y="252">Six requests at 0.80 to 0.95 s, six at 1.00 to 1.15 s, one every 0.2 s to 2.8 s. From code/71-lld-rate-limiter.</text>
+</svg>
+</div>
+<figcaption>The two buckets are one algorithm written twice. The fixed window lets eight through in 290 milliseconds. The log is exact, and the counter is close to it, erring in both directions.</figcaption>
+</figure>
+
+<p>Every row agrees on the first burst: four allowed, two refused. They part company at one second. The fixed window counter starts again from zero, and lets four of the second burst through, so eight requests passed between 0.80 and 1.09 seconds. The sliding log refuses all six, because the last second already contains four. The token bucket lets one through, at 1.06 seconds, because tokens return at one every 250 milliseconds and one has accumulated since the first request. On the steady requests afterwards, the sliding counter allows the request at 1.4 seconds that the log refuses: it assumes the first burst was spread evenly across the first second, when in fact it all came at the end and still lies within the last second.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Two implementations of the sliding counter can differ by one request. The resilience chapter’s version allows a request while the estimate is below the limit. This one requires the estimate after the request to stay within the limit, as every other algorithm here does. On that chapter’s worked example, an estimate of 49.5 against a limit of 50, the earlier version allows and this one refuses. Neither is wrong, but a test that compares them will find the difference, so decide which one you mean.</p></div>
+
+<h3 id="overshoot">How far above the limit each can go</h3>
+<p>The figure shows a pattern chosen to expose the boundary. A broader test sends 100,000 requests in bursts of up to 30, separated by quiet gaps of up to two seconds, with a limit of 10 a second, and asks two questions of each algorithm. What is the largest number of requests it allowed in any one-second span? And how many did it allow on average?</p>
+
+<figure class="fig wide" id="fig-worst">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 374" role="img" aria-labelledby="f713t f713d">
+<title id="f713t">How far above the limit each algorithm can go</title>
+<desc id="f713d">Bars measured over 100,000 requests from one client sending bursts of up to 30 requests, with a limit of 10 a second. The most requests allowed in any one-second span: token bucket 19, GCRA 19, fixed window 20, sliding log 10, sliding counter 19. The average allowed per second over the whole run: token bucket 6.75, GCRA 6.75, fixed window 6.71, sliding log 5.53, sliding counter 5.32.</desc>
+<text class="tb" x="10" y="18">The most allowed in any one-second span</text>
+<text class="ts" x="10" y="34">the same client, sending bursts of up to 30 at a time</text>
+<text class="ts end" x="190" y="61">Token bucket</text>
+<rect class="bar " x="200" y="48" width="342.0" height="17" rx="3"/>
+<text class="ts tb" x="550.0" y="61">19</text>
+<rect class="hit" x="10" y="45" width="700" height="23" data-tip="token bucket|the most allowed in any one-second span: 19|limit 10 a second"/>
+<text class="ts end" x="190" y="84">GCRA</text>
+<rect class="bar mute" x="200" y="71" width="342.0" height="17" rx="3"/>
+<text class="ts tb" x="550.0" y="84">19</text>
+<rect class="hit" x="10" y="68" width="700" height="23" data-tip="GCRA|the most allowed in any one-second span: 19|limit 10 a second"/>
+<text class="ts end" x="190" y="107">Fixed window</text>
+<rect class="bar " x="200" y="94" width="360.0" height="17" rx="3"/>
+<text class="ts tb" x="568.0" y="107">20</text>
+<rect class="hit" x="10" y="91" width="700" height="23" data-tip="fixed window|the most allowed in any one-second span: 20|limit 10 a second"/>
+<text class="ts end" x="190" y="130">Sliding log</text>
+<rect class="bar store" x="200" y="117" width="180.0" height="17" rx="3"/>
+<text class="ts tb" x="388.0" y="130">10</text>
+<rect class="hit" x="10" y="114" width="700" height="23" data-tip="sliding log|the most allowed in any one-second span: 10|limit 10 a second"/>
+<text class="ts end" x="190" y="153">Sliding counter</text>
+<rect class="bar " x="200" y="140" width="342.0" height="17" rx="3"/>
+<text class="ts tb" x="550.0" y="153">19</text>
+<rect class="hit" x="10" y="137" width="700" height="23" data-tip="sliding counter|the most allowed in any one-second span: 19|limit 10 a second"/>
+<line class="axis" x1="200" y1="44" x2="200" y2="161"/>
+<line class="axis" x1="380" y1="44" x2="380" y2="163" style="stroke-dasharray:4 3"/>
+<text class="ts mid" x="380" y="177">the limit</text>
+<line class="axis" x1="560" y1="44" x2="560" y2="163" style="stroke-dasharray:4 3"/>
+<text class="ts mid" x="560" y="177">twice the limit</text>
+<text class="tb" x="10" y="207">The average allowed per second</text>
+<text class="ts" x="10" y="223">over the whole run of 100,000 requests</text>
+<text class="ts end" x="190" y="250">Token bucket</text>
+<rect class="bar " x="200" y="237" width="121.5" height="17" rx="3"/>
+<text class="ts tb" x="329.5" y="250">6.75</text>
+<rect class="hit" x="10" y="234" width="700" height="23" data-tip="token bucket|the average allowed per second: 6.75|limit 10 a second"/>
+<text class="ts end" x="190" y="273">GCRA</text>
+<rect class="bar mute" x="200" y="260" width="121.5" height="17" rx="3"/>
+<text class="ts tb" x="329.5" y="273">6.75</text>
+<rect class="hit" x="10" y="257" width="700" height="23" data-tip="GCRA|the average allowed per second: 6.75|limit 10 a second"/>
+<text class="ts end" x="190" y="296">Fixed window</text>
+<rect class="bar " x="200" y="283" width="120.8" height="17" rx="3"/>
+<text class="ts tb" x="328.8" y="296">6.71</text>
+<rect class="hit" x="10" y="280" width="700" height="23" data-tip="fixed window|the average allowed per second: 6.71|limit 10 a second"/>
+<text class="ts end" x="190" y="319">Sliding log</text>
+<rect class="bar store" x="200" y="306" width="99.5" height="17" rx="3"/>
+<text class="ts tb" x="307.5" y="319">5.53</text>
+<rect class="hit" x="10" y="303" width="700" height="23" data-tip="sliding log|the average allowed per second: 5.53|limit 10 a second"/>
+<text class="ts end" x="190" y="342">Sliding counter</text>
+<rect class="bar " x="200" y="329" width="95.8" height="17" rx="3"/>
+<text class="ts tb" x="303.8" y="342">5.32</text>
+<rect class="hit" x="10" y="326" width="700" height="23" data-tip="sliding counter|the average allowed per second: 5.32|limit 10 a second"/>
+<line class="axis" x1="200" y1="233" x2="200" y2="350"/>
+<line class="axis" x1="380" y1="233" x2="380" y2="352" style="stroke-dasharray:4 3"/>
+<text class="ts mid" x="380" y="366">the limit</text>
+</svg>
+</div>
+<figcaption>Every algorithm keeps the long-run average under the limit. Only the log also keeps every one-second span under it. The sliding counter, built to approximate the log, can reach nearly twice the limit when a burst sits at the end of a window.</figcaption>
+</figure>
+
+<p>The averages say that every algorithm enforces the limit over time. The first group says what “10 a second” means to each. Only the sliding log allowed at most 10 in every second. The token bucket allowed 19 in one span: a full bucket of 10, emptied at once, and nine more tokens returning over the following second. That is by design, and is the meaning of the bucket’s size. The fixed window reached 20, the boundary burst. The surprise is the sliding counter, which also reached 19. Its estimate assumes last window’s requests were evenly spread. When they all came at the end of that window, it underestimates the true count, and lets nearly a second burst through.</p>
+<p>This does not contradict Cloudflare’s finding that the counter was wrong for 0.003% of real requests, since real traffic is rarely shaped like this test. But a limit against an adversary, such as on login attempts, is judged by its worst case, and only the log guarantees that.</p>
+
+<h3 id="keyed">A state for each client</h3>
+<pre data-lang="ts" data-title="KeyedLimiter: one algorithm, and a bounded memory of clients">
+// One algorithm, a state for each key, and a bound on how many keys are remembered.
+export class KeyedLimiter<S> {
+  readonly algorithm: Algorithm<S>;
+  private readonly states: LruCache<string, S>;
+  private latest = -Infinity; // the largest time seen so far
+
+  constructor(algorithm: Algorithm<S>, maxKeys: number) {
+    this.algorithm = algorithm;
+    this.states = new LruCache(maxKeys); // the least recently active key is forgotten first
+  }
+
+  // Works out the decision and the state that would follow, without storing anything.
+  check(key: string, now: number, cost = 1): { decision: Decision; commit: () => void } {
+    if (!Number.isInteger(cost) || cost < 1 || cost > this.algorithm.limit) {
+      throw new RangeError(`cost ${cost} can never be allowed by a limit of ${this.algorithm.limit}`);
+    }
+    now = Math.max(now, this.latest); // a clock that steps back must not hand out a fresh allowance
+    this.latest = now;
+    const state = this.states.get(key) ?? this.algorithm.start(now);
+    const { decision, next } = this.algorithm.decide(state, now, cost);
+    return { decision, commit: () => this.states.put(key, next) };
+  }
+
+  tryAcquire(key: string, now: number, cost = 1): Decision {
+    const { decision, commit } = this.check(key, now, cost);
+    commit();
+    return decision;
+  }
+
+  get keys(): number {
+    return this.states.size;
+  }
+}
+</pre>
+<p>Three lines in <code>check</code> are defensive, and each answers a question an interviewer may ask.</p>
+<ul>
+  <li><b>A cost that can never be allowed is an error, not a refusal.</b> A request costing 11 against a limit of 10 would be refused forever, with a time to wait that is a lie. It throws instead, so that the mistake is found where it was made.</li>
+  <li><b>Time cannot go backward.</b> The time of day on a server is corrected by synchronization and can step back (<x-ref to="distributed-fundamentals#clocks"></x-ref>). In the test, a fixed window counter given the times 1000, 1001 and 1002, and then 999, believed a new window had begun and allowed a fourth request. Through <code>KeyedLimiter</code>, the 999 is treated as 1002 and refused.</li>
+  <li><b>Nothing is stored by <code>check</code>.</b> It returns the decision and a <code>commit</code> function. <code>tryAcquire</code> is the common case of checking and committing at once.</li>
+</ul>
+
+<h2 id="memory">Remembering clients</h2>
+<p>A limiter that keeps a state for every key it has ever seen grows without end, and a client that rotates through IP addresses can make it grow on purpose. So the states live in the least-recently-used cache of <x-ref to="lld-lru-cache"></x-ref>, which forgets the client that has been quiet longest. Forgetting is safe only under a condition, and the test shows what happens without it.</p>
+<p>A client that has been quiet for a whole window is back where it started: a full bucket, an empty log, a counter that has rolled over. Forgetting it changes nothing, because <code>start</code> would recreate the same state. A client that is forgotten while still being limited is different. On its next request it gets a fresh state, and with it a full allowance.</p>
+<table>
+<thead><tr><th>Keys the limiter can remember</th><th>Share of requests allowed</th></tr></thead>
+<tbody>
+<tr><th>2,000</th><td>54.1%</td></tr>
+<tr><th>1,000</th><td>54.1%</td></tr>
+<tr><th>900</th><td>86.8%</td></tr>
+<tr><th>500</th><td>100%</td></tr>
+</tbody>
+</table>
+<p>The test sent 200,000 requests over ten seconds from 1,000 clients chosen at random, each asking for about twice its limit of 10 a second. With room for every client, about half were allowed, as they should be. With room for 900, the share rose to 87%. With room for 500, every client was forgotten before it had used its ten, and the limiter, returning correct-looking answers throughout, limited nobody.</p>
+<p>The rule: if the limiter can remember as many clients as are active within any one window, an LRU never forgets a client that is still being limited. A client forgotten and back within a window would mean that it and every client used since were active within one window, more than the limiter holds. A second test checked this on 30 clients taking turns, with at most 12 in any one-second span. With room for 12, decisions matched a limiter with unlimited memory exactly. With room for 8, they did not.</p>
+<p>How much memory that takes depends on the algorithm. The chapter’s code measured the heap used for each client, with every client at its limit, in Node 22.</p>
+<table>
+<thead><tr><th>Algorithm</th><th>Bytes for each client, limit 100 a minute</th></tr></thead>
+<tbody>
+<tr><th>GCRA</th><td>69</td></tr>
+<tr><th>Token bucket</th><td>77</td></tr>
+<tr><th>Fixed window</th><td>77</td></tr>
+<tr><th>Sliding counter</th><td>85</td></tr>
+<tr><th>Sliding log</th><td>1,445</td></tr>
+</tbody>
+</table>
+<p>The figures include the map entry and use numbers as keys, so a real key adds its own size. The four small states differ by little, because the object around the numbers costs more than the numbers. The log grows with the limit: separate runs measured about 365 bytes at a limit of 10, 1,455 at 100 and 12,244 at 1,000, close to 250 bytes plus 12 for each timestamp. The 12 rather than 8 is most likely spare room that the array keeps for growth after a push.</p>
+
+<div class="widget" data-widget="limitermem">
+<h4>Memory to remember every active client</h4>
+<p>Uses the measured sizes above. The limit matters only for the sliding log, which keeps one timestamp for each request in the window.</p>
+<div class="controls">
+  <label>Clients active in one window<input type="number" name="clients" value="1000000" min="1" max="1000000000" step="1"></label>
+  <label>Limit, requests a window<input type="number" name="limit" value="100" min="1" max="100000" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 150" role="img" aria-label="Bars of the memory needed by each of the five algorithms for the number of clients entered, on one scale."><text x="120" y="25" class="ts end">Token bucket</text><rect x="130" y="12" width="15.9" height="17" rx="3" class="bar "></rect><text x="153.9" y="25" class="ts tb">77 MB, 77 bytes each</text><text x="120" y="49" class="ts end">GCRA</text><rect x="130" y="36" width="14.3" height="17" rx="3" class="bar mute"></rect><text x="152.3" y="49" class="ts tb">69 MB, 69 bytes each</text><text x="120" y="73" class="ts end">Fixed window</text><rect x="130" y="60" width="15.9" height="17" rx="3" class="bar "></rect><text x="153.9" y="73" class="ts tb">77 MB, 77 bytes each</text><text x="120" y="97" class="ts end">Sliding counter</text><rect x="130" y="84" width="17.6" height="17" rx="3" class="bar "></rect><text x="155.6" y="97" class="ts tb">85 MB, 85 bytes each</text><text x="120" y="121" class="ts end">Sliding log</text><rect x="130" y="108" width="300.0" height="17" rx="3" class="bar store"></rect><text x="438.0" y="121" class="ts tb">1.45 GB, 1,450 bytes each</text><text x="10" y="144" class="ts">Every client at its limit. Bars share one scale.</text></svg>
+<dl class="results">
+  <div><dt>Token bucket</dt><dd data-out="bucket">77 MB</dd></div>
+  <div><dt>Sliding counter</dt><dd data-out="counter">85 MB</dd></div>
+  <div><dt>Sliding log</dt><dd data-out="log">1.45 GB</dd></div>
+  <div><dt>Log compared with bucket</dt><dd data-out="ratio">18.8×</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Remembering 1,000,000 clients takes about 77 MB as token buckets and about 1.45 GB as sliding logs of 100 timestamps each, 18.8 times as much. The limiter’s bound on keys must be at least the number of clients active within one window, or it starts forgetting clients who are still being limited.</p>
+</div>
+
+<h2 id="several">Several limits at once</h2>
+<p>A limit for each user does not protect a service from a thousand users arriving together, so real APIs apply two or more limits to the same request: one for the user, one for the whole service, perhaps one for the route (<x-ref to="resilience-patterns#rl-practice"></x-ref>). The obvious code calls <code>tryAcquire</code> on each limit in a loop and stops at the first refusal. It breaks the third invariant: when a later limit refuses, the earlier ones have already taken their share for a request that will not run.</p>
+
+<figure class="fig wide" id="fig-composite">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 448" role="img" aria-labelledby="f714t f714d">
+<title id="f714t">Two limits at once, checked one after the other or together</title>
+<desc id="f714d">Two sequences with a service limit of 5 and a limit of 2 for each user. A spammer has used both of their own. Checked in turn, each spammer request takes a token from the service limit before the user limit refuses it, so the service limit empties and Ana, who has used nothing, is refused. Checked together, each limit is only asked whether it would allow; the user limit would refuse, so nothing is taken, and Ana’s request later passes both and is charged to both.</desc>
+<text class="tb" x="10" y="16">Each limit takes its share as it is checked</text>
+<g data-scene="turn">
+<text class="tb mid" x="50" y="36">Spammer</text>
+<line class="axis" x1="50" y1="44" x2="50" y2="186"/>
+<text class="tb mid" x="150" y="36">Ana</text>
+<line class="axis" x1="150" y1="44" x2="150" y2="186"/>
+<text class="tb mid" x="450" y="36">service limit</text>
+<line class="axis" x1="450" y1="44" x2="450" y2="186"/>
+<text class="tb mid" x="630" y="36">user limits</text>
+<line class="axis" x1="630" y1="44" x2="630" y2="186"/>
+<g data-s="1">
+<path class="e sig" d="M51 68H449"/>
+<text class="ts mid" x="250.0" y="62">1. take one: allowed</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M51 94H629"/>
+<text class="ts mid" x="340.0" y="88">2. take one: refused, 429</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n fault" x="58" y="106" width="176.6" height="22" rx="4"/>
+<text class="ts mid" x="146.3" y="121">3. four more, the same way</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M151 146H449"/>
+<text class="ts mid" x="300.0" y="140">4. take one: refused, 429</text>
+</g>
+</g>
+<path class="e none dash" d="M10 202H710"/>
+<text class="tb" x="10" y="224">Every limit is asked first, and charged only if all agree</text>
+<g data-scene="all">
+<text class="tb mid" x="50" y="244">Spammer</text>
+<line class="axis" x1="50" y1="252" x2="50" y2="440"/>
+<text class="tb mid" x="150" y="244">Ana</text>
+<line class="axis" x1="150" y1="252" x2="150" y2="440"/>
+<text class="tb mid" x="450" y="244">service limit</text>
+<line class="axis" x1="450" y1="252" x2="450" y2="440"/>
+<text class="tb mid" x="630" y="244">user limits</text>
+<line class="axis" x1="630" y1="252" x2="630" y2="440"/>
+<g data-s="1">
+<path class="e sig" d="M51 276H449"/>
+<text class="ts mid" x="250.0" y="270">1. would you allow it? yes</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M51 302H629"/>
+<text class="ts mid" x="340.0" y="296">2. would you allow it? no</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n fault" x="58" y="314" width="188.8" height="22" rx="4"/>
+<text class="ts mid" x="152.4" y="329">3. 429, and nothing is taken</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M151 354H449"/>
+<text class="ts mid" x="300.0" y="348">4. would you allow it? yes</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M151 380H629"/>
+<text class="ts mid" x="390.0" y="374">5. would you allow it? yes</text>
+</g>
+<g data-s="6" data-packet="none">
+<rect class="n store" x="158" y="392" width="188.8" height="22" rx="4"/>
+<text class="ts mid" x="252.4" y="407">6. both agree: both take one</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="turn" data-label="One at a time">
+  <li data-msg="take" data-state="Service: 4 of 5 left; spammer: 0 of 2; Ana: 2 of 2">The spammer has used their own two. The service limit is checked first, and takes one.</li>
+  <li data-msg="take" data-state="Service: 4 of 5 left; spammer: 0 of 2; Ana: 2 of 2">The user limit refuses. The token taken by the service limit is not given back.</li>
+  <li data-msg="none" data-state="Service: 0 of 5 left; spammer: 0 of 2; Ana: 2 of 2">Four more requests do the same, each costing the service limit a token.</li>
+  <li data-msg="take" data-state="Service: 0 of 5 left; spammer: 0 of 2; Ana: 2 of 2, unused">Ana, who has made no requests, is refused by a service limit emptied by requests that never ran.</li>
+</ol>
+<ol class="steps" data-scene="all" data-label="All or nothing">
+  <li data-msg="check" data-state="Service: 5 of 5 left; spammer: 0 of 2; Ana: 2 of 2">The service limit works out its answer and next state, and stores nothing.</li>
+  <li data-msg="check" data-state="Service: 5 of 5 left; spammer: 0 of 2; Ana: 2 of 2">The user limit, with nothing left for the spammer, would refuse.</li>
+  <li data-msg="none" data-state="Service: 5 of 5 left; spammer: 0 of 2; Ana: 2 of 2">One refusal is enough: 429, and neither limit changes.</li>
+  <li data-msg="check" data-state="Service: 5 of 5 left; spammer: 0 of 2; Ana: 2 of 2">Ana’s request is checked the same way.</li>
+  <li data-msg="check" data-state="Service: 5 of 5 left; spammer: 0 of 2; Ana: 2 of 2">Her own limit has room too.</li>
+  <li data-msg="none" data-state="Service: 4 of 5 left; spammer: 0 of 2; Ana: 1 of 2">Both allow, so both store their next state, and the request runs.</li>
+</ol>
+<figcaption>Checked one at a time, a request can be charged by limits that pass it and then refused by a later one. Asking first and charging only on agreement keeps refused requests free.</figcaption>
+</figure>
+
+<p>The test measured how much this matters. For ten simulated seconds, a service limit of 100 a second and a user limit of 10 a second were applied to a spammer sending a request every millisecond and to nine ordinary users sending about five a second each. With the limits checked in turn, service first, the ordinary users were served 5 times out of 455. The spammer’s refused requests had emptied the service limit. With the version below, they were served all 455 times, and the spammer received 109: ten a second, plus the bucket that was full at the start.</p>
+<pre data-lang="ts" data-title="All of the limits, or none">
+// Several limits that must all agree: for example one for each user and one for the whole service.
+// Nothing is consumed unless every limit allows the request.
+export interface Limit {
+  readonly name: string;
+  readonly limiter: KeyedLimiter<unknown>;
+  readonly keyOf: (request: { user: string; route: string }) => string;
+}
+export function allOf(limits: readonly Limit[]) {
+  return (request: { user: string; route: string }, now: number): { decision: Decision; blockedBy: string | null } => {
+    const checks = limits.map((limit) => ({ limit, ...limit.limiter.check(limit.keyOf(request), now) }));
+    const refused = checks.filter((c) => !c.decision.allowed);
+    if (refused.length === 0) {
+      for (const c of checks) c.commit();
+      const closest = checks.reduce((a, b) => (b.decision.remaining < a.decision.remaining ? b : a)); // the limit nearest to running out
+      return { decision: closest.decision, blockedBy: null };
+    }
+    const worst = refused.reduce((a, b) => (b.decision.retryAfterMs > a.decision.retryAfterMs ? b : a));
+    return { decision: worst.decision, blockedBy: worst.limit.name };
+  };
+}
+</pre>
+<p>This is where splitting <code>check</code> from <code>commit</code> pays for itself. Every limit is asked first, and nothing is stored until all have agreed. When several refuse, the answer reports the one with the longest wait, since retrying before then is certain to fail again. Putting the user limit first would have avoided this failure but caused another: users charged for requests the service limit refused.</p>
+
+<h2 id="http">Rules, and the HTTP edge</h2>
+<p>Different requests deserve different limits. Login attempts should be limited tightly and by address, since the attacker does not have an account yet. Uploads are expensive. Everything else can be generous. A list of rules, tried in order, says which applies.</p>
+<pre data-lang="ts" data-title="Rules, the response headers, and a decorator for any handler">
+export interface Request { user: string; route: string; ip: string }
+export interface Response { status: number; headers: Record<string, string>; body: string }
+
+// Which limit applies to a request: the first rule that matches.
+export interface Rule { name: string; matches: (r: Request) => boolean; perMinute: number; keyOf: (r: Request) => string }
+export const ruleFor = (rules: readonly Rule[], request: Request): Rule => {
+  const rule = rules.find((r) => r.matches(request));
+  if (!rule) throw new Error(`no rate limit rule matches ${request.route}`); // the list should end with a catch-all
+  return rule;
+};
+
+// The decision, in the form of the IETF draft's header fields, and Retry-After when refused.
+export function headersFor(decision: Decision, policy: string, limit: number, windowS: number, resetS: number): Record<string, string> {
+  const headers: Record<string, string> = {
+    "RateLimit-Policy": `"${policy}";q=${limit};w=${windowS}`,
+    "RateLimit": `"${policy}";r=${decision.remaining};t=${resetS}`,
+  };
+  if (!decision.allowed) headers["Retry-After"] = String(Math.ceil(decision.retryAfterMs / 1000));
+  return headers;
+}
+
+// A decorator around any handler: the handler runs only when the limiter allows it.
+export function rateLimited(
+  handler: (r: Request) => Response,
+  decide: (r: Request) => { decision: Decision; rule: Rule },
+): (r: Request) => Response {
+  return (request) => {
+    const { decision, rule } = decide(request);
+    const headers = headersFor(decision, rule.name, rule.perMinute, 60, Math.ceil(decision.resetMs / 1000));
+    if (!decision.allowed) return { status: 429, headers, body: "Too many requests" };
+    const response = handler(request);
+    return { ...response, headers: { ...response.headers, ...headers } };
+  };
+}
+</pre>
+<p>The test’s rules are login at 5 a minute keyed by <code>ip:</code> and the address, uploads at 20 a minute keyed by <code>user:</code>, the user and <code>:upload</code>, and a last rule matching everything at 600 a minute for each user. Three details carry most of the weight.</p>
+<ul>
+  <li><b>The key belongs to the rule.</b> The same user has separate allowances for uploads and for everything else, because the keys differ. Login is counted by IP address.</li>
+  <li><b>The list ends with a rule that matches everything.</b> Without it a new route would have no limit at all, silently. <code>ruleFor</code> throws if nothing matches, so that the mistake shows up in the first test that touches the route.</li>
+  <li><b>The handler runs only when the request is allowed.</b> In the test, seven login attempts in the same instant got 200 five times and then 429 twice, and the handler ran five times. The refusal carried <code>Retry-After: 12</code>, since a limit of 5 a minute returns one token every 12 seconds, and <code>RateLimit: "login";r=0;t=60</code>: nothing left, and all five back in a minute. At 12 seconds the next attempt succeeded. An attempt from another address was allowed throughout.</li>
+</ul>
+<p>The header fields follow the IETF draft “RateLimit header fields for HTTP”, version 11 of May 2026, still a draft. <code>RateLimit-Policy</code> describes the limit: a quota <code>q</code> in a window of <code>w</code> seconds. <code>RateLimit</code> reports the current position: <code>r</code> remaining, and <code>t</code> seconds until the quota is restored. That second number is why <code>Decision</code> carries <code>resetMs</code> as well as <code>retryAfterMs</code>: the wait for one more request and the wait for the whole allowance are different questions. Status 429 itself is defined in RFC 6585. The rate limiting module of NGINX answers 503 by default unless <code>limit_req_status</code> is set, telling clients the server is unavailable rather than that they should slow down.</p>
+<div class="note production"><p><span class="label">In production.</span> When several limits apply, the draft allows a server to report only the one closest to running out. That is what <code>allOf</code> does when every limit allows: it returns the decision of the limit with the fewest requests remaining.</p></div>
+
+<h2 id="concurrency">Concurrency</h2>
+<p>In one Node process, <code>KeyedLimiter</code> is safe without a lock. <code>check</code> and <code>commit</code> are synchronous, and nothing else runs between reading a state and storing the next one, so each decision is atomic by construction (<x-ref to="concurrency-in-code#loop"></x-ref>). That changes the moment the state moves out of the process. With twenty servers behind a load balancer, each server’s own limiter would let a client make twenty times its limit, so the states must be shared, typically in Redis. Every access to them now involves a wait, and the obvious code reads, decides and writes in three steps.</p>
+<pre data-lang="ts" data-title="A remote store, and two ways to use it">
+// Read, decide, write: three steps, with waits between them where other requests can read the same old state.
+export async function racyAcquire<S>(store: StateStore<S>, algorithm: Algorithm<S>, key: string, now: number): Promise<Decision> {
+  const state = (await store.get(key)) ?? algorithm.start(now);
+  const { decision, next } = algorithm.decide(state, now, 1);
+  await store.set(key, next);
+  return decision;
+}
+
+// The same decision, made inside one atomic update.
+export function atomicAcquire<S>(store: StateStore<S>, algorithm: Algorithm<S>, key: string, now: number): Promise<Decision> {
+  return store.update(key, (state) => {
+    const { decision, next } = algorithm.decide(state ?? algorithm.start(now), now, 1);
+    return { next, result: decision };
+  });
+}
+</pre>
+
+<figure class="fig wide" id="fig-race">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 404" role="img" aria-labelledby="f715t f715d">
+<title id="f715t">Two requests and one token left, with the state in a remote store</title>
+<desc id="f715d">Two sequences between request A, request B and a store that holds a token bucket with one token left. In the first, each request reads the state, decides, and writes the result back as separate calls. Both read one token before either writes, so both decide to allow, both write zero, and two requests pass with one token. In the second, each request sends one atomic update that reads, decides and writes inside the store. A’s update finds one token and allows; B’s update, applied after it, finds none and refuses.</desc>
+<text class="tb" x="10" y="16">Read, decide, write</text>
+<g data-scene="racy">
+<text class="tb mid" x="90" y="36">Request A</text>
+<line class="axis" x1="90" y1="44" x2="90" y2="208"/>
+<text class="tb mid" x="360" y="36">store</text>
+<line class="axis" x1="360" y1="44" x2="360" y2="208"/>
+<text class="tb mid" x="630" y="36">Request B</text>
+<line class="axis" x1="630" y1="44" x2="630" y2="208"/>
+<g data-s="1">
+<path class="e" d="M91 66H359"/>
+<text class="ts mid" x="225.0" y="60">1. get("ana")</text>
+</g>
+<g data-s="2">
+<path class="e" d="M629 92H361"/>
+<text class="ts mid" x="495.0" y="86">2. get("ana")</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M359 118H91"/>
+<text class="ts mid" x="225.0" y="112">3. 1 token</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M361 144H629"/>
+<text class="ts mid" x="495.0" y="138">4. 1 token</text>
+</g>
+<g data-s="5">
+<path class="e" d="M91 170H359"/>
+<text class="ts mid" x="225.0" y="164">5. set(0 tokens)</text>
+</g>
+<g data-s="6">
+<path class="e fault" d="M629 196H361"/>
+<text class="ts mid" x="495.0" y="190">6. set(0 tokens)</text>
+</g>
+</g>
+<path class="e none dash" d="M10 222H710"/>
+<text class="tb" x="10" y="244">One atomic update</text>
+<g data-scene="atomic">
+<text class="tb mid" x="90" y="264">Request A</text>
+<line class="axis" x1="90" y1="272" x2="90" y2="396"/>
+<text class="tb mid" x="360" y="264">store</text>
+<line class="axis" x1="360" y1="272" x2="360" y2="396"/>
+<text class="tb mid" x="630" y="264">Request B</text>
+<line class="axis" x1="630" y1="272" x2="630" y2="396"/>
+<g data-s="1">
+<path class="e" d="M91 294H359"/>
+<text class="ts mid" x="225.0" y="288">1. update("ana", decide)</text>
+</g>
+<g data-s="2">
+<path class="e" d="M629 320H361"/>
+<text class="ts mid" x="495.0" y="314">2. update("ana", decide)</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M359 346H91"/>
+<text class="ts mid" x="225.0" y="340">3. allowed, 0 left</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M361 372H629"/>
+<text class="ts mid" x="495.0" y="366">4. refused</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="racy" data-label="Read, decide, write">
+  <li data-msg="get" data-state="Tokens in the store: 1; allowed: none yet">Request A reads Ana’s bucket, which has one token left.</li>
+  <li data-msg="get" data-state="Tokens in the store: 1; allowed: none yet">Before A writes anything, request B reads the same bucket.</li>
+  <li data-msg="1" data-state="Tokens in the store: 1; A will allow">A sees one token, and decides to allow.</li>
+  <li data-msg="1" data-state="Tokens in the store: 1; A and B will allow">B sees the same token, and decides to allow too.</li>
+  <li data-msg="set" data-state="Tokens in the store: 0; allowed: A">A writes back an empty bucket.</li>
+  <li data-msg="set" data-state="Tokens in the store: 0; allowed: A and B">B writes an empty bucket too. Two requests passed on one token.</li>
+</ol>
+<ol class="steps" data-scene="atomic" data-label="Atomic update">
+  <li data-msg="update" data-state="Tokens in the store: 1">A sends the whole decision to the store, to read, decide and write with nothing in between.</li>
+  <li data-msg="update" data-state="Tokens in the store: 1">B does the same. The store applies the updates one after the other.</li>
+  <li data-msg="ok" data-state="Tokens in the store: 0; allowed: A">A’s update runs first, finds the token and takes it.</li>
+  <li data-msg="429" data-state="Tokens in the store: 0; allowed: A; refused: B">B’s update runs on the state A left behind, and finds nothing.</li>
+</ol>
+<figcaption>The test ran twenty requests at once against a bucket of ten. Reading and writing in separate calls allowed all twenty. The atomic update allowed exactly ten.</figcaption>
+</figure>
+
+<p>The test used a store that waits one millisecond on every call, standing in for the network. Twenty requests for the same client were started at once against a limit of 10. Reading, deciding and writing in separate calls allowed all twenty, because every request read the full bucket before any of them wrote. Sending the decision as one atomic update allowed exactly ten. This is the race of <x-ref to="concurrency-in-code#races"></x-ref>, and it needs no threads: an <code>await</code> between reading and writing is enough.</p>
+<p>The atomic version is possible only because the algorithm is a pure function of the state. The whole decision can be sent to wherever the state lives and run there. In Redis that is a short script, which Redis runs with nothing else interleaved. In a SQL database it is an <code>UPDATE</code> whose new values are computed from the old ones in the same statement, or a transaction that locks the row. <x-ref to="hld-rate-limiter"></x-ref> designs that service, including what to do when the store cannot be reached.</p>
+<p>In a language with threads, the in-memory limiter needs a lock even in one process. Rather than one lock around the map, divide the keys among several independently locked maps by hash, or keep each state in an atomic reference and replace it by compare-and-set, retrying on conflict. A retry is harmless because <code>decide</code> has no side effects.</p>
+
+<h2 id="walk">Step 7: Walk it</h2>
+<p>Follow one upload from Ana through a server with two limits: her rule, uploads at 20 a minute, and a service limit of 1,000 a second.</p>
+<ol>
+  <li>The decorator receives <code>POST /photos</code>. <code>ruleFor</code> skips the login rule and matches the upload rule, whose key is <code>user:ana:upload</code>.</li>
+  <li><code>allOf</code> asks the upload limiter whether it would allow the request now. It finds Ana’s state, or starts a full bucket, and the algorithm returns “allowed, 7 remaining” and the next state. Nothing is stored.</li>
+  <li>It asks the service limiter the same question for the key <code>all</code>. Allowed.</li>
+  <li>Both agreed, so both commit their new states.</li>
+  <li>The handler runs, and its response leaves with <code>RateLimit-Policy: "upload";q=20;w=60</code> and <code>RateLimit: "upload";r=7;t=39</code>: seven more uploads now, and the full twenty after 39 seconds, since thirteen tokens are out and one returns every three seconds.</li>
+  <li>Had either limit refused, nothing would have been stored, the handler would not have run, and the answer would have been 429 with <code>Retry-After</code> set from the longer of the waits.</li>
+</ol>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Twenty servers share the limits</th><td>States move to a shared store, and every decision becomes one atomic update there. A store that cannot be reached needs a policy: let requests through, or refuse them</td><td>The algorithms. They already take a state and return the next one</td></tr>
+<tr><th>Wait instead of refusing</th><td>The limiter returns the time at which the request may proceed, and the caller sleeps until then. Go’s <code>golang.org/x/time/rate</code> offers <code>Allow</code>, <code>Reserve</code> and <code>Wait</code> on one token bucket</td><td>The decision. <code>retryAfterMs</code> is already the time to wait</td></tr>
+<tr><th>Limit requests in progress, not requests begun</th><td>A different shape: acquire on start, release on finish, like a semaphore with a count for each client. It catches slow, expensive requests that a rate allows</td><td>The rules, the key, and the all-or-none combination</td></tr>
+<tr><th>A per-minute and a per-day limit together</th><td>Two limits on the same key, combined by <code>allOf</code>. The headers can report both policies, or the one closest to running out</td><td>Everything else</td></tr>
+<tr><th>Paying customers get higher limits</th><td><code>perMinute</code> comes from the customer’s plan, looked up by the rule. Changing a plan should not reset the client’s state</td><td>The algorithm and the store</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> Name the five algorithms in a sentence each and pick the token bucket as a default, then spend the time on the design around it: the time passed in, the algorithm as a pure function of a state, the bounded memory of clients and its condition, and the atomic update once the state is shared. The question “what happens with two servers?” is coming, and the answer is ready if the decision is already a function that can run where the state lives.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Reading the clock inside the limiter</th><td>Tests must wait, or replace a global</td><td>Pass the time in</td></tr>
+<tr><th>A map of states that is never trimmed</th><td>Memory grows with every client ever seen, and an attacker can grow it on purpose</td><td>A bounded cache, sized for the clients active within one window</td></tr>
+<tr><th>A bounded cache that is too small</th><td>Clients are forgotten while being limited and return with a full allowance. With half the room needed, the test’s limiter refused nothing</td><td>Size it from the number of clients active within a window, and measure how often it forgets a state that is not at rest</td></tr>
+<tr><th>Checking several limits in a loop that charges as it goes</th><td>Refused requests use up shared limits, and innocent clients are refused</td><td>Check all, then commit all</td></tr>
+<tr><th>Read, decide and write as separate calls to a shared store</th><td>Simultaneous requests all see the same state. Twenty passed a limit of ten in the test</td><td>One atomic update in the store</td></tr>
+<tr><th>Trusting the time of day to move forward</th><td>A clock stepped back opens a fresh window</td><td>Never let the limiter’s time go backward, or use a monotonic clock where one is available</td></tr>
+<tr><th>No catch-all rule</th><td>A new route has no limit, and nobody notices</td><td>End the list with a rule that matches everything, and fail loudly when nothing matches</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="resilience-patterns#rate-limiting"></x-ref>: the five algorithms, and why services limit their callers.</li>
+  <li><x-ref to="lld-lru-cache"></x-ref>: the bounded cache that holds the states.</li>
+  <li><x-ref to="concurrency-in-code"></x-ref>: the read-then-write race, and locks in threaded code.</li>
+  <li><x-ref to="behavioral-patterns#strategy"></x-ref> and <x-ref to="structural-patterns#decorator"></x-ref>: the two patterns that shape the classes.</li>
+  <li><x-ref to="distributed-fundamentals#clocks"></x-ref>: why the time of day can go backward.</li>
+  <li><x-ref to="multi-tenancy#noisy-neighbors"></x-ref>: limits as protection between tenants.</li>
+  <li><x-ref to="hld-rate-limiter"></x-ref>: the same limiter as a service shared by many servers.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Make each algorithm a pure function: a state, a time and a cost in; a decision and the next state out. Storage, time and HTTP stay outside it.</li>
+  <li>Pass the time in. Tests become arithmetic, and the limiter can refuse to let time go backward.</li>
+  <li>Token bucket and GCRA are one algorithm. On 150,000 random requests they made identical decisions.</li>
+  <li>“10 a second” means different things: only the sliding log kept every one-second span at 10. The bucket, the fixed window and, on bursty traffic, the sliding counter reached 19 or 20.</li>
+  <li>Bound the memory with an LRU of clients, sized for every client active within one window. Smaller than that, the limiter forgets clients mid-limit, and can stop limiting altogether.</li>
+  <li>Combine limits by checking all and committing only if all agree. Charging as you go lets refused requests drain shared limits.</li>
+  <li>Once the state is shared, each decision must be one atomic update where the state lives. A read and a write with a wait between them let twenty requests through a limit of ten.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does <code>Algorithm</code> return the next state instead of updating a field?</summary><p>So that deciding and storing are separate. A caller can ask what would happen without changing anything, which combining limits needs. The state can live in a map, a cache or another process. And the decision can be run atomically inside a shared store, which fixes the race between servers.</p></details>
+<details><summary>A token bucket allows 10 a second. What is the most it can allow in one second, and is that a bug?</summary><p>Close to 20: a full bucket of 10 spent at once, plus up to 10 more tokens returning during the following second. The test measured 19 in one span. It is the documented behavior. The size of the bucket is the burst the limiter is willing to accept. If no span may exceed 10, use a sliding log, or a bucket smaller than the rate.</p></details>
+<details><summary>A limiter keeps client states in an LRU cache with room for 10,000. On a busy day 50,000 clients are active within each minute, against a limit of 100 a minute. What happens?</summary><p>Clients are forgotten while they are still being limited, and each one returns to a fresh state with a full allowance. Depending on the order of requests, the limiter may refuse almost nothing. In the chapter’s test, room for half of the active clients made it refuse nothing. The cache must hold at least as many clients as are active within one window.</p></details>
+<details><summary>A request must pass a per-user limit and a service-wide limit. The code calls <code>tryAcquire</code> on each in turn. What goes wrong?</summary><p>When the first limit allows and the second refuses, the first has already been charged for a request that does not run. With the service limit first, a client making many refused requests drains the shared limit, and other clients are refused. In the test, ordinary users were served 5 times out of 455. Check all limits, then commit all only if all allow.</p></details>
+<details><summary>Why is the in-memory limiter safe without a lock in Node, and when does that stop being true?</summary><p><code>check</code> and <code>commit</code> are synchronous, so no other request runs between reading a state and writing the next. Once there is a wait between the two, as with separate reads and writes to a remote store, every request in flight can read the same old state.</p></details>
+<details><summary>Login attempts are limited to 5 a minute, keyed by user name. What is wrong with that key, and what is better?</summary><p>An attacker trying one password against many accounts is never limited, since each account sees one attempt, and anyone can lock a real user out with five failed attempts in their name. Limit by address as well, tightly, and keep any account limit generous.</p></details>
+<details><summary>The server’s clock is corrected backward by two seconds. What can a fixed window limiter do wrong, and how does the chapter’s design prevent it?</summary><p>A time earlier than the current window’s start looks like a new window, with its counter at zero, so a client that had used its whole allowance gets a fresh one. In the test, a fixed window given 1000, 1001, 1002 and then 999 allowed the fourth request. <code>KeyedLimiter</code> never lets time go backward: it treats any time earlier than the latest seen as the latest, and the request is refused.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Brandur Leach, <a href="https://brandur.org/rate-limiting">Rate Limiting, Cells, and GCRA</a>, 18 September 2015. GCRA and its theoretical arrival time, applied to an API.</li>
+  <li><a href="https://en.wikipedia.org/wiki/Generic_cell_rate_algorithm">Generic cell rate algorithm</a>, Wikipedia. Origins in ATM networks, ITU-T I.371, and the two equivalent descriptions.</li>
+  <li>Roberto Polli, Alejandro Martinez Ruiz and Darrel Miller, <a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/">RateLimit header fields for HTTP</a>, Internet-Draft version 11, IETF, 23 May 2026.</li>
+  <li>M. Nottingham and R. Fielding, <a href="https://www.rfc-editor.org/rfc/rfc6585">RFC 6585: Additional HTTP Status Codes</a>, April 2012. Status 429.</li>
+  <li>NGINX, <a href="https://nginx.org/en/docs/http/ngx_http_limit_req_module.html">Module ngx_http_limit_req_module</a>. A leaky bucket with <code>burst</code> and <code>nodelay</code>, and 503 as the default status.</li>
+  <li>Go, <a href="https://pkg.go.dev/golang.org/x/time/rate">package golang.org/x/time/rate</a>. A token bucket with <code>Allow</code>, <code>Reserve</code> and <code>Wait</code>.</li>
+  <li>Paul Tarjan, <a href="https://stripe.com/blog/rate-limiters">Scaling your API with rate limiters</a>, Stripe, 30 March 2017. Four limiters used together.</li>
+  <li>Julien Desgats, <a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/">How we built rate limiting capable of scaling to millions of domains</a>, Cloudflare, June 2017. The sliding window counter on real traffic.</li>
+</ol>
+</section>

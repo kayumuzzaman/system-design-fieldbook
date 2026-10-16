@@ -1,0 +1,751 @@
+<!--meta
+{ "description": "The SOLID principles explained with before-and-after TypeScript: single responsibility, open/closed, Liskov substitution, interface segregation and dependency inversion, followed by DRY, KISS, YAGNI and the Law of Demeter, how the principles pull against each other, and how to apply them without over-engineering.",
+  "lede": "Software is rarely hard to write the first time. It becomes hard on the tenth change, when touching one thing breaks three others. Design principles are compressed experience about what makes code survive change. This chapter works through the five that go by the name SOLID, each with code that was run before and after, then four shorter rules that travel with them, and ends with the part most summaries leave out: when not to apply them.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">What a design principle is for</h2>
+<p>The previous chapter ended with two measures of a design: coupling between parts should be low, and cohesion within each part should be high. Those say what good looks like. They do not say what to do on a Tuesday afternoon with a class that has grown to six hundred lines. Principles are the next level down: rules of thumb, each aimed at one common way that code becomes hard to change.</p>
+<p>The best-known set was assembled by Robert C. Martin around 2000 from his own work and that of others, and later given the acronym SOLID.</p>
+<table>
+<thead><tr><th></th><th>Principle</th><th>In one sentence</th><th>The trouble it prevents</th></tr></thead>
+<tbody>
+<tr><th>S</th><td>Single responsibility</td><td>A class should have one reason to change</td><td>A change for one purpose breaking another</td></tr>
+<tr><th>O</th><td>Open/closed</td><td>Add behavior by adding code, not by editing code that works</td><td>Every new case reopening tested functions</td></tr>
+<tr><th>L</th><td>Liskov substitution</td><td>Anything that claims to be a subtype must behave like one</td><td>Code that is correct for the type failing for one of its subtypes</td></tr>
+<tr><th>I</th><td>Interface segregation</td><td>Callers should not depend on methods they do not use</td><td>Wide interfaces that are hard to implement, fake and change</td></tr>
+<tr><th>D</th><td>Dependency inversion</td><td>The important code should not depend on the replaceable code</td><td>Business rules welded to a database or a framework</td></tr>
+</tbody>
+</table>
+<p>They are guidelines and not laws. Each has a cost, usually more classes and more indirection, and the last section of this chapter is about paying it only where it buys something. The examples continue with the photo app. Every “before” and “after” below was run, and where the two are supposed to behave identically a test confirmed that they do.</p>
+
+<h2 id="srp">Single responsibility</h2>
+<p>The photo app emails each user a monthly summary of the storage they use. The first version is one class.</p>
+<pre data-lang="ts" data-title="A usage report as one class, then as three pieces">
+export type StoredPhoto = { bytes: number; deleted: boolean };
+export type Usage = { photos: number; gigabytes: number };
+type Send = (to: string, html: string) => void;
+
+// Before: one class answers to three different people.
+export class UsageReportBefore {
+  private readonly photos: StoredPhoto[];
+  private readonly send: Send;
+
+  constructor(photos: StoredPhoto[], send: Send) {
+    this.photos = photos;
+    this.send = send;
+  }
+
+  usage(): Usage { // the finance team decides what counts toward a bill
+    const kept = this.photos.filter((p) => !p.deleted);
+    return { photos: kept.length, gigabytes: Math.ceil(kept.reduce((sum, p) => sum + p.bytes, 0) / 1e9) };
+  }
+  html(): string { // the design team decides how it looks
+    const u = this.usage();
+    return `<h1>Your storage</h1><p>${u.photos} photos, ${u.gigabytes} GB</p>`;
+  }
+  email(to: string): void { // the operations team decides how mail is delivered
+    this.send(to, this.html());
+  }
+}
+
+// After: one piece for each of them.
+export function usageOf(photos: StoredPhoto[]): Usage {
+  const kept = photos.filter((p) => !p.deleted);
+  return { photos: kept.length, gigabytes: Math.ceil(kept.reduce((sum, p) => sum + p.bytes, 0) / 1e9) };
+}
+
+export function usageAsHtml(usage: Usage): string {
+  return `<h1>Your storage</h1><p>${usage.photos} photos, ${usage.gigabytes} GB</p>`;
+}
+
+export class ReportMailer {
+  private readonly send: Send;
+  constructor(send: Send) {
+    this.send = send;
+  }
+  deliver(to: string, html: string): void {
+    this.send(to, html);
+  }
+}
+</pre>
+<p>The class is short and it works. The problem is who asks for it to change. Finance changes what counts toward a bill: perhaps deleted photos should count for thirty days. Design changes the wording and layout. Operations changes how mail is sent. Three groups, with unrelated reasons and unrelated schedules, edit the same file. When design reworks the HTML and accidentally alters a line that <code>usage</code> relied on, a billing figure is wrong, and nobody in finance was told the file had been touched.</p>
+
+<figure class="fig wide" id="fig-srp">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f571t f571d">
+<title id="f571t">One class answering to three groups of people, and three pieces answering to one each</title>
+<desc id="f571d">On the left, three groups each have a reason to ask for changes: finance decides what counts toward a bill, design decides how the report looks, and operations decides how mail is delivered. All three point at one class, UsageReport, with the methods usage, html and email. On the right, the same three groups each point at a separate piece: the function usageOf, the function usageAsHtml and the class ReportMailer.</desc>
+<text class="tb" x="10" y="18">Before: three reasons to change one class</text>
+<text class="tb" x="380" y="18">After: one reason for each piece</text>
+<rect class="n fault" x="200" y="60" width="140" height="86" rx="4"/>
+<text class="tb mid" x="270" y="79">UsageReport</text>
+<line class="sep fault" x1="200" y1="88" x2="340" y2="88"/>
+<text class="ts" x="208" y="104">+ usage()</text>
+<text class="ts" x="208" y="120">+ html()</text>
+<text class="ts" x="208" y="136">+ email(to)</text>
+<rect class="n" x="10" y="40" width="150" height="40" rx="6"/>
+<text class="tb mid" x="85" y="56">Finance</text>
+<text class="ts mid" x="85" y="73">what counts toward a bill</text>
+<path class="e" d="M161 60L198 110"/>
+<rect class="n" x="380" y="40" width="150" height="40" rx="6"/>
+<text class="tb mid" x="455" y="56">Finance</text>
+<text class="ts mid" x="455" y="73">what counts toward a bill</text>
+<path class="e" d="M531 60H568"/>
+<rect class="n store" x="570" y="44" width="140" height="32" rx="4"/>
+<text class="ts tb mid" x="640" y="64">usageOf(photos)</text>
+<rect class="n" x="10" y="96" width="150" height="40" rx="6"/>
+<text class="tb mid" x="85" y="112">Design</text>
+<text class="ts mid" x="85" y="129">how the report looks</text>
+<path class="e" d="M161 116L198 126"/>
+<rect class="n" x="380" y="96" width="150" height="40" rx="6"/>
+<text class="tb mid" x="455" y="112">Design</text>
+<text class="ts mid" x="455" y="129">how the report looks</text>
+<path class="e" d="M531 116H568"/>
+<rect class="n store" x="570" y="100" width="140" height="32" rx="4"/>
+<text class="ts tb mid" x="640" y="120">usageAsHtml(usage)</text>
+<rect class="n" x="10" y="152" width="150" height="40" rx="6"/>
+<text class="tb mid" x="85" y="168">Operations</text>
+<text class="ts mid" x="85" y="185">how mail is delivered</text>
+<path class="e" d="M161 172L198 142"/>
+<rect class="n" x="380" y="152" width="150" height="40" rx="6"/>
+<text class="tb mid" x="455" y="168">Operations</text>
+<text class="ts mid" x="455" y="185">how mail is delivered</text>
+<path class="e" d="M531 172H568"/>
+<rect class="n store" x="570" y="156" width="140" height="32" rx="4"/>
+<text class="ts tb mid" x="640" y="176">ReportMailer</text>
+<text class="ts" x="10" y="212">A change asked for by one group is made in a file</text>
+<text class="ts" x="10" y="228">that the other two also rely on.</text>
+<text class="ts" x="380" y="212">Each piece changes when one group asks,</text>
+<text class="ts" x="380" y="228">and only then.</text>
+</svg>
+</div>
+<figcaption>“One responsibility” does not mean “one method”. It means one group of people whose requests can cause this code to change.</figcaption>
+</figure>
+
+<p>The <dfn>single responsibility principle</dfn> says that a class or module should have only one reason to change, where a reason is a person or group who can ask for the change. In the second version a request from finance touches <code>usageOf</code> and nothing else. Both versions produced the same email in a test.</p>
+<p>Two misreadings are common. The principle does not say a class should do one small thing: <code>Album</code> in the previous chapter has five methods and one responsibility. And it does not say to split everything: code that always changes together belongs together. The test is the question “if this were wrong, who would notice, and who would ask for it to be fixed?”. If the answer names two different groups, there are two responsibilities.</p>
+
+<h2 id="ocp">Open/closed</h2>
+<p>Storage plans have prices and limits. The simplest code is a function for each question, with a branch for each plan.</p>
+<pre data-lang="ts" data-title="Plans as branches in functions, then as objects behind an interface">
+// Before: every question about plans is a function that lists the plans. Prices are in cents.
+export type PlanName = "free" | "plus" | "family";
+
+export function monthlyPriceBefore(plan: PlanName, gigabytes: number): number {
+  if (plan === "free") return 0;
+  if (plan === "plus") return 300 + Math.max(0, gigabytes - 100) * 2;
+  return 800 + Math.max(0, gigabytes - 500) * 2;
+}
+
+export function albumLimitBefore(plan: PlanName): number {
+  if (plan === "free") return 10;
+  if (plan === "plus") return 200;
+  return 1000;
+}
+
+// After: a plan is an object that answers the questions about itself.
+export interface Plan {
+  readonly name: string;
+  readonly albumLimit: number;
+  monthlyPrice(gigabytes: number): number;
+}
+
+const withAllowance = (name: string, base: number, included: number, albumLimit: number): Plan => ({
+  name,
+  albumLimit,
+  monthlyPrice: (gigabytes) => base + Math.max(0, gigabytes - included) * 2,
+});
+
+export const free: Plan = { name: "free", albumLimit: 10, monthlyPrice: () => 0 };
+export const plus = withAllowance("plus", 300, 100, 200);
+export const family = withAllowance("family", 800, 500, 1000);
+
+export class Plans {
+  private readonly byName = new Map<string, Plan>();
+
+  constructor(plans: Plan[]) {
+    for (const plan of plans) this.byName.set(plan.name, plan);
+  }
+  named(name: string): Plan {
+    const plan = this.byName.get(name);
+    if (!plan) throw new Error(`no plan called ${name}`);
+    return plan;
+  }
+}
+
+// A year later: a new plan with a rule of its own. Nothing above this line is edited.
+export const pro: Plan = {
+  name: "pro",
+  albumLimit: 5000,
+  monthlyPrice: (gigabytes) => 2000 + Math.ceil(Math.max(0, gigabytes - 2000) / 1000) * 500, // sold in blocks of a terabyte
+};
+</pre>
+<p>Then the business adds a Pro plan, priced differently from the others.</p>
+
+<figure class="fig wide" id="fig-ocp">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 314" role="img" aria-labelledby="f572t f572d">
+<title id="f572t">What adding a new plan touches</title>
+<desc id="f572d">Two versions of the same change, adding a Pro plan. In the first, three existing functions that each list the plans must be opened and given a new branch: the price function, the album limit function, and every other function that asks which plan this is. In the second, the existing plan objects and the registry are left alone, one new plan object is written, and it is handed to the registry when the program starts.</desc>
+<text class="tb" x="10" y="18">Functions that list the plans</text>
+<g data-scene="edit">
+<rect class="n" x="10" y="34" width="330" height="32" rx="4"/>
+<text class="ts tb" x="22" y="54">monthlyPriceBefore(plan, gb)</text>
+<g class="hide" data-s="1">
+<rect class="n fault" x="360" y="37" width="180" height="26" rx="4"/>
+<text class="ts mid" x="450" y="54">opened: + a branch for pro</text>
+<path class="e fault" d="M358 50H342"/>
+</g>
+<rect class="n" x="10" y="76" width="330" height="32" rx="4"/>
+<text class="ts tb" x="22" y="96">albumLimitBefore(plan)</text>
+<g class="hide" data-s="2">
+<rect class="n fault" x="360" y="79" width="180" height="26" rx="4"/>
+<text class="ts mid" x="450" y="96">opened: + a branch for pro</text>
+<path class="e fault" d="M358 92H342"/>
+</g>
+<rect class="n" x="10" y="118" width="330" height="32" rx="4"/>
+<text class="ts tb" x="22" y="138">…and every other function that asks “which plan?”</text>
+<g class="hide" data-s="3">
+<rect class="n fault" x="360" y="121" width="180" height="26" rx="4"/>
+<text class="ts mid" x="450" y="138">opened: + a branch for pro</text>
+<path class="e fault" d="M358 134H342"/>
+</g>
+</g>
+<path class="e none dash" d="M10 166H710"/>
+<text class="tb" x="10" y="186">Plans as objects behind one interface</text>
+<g data-scene="extend">
+<rect class="n sig" x="10" y="200" width="150" height="84" rx="4"/>
+<text class="ts mid" x="85" y="216">«interface»</text>
+<text class="tb mid" x="85" y="233">Plan</text>
+<line class="sep sig" x1="10" y1="242" x2="160" y2="242"/>
+<text class="ts" x="18" y="258">+ monthlyPrice(gb)</text>
+<text class="ts" x="18" y="274">+ albumLimit</text>
+<rect class="n" x="200" y="212" width="80" height="28" rx="4"/>
+<text class="ts tb mid" x="240" y="230">free</text>
+<rect class="n" x="290" y="212" width="80" height="28" rx="4"/>
+<text class="ts tb mid" x="330" y="230">plus</text>
+<rect class="n" x="380" y="212" width="80" height="28" rx="4"/>
+<text class="ts tb mid" x="420" y="230">family</text>
+<rect class="n" x="560" y="200" width="150" height="80" rx="4"/>
+<text class="tb mid" x="635" y="219">Plans</text>
+<line class="sep" x1="560" y1="228" x2="710" y2="228"/>
+<text class="ts" x="568" y="244">− byName</text>
+<line class="sep" x1="560" y1="254" x2="710" y2="254"/>
+<text class="ts" x="568" y="270">+ named(name)</text>
+<text class="ts mid" x="330" y="262">none of these is opened</text>
+<g class="hide" data-s="1">
+<rect class="n store" x="470" y="212" width="70" height="28" rx="4"/>
+<text class="ts tb mid" x="505" y="230">pro</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M505 242V262C505 304 635 304 635 282"/>
+<text class="ts mono mid" x="330" y="296">new Plans([free, plus, family, pro])</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="edit" data-label="Editing">
+  <li data-msg="+ if pro" data-state="Working functions reopened: 1; Tests that could now fail: every price test">The price of the new plan needs a branch in the function that computes prices. A function that was correct is opened and edited.</li>
+  <li data-msg="+ if pro" data-state="Working functions reopened: 2; Tests that could now fail: price and limit tests">The album limit needs one too. This is a different function, possibly in a different file, and nothing forces anyone to remember it.</li>
+  <li data-msg="+ if pro" data-state="Working functions reopened: 3 or more; Tests that could now fail: anything that mentions a plan">So does every other function that asks which plan this is. The compiler helps only if each of them was written to be exhaustive.</li>
+</ol>
+<ol class="steps" data-scene="extend" data-label="Extending">
+  <li data-msg="none" data-state="Working functions reopened: none; Tests that could now fail: only the new plan’s own">With plans as objects, the new plan is one new object that states its own price rule and limit. It can be written and tested without opening anything.</li>
+  <li data-msg="pro" data-state="Working functions reopened: none; Tests that could now fail: only the new plan’s own">The one existing line that changes is the list handed to the registry at startup. Code that asks a plan for its price works for the new plan unchanged.</li>
+</ol>
+<figcaption>“Closed for modification” is about risk. Code that is not opened cannot be broken by the change.</figcaption>
+</figure>
+
+<p>The <dfn>open/closed principle</dfn> says that a module should be open for extension and closed for modification: it should be possible to add new behavior by writing new code, without editing code that already works. In the second version the Pro plan is one new object, and the registry and every caller are untouched. A test confirmed that the object version gives the same price and limit as the functions for every existing plan.</p>
+<p>The mechanism is the polymorphism of <x-ref to="oop-in-typescript#polymorphism"></x-ref>. What the principle adds is a way to decide where to use it. No design can be closed against every possible change, and trying produces abstractions nobody needs. Choose the direction in which the code has already changed more than once. Plans get added. So plans are the thing to make pluggable. A sensible rule: write the simple branch the first time, and introduce the interface when the second or third variation arrives and shows what varies.</p>
+
+<h2 id="lsp">Liskov substitution</h2>
+<p>The principle is named for Barbara Liskov, who stated it in 1987. A subtype must be usable anywhere its supertype is expected, without the program going wrong. The compiler checks part of this: that the methods exist with compatible types. It cannot check the rest, which is that they behave as the supertype promised.</p>
+<p>The photos service takes a snapshot of its store every night for backups. A snapshot can be read and must never be written. It is tempting to make it one more kind of store.</p>
+<pre data-lang="ts" data-title="A snapshot that claims to be a store">
+// A snapshot of last night's photos. It has the right shape, and it breaks the promise that save works.
+export class SnapshotStore implements PhotoStore {
+  private readonly source: PhotoStore;
+  constructor(source: PhotoStore) {
+    this.source = source;
+  }
+  async save(): Promise<void> {
+    throw new Error("a snapshot cannot be changed");
+  }
+  load(id: string): Promise<Uint8Array | null> {
+    return this.source.load(id);
+  }
+}
+
+// Written for "any PhotoStore". It compiles with a snapshot as the destination, and fails when run.
+export async function copyAll(from: PhotoStore, to: PhotoStore, ids: string[]): Promise<number> {
+  let copied = 0;
+  for (const id of ids) {
+    const bytes = await from.load(id);
+    if (bytes) {
+      await to.save(id, bytes);
+      copied += 1;
+    }
+  }
+  return copied;
+}
+</pre>
+<p><code>copyAll</code> is correct. It was written against the <code>PhotoStore</code> interface and uses nothing else. Handed a <code>SnapshotStore</code> as the destination, it compiles and then fails on the first photo.</p>
+
+<figure class="fig wide" id="fig-lsp">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 336" role="img" aria-labelledby="f573t f573d">
+<title id="f573t">A subtype that cannot keep its supertype’s promise</title>
+<desc id="f573d">Two sequences. In the first, the function copyAll is written for any PhotoStore and is given a SnapshotStore as its destination. The compiler accepts this because the snapshot has both methods. At run time, the first call to save throws an error. In the second, the interface is split in two. A Snapshot claims only to be a PhotoReader, so the compiler rejects it as a destination, while reading from the snapshot into a real store works.</desc>
+<text class="tb" x="10" y="16">One wide interface: PhotoStore has save and load</text>
+<g data-scene="wide">
+<text class="tb mid" x="170" y="36">copyAll(from, to)</text>
+<line class="axis" x1="170" y1="44" x2="170" y2="142"/>
+<text class="tb mid" x="560" y="36">to: a SnapshotStore</text>
+<line class="axis" x1="560" y1="44" x2="560" y2="142"/>
+<g data-s="1" data-packet="none">
+<rect class="n store" x="178" y="58" width="353.5" height="22" rx="4"/>
+<text class="ts mid" x="354.75" y="73">1. is a SnapshotStore a PhotoStore? it has both methods</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M171 100H559"/>
+<text class="ts mid" x="365.0" y="94">2. save("p1", bytes)</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M559 128H171"/>
+<text class="ts mid" x="365.0" y="122">3. Error: a snapshot cannot be changed</text>
+</g>
+</g>
+<path class="e none dash" d="M10 158H710"/>
+<text class="tb" x="10" y="178">Two narrow interfaces: PhotoReader and PhotoWriter</text>
+<g data-scene="narrow">
+<text class="tb mid" x="130" y="198">copyAllSafely(from, to)</text>
+<line class="axis" x1="130" y1="206" x2="130" y2="316"/>
+<text class="tb mid" x="400" y="198">a Snapshot</text>
+<line class="axis" x1="400" y1="206" x2="400" y2="316"/>
+<text class="tb mid" x="630" y="198">a MemoryStore</text>
+<line class="axis" x1="630" y1="206" x2="630" y2="316"/>
+<g data-s="1" data-packet="none">
+<rect class="n fault" x="138" y="220" width="280.3" height="22" rx="4"/>
+<text class="ts mid" x="278.15" y="235">1. to: a Snapshot? it has no save: rejected</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M131 262H399"/>
+<text class="ts mid" x="265.0" y="256">2. load("p1")</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M131 290H629"/>
+<text class="ts mid" x="380.0" y="284">3. save("p1", bytes)</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="wide" data-label="One wide interface">
+  <li data-msg="none" data-state="The compiler says: accepted; At run time: not run yet">The compiler compares shapes. The snapshot has a save and a load with the right parameters, so it is accepted wherever a PhotoStore is wanted.</li>
+  <li data-state="The compiler says: accepted; At run time: running">The function does what its parameter types say it may: it saves the first photo to the destination.</li>
+  <li data-msg="Error" data-state="The compiler says: accepted; At run time: fails on the first photo">The snapshot has a save method only because the interface demanded one. It throws. Code written correctly against the interface has failed.</li>
+</ol>
+<ol class="steps" data-scene="narrow" data-label="Two narrow interfaces">
+  <li data-msg="none" data-state="The compiler says: a Snapshot is not a PhotoWriter; At run time: never reached">The destination must be a PhotoWriter. A Snapshot claims only to be a PhotoReader, so the call does not compile.</li>
+  <li data-state="The compiler says: accepted; At run time: running">Used as the source, the snapshot is exactly what was asked for: something that can be read.</li>
+  <li data-state="The compiler says: accepted; At run time: works">A real store is the destination. Each type now promises only what it can do, so everything that compiles also runs.</li>
+</ol>
+<figcaption>A type is a promise about behavior, not only about method names. The compiler can check the names. Keeping the rest of the promise is up to the designer.</figcaption>
+</figure>
+
+<p>The <dfn>Liskov substitution principle</dfn> says that if code works with a type, it must keep working when given any subtype of that type. A subtype breaks it in four typical ways.</p>
+<table>
+<thead><tr><th>The subtype</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>Refuses something the supertype accepts</th><td>A store whose <code>save</code> rejects files over 1 MB when the interface set no limit</td></tr>
+<tr><th>Delivers less than the supertype promised</th><td>A <code>save</code> that returns before the data is stored, when callers rely on being able to <code>load</code> it at once</td></tr>
+<tr><th>Throws where the supertype does not</th><td>The snapshot’s <code>save</code>, or any method whose body is “not supported”</td></tr>
+<tr><th>Breaks a rule the supertype maintained</th><td>A subclass of <code>Album</code> that lets the cover be a photo outside the album</td></tr>
+</tbody>
+</table>
+<p>A method that exists only to throw “not supported” is the clearest sign. The type is claiming to be something it is not. The fix is rarely inside the subtype. It is to make the promise smaller, so that it can be kept.</p>
+<pre data-lang="ts" data-title="Two smaller interfaces. A snapshot is a reader and nothing more">
+// After: two smaller promises. A type now claims only what it can keep.
+export interface PhotoReader {
+  load(id: string): Promise<Uint8Array | null>;
+}
+export interface PhotoWriter {
+  save(id: string, bytes: Uint8Array): Promise<void>;
+}
+
+export class Snapshot implements PhotoReader {
+  private readonly source: PhotoReader;
+  constructor(source: PhotoReader) {
+    this.source = source;
+  }
+  load(id: string): Promise<Uint8Array | null> {
+    return this.source.load(id);
+  }
+}
+</pre>
+<p>With a function declared as <code>copyAllSafely(from: PhotoReader, to: PhotoWriter, …)</code>, passing a snapshot as the destination is rejected by the compiler. The same mistake that failed in production now cannot be written.</p>
+
+<h2 id="isp">Interface segregation</h2>
+<p>The fix above is the next principle arriving early. Here it is from the caller’s side. The photos service uses a media library that can resize images, find faces, read text out of pictures and convert video. A function that makes thumbnails needs one of those four.</p>
+<pre data-lang="ts" data-title="One wide interface, then one for each need">
+type Image = { width: number; height: number };
+
+// Before: one interface for everything the media library can do.
+export interface MediaTools {
+  resize(image: Image, width: number): Image;
+  detectFaces(image: Image): number;
+  readText(image: Image): string;
+  transcodeVideo(path: string, format: string): string;
+}
+
+export function thumbnailBefore(tools: MediaTools, image: Image): Image {
+  return tools.resize(image, 200); // uses one method of four
+}
+
+// After: one interface for each thing a caller might need.
+export interface Resizer {
+  resize(image: Image, width: number): Image;
+}
+export interface FaceDetector {
+  detectFaces(image: Image): number;
+}
+
+export function thumbnail(resizer: Resizer, image: Image): Image {
+  return resizer.resize(image, 200);
+}
+
+// One class can still do several jobs. Each caller sees only the part it asked for.
+export class ImageTools implements Resizer, FaceDetector {
+  resize(image: Image, width: number): Image {
+    return { width, height: Math.round((image.height * width) / image.width) };
+  }
+  detectFaces(): number {
+    return 0;
+  }
+}
+</pre>
+<p>The <dfn>interface segregation principle</dfn> says that no caller should be forced to depend on methods it does not use. The cost of ignoring it showed up in the test for this code. To exercise <code>thumbnailBefore</code>, the test had to supply an object with all four methods, three of them written only to throw. To exercise <code>thumbnail</code>, it supplied an object with one. The same burden falls on every real implementation, and a class that can resize and cannot transcode video ends up with a method that throws, which is the Liskov violation again.</p>
+<ul>
+  <li><b>Design interfaces from the caller’s side.</b> Ask what this function needs from its collaborator, and name that. <code>Resizer</code> describes a role. <code>MediaTools</code> describes a product.</li>
+  <li><b>One class may play several roles.</b> <code>ImageTools</code> implements two interfaces. Splitting interfaces does not require splitting classes.</li>
+  <li><b>Narrow parameter types cost nothing in TypeScript.</b> Because types are matched by shape, a function can ask for <code>{ resize(…): Image }</code> and accept any existing object that has it.</li>
+</ul>
+
+<h2 id="dip">Dependency inversion</h2>
+<p>Some code in a system is the reason the system exists: the rule that only an album’s owner may share it. Other code is plumbing that could be swapped: which database, which mail service. The first kind should be the most stable and the easiest to test. In the natural way of writing it, the opposite happens.</p>
+<pre data-lang="ts" data-title="A rule that builds its own database client, then one that is handed what it needs">
+// Before: the rule about sharing creates its own database and mail clients.
+export class ShareAlbumBefore {
+  private readonly albums = new SqlAlbums();
+  private readonly mailer = new SmtpMailer();
+
+  run(albumId: string, by: string, withUser: string): void {
+    const album = this.albums.find(albumId);
+    if (album.owner !== by) throw new Error("only the owner can share an album");
+    if (!album.sharedWith.includes(withUser)) album.sharedWith.push(withUser);
+    this.albums.save(album);
+    this.mailer.send(withUser, `${by} shared an album with you`);
+  }
+}
+
+// After: the rule says what it needs, as interfaces it owns. Something else decides what to plug in.
+export interface Albums {
+  find(id: string): Album;
+  save(album: Album): void;
+}
+export interface Mailer {
+  send(to: string, text: string): void;
+}
+
+export class ShareAlbum {
+  private readonly albums: Albums;
+  private readonly mailer: Mailer;
+
+  constructor(albums: Albums, mailer: Mailer) {
+    this.albums = albums;
+    this.mailer = mailer;
+  }
+
+  run(albumId: string, by: string, withUser: string): void {
+    const album = this.albums.find(albumId);
+    if (album.owner !== by) throw new Error("only the owner can share an album");
+    if (!album.sharedWith.includes(withUser)) album.sharedWith.push(withUser);
+    this.albums.save(album);
+    this.mailer.send(withUser, `${by} shared an album with you`);
+  }
+}
+
+// The one place that knows which real classes exist. It runs once, when the program starts.
+export function buildShareAlbum(): ShareAlbum {
+  return new ShareAlbum(new SqlAlbums(), new SmtpMailer());
+}
+</pre>
+<p>In the first class, the rule cannot be run without a database and a mail server. A test that tried got “no database is reachable from here”. Everything about the database client, its connection settings, its failures and its upgrade schedule, has become the sharing rule’s problem.</p>
+
+<figure class="fig wide" id="fig-dip">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f574t f574d">
+<title id="f574t">The direction of dependency, before and after it is inverted</title>
+<desc id="f574d">Two class diagrams, each divided by a dashed line into the rule above and the details below. Before: the class ShareAlbumBefore, which holds the rule about sharing, points down to the concrete classes SqlAlbums and SmtpMailer. After: ShareAlbum points to two interfaces, Albums and Mailer, which sit above the line with it. SqlAlbums and SmtpMailer, below the line, point up to those interfaces, as do the in-memory fakes used in tests.</desc>
+<text class="tb" x="10" y="18">Before: the rule depends on the details</text>
+<text class="tb" x="380" y="18">After: the details depend on the rule</text>
+<path class="e none dash" d="M10 176H340"/>
+<path class="e none dash" d="M380 176H710"/>
+<text class="ts end" x="340" y="170">the rule</text>
+<text class="ts end" x="340" y="190">the details</text>
+<text class="ts end" x="710" y="170">the rule</text>
+<text class="ts end" x="710" y="190">the details</text>
+<rect class="n fault" x="90" y="40" width="170" height="54" rx="4"/>
+<text class="tb mid" x="175" y="59">ShareAlbumBefore</text>
+<line class="sep fault" x1="90" y1="68" x2="260" y2="68"/>
+<text class="ts" x="98" y="84">+ run(album, by, with)</text>
+<rect class="n" x="30" y="222" width="130" height="28" rx="4"/>
+<text class="tb mid" x="95" y="241">SqlAlbums</text>
+<rect class="n" x="190" y="222" width="130" height="28" rx="4"/>
+<text class="tb mid" x="255" y="241">SmtpMailer</text>
+<path class="e assoc" d="M141 94 L95 222"/>
+<path class="e assoc" d="M209 94 L255 222"/>
+<text class="ts" x="10" y="274">To run or test the rule, you need a database</text>
+<text class="ts" x="10" y="290">and a mail server.</text>
+<rect class="n store" x="470" y="34" width="150" height="54" rx="4"/>
+<text class="tb mid" x="545" y="53">ShareAlbum</text>
+<line class="sep store" x1="470" y1="62" x2="620" y2="62"/>
+<text class="ts" x="478" y="78">+ run(album, by, with)</text>
+<rect class="n sig" x="400" y="112" width="130" height="42" rx="4"/>
+<text class="ts mid" x="465" y="128">«interface»</text>
+<text class="tb mid" x="465" y="145">Albums</text>
+<rect class="n sig" x="560" y="112" width="130" height="42" rx="4"/>
+<text class="ts mid" x="625" y="128">«interface»</text>
+<text class="tb mid" x="625" y="145">Mailer</text>
+<path class="e assoc" d="M515 88 L465 112"/>
+<path class="e assoc" d="M575 88 L625 112"/>
+<rect class="n" x="380" y="222" width="100" height="28" rx="4"/>
+<text class="tb mid" x="430" y="241">SqlAlbums</text>
+<rect class="n" x="600" y="222" width="110" height="28" rx="4"/>
+<text class="tb mid" x="655" y="241">SmtpMailer</text>
+<rect class="n ghost" x="492" y="222" width="96" height="28" rx="4"/>
+<text class="tb mid" x="540" y="241">test fakes</text>
+<path class="e implements" d="M430 222 L445.5 154"/>
+<path class="e implements" d="M655 222 L644.5 154"/>
+<path class="e implements" d="M520.8 222 L497.5 154"/>
+<path class="e implements" d="M559.2 222 L592.5 154"/>
+<text class="ts" x="380" y="274">Every arrow that crosses the line now points upward.</text>
+<text class="ts" x="380" y="290">The rule can be run with anything that fits the interfaces.</text>
+</svg>
+</div>
+<figcaption>“Inversion” describes the arrows. The class that holds the rule used to point at the database. Now the database class points at an interface the rule defined.</figcaption>
+</figure>
+
+<p>The <dfn>dependency inversion principle</dfn> says that code expressing policy should not depend on code handling details. Both should depend on an abstraction, and the abstraction should be shaped by what the policy needs. In the second version <code>ShareAlbum</code> declares two small interfaces, and the database class conforms to them. The test ran the rule with two fakes of three lines each, and checked that sharing twice adds a person once and that a non-owner is refused.</p>
+<p>Two terms are often confused with the principle and are worth separating.</p>
+<ul>
+  <li><dfn>Dependency injection</dfn> is the technique that makes it work: an object receives the things it depends on, usually through its constructor, instead of creating them. It needs no framework. The constructor of <code>ShareAlbum</code> is dependency injection.</li>
+  <li>The <dfn>composition root</dfn> is the one place in a program, near its entry point, where the real objects are created and connected. <code>buildShareAlbum</code> is a small one. It is the only code that names both the rule and the concrete database class.</li>
+</ul>
+<p>At the scale of a whole application, the same idea arranges the layers (<x-ref to="application-architecture"></x-ref>), and it is what makes the testing approach of <x-ref to="errors-and-testing"></x-ref> possible.</p>
+
+<h2 id="others">Four shorter rules</h2>
+<p>SOLID is about the shape of classes. Four older rules are about habits of mind, and they are quoted at least as often.</p>
+<h3 id="dry">Do not repeat yourself</h3>
+<p><dfn>DRY</dfn>, for “do not repeat yourself”, says that every piece of knowledge should have one authoritative place in a system. The word that matters is knowledge. The rule that a free plan allows ten albums is knowledge. If it is written in the web server, in the mobile app and in a database constraint, the three will one day disagree.</p>
+<p>The principle is not about text that happens to look alike. An album title and a display name may both be limited to 60 characters today. They are two decisions, made by different people for different reasons, and merging them into one <code>validateName</code> function ties together things that will want to change separately. Removing that kind of duplication creates coupling where there was none. A useful guard is to wait for the third occurrence before extracting anything, and to ask whether the copies would have to change together. If the answer is no, leave them alone. A little duplication is far cheaper to live with than the wrong abstraction.</p>
+<h3 id="kiss-yagni">Keep it simple, and build it when you need it</h3>
+<p><dfn>KISS</dfn>, usually read as “keep it simple”, says to prefer the most direct design that meets the requirements. <dfn>YAGNI</dfn>, “you aren’t gonna need it”, says not to build something for a need you only expect. Both push against the principles above, and that is their purpose.</p>
+<p>The argument for YAGNI is about cost. A feature or an extension point built on speculation costs the time to build it, the time to carry it through every later change, and the distortion it leaves in the design when the real need turns out to have a different shape. It pays off only if the guess was right in detail. The cheap alternative is code that is simple enough to change when the need is real. YAGNI is not an argument against tests, clear names or small functions. Those are what keep a later change cheap.</p>
+<h3 id="demeter">The Law of Demeter</h3>
+<p>The <dfn>Law of Demeter</dfn>, also called the principle of least knowledge, says that a method should call only its own object, its parameters, objects it creates and objects its own object holds. In short: talk to your neighbors, not to your neighbors’ neighbors. It is named for a research project at Northeastern University, where it was formulated in 1987.</p>
+<pre data-lang="ts" data-title="Deciding whether an upload is allowed: reaching through, then asking">
+// Before: plain records, and a caller that walks through three of them.
+type PlanData = { maxPhotoBytes: number };
+type OwnerData = { active: boolean; plan: PlanData };
+type AlbumData = { owner: OwnerData; photoCount: number };
+
+export function canUploadBefore(album: AlbumData, bytes: number): boolean {
+  return album.owner.active && album.owner.plan.maxPhotoBytes >= bytes && album.photoCount < 1000;
+}
+
+// After: each object answers a question about itself, and asks its neighbor about the rest.
+export class Plan {
+  private readonly maxPhotoBytes: number;
+  constructor(maxPhotoBytes: number) {
+    this.maxPhotoBytes = maxPhotoBytes;
+  }
+  allows(bytes: number): boolean {
+    return bytes <= this.maxPhotoBytes;
+  }
+}
+
+export class Owner {
+  private readonly active: boolean;
+  private readonly plan: Plan;
+  constructor(active: boolean, plan: Plan) {
+    this.active = active;
+    this.plan = plan;
+  }
+  canStore(bytes: number): boolean {
+    return this.active && this.plan.allows(bytes);
+  }
+}
+
+export class Album {
+  private readonly owner: Owner;
+  private photoCount = 0;
+  constructor(owner: Owner) {
+    this.owner = owner;
+  }
+  canAccept(bytes: number): boolean {
+    return this.photoCount < 1000 && this.owner.canStore(bytes);
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-demeter">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f575t f575d">
+<title id="f575t">Reaching through objects, and asking the nearest one</title>
+<desc id="f575d">Four boxes in a row: the caller, an album, its owner and the owner’s plan. In the first story the caller takes the owner out of the album, then the plan out of the owner, then a limit out of the plan, and so comes to depend on all three. In the second the caller asks the album one question, the album asks its owner, the owner asks its plan, and the caller depends on the album alone.</desc>
+<rect class="n sig" x="20" y="96" width="140" height="44" rx="6"/>
+<text class="tb mid" x="90" y="122.5">The caller</text>
+<rect class="n" x="200" y="96" width="140" height="44" rx="6"/>
+<text class="tb mid" x="270" y="122.5">Album</text>
+<rect class="n" x="380" y="96" width="140" height="44" rx="6"/>
+<text class="tb mid" x="450" y="122.5">Owner</text>
+<rect class="n" x="560" y="96" width="140" height="44" rx="6"/>
+<text class="tb mid" x="630" y="122.5">Plan</text>
+<g data-scene="reach">
+<g data-s="1">
+<path class="e fault" d="M161 118H198"/>
+<text class="ts mid" x="180" y="90">album.owner</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M90 95C150 40 380 40 440 94"/>
+<text class="ts mid" x="265" y="46">.active   .plan</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M70 95C140 4 560 4 630 94"/>
+<text class="ts mid" x="350" y="18">.maxPhotoBytes</text>
+</g>
+</g>
+<g data-scene="ask">
+<g data-s="1">
+<path class="e store" d="M161 118H198"/>
+<text class="ts mid" x="180" y="160">canAccept(bytes)</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M341 118H378"/>
+<text class="ts mid" x="360" y="160">canStore(bytes)</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M521 118H558"/>
+<text class="ts mid" x="540" y="160">allows(bytes)</text>
+</g>
+</g>
+<text class="ts" x="10" y="200">An arrow means “this code would have to change if that class changed its fields”.</text>
+</svg>
+</div>
+<ol class="steps" data-scene="reach" data-label="Reaching through">
+  <li data-msg="album.owner" data-state="The caller would break if these changed: Album">To decide whether an upload is allowed, the caller takes the owner out of the album.</li>
+  <li data-msg="owner.plan" data-state="The caller would break if these changed: Album, Owner">It reads whether the owner is active, and takes the plan out of the owner. The caller now knows how owners are built.</li>
+  <li data-msg="plan.maxPhotoBytes" data-state="The caller would break if these changed: Album, Owner, Plan">It reads the size limit out of the plan. A change to how plans store limits would now break code that thought it was dealing with an album.</li>
+</ol>
+<ol class="steps" data-scene="ask" data-label="Asking">
+  <li data-msg="canAccept(bytes)" data-state="The caller would break if these changed: Album">The caller asks the album a question about the album: can you accept a photo of this size?</li>
+  <li data-msg="canStore(bytes)" data-state="The caller would break if these changed: Album">The album checks its own count and asks its owner about storage. The caller does not know that an owner exists.</li>
+  <li data-msg="allows(bytes)" data-state="The caller would break if these changed: Album">The owner checks that it is active and asks its plan. Each object has spoken only to the one next to it.</li>
+</ol>
+<figcaption>The number of calls is the same. What changed is how many classes the caller is tied to.</figcaption>
+</figure>
+
+<p>The first function knows the structure of three types. A decision to give owners several plans, or to move the size limit somewhere else, breaks code that thought it was working with an album. In the second version each object answers a question about itself, a style often summarized as “tell, don’t ask”. The two gave the same answers in a test.</p>
+<p>The law concerns objects with behavior. A chain through plain data, such as <code>order.address.city</code> on a record that came from JSON, is reading a document and not a violation. Nor is a fluent chain in which every call returns the same kind of object, such as array methods.</p>
+
+<h2 id="balance">Applying them without overdoing it</h2>
+<p>Read as commands to be maximized, the principles produce bad software of a recognizable kind: an interface for every class, a factory for every constructor, twelve files to follow before finding the line that does anything. The principles are answers to problems. Where the problem is absent, the answer is only cost.</p>
+<table>
+<thead><tr><th>Principle</th><th>Under-applied</th><th>Over-applied</th><th>A reasonable trigger</th></tr></thead>
+<tbody>
+<tr><th>Single responsibility</th><td>Classes that everyone edits for unrelated reasons</td><td>Dozens of tiny classes that only make sense together</td><td>Two groups, or two schedules, changing one file</td></tr>
+<tr><th>Open/closed</th><td>Every new case reopens working code in several places</td><td>Extension points for variations that never arrive</td><td>The second or third variation of the same thing</td></tr>
+<tr><th>Liskov substitution</th><td>Methods that throw “not supported”</td><td>Hard to overdo. This one is closer to a correctness rule</td><td>Always, whenever you write <code>extends</code> or <code>implements</code></td></tr>
+<tr><th>Interface segregation</th><td>Fakes with ten stubbed methods</td><td>One-method interfaces nobody can find</td><td>A caller that uses a fraction of what it is given</td></tr>
+<tr><th>Dependency inversion</th><td>Business rules that need a database to run</td><td>An interface with exactly one implementation, forever, for something that is not a boundary</td><td>A boundary: storage, network, clock, another team’s service</td></tr>
+<tr><th>DRY</th><td>The same rule in three places, drifting apart</td><td>Unrelated code forced through one shared function</td><td>The third copy, of the same knowledge</td></tr>
+</tbody>
+</table>
+<p>The principles also pull against each other, and knowing the tensions is most of the skill.</p>
+<ul>
+  <li><b>Open/closed against YAGNI.</b> One says prepare for extension, the other says do not prepare. Resolve it with evidence: extend along the lines the code has already changed.</li>
+  <li><b>DRY against low coupling.</b> Sharing code between two services removes duplication and ties their releases together. Across a service boundary, a little duplication is usually the better trade (<x-ref to="monoliths-and-microservices"></x-ref>).</li>
+  <li><b>Single responsibility against simplicity.</b> Each split adds a name to learn and a connection to follow. A fifty-line class with two mild responsibilities may be better left alone.</li>
+</ul>
+<p>One question settles most cases: what change am I making easier, and has that change ever been asked for?</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Do not recite the acronym. Use the principles as reasons while you design: “pricing varies by plan and plans get added, so that is an interface”, “the booking rule should not know about the payment provider, so it takes a gateway through its constructor”. If asked to critique code, look for the three concrete signs from this chapter: a class two teams would edit, a switch on type repeated in several places, and a method that exists only to throw.</p></div>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Introducing an abstraction to remove a duplication you have seen twice, then bending it with flags and optional parameters as the two uses drift apart. A function with five boolean parameters is usually two or three functions that were merged too early. Putting the duplication back is a legitimate refactoring.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Reading “single responsibility” as “one method”</th><td>A swarm of classes with no behavior worth naming</td><td>Group by who asks for changes</td></tr>
+<tr><th>Switching on a type name in several functions</th><td>Each new type means finding every switch</td><td>Move the varying behavior behind an interface, once it has varied</td></tr>
+<tr><th>Building extension points in advance</th><td>Abstractions shaped for needs that never came</td><td>Simple code first, and the interface when the variation is real</td></tr>
+<tr><th>Implementing an interface with methods that throw</th><td>Correct callers fail at run time</td><td>Split the interface until every implementer can keep all of it</td></tr>
+<tr><th>One wide interface for a whole subsystem</th><td>Every caller and every fake depends on all of it</td><td>Small interfaces named for roles</td></tr>
+<tr><th>Creating collaborators with <code>new</code> inside business logic</th><td>The rule cannot be tested or reused without its infrastructure</td><td>Pass them in, and assemble at one place</td></tr>
+<tr><th>Merging code that only looks alike</th><td>Unrelated features coupled through a shared helper</td><td>Share knowledge, not coincidence</td></tr>
+<tr><th>Long chains through other objects’ internals</th><td>A change deep in one class breaks distant callers</td><td>Ask the nearest object to do the work</td></tr>
+<tr><th>Treating the principles as a checklist to maximize</th><td>Indirection without benefit</td><td>Apply each where its problem has appeared</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="oop-in-typescript"></x-ref>: encapsulation, interfaces, polymorphism and composition, which these principles build on.</li>
+  <li><x-ref to="api-styles"></x-ref>: the same advice about small, stable interfaces, applied between services.</li>
+  <li><x-ref to="creational-patterns"></x-ref>, <x-ref to="structural-patterns"></x-ref> and <x-ref to="behavioral-patterns"></x-ref>: named solutions that apply these principles to recurring problems.</li>
+  <li><x-ref to="application-architecture"></x-ref>: dependency inversion at the scale of a whole application.</li>
+  <li><x-ref to="errors-and-testing"></x-ref>: dependency injection and test doubles.</li>
+  <li><x-ref to="monoliths-and-microservices"></x-ref>: coupling and cohesion between services.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Principles exist to keep change cheap. Each one targets a specific way that code becomes hard to change.</li>
+  <li>Single responsibility: group code by who asks for it to change, and separate what answers to different people.</li>
+  <li>Open/closed: where the same kind of variation keeps arriving, make it something you add and not something you edit.</li>
+  <li>Liskov substitution: a subtype must keep every promise of its supertype. A method that only throws is a broken promise.</li>
+  <li>Interface segregation: design interfaces from the caller’s needs, small and named for a role.</li>
+  <li>Dependency inversion: business rules declare the interfaces they need and receive implementations from outside. One place assembles the real objects.</li>
+  <li>DRY is about knowledge, not similar text. KISS and YAGNI say to solve the problem you have.</li>
+  <li>The Law of Demeter: ask the nearest object, and do not reach through it.</li>
+  <li>Every principle has a cost in indirection. Apply one when its problem has shown up, not before.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>An <code>Invoice</code> class calculates tax, renders a PDF and writes itself to the database. Which principle does it strain, and how would you decide where to split it?</summary><p>Single responsibility. Ask who would request each change: tax rules come from finance or the law, the PDF layout from design or customers, and persistence from the engineers who run the database. Those are three reasons to change, so three pieces: a calculation, a renderer and a repository. If in practice only one person ever touches all three together, the split is less urgent.</p></details>
+<details><summary>A function computes shipping cost with a <code>switch</code> over five carriers. Is that a violation of the open/closed principle?</summary><p>Not by itself. One switch in one place is simple and easy to read. It becomes a problem when carriers are added regularly and the same switch appears in several functions, such as cost, tracking link and label format, so that each new carrier means editing all of them. At that point a <code>Carrier</code> interface with one object for each carrier turns the change into an addition.</p></details>
+<details><summary><code>ReadOnlyList</code> extends <code>List</code> and overrides <code>add</code> to throw. A function that accepts a <code>List</code> and appends to it receives one. What principle is broken, by which class, and what is the fix?</summary><p>Liskov substitution, by <code>ReadOnlyList</code>: it claims to be a list and cannot keep the promise that <code>add</code> works. The function is not at fault. The fix is to make the promise smaller: a <code>ReadableList</code> interface with only the reading methods, which both kinds implement, and a separate interface for writing. Functions then ask for exactly what they need, and passing a read-only list where writing is required fails at compile time.</p></details>
+<details><summary>Why did the test for a function taking the four-method <code>MediaTools</code> need three stubs that throw, and why does that matter beyond the test?</summary><p>Because the parameter type demanded all four methods although the function uses one. The test is the first caller to feel it, and every real implementation feels it too: a library that can resize but not transcode video must still provide something for <code>transcodeVideo</code>. A change to any of the four methods also forces a recompile and review of code that never called it. Asking for a <code>Resizer</code> removes all three costs.</p></details>
+<details><summary>What is the difference between dependency inversion and dependency injection?</summary><p>Dependency inversion is a principle about direction: important policy code should depend on abstractions it defines, and detail code should conform to them. Dependency injection is a technique: an object is given its collaborators from outside instead of constructing them. Injection is the usual way to achieve inversion, but you can inject a concrete class and gain testability without inverting anything, and the principle says nothing about frameworks or containers.</p></details>
+<details><summary>Two functions, one validating album titles and one validating display names, contain identical code. Should they be merged under DRY?</summary><p>Only if they represent the same piece of knowledge, meaning that a change to one rule must always be a change to the other. Here they are separate decisions that happen to coincide, so merging couples them: the day display names are allowed emoji and album titles are not, the shared function grows a flag. Leave them separate, or share a small helper for the mechanical part, such as measuring length.</p></details>
+<details><summary>Rewrite <code>order.customer.wallet.balance >= order.total</code> to follow the Law of Demeter, and say what was gained.</summary><p>Ask the order: <code>order.canBePaid()</code>, which asks its customer <code>canPay(total)</code>, which asks its wallet <code>covers(amount)</code>. The caller now depends only on <code>Order</code>. The customer can change how it holds money, to several wallets or a credit line, without any caller of the order being edited. The check also has one home, so it cannot be written slightly differently in ten places.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Robert C. Martin, <cite>Agile Software Development: Principles, Patterns, and Practices</cite>, Prentice Hall, 2002, which collects the five principles, and <cite>Clean Architecture</cite>, Prentice Hall, 2017, which restates single responsibility in terms of the people who ask for changes.</li>
+  <li>Barbara Liskov and Jeannette Wing, “A Behavioral Notion of Subtyping”, <cite>ACM Transactions on Programming Languages and Systems</cite>, 1994.</li>
+  <li>Bertrand Meyer, <cite>Object-Oriented Software Construction</cite>, Prentice Hall, 1988. The original statement of the open/closed principle.</li>
+  <li>Andrew Hunt and David Thomas, <cite>The Pragmatic Programmer</cite>, 20th anniversary edition, Addison-Wesley, 2019. The source of DRY.</li>
+  <li>Karl Lieberherr and Ian Holland, “Assuring Good Style for Object-Oriented Programs”, <cite>IEEE Software</cite>, 1989. The Law of Demeter.</li>
+  <li>Sandi Metz, <a href="https://sandimetz.com/blog/2016/1/20/the-wrong-abstraction">The Wrong Abstraction</a>, 2016.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/bliki/Yagni.html">Yagni</a>, 2015. The costs of building for a presumed need.</li>
+</ol>
+</section>

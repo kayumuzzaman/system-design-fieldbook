@@ -1,0 +1,602 @@
+<!--meta
+{ "description": "OAuth 2.0, OpenID Connect and single sign-on explained for system design: the authorization code flow with PKCE, scopes and what an API must check, access token lifetimes, where a web application should keep its tokens, ID tokens, SAML and SCIM, API keys, workload identity, and carrying a user’s identity between services.",
+  "lede": "The previous chapter was about one system and its own users. This one is about what happens when identity has to cross a boundary: another application wants access to a user’s data, your application wants to accept a sign-in performed somewhere else, a company wants one sign-in for everything, or the caller is a program with no person behind it. One idea covers all four: a trusted issuer hands out signed statements that are limited in what they allow and in how long they last.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="problem">Identity across a boundary</h2>
+<p>The photo app can now sign Ana in and remember her (<x-ref to="authentication"></x-ref>). Four further demands arrive as soon as the product meets the rest of the world.</p>
+<table>
+<thead><tr><th>Situation</th><th>What is needed</th><th>Answered by</th></tr></thead>
+<tbody>
+<tr><th>A printing service wants to read Ana’s photos</th><td>Limited access to her data, without her password</td><td>OAuth 2.0</td></tr>
+<tr><th>Ben would like to sign in with the account he already has elsewhere</th><td>A trustworthy statement of who signed in, from another system</td><td>OpenID Connect</td></tr>
+<tr><th>A company buys the photo app for its staff</th><td>One sign-in, controlled by the company, for every application</td><td>Single sign-on</td></tr>
+<tr><th>A partner’s server, and your own services, call the API</th><td>An identity for a program</td><td>API keys, certificates, workload identity</td></tr>
+</tbody>
+</table>
+<p>All four rest on the same mechanism. Somebody both sides trust, an <em>issuer</em>, checks the caller once and hands over a token: a statement of who or what the holder is and what it may do, signed so that it cannot be altered, and short-lived so that a stolen copy soon stops working. The protocols in this chapter differ mainly in who the issuer is and who reads the token.</p>
+
+<h2 id="oauth">OAuth 2.0: access without the password</h2>
+<p>Ana wants a printing service, Printly, to make a book from her photos. The worst design is the one that was once common: Printly asks for her photo app password and signs in as her. Printly could then do anything Ana can, forever, and the only way to stop it would be to change the password, which also cuts off every other service she gave it to.</p>
+<p><dfn>OAuth 2.0</dfn> is the standard protocol for letting one application act on a user’s resources in another, with the user’s consent and without the user’s password. It names four parties.</p>
+<table>
+<thead><tr><th>Role</th><th>In this example</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><th>Resource owner</th><td>Ana</td><td>Owns the data and gives consent</td></tr>
+<tr><th>Client</th><td>Printly</td><td>Wants access</td></tr>
+<tr><th>Authorization server</th><td>The photo app’s sign-in service</td><td>Authenticates Ana, asks her, and issues tokens</td></tr>
+<tr><th>Resource server</th><td>The photo app’s API</td><td>Holds the data and accepts tokens</td></tr>
+</tbody>
+</table>
+<p>What Printly receives is an access token limited by a <dfn>scope</dfn>: a named permission, such as <code>photos:read</code>, that the user approved and the API enforces. The recommended way to obtain it is the authorization code flow.</p>
+
+<figure class="fig wide" id="fig-oauth">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 348" role="img" aria-labelledby="f521t f521d">
+<title id="f521t">The OAuth authorization code flow with PKCE</title>
+<desc id="f521d">A sequence between Ana’s browser, a printing service called Printly, the photo app’s authorization server and the photo app’s API. Ana asks Printly to print her photos. Printly redirects her browser to the authorization server with its client identifier, the scope photos:read and a code challenge. Ana signs in there and approves. The authorization server redirects her browser back to Printly with a one-time code. Printly exchanges the code for tokens in a direct call to the authorization server, sending the code verifier that matches the challenge. It receives an access token limited to reading photos for fifteen minutes, calls the API with it and receives the photos. Printly never sees Ana’s password.</desc>
+<text class="tb mid" x="80" y="20">Ana’s browser</text>
+<line class="axis" x1="80" y1="28" x2="80" y2="320"/>
+<text class="tb mid" x="270" y="20">Printly</text>
+<line class="axis" x1="270" y1="28" x2="270" y2="320"/>
+<text class="tb mid" x="470" y="20">Authorization server</text>
+<line class="axis" x1="470" y1="28" x2="470" y2="320"/>
+<text class="tb mid" x="660" y="20">Photos API</text>
+<line class="axis" x1="660" y1="28" x2="660" y2="320"/>
+<g data-s="1">
+<path class="e sig" d="M81 54H269"/>
+<text class="ts mid" x="175.0" y="48">1. print my photos</text>
+</g>
+<g data-s="2">
+<path class="e" d="M269 82H81"/>
+<text class="ts mid" x="175.0" y="76">2. redirect to the photo app</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M81 110H469"/>
+<text class="ts mid" x="275.0" y="104">authorize? client, scope, challenge</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M81 138H469"/>
+<text class="ts mid" x="275.0" y="132">3. Ana signs in and approves</text>
+</g>
+<g data-s="4">
+<path class="e" d="M469 166H81"/>
+<text class="ts mid" x="275.0" y="160">4. redirect back, with a code</text>
+</g>
+<g data-s="4">
+<path class="e" d="M81 194H269"/>
+<text class="ts mid" x="175.0" y="188">the one-time code</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M271 222H469"/>
+<text class="ts mid" x="370.0" y="216">5. POST /token: code and verifier</text>
+</g>
+<g data-s="6">
+<path class="e" d="M469 250H271"/>
+<text class="ts mid" x="370.0" y="244">6. access token, 15 minutes</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M271 278H659"/>
+<text class="ts mid" x="465.0" y="272">7. GET /photos with the token</text>
+</g>
+<g data-s="8">
+<path class="e store" d="M659 306H271"/>
+<text class="ts mid" x="465.0" y="300">8. Ana’s photos</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Printly holds: nothing; Ana’s password seen by: nobody yet">Ana asks Printly, a printing service, to fetch her pictures from the photo app. Printly needs permission, and must never learn her password.</li>
+  <li data-msg="redirect|scope photos:read, challenge">Printly redirects her browser to the photo app’s authorization server. The address says who is asking, what for, and carries a challenge: the hash of a secret Printly has just made up.</li>
+  <li data-msg="sign-in, approval" data-state="Printly holds: nothing; Ana’s password seen by: the authorization server only">Ana signs in on the photo app’s own page and is asked whether Printly may read her photos. Her password goes here and nowhere else.</li>
+  <li data-msg="code|code" data-state="Printly holds: a one-time code; Ana’s password seen by: the authorization server only">The server redirects her browser back to Printly with a code that works once and expires within minutes. A code alone is useless to anyone who intercepts it.</li>
+  <li data-msg="code, verifier">Printly exchanges the code in a direct call, server to server, and reveals the secret behind the challenge. Only the party that started the flow can do that.</li>
+  <li data-msg="access token" data-state="Printly holds: a token: read photos, 15 minutes; Ana’s password seen by: the authorization server only">The server hashes the verifier, compares it with the challenge it kept, and issues an access token limited to what Ana approved.</li>
+  <li data-msg="GET /photos, token">Printly calls the API and presents the token.</li>
+  <li data-msg="photos">The API checks the token’s signature, audience, expiry and scope, and returns the photos. It can refuse anything outside the scope, such as deleting one.</li>
+</ol>
+<figcaption>The password stays with the party that issued it. Everyone else receives a token that says what it allows, for whom, and until when.</figcaption>
+</figure>
+
+<p>The flow uses two channels on purpose. The <dfn>front channel</dfn> is the user’s browser being redirected from one site to the other. It is the only way to involve the user, and it leaks: addresses end up in browser history, in logs and in referrer headers. So only a short-lived, single-use code travels that way. The <dfn>back channel</dfn> is a direct call from Printly’s server to the authorization server, and tokens travel only there.</p>
+<p>One gap remains. On a phone, a malicious app can sometimes arrange to receive the redirect meant for the real app, and with it the code. <dfn>PKCE</dfn>, pronounced “pixy” and short for Proof Key for Code Exchange, closes it. The client invents a random secret at the start, sends only its hash with the first request, and must present the secret itself when it exchanges the code. An intercepted code is useless without it.</p>
+
+<pre data-lang="ts" data-title="PKCE: three functions">
+import { createHash, randomBytes } from "node:crypto";
+
+export function createVerifier(): string {
+  return randomBytes(32).toString("base64url"); // 43 characters, kept by the app
+}
+
+export function challengeFor(verifier: string): string {
+  return createHash("sha256").update(verifier).digest("base64url"); // sent in the first request
+}
+
+// On the authorization server, when the code is exchanged:
+export function verifierMatches(verifier: string, storedChallenge: string): boolean {
+  return challengeFor(verifier) === storedChallenge;
+}
+</pre>
+<p>PKCE began as a fix for mobile apps and is now expected of every client. The OAuth security best practice published as RFC 9700 in 2025 requires it for clients that cannot keep a secret, recommends it for the rest, and requires authorization servers to compare redirect addresses exactly, character for character. OAuth 2.1, which gathers these rules into one document, was still an Internet-Draft when this chapter was written.</p>
+<table>
+<thead><tr><th>Flow</th><th>Who uses it</th><th>Status</th></tr></thead>
+<tbody>
+<tr><th>Authorization code with PKCE</th><td>Web apps, single-page apps and mobile apps acting for a user</td><td>The default</td></tr>
+<tr><th>Client credentials</th><td>A service calling another on its own behalf, with no user</td><td>Current</td></tr>
+<tr><th>Device authorization</th><td>Televisions and command-line tools: “go to this address on your phone and enter this code”</td><td>Current</td></tr>
+<tr><th>Refresh token</th><td>Any client renewing an access token</td><td>Current, with rotation (<x-ref to="authentication#revocation"></x-ref>)</td></tr>
+<tr><th>Implicit</th><td>Older single-page apps: the token came back in the address itself</td><td>Do not use</td></tr>
+<tr><th>Resource owner password</th><td>The client collects the password and forwards it</td><td>Do not use. It is the problem OAuth exists to solve</td></tr>
+</tbody>
+</table>
+
+<h3 id="scopes">What the API must check</h3>
+<p>Issuing a token is half the protocol. The other half is the resource server refusing everything the token does not cover. The function below is what the photo API runs on every request. It builds on the token verifier from <x-ref to="authentication#tokens"></x-ref>.</p>
+<pre data-lang="ts" data-title="At the API: verify the token, then require the scope">
+import { verify, type Claims } from "./jwt";
+
+const EXPECT = { iss: "https://id.photos.example", aud: "photos-api" };
+
+// What the API does with every request that carries an access token.
+export function requireScope(authorization: string | undefined, needed: string, key: Buffer, now?: number): Claims {
+  const token = /^Bearer (.+)$/.exec(authorization ?? "")?.[1];
+  if (!token) throw new Error("401: no token");
+  const claims = verify(token, key, EXPECT, now); // signature, issuer, audience, expiry
+  const granted = String(claims.scope ?? "").split(" ");
+  if (!granted.includes(needed)) throw new Error(`403: token lacks ${needed}`);
+  return claims; // claims.sub is the user. What that user may do is a separate check.
+}
+</pre>
+<p>Three points about scopes are often misunderstood.</p>
+<ul>
+  <li><b>A scope limits the client, not the user.</b> <code>photos:read</code> says Printly may read photos on Ana’s behalf. Which photos Ana herself may read is a separate question, answered by the checks in <x-ref to="authorization"></x-ref>. A token never grants more than its user has.</li>
+  <li><b>Compare whole scope names.</b> Tested against the code above, a token carrying <code>photos:readonly</code> was refused when <code>photos:read</code> was required. A check written as “starts with” would have let it through.</li>
+  <li><b>Ask for little.</b> Users approve what they are shown. A client that asks for everything gets refused by careful users and becomes a larger loss when its tokens are stolen.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> Tokens held by third parties are part of your attack surface. Between 8 and 18 August 2025 an attacker used OAuth tokens stolen from Salesloft’s Drift integration to query the Salesforce data of hundreds of companies that had connected it, searching the results for cloud keys and passwords. No password or second factor was involved at any of those companies: the tokens were enough. Every Drift token was revoked on 20 August. Know which integrations hold tokens for your system, keep their scopes narrow, and be able to revoke all of one client’s tokens at once.</p></div>
+
+<h3 id="lifetimes">How long should a token live?</h3>
+<p>A short access token limits what a thief gets and how long a revoked user keeps access. A long one spares the authorization server work. The calculator shows the trade for a service with 100,000 clients connected at once, each making 20 requests a minute, and a 15-minute access token.</p>
+
+<div class="widget" data-widget="tokenlife">
+<h4>Access token lifetime</h4>
+<p>The load that renewing tokens puts on the issuer, against how long a revoked token keeps working.</p>
+<div class="controls">
+  <label>Clients connected at once<input type="number" name="clients" value="100000" min="1" max="1000000000" step="1"></label>
+  <label>Access token lifetime, minutes<input type="number" name="lifetime" value="15" min="1" max="1440" step="1"></label>
+  <label>API requests per client per minute<input type="number" name="rpm" value="20" min="0.1" max="10000" step="0.1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 230" role="img" aria-label="Refresh requests a second at the issuer, falling as the access token lifetime grows. A dot marks the chosen lifetime."><line x1="64" x2="620" y1="20" y2="20" class="grid"></line><text x="56" y="24" class="ts end">1,670</text><line x1="64" x2="620" y1="103" y2="103" class="grid"></line><text x="56" y="107" class="ts end">833</text><line x1="64" x2="620" y1="186" y2="186" class="axis"></line><text x="56" y="190" class="ts end">0</text><text x="64" y="203" class="ts mid">1 min</text><text x="195.9" y="203" class="ts mid">15 min</text><text x="337.3" y="203" class="ts mid">30 min</text><text x="478.6" y="203" class="ts mid">45 min</text><text x="620" y="203" class="ts mid">60 min</text><text x="342" y="224" class="ts mid">Access token lifetime. The curve is refresh requests a second at the issuer.</text><path d="M64 20 L64 20.7 L64.2 22.7 L64.3 25.9 L64.6 30.2 L65 35.4 L65.4 41.3 L65.9 47.8 L66.5 54.5 L67.1 61.4 L67.9 68.2 L68.7 75 L69.6 81.6 L70.5 87.9 L71.6 93.9 L72.7 99.6 L73.9 105 L75.2 110 L76.5 114.7 L77.9 119 L79.4 123.1 L81 126.9 L82.7 130.4 L84.4 133.6 L86.2 136.6 L88.1 139.4 L90.1 142 L92.1 144.4 L94.3 146.6 L96.5 148.7 L98.8 150.6 L101.1 152.4 L103.5 154 L106 155.6 L108.6 157.1 L111.3 158.4 L114 159.7 L116.9 160.9 L119.8 162 L122.7 163 L125.8 164 L128.9 165 L132.1 165.8 L135.4 166.6 L138.8 167.4 L142.2 168.1 L145.7 168.8 L149.3 169.5 L153 170.1 L156.7 170.7 L160.5 171.2 L164.4 171.8 L168.4 172.3 L172.5 172.7 L176.6 173.2 L180.8 173.6 L185.1 174 L189.4 174.4 L193.9 174.8 L198.4 175.1 L203 175.5 L207.7 175.8 L212.4 176.1 L217.2 176.4 L222.2 176.7 L227.1 176.9 L232.2 177.2 L237.3 177.4 L242.5 177.7 L247.8 177.9 L253.2 178.1 L258.6 178.3 L264.2 178.5 L269.8 178.7 L275.4 178.9 L281.2 179.1 L287 179.3 L292.9 179.4 L298.9 179.6 L305 179.8 L311.1 179.9 L317.3 180 L323.6 180.2 L330 180.3 L336.4 180.5 L343 180.6 L349.6 180.7 L356.2 180.8 L363 180.9 L369.8 181 L376.8 181.1 L383.7 181.2 L390.8 181.3 L397.9 181.4 L405.2 181.5 L412.5 181.6 L419.8 181.7 L427.3 181.8 L434.8 181.9 L442.4 182 L450.1 182 L457.9 182.1 L465.7 182.2 L473.6 182.3 L481.6 182.3 L489.7 182.4 L497.8 182.5 L506.1 182.5 L514.4 182.6 L522.7 182.7 L531.2 182.7 L539.7 182.8 L548.3 182.8 L557 182.9 L565.8 182.9 L574.6 183 L583.6 183 L592.5 183.1 L601.6 183.1 L610.8 183.2 L620 183.2" class="line"></path><line x1="195.9" x2="195.9" y1="174.9" y2="186" class="e none dash"></line><circle cx="195.9" cy="174.9" r="5.5" class="dot"></circle><text x="205.9" y="146.9" class="tb">111 refreshes a second</text><text x="205.9" y="162.9" class="ts">a revoked token works for up to 15 min</text></svg>
+<dl class="results">
+  <div><dt>Refreshes per second at the issuer</dt><dd data-out="refresh">111</dd></div>
+  <div><dt>API requests per second</dt><dd data-out="requests">33.3 thousand</dd></div>
+  <div><dt>Requests served by one token</dt><dd data-out="pertoken">300</dd></div>
+  <div><dt>A revoked token works for up to</dt><dd data-out="exposure">15 min</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">With 100 thousand clients and an access token that lives for 15 min, the issuer handles 111 refreshes a second, and each token serves about 300 API requests with no lookup. Checking a server-side session on every request would mean 33.3 thousand lookups a second. The price is that a token revoked at the issuer keeps working for up to 15 min. Between five minutes and an hour is the usual range.</p>
+</div>
+
+<p>The curve is steep at the left and nearly flat at the right. Shortening a token from an hour to fifteen minutes costs little. Shortening it from five minutes to one multiplies the issuer’s load by five and makes the issuer something every request soon depends on, which is the property tokens were chosen to avoid.</p>
+<p>Two refinements exist for cases where a bearer token is not good enough. An API can ask the authorization server about each token instead of verifying it locally, called introspection, which restores instant revocation at the price of a call per request. And a token can be bound to a key held by the client, so that a stolen copy is useless without the key. Both are worth knowing by name and are rarely the first thing to reach for.</p>
+
+<h2 id="browser">Where a web application keeps its tokens</h2>
+<p>A server can keep a secret. A page running in a browser cannot: anything the page’s own code can read, a script injected into the page can read too (<x-ref to="threats-and-defenses"></x-ref>). The IETF’s best practice for browser-based applications, published as RFC 10017 in August 2026, describes three architectures and ranks them by what such a script can get.</p>
+
+<figure class="fig wide" id="fig-patterns">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 276" role="img" aria-labelledby="f522t f522d">
+<title id="f522t">Three places a web application can keep its tokens</title>
+<desc id="f522d">Three columns, each showing a browser, a backend and an API. In a browser-based client the browser holds the access token and the refresh token and calls the API itself, and there is no backend. With a token-mediating backend, the backend holds the refresh token, the browser holds the access token and calls the API itself. With a backend for frontend, the backend holds both tokens and calls the API, and the browser holds only a session cookie. Under each column is what a script injected into the page can do: take both tokens and keep renewing them, take the access token until it expires, or send requests while the page is open and take nothing away.</desc>
+<text class="tb" x="10" y="18">Browser-based client</text>
+<rect class="n fault" x="10" y="30" width="220" height="60" rx="6"/>
+<text class="tb mid" x="120" y="47.5">Browser</text>
+<text class="ts mid" x="120" y="64.5">holds the access token</text>
+<text class="ts mid" x="120" y="81.5">and the refresh token</text>
+<rect class="n ghost" x="10" y="104" width="220" height="46" rx="6"/>
+<text class="ts mid" x="120" y="131.5">no backend</text>
+<rect class="n" x="10" y="164" width="220" height="42" rx="6"/>
+<text class="tb mid" x="120" y="181">API</text>
+<text class="ts mid" x="120" y="198">called by the browser</text>
+<text class="ts" x="10" y="230">A script injected into the page can</text>
+<text class="ts" x="10" y="246">take both tokens and go on</text>
+<text class="ts" x="10" y="262">renewing them from elsewhere.</text>
+<text class="tb" x="250" y="18">Token-mediating backend</text>
+<rect class="n fault" x="250" y="30" width="220" height="60" rx="6"/>
+<text class="tb mid" x="360" y="56">Browser</text>
+<text class="ts mid" x="360" y="73">holds the access token</text>
+<rect class="n store" x="250" y="104" width="220" height="46" rx="6"/>
+<text class="tb mid" x="360" y="123">Backend</text>
+<text class="ts mid" x="360" y="140">holds the refresh token</text>
+<rect class="n" x="250" y="164" width="220" height="42" rx="6"/>
+<text class="tb mid" x="360" y="181">API</text>
+<text class="ts mid" x="360" y="198">called by the browser</text>
+<text class="ts" x="250" y="230">An injected script can take the</text>
+<text class="ts" x="250" y="246">access token and use it elsewhere</text>
+<text class="ts" x="250" y="262">until it expires.</text>
+<text class="tb" x="490" y="18">Backend for frontend</text>
+<rect class="n store" x="490" y="30" width="220" height="60" rx="6"/>
+<text class="tb mid" x="600" y="47.5">Browser</text>
+<text class="ts mid" x="600" y="64.5">holds a session cookie</text>
+<text class="ts mid" x="600" y="81.5">and no tokens</text>
+<rect class="n store" x="490" y="104" width="220" height="46" rx="6"/>
+<text class="tb mid" x="600" y="123">Backend</text>
+<text class="ts mid" x="600" y="140">holds both tokens</text>
+<rect class="n" x="490" y="164" width="220" height="42" rx="6"/>
+<text class="tb mid" x="600" y="181">API</text>
+<text class="ts mid" x="600" y="198">called by the backend</text>
+<text class="ts" x="490" y="230">An injected script can send requests</text>
+<text class="ts" x="490" y="246">while the page is open. It can take</text>
+<text class="ts" x="490" y="262">nothing away with it.</text>
+</svg>
+</div>
+<figcaption>The same application, built three ways. Moving the tokens out of the browser changes what a successful script injection is worth to the attacker.</figcaption>
+</figure>
+
+<p>A <dfn>backend for frontend</dfn> is a server-side component belonging to one web application that holds the tokens, runs the OAuth flow as a client able to keep a secret, and calls APIs on the browser’s behalf. The browser holds only a session cookie with the attributes described in <x-ref to="authentication#cookies"></x-ref>. RFC 10017 strongly recommends this pattern for business applications and anything handling personal data.</p>
+<table>
+<thead><tr><th>Client</th><th>Recommended arrangement</th></tr></thead>
+<tbody>
+<tr><th>Web application with a backend</th><td>Backend for frontend. Tokens never reach the browser</td></tr>
+<tr><th>Single-page app with no backend of its own</th><td>Authorization code with PKCE in the browser, tokens kept in memory, short lifetimes, refresh tokens that rotate. Accept that it is the weakest of the three</td></tr>
+<tr><th>Mobile app</th><td>Authorization code with PKCE through the system browser, never an embedded web view, so the app cannot see the password. Tokens in the platform’s secure storage</td></tr>
+<tr><th>Command-line tool or television</th><td>Device authorization</td></tr>
+</tbody>
+</table>
+
+<h2 id="oidc">OpenID Connect: signing in with another account</h2>
+<p>OAuth answers “what may this application do?”. It was not designed to answer “who just signed in?”, and using it for that has caused real vulnerabilities. An access token says what its holder may do. It does not say that the person in front of this browser is the person it was issued for, and it is addressed to the API, not to the application.</p>
+<p><dfn>OpenID Connect</dfn>, or OIDC, is a thin layer on top of OAuth 2.0 that adds exactly that missing statement. It stands behind every “Sign in with Google” or “Sign in with Apple” button. The flow is the same authorization code flow, with the scope <code>openid</code>, and the token response contains one more item.</p>
+<p>An <dfn>ID token</dfn> is a signed token, addressed to the client application, that says which user authenticated, with which provider, when and how.</p>
+<pre data-lang="text" data-title="The claims in an ID token, decoded">
+{
+  "iss": "https://accounts.example",      who vouches for this
+  "sub": "110169484474386276334",         the user, as the provider knows them: stable and never reused
+  "aud": "photos-web",                    the application this token is for
+  "exp": 1800000600,  "iat": 1800000000,  valid for ten minutes
+  "nonce": "n-0S6_WzA2Mj",                the random value this application sent with its request
+  "auth_time": 1799999990,                when the user actually signed in
+  "amr": ["hwk", "user"],                 how: a hardware-backed key, with the user present
+  "email": "ben@example.net",  "email_verified": true
+}
+</pre>
+<table>
+<thead><tr><th>Token</th><th>Audience</th><th>Says</th><th>Send it to</th></tr></thead>
+<tbody>
+<tr><th>ID token</th><td>The application that asked for the sign-in</td><td>Who signed in, when, and by what method</td><td>Nobody. Verify it, read it, start your own session</td></tr>
+<tr><th>Access token</th><td>An API</td><td>What the holder may do there</td><td>That API only</td></tr>
+<tr><th>Refresh token</th><td>The authorization server</td><td>Nothing readable</td><td>The authorization server only</td></tr>
+</tbody>
+</table>
+<p>Three details save trouble later.</p>
+<ul>
+  <li><b>Identify the user by issuer and subject.</b> Store the pair of <code>iss</code> and <code>sub</code>. Do not key accounts on the email address: addresses change hands, and a provider may return one the user never verified.</li>
+  <li><b>Check the <code>nonce</code>.</b> The application invents it, stores it with the browser’s session, and refuses an ID token that does not carry it back. That ties the token to the sign-in this browser started.</li>
+  <li><b>Use discovery.</b> A provider publishes its endpoints and signing keys at a well-known address under its domain. Libraries read it and follow key changes automatically. Do not copy keys into configuration by hand.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> A token is only as trustworthy as the issuer’s signing key and the care taken in checking which key signed it. In 2023 an attacker obtained a signing key belonging to Microsoft’s consumer account system and used it to forge tokens for the email of about 25 organizations, government agencies among them. The forgeries worked because of a second fault: a validation error let a key meant only for consumer accounts be accepted for enterprise ones. Keep signing keys in hardware, rotate them, and make every verifier pin down exactly which issuer and which keys it accepts.</p></div>
+
+<h2 id="sso">Single sign-on</h2>
+<p>A company with forty internal applications does not want forty passwords per employee, forty places to add a second factor, and forty accounts to remember to close when someone leaves.</p>
+<p><dfn>Single sign-on</dfn>, or SSO, is an arrangement in which applications hand authentication to one shared service and accept its signed statement about who the user is. That service is the <dfn>identity provider</dfn>. The applications that trust it are called relying parties or service providers.</p>
+
+<figure class="fig wide" id="fig-sso">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f523t f523d">
+<title id="f523t">Single sign-on: one identity provider trusted by several applications</title>
+<desc id="f523d">Ana signs in once, with a passkey, at her company’s identity provider. Three applications, mail, wiki and payroll, each redirect to the identity provider when she arrives and receive a signed statement saying who she is. None of them stores a password. Disabling her account at the identity provider closes all three.</desc>
+<rect class="n" x="10" y="70" width="120" height="50" rx="6"/>
+<text class="tb mid" x="70" y="91">Ana</text>
+<text class="ts mid" x="70" y="108">one sign-in</text>
+<path class="e sig" d="M130 95H228"/>
+<text class="ts mid" x="179" y="88">passkey</text>
+<rect class="n sig" x="230" y="56" width="200" height="78" rx="6"/>
+<text class="tb mid" x="330" y="82.5">Identity provider</text>
+<text class="ts mid" x="330" y="99.5">holds the accounts,</text>
+<text class="ts mid" x="330" y="116.5">the factors and the session</text>
+<rect class="n" x="560" y="20" width="150" height="42" rx="6"/>
+<text class="tb mid" x="635" y="37">Mail</text>
+<text class="ts mid" x="635" y="54">stores no password</text>
+<path class="e store" d="M430 81C490 81 500 41 558 41"/>
+<rect class="n" x="560" y="76" width="150" height="42" rx="6"/>
+<text class="tb mid" x="635" y="93">Wiki</text>
+<text class="ts mid" x="635" y="110">stores no password</text>
+<path class="e store" d="M430 95C490 95 500 97 558 97"/>
+<rect class="n" x="560" y="132" width="150" height="42" rx="6"/>
+<text class="tb mid" x="635" y="149">Payroll</text>
+<text class="ts mid" x="635" y="166">stores no password</text>
+<path class="e store" d="M430 109C490 109 500 153 558 153"/>
+<text class="ts mid" x="495" y="14">signed statement: “this is Ana”</text>
+<text class="ts" x="10" y="198">Each application trusts the provider’s signature and keeps no credential of its own. Adding a second factor, or closing</text>
+<text class="ts" x="10" y="214">an account when someone leaves, is done once, in one place. The provider also becomes the one door worth attacking.</text>
+</svg>
+</div>
+<figcaption>Single sign-on moves every password out of the applications and into one system that can be defended properly.</figcaption>
+</figure>
+
+<p>What makes it <em>single</em> is the provider’s own session. The first application of the day causes a sign-in. Every later one gets its answer without the user doing anything.</p>
+
+<figure class="fig wide" id="fig-sso-flow">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 524" role="img" aria-labelledby="f524t f524d">
+<title id="f524t">Single sign-on: the first application asks Ana to sign in, the second does not</title>
+<desc id="f524d">Two sequences. In the first, Ana opens the wiki, which redirects her browser to the identity provider. She signs in there with her passkey, is redirected back with a code, and the wiki starts its own session for her. In the second, an hour later, she opens payroll, which redirects her to the same provider. The provider already has a session for her browser, so it redirects her straight back without asking anything, and payroll starts its own session.</desc>
+<text class="tb" x="10" y="16">The first application</text>
+<g data-scene="first">
+<text class="tb mid" x="110" y="36">Ana’s browser</text>
+<line class="axis" x1="110" y1="44" x2="110" y2="246"/>
+<text class="tb mid" x="360" y="36">Wiki</text>
+<line class="axis" x1="360" y1="44" x2="360" y2="246"/>
+<text class="tb mid" x="610" y="36">Identity provider</text>
+<line class="axis" x1="610" y1="44" x2="610" y2="246"/>
+<g data-s="1">
+<path class="e sig" d="M111 70H359"/>
+<text class="ts mid" x="235.0" y="64">1. open the wiki</text>
+</g>
+<g data-s="2">
+<path class="e" d="M359 97H111"/>
+<text class="ts mid" x="235.0" y="91">2. redirect to the provider</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M111 124H609"/>
+<text class="ts mid" x="360.0" y="118">who is this? asked by the wiki</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M111 151H609"/>
+<text class="ts mid" x="360.0" y="145">3. Ana signs in with her passkey</text>
+</g>
+<g data-s="4">
+<path class="e" d="M609 178H111"/>
+<text class="ts mid" x="360.0" y="172">4. redirect back, with a code</text>
+</g>
+<g data-s="4">
+<path class="e" d="M111 205H359"/>
+<text class="ts mid" x="235.0" y="199">the one-time code</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n store" x="144.9" y="218" width="207.1" height="22" rx="4"/>
+<text class="ts mid" x="248.45" y="233">5. start a wiki session for Ana</text>
+</g>
+</g>
+<path class="e none dash" d="M10 262H710"/>
+<text class="tb" x="10" y="282">The second application, an hour later</text>
+<g data-scene="second">
+<text class="tb mid" x="110" y="302">Ana’s browser</text>
+<line class="axis" x1="110" y1="310" x2="110" y2="512"/>
+<text class="tb mid" x="360" y="302">Payroll</text>
+<line class="axis" x1="360" y1="310" x2="360" y2="512"/>
+<text class="tb mid" x="610" y="302">Identity provider</text>
+<line class="axis" x1="610" y1="310" x2="610" y2="512"/>
+<g data-s="1">
+<path class="e sig" d="M111 336H359"/>
+<text class="ts mid" x="235.0" y="330">1. open payroll</text>
+</g>
+<g data-s="2">
+<path class="e" d="M359 363H111"/>
+<text class="ts mid" x="235.0" y="357">2. redirect to the provider</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M111 390H609"/>
+<text class="ts mid" x="360.0" y="384">who is this? asked by payroll</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n store" x="394.9" y="403" width="207.1" height="22" rx="4"/>
+<text class="ts mid" x="498.45" y="418">3. already signed in: no prompt</text>
+</g>
+<g data-s="4">
+<path class="e" d="M609 444H111"/>
+<text class="ts mid" x="360.0" y="438">4. redirect back, with a code</text>
+</g>
+<g data-s="4">
+<path class="e" d="M111 471H359"/>
+<text class="ts mid" x="235.0" y="465">the one-time code</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n store" x="126.6" y="484" width="225.4" height="22" rx="4"/>
+<text class="ts mid" x="239.3" y="499">5. start a payroll session for Ana</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="first" data-label="The first application">
+  <li data-state="Session at the identity provider: none; Ana is signed in to: nothing">Ana opens the wiki at the start of the day. It has no session for her.</li>
+  <li data-msg="redirect|who is this?">The wiki does not ask for a password. It redirects her browser to the company’s identity provider and says which application is asking.</li>
+  <li data-msg="passkey sign-in" data-state="Session at the identity provider: Ana, since 09:02; Ana is signed in to: nothing">The provider has no session for this browser either, so Ana signs in. This is the only time today that she will.</li>
+  <li data-msg="code|code">The provider redirects her back with a one-time code. The wiki exchanges it for a signed statement of who she is.</li>
+  <li data-msg="none" data-state="Session at the identity provider: Ana, since 09:02; Ana is signed in to: the wiki">The wiki verifies the statement and starts its own session. It never saw a credential.</li>
+</ol>
+<ol class="steps" data-scene="second" data-label="The second application">
+  <li data-state="Session at the identity provider: Ana, since 09:02; Ana is signed in to: the wiki">An hour later Ana opens payroll, which has never seen her.</li>
+  <li data-msg="redirect|provider’s session cookie">Payroll redirects her to the same provider. Her browser sends along the cookie for the session it already has there.</li>
+  <li data-msg="none">The provider recognizes its own session. Ana is not asked for anything.</li>
+  <li data-msg="code|code">It redirects her straight back with a code for payroll. The round trip takes a fraction of a second, and Ana sees only payroll opening.</li>
+  <li data-msg="none" data-state="Session at the identity provider: Ana, since 09:02; Ana is signed in to: the wiki and payroll">Payroll starts its own session. Closing Ana’s account at the provider would stop both applications from renewing theirs.</li>
+</ol>
+<figcaption>Single sign-on is the second half of this figure: an application that has never seen the user gets a signed answer without the user doing anything.</figcaption>
+</figure>
+
+<p>Two protocols carry the statement. OpenID Connect is the choice for anything built now. <dfn>SAML</dfn> 2.0 is an older standard, from 2005, that carries signed XML documents through the browser, and it is still what many large organizations require. A product sold to enterprises generally has to support both. They do the same job.</p>
+<table>
+<thead><tr><th>Question</th><th>What to know</th></tr></thead>
+<tbody>
+<tr><th>How are accounts created and removed?</th><td>A companion standard, <dfn>SCIM</dfn>, lets the identity provider create, update and deactivate accounts in each application. Without it, a departed employee’s account lingers until someone remembers</td></tr>
+<tr><th>What happens at sign-out?</th><td>The application’s own session ends easily. Ending the session in every other application at once is unreliable in practice, so keep application sessions short and let them renew silently from the provider</td></tr>
+<tr><th>What if the provider is down?</th><td>Nobody can sign in anywhere. Existing sessions keep working until they expire. It is a single point of failure that deserves the engineering of <x-ref to="availability-and-reliability"></x-ref></td></tr>
+<tr><th>What if the provider is breached?</th><td>Everything behind it is exposed. Concentrating the risk is still the right trade, because one well-defended system is easier to protect than forty</td></tr>
+</tbody>
+</table>
+<p>For a product with business customers, single sign-on is also a tenancy feature. Each customer brings its own identity provider, and the application must work out which provider to send a user to, usually from the domain of the email address, and map the returned identity to the right tenant and to no other (<x-ref to="multi-tenancy#context"></x-ref>).</p>
+
+<h2 id="service">When the caller is a program</h2>
+<p>Much of the traffic in a real system has no person behind it: a partner’s server calling your API, one of your services calling another, a scheduled job, a deployment pipeline. Programs cannot type passwords or touch a sensor.</p>
+<table>
+<thead><tr><th>Method</th><th>How it works</th><th>Use it for</th><th>Watch for</th></tr></thead>
+<tbody>
+<tr><th>API key</th><td>A long random string sent with each request</td><td>Customers and partners calling your public API</td><td>It never expires unless you make it, and it leaks</td></tr>
+<tr><th>OAuth client credentials</th><td>The caller exchanges its own identifier and secret for a short-lived access token</td><td>Server-to-server calls that should carry scopes and expire</td><td>The secret is still a long-lived secret</td></tr>
+<tr><th>Mutual TLS</th><td>Both ends of the connection present certificates</td><td>Service-to-service calls inside a platform (<x-ref to="service-communication#mtls"></x-ref>)</td><td>Certificates must be issued and rotated automatically</td></tr>
+<tr><th>Workload identity</th><td>The platform vouches for what is running and issues it short-lived credentials</td><td>Services, jobs and pipelines on a cloud or an orchestrator</td><td>You are trusting the platform’s statement</td></tr>
+</tbody>
+</table>
+<h3 id="api-keys">API keys</h3>
+<p>An <dfn>API key</dfn> is a long random secret, issued to a customer or a program, that identifies and authenticates the caller on every request. API keys are simple, which is why they are everywhere, and long-lived, which is why they leak. One survey found about 29 million secrets in public commits on GitHub during 2025, and that most of the valid ones it had found in 2022 were still working years later.</p>
+<pre data-lang="ts" data-title="Issuing an API key and checking one">
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+
+type StoredKey = { id: string; hash: Buffer; scopes: string[]; lastUsed?: Date };
+
+const sha256 = (text: string) => createHash("sha256").update(text).digest();
+
+// Called once, when the customer creates a key. The full key is shown to them and never stored.
+export function createApiKey(scopes: string[]): { key: string; stored: StoredKey } {
+  const id = randomBytes(6).toString("hex"); // public: appears in logs and in the dashboard
+  const secret = randomBytes(32).toString("base64url"); // 256 random bits
+  const key = `photos_live_${id}_${secret}`;
+  return { key, stored: { id, hash: sha256(key), scopes } };
+}
+
+// Called on every request. `find` looks a key up by its public id.
+export function checkApiKey(presented: string, find: (id: string) => StoredKey | undefined): StoredKey | null {
+  const match = /^photos_live_([0-9a-f]{12})_[A-Za-z0-9_-]{43}$/.exec(presented);
+  if (!match) return null;
+  const stored = find(match[1]);
+  if (!stored) return null;
+  // A fast hash is enough: the key is random, so there is nothing to guess.
+  return timingSafeEqual(sha256(presented), stored.hash) ? stored : null;
+}
+</pre>
+<p>The code shows three of the habits that limit the damage, and a fourth belongs around it.</p>
+<ul>
+  <li><b>Show the key once and store only its hash.</b> A key is long and random, so a single fast hash is enough. The slow hash of <x-ref to="authentication#passwords"></x-ref> is for secrets that people choose.</li>
+  <li><b>Give keys a recognizable prefix.</b> Support staff can tell what a key is, and automated scanners can find leaked ones in public code and report them.</li>
+  <li><b>Scope every key</b>, so that a key for uploads cannot delete, and a leaked key can be traced to one integration.</li>
+  <li><b>Make rotation painless</b>: allow two keys to be valid at once, show when each was last used, and let keys expire.</li>
+</ul>
+<h3 id="workload">No stored secret at all</h3>
+<p>The better direction is to have no long-lived secret. <dfn>Workload identity</dfn> means that a running program is given its identity by the platform that started it, as a short-lived credential that is replaced automatically, instead of holding a secret that somebody had to copy into it. A cloud platform does this for virtual machines and functions. Kubernetes does it for pods. A build pipeline can present a signed statement of which repository and branch it is running for, and a cloud account can be configured to trust that statement and nothing else. Nothing is stored in code or configuration, so there is nothing to leak. <x-ref to="cryptography-in-practice"></x-ref> returns to this under secrets management.</p>
+
+<h3 id="hops">The user’s identity between services</h3>
+<p>When a user’s request passes through several services, which identity do the inner calls carry? Both.</p>
+
+<figure class="fig wide" id="fig-hops">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 212" role="img" aria-labelledby="f525t f525d">
+<title id="f525t">Two identities on every hop of a request</title>
+<desc id="f525d">Ana’s phone calls the gateway, the gateway calls the photos service, and the photos service calls the tags service. On every hop the request carries the same access token for user 871, and each service verifies it again. Underneath, each connection identifies the calling service: ordinary TLS from the phone, then mutual TLS in which the gateway and the photos service each present their own certificate.</desc>
+<rect class="n" x="10" y="72" width="110" height="46" rx="6"/>
+<text class="tb mid" x="65" y="99.5">Ana’s phone</text>
+<rect class="n sig" x="207" y="72" width="110" height="46" rx="6"/>
+<text class="tb mid" x="262" y="99.5">Gateway</text>
+<rect class="n sig" x="403" y="72" width="110" height="46" rx="6"/>
+<text class="tb mid" x="458" y="99.5">Photos service</text>
+<rect class="n sig" x="600" y="72" width="110" height="46" rx="6"/>
+<text class="tb mid" x="655" y="99.5">Tags service</text>
+<path class="e sig" d="M121 95H206"/>
+<text class="ts mid" x="163.5" y="56">access token: user 871</text>
+<text class="ts mid" x="163.5" y="140">TLS: the server proves itself</text>
+<path class="e sig" d="M318 95H402"/>
+<text class="ts mid" x="360" y="56">the same token, verified again</text>
+<text class="ts mid" x="360" y="140">mTLS: I am the gateway</text>
+<path class="e sig" d="M514 95H599"/>
+<text class="ts mid" x="556.5" y="56">the same token, verified again</text>
+<text class="ts mid" x="556.5" y="140">mTLS: I am the photos service</text>
+<text class="tb" x="10" y="24">The request says which user it is for</text>
+<text class="tb" x="10" y="172">The connection says which service is calling</text>
+<text class="ts" x="10" y="192">A service that trusted either one alone could be fooled: by a stolen token arriving from an unknown machine,</text>
+<text class="ts" x="10" y="208">or by a compromised service claiming to act for any user it likes.</text>
+</svg>
+</div>
+<figcaption>Each service checks both the caller and the user for itself. Nothing is taken on trust from the hop before.</figcaption>
+</figure>
+
+<p>The gateway is the natural place to reject requests with no valid token at all (<x-ref to="proxies-and-load-balancers#api-gateway"></x-ref>), and it is not a reason for the services behind it to stop checking. A service that accepts “this is on behalf of user 871” from any caller on the internal network, without proof, has no authentication left once one service is compromised. That is the practical meaning of zero trust (<x-ref to="service-communication#mtls"></x-ref>).</p>
+<p>One refinement matters at scale. If the gateway forwards the user’s original token everywhere, every internal service holds a token that the public API would accept. Many systems instead have the gateway, or each service, exchange the incoming token for a new one addressed to the next service only, with a narrower scope and a short lifetime. A token captured deep inside the system then opens one door, briefly.</p>
+
+<h2 id="design">Choosing for a real system</h2>
+<p>For the photo app, the callers that are not a person at the app’s own sign-in page come out like this.</p>
+<table>
+<thead><tr><th>Caller</th><th>Proves identity with</th><th>Carried afterward as</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A user who prefers an existing account</th><td>OpenID Connect with two or three large providers</td><td>The photo app’s own session, keyed on issuer and subject</td><td>No new password to leak</td></tr>
+<tr><th>The web application</th><td>The user’s sign-in</td><td>A session cookie to a backend for frontend, which holds the tokens</td><td>Nothing for an injected script to steal</td></tr>
+<tr><th>A third party such as Printly</th><td>OAuth authorization code with PKCE, with the user’s consent</td><td>A 15-minute access token limited by scope, and a rotating refresh token</td><td>The password never leaves the photo app</td></tr>
+<tr><th>A partner’s server</th><td>An API key, or client credentials</td><td>The key itself, or a short-lived token</td><td>No user is involved</td></tr>
+<tr><th>One internal service calling another</th><td>Mutual TLS or workload identity</td><td>The connection, plus the user’s token verified at each hop</td><td>Every hop knows both the service and the user</td></tr>
+<tr><th>Staff using internal tools</th><td>The company identity provider, with a device-bound passkey</td><td>Short sessions in each tool</td><td>One place to add a factor or close an account</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Name the caller before the mechanism. “Third parties get scoped OAuth tokens, our own web app uses a session to a backend that holds the tokens, and services authenticate each other with mutual TLS and pass the user’s token along” covers most designs in one sentence. Expect a follow-up on revocation: say how long an access token lives and what deleting a refresh token does.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Asking users for their password to another service</th><td>Unlimited, irrevocable access, and users trained to hand passwords over</td><td>OAuth with the narrowest scope that works</td></tr>
+<tr><th>Authorization code flow without PKCE, or loose matching of redirect addresses</th><td>Codes intercepted or sent to an attacker’s address</td><td>PKCE for every client, and exact comparison</td></tr>
+<tr><th>Using an access token as proof of who signed in</th><td>A token issued to one application is accepted by another</td><td>OpenID Connect, and verify the ID token’s audience and nonce</td></tr>
+<tr><th>Keying accounts on an email address from a provider</th><td>Account takeover when an address is reassigned or unverified</td><td>Issuer and subject</td></tr>
+<tr><th>Tokens stored where page scripts can read them</th><td>Any injected script takes them</td><td>A backend for frontend and a session cookie</td></tr>
+<tr><th>Checking a scope by prefix, or not at all</th><td>Tokens do more than the user approved</td><td>Exact scope names, checked at the API on every request</td></tr>
+<tr><th>Single sign-on without automatic deprovisioning</th><td>Former employees keep working accounts</td><td>SCIM, and short application sessions</td></tr>
+<tr><th>Long-lived secrets in code or configuration</th><td>They leak, and keep working</td><td>Workload identity, or a secrets manager with rotation</td></tr>
+<tr><th>Trusting a user identifier passed between services</th><td>One compromised service can act as anyone</td><td>Pass the user’s token and verify it at each service</td></tr>
+<tr><th>No way to revoke one integration’s tokens</th><td>A breach at a partner becomes your breach for as long as it takes to notice</td><td>Tokens recorded per client, with one switch to revoke them</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="authentication"></x-ref>: sessions, tokens, refresh rotation and passkeys, which this chapter builds on.</li>
+  <li><x-ref to="proxies-and-load-balancers#api-gateway"></x-ref>: checking tokens at the edge.</li>
+  <li><x-ref to="service-communication"></x-ref>: mutual TLS and identity between services.</li>
+  <li><x-ref to="multi-tenancy"></x-ref>: mapping a signed-in user to a tenant.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: the identity provider as a dependency of everything.</li>
+  <li><x-ref to="authorization"></x-ref>: what the user may do, which a scope does not decide.</li>
+  <li><x-ref to="cryptography-in-practice"></x-ref>: signing keys, their rotation, and secrets management.</li>
+  <li><x-ref to="threats-and-defenses"></x-ref>: the script injection that makes token storage matter.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>OAuth 2.0 gives an application limited, revocable access to a user’s data without the user’s password. Use the authorization code flow with PKCE.</li>
+  <li>Only a single-use code crosses the browser. Tokens travel on a direct call between servers.</li>
+  <li>A scope limits what the client may do. The API must check it on every request, and what the user may do is a separate check.</li>
+  <li>Token lifetime trades load on the issuer against how long a revoked token works. Minutes, not days.</li>
+  <li>In a web application, keep tokens on a backend and give the browser a session cookie.</li>
+  <li>OpenID Connect adds an ID token: a signed statement, for the application, of who signed in. Identify users by issuer and subject.</li>
+  <li>Single sign-on moves authentication into one identity provider, which makes that provider both the best-defended and the most critical system you depend on.</li>
+  <li>Programs authenticate with keys, certificates or identities issued by the platform. Prefer credentials that expire by themselves to secrets that are stored.</li>
+  <li>Inside a system, every hop verifies two things for itself: which service is calling and which user the request is for.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does the authorization code flow return a code through the browser and not the access token itself?</summary><p>The browser redirect is a leaky channel: addresses are recorded in history, logs and referrer headers, and on a phone another app may receive the redirect. A code is single-use, expires within minutes and, with PKCE, is useless without the verifier that only the real client holds. The token is then delivered on a direct call between the client and the authorization server, where none of those leaks apply.</p></details>
+<details><summary>A mobile app starts the flow with a code challenge. An attacker’s app on the same phone intercepts the redirect and obtains the code. What happens when it tries to use it?</summary><p>The token request must include the code verifier whose hash equals the challenge sent at the start. The attacker’s app saw the code but never the verifier, which stayed in the real app’s memory, and it cannot be derived from the challenge. The authorization server refuses the exchange.</p></details>
+<details><summary>Printly holds a token with the scope <code>photos:read</code> for Ana. It requests a photo that belongs to Ben and is not shared with Ana. Which check refuses it?</summary><p>Not the scope check, which passes: the token does allow reading photos. The refusal comes from the API’s authorization check for the user in the token, Ana, against the photo requested. A scope limits what the client may do on the user’s behalf and can never grant more than the user has.</p></details>
+<details><summary>A service has 100,000 connected clients, each making 20 requests a minute, and 15-minute access tokens. How many refreshes a second does the issuer handle, and how does that compare with checking a session on every request?</summary><p>Each client refreshes once every 900 seconds, so the issuer sees about 111 refreshes a second. The API handles about 33,000 requests a second, so a session store would be consulted 300 times as often. The cost of the saving is that a revoked token keeps working for up to fifteen minutes.</p></details>
+<details><summary>An application lets users sign in with an external provider and links accounts by the email address in the ID token. Describe a way this goes wrong.</summary><p>If the provider returns an email address the user has not verified, an attacker can register there with the victim’s address and be signed in to the victim’s account. Addresses are also reassigned over time. The stable identifier is the pair of issuer and subject, and an email should be used for linking only when the provider states that it is verified, and preferably after the user confirms.</p></details>
+<details><summary>In a backend-for-frontend design, a script is injected into the page. What can it do, and what can it not do?</summary><p>It can make requests through the backend while the user has the page open, because the browser attaches the session cookie to them, so it can read or change what the user could. It cannot read the cookie, which is marked <code>HttpOnly</code>, and there are no tokens in the browser to copy. The attack ends when the page closes, and nothing reusable leaves with the attacker.</p></details>
+<details><summary>Why can an API key be stored as a fast hash when a password cannot?</summary><p>The slow hash exists because people choose from a small set of likely passwords, which makes guessing feasible. An API key is 256 bits from a random generator. No number of guesses per second covers a meaningful fraction of that space, so a single fast hash already prevents recovery, and it keeps the check on every request cheap.</p></details>
+<details><summary>The gateway validates every user token. Why should the services behind it validate the token again?</summary><p>Because the internal network is not a guarantee of who is calling. If any internal service, job or machine is compromised, it can call other services directly and claim to act for any user. A service that verifies the token itself, and verifies which service is on the other end of the connection, cannot be fooled that way.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Dick Hardt, editor, <a href="https://www.rfc-editor.org/rfc/rfc6749">RFC 6749: The OAuth 2.0 Authorization Framework</a>, 2012.</li>
+  <li>Nat Sakimura, John Bradley and Naveen Agarwal, <a href="https://www.rfc-editor.org/rfc/rfc7636">RFC 7636: Proof Key for Code Exchange by OAuth Public Clients</a>, 2015. Appendix B supplies the test value the code in this chapter was checked against.</li>
+  <li>Torsten Lodderstedt, John Bradley, Andrey Labunets and Daniel Fett, <a href="https://datatracker.ietf.org/doc/html/rfc9700">RFC 9700: Best Current Practice for OAuth 2.0 Security</a>, January 2025.</li>
+  <li>Aaron Parecki, Philippe De Ryck and David Waite, <a href="https://www.rfc-editor.org/rfc/rfc10017.html">RFC 10017: OAuth 2.0 for Browser-Based Applications</a>, August 2026. The three architectures and their ranking.</li>
+  <li>William Denniss and John Bradley, <a href="https://www.rfc-editor.org/rfc/rfc8252">RFC 8252: OAuth 2.0 for Native Apps</a>, 2017. Why mobile apps use the system browser.</li>
+  <li>IETF OAuth Working Group, <a href="https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/">The OAuth 2.1 Authorization Framework</a>, Internet-Draft.</li>
+  <li>OpenID Foundation, <a href="https://openid.net/specs/openid-connect-core-1_0.html">OpenID Connect Core 1.0</a>, 2014, incorporating errata set 2, December 2023.</li>
+  <li>Help Net Security, <a href="https://www.helpnetsecurity.com/2025/08/27/hundreds-of-salesforce-customer-orgs-hit-in-clever-attack-with-potentially-huge-blast-radius/">Hundreds of Salesforce customer orgs hit in clever attack with potentially huge blast radius</a>, August 2025.</li>
+  <li>Microsoft Threat Intelligence, <a href="https://www.microsoft.com/en-us/security/blog/2023/07/14/analysis-of-storm-0558-techniques-for-unauthorized-email-access/">Analysis of Storm-0558 techniques for unauthorized email access</a>, July 2023.</li>
+  <li>GitGuardian, The State of Secrets Sprawl 2026, March 2026, as reported by <a href="https://www.cpomagazine.com/?p=41171">CPO Magazine</a>.</li>
+</ol>
+</section>

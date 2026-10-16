@@ -1,0 +1,647 @@
+<!--meta
+{ "description": "A high-level design of a collaborative text editor: one server per open document that orders operations, operational transformation tested on random pairs and in a simulated network against editing without it, the server's work measured against network delay, a sequence CRDT that converges under any delivery order with its metadata measured, presence throttled because it grows with the square of the people, and recovery from an operation log and snapshots.",
+  "lede": "Two people put their cursors in the same sentence and type. Each sees their own letters at once, sees the other’s a moment later, and a second after that both screens show exactly the same text, though neither waited for the other. This chapter builds the two techniques that make that possible, operational transformation and CRDTs, tests that they converge under random concurrent edits, and measures what each costs.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a collaborative document editor. Several people open the same document and type at the same time; each sees their own typing immediately and everyone else’s within a fraction of a second, along with their cursors. People can keep editing offline and have their changes merged when they reconnect. Every copy must end up identical, and no acknowledged edit may be lost.</p></div>
+<p>The obvious designs fail. Locking the document, or a paragraph, makes people wait for each other. Sending whole versions and keeping the newest, as file sync does with its conflict copies (<x-ref to="hld-file-sync#conflicts"></x-ref>), throws away someone’s typing every second. And sending each keystroke as “insert x at position 8” breaks the moment two people type at once, because position 8 on one screen is not position 8 on the other. What is needed is a way to apply edits made concurrently, in any order, so that every copy ends the same and each edit still does what its author meant. This is the replication of <x-ref to="replication#multi-leader"></x-ref> with every keyboard a leader. In the terms of <x-ref to="hld-method#shapes"></x-ref>, this is concurrent edits converging to one document.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Edit plain text together, each person’s typing shown at once to themselves</th><td>Yes</td></tr>
+<tr><th>See others’ edits and cursors within a fraction of a second</th><td>Yes</td></tr>
+<tr><th>Edit offline and merge on reconnect</th><td>Yes</td></tr>
+<tr><th>Version history, and restoring an old version</th><td>Yes</td></tr>
+<tr><th>Formatting, comments, suggestions</th><td>Follow-up questions: the same mechanisms with more kinds of operation</td></tr>
+<tr><th>Spreadsheets and drawings</th><td>No</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>50 million people edit on a day, for 20 minutes on average; up to 100 people in one document</td></tr>
+<tr><th>Latency</th><td>Own typing shown immediately, with no network in the way; others’ edits within about 200 ms on a good connection</td></tr>
+<tr><th>Convergence</th><td>Once everyone has received the same edits, every copy shows exactly the same text</td></tr>
+<tr><th>Durability</th><td>An edit acknowledged by the server is never lost; history kept for the life of the document</td></tr>
+<tr><th>Availability</th><td>Editing continues offline and through a server failure; the document catches up afterwards</td></tr>
+</tbody>
+</table>
+<p><dfn>Convergence</dfn> is the guarantee that replicas which have received the same set of edits hold the same state, whatever order the edits arrived in. It is the eventual consistency of <x-ref to="consistency-models#eventual"></x-ref>, made exact.</p>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">operations: 50 million people × 20 minutes × 60 s × 2 operations a second ≈ 120 billion a day ≈ 1.4 million a second on average<br>
+operation log: 120 billion × 100 bytes = 12 TB a day, before old operations are compacted into snapshots<br>
+people editing at an average moment: 50 million × 20 ÷ 1,440 ≈ 694,000, each with a connection, and several times that in the busiest hours<br>
+one document with 10 people: 20 operations a second in; 180 messages a second out; cursor updates at 4 a second add 360 more</div>
+<p>Two operations a second while typing is an assumption: editors combine keystrokes into one operation while they wait for the server, as Step 6a shows. The numbers decide three things (<x-ref to="estimation#method"></x-ref>). Each document is small and busy, so it lives in the memory of one server, and the whole system is many such servers. The log grows by terabytes a day and must be compacted. And the messages inside one document grow with the square of the people in it, and presence, not editing, is most of them.</p>
+
+<div class="widget" data-widget="editing99">
+<h4>Operations and presence</h4>
+<p>The messages one document’s server handles for a number of people in it, and the operations across the whole service.</p>
+<div class="controls">
+  <label>People in one document<input type="number" name="people" value="10" min="1" max="100" step="1"></label>
+  <label>Operations a second, each<input type="number" name="edits" value="2" min="0" max="20" step="0.5"></label>
+  <label>Cursor updates a second, each<input type="number" name="cursors" value="4" min="0" max="60" step="1"></label>
+  <label>People editing a day, millions<input type="number" name="users" value="50" min="0" max="5000" step="10"></label>
+  <label>Minutes each spends editing<input type="number" name="minutes" value="20" min="0" max="1440" step="5"></label>
+  <label>Bytes per stored operation<input type="number" name="size" value="100" min="1" max="10000" step="10"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 200" role="img" aria-label="Messages a second sent by one document’s server as the number of people in it grows, with and without presence, rising with the square of the people."><line x1="60" y1="170" x2="600" y2="170" class="grid"></line><text x="54" y="174" class="ts end">0</text><line x1="60" y1="92" x2="600" y2="92" class="grid"></line><text x="54" y="96" class="ts end">1,140</text><line x1="60" y1="14" x2="600" y2="14" class="grid"></line><text x="54" y="18" class="ts end">2,280</text><path d="M60 170 L88.4 169.2 L116.8 167.5 L145.3 165.1 L173.7 161.8 L202.1 157.7 L230.5 152.8 L258.9 147 L287.4 140.4 L315.8 133.1 L344.2 124.8 L372.6 115.8 L401.1 106 L429.5 95.3 L457.9 83.8 L486.3 71.5 L514.7 58.3 L543.2 44.4 L571.6 29.6 L600 14" class="line"></path><path d="M60 170 L88.4 169.7 L116.8 169.2 L145.3 168.4 L173.7 167.3 L202.1 165.9 L230.5 164.3 L258.9 162.3 L287.4 160.1 L315.8 157.7 L344.2 154.9 L372.6 151.9 L401.1 148.7 L429.5 145.1 L457.9 141.3 L486.3 137.2 L514.7 132.8 L543.2 128.1 L571.6 123.2 L600 118" class="e none store"></path><text x="600" y="6" class="ts end">with presence</text><text x="600" y="110" class="ts end">edits only</text><circle cx="315.8" cy="133.1" r="5" class="dot"></circle><text x="60" y="192" class="ts">Messages a second sent by one document’s server, by people in the document: 1 to 20.</text></svg>
+<dl class="results">
+  <div><dt>Operations into the document’s server</dt><dd data-out="inbound">20 a second</dd></div>
+  <div><dt>Operations broadcast</dt><dd data-out="outbound">180 a second</dd></div>
+  <div><dt>Presence broadcast</dt><dd data-out="presence">360 a second</dd></div>
+  <div><dt>Operations, whole service</dt><dd data-out="total">1.39 million a second</dd></div>
+  <div><dt>Operation log a day</dt><dd data-out="logday">12 TB</dd></div>
+  <div><dt>Editing at an average moment</dt><dd data-out="online">694 thousand</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">With 10 people in one document, its server receives 20 operations a second and sends 540 messages, 67% of them presence. Doubling the people roughly quadruples the messages, which is why presence is throttled and large audiences get a read-only view.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="One WebSocket per open document">
+GET /v1/docs/d-42/live          Upgrade: websocket
+server → { "type": "hello", "revision": 1041, "snapshot": "…/d-42/1000", "ops": [ …41 operations… ] }
+
+client → { "type": "op", "client_seq": 17, "base": 1041, "op": [8, "on ", 6] }
+server → { "type": "ack", "client_seq": 17, "revision": 1043 }
+server → { "type": "op", "revision": 1042, "author": "bob", "op": [5, -3, 6] }
+
+client → { "type": "presence", "cursor": 8, "selection": [8, 11] }      sent on, never stored
+</pre>
+<pre data-lang="http" data-title="History">
+GET  /v1/docs/d-42/versions?before=1043
+POST /v1/docs/d-42/restore      { "revision": 900 }      → a new operation that turns the text back
+</pre>
+<p>An operation names the revision it was made on, its base, which is how the server knows what its author had not yet seen. The <code>client_seq</code> numbers each client’s operations, so an operation sent again after a reconnect is recognized and acknowledged instead of applied twice (<x-ref to="idempotency-and-delivery#keys"></x-ref>). Restoring a version does not rewrite history: it appends an operation, so people editing at that moment are transformed past it like any other edit.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Where</th></tr></thead>
+<tbody>
+<tr><th>Document</th><td>document id</td><td>Title, owner, sharing, current revision, latest snapshot</td><td>A relational database</td></tr>
+<tr><th>Operation log</th><td>document, revision</td><td>The operation, its author and time</td><td>An append-only store partitioned by document (<x-ref to="partitioning"></x-ref>)</td></tr>
+<tr><th>Snapshots</th><td>document, revision</td><td>The whole text at that revision</td><td>Object storage</td></tr>
+<tr><th>Named versions</th><td>document, name</td><td>A revision someone chose to keep</td><td>The relational database</td></tr>
+<tr><th>Owner of an open document</th><td>document id</td><td>Which document server holds it, under a lease</td><td>A coordination service (<x-ref to="membership-and-coordination#locks"></x-ref>)</td></tr>
+<tr><th>Presence</th><td>document, person</td><td>Cursor and selection</td><td>The document server’s memory only</td></tr>
+<tr><th>On the client</th><td>document</td><td>A copy of the text, and operations not yet acknowledged</td><td>The browser’s storage, for offline work</td></tr>
+</tbody>
+</table>
+<p>The text is derived: any revision is a snapshot plus the operations after it, which is how version history works and how a server that takes over a document rebuilds it (<x-ref to="event-driven-architecture#event-sourcing"></x-ref>). Once a snapshot is taken, the operations before it can be merged into coarser steps for history and the fine-grained ones dropped.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f991t f991d">
+<title id="f991t">A collaborative editor: one server per document, an operation log, and presence on the side</title>
+<desc id="f991d">Editors in browsers and apps keep a local copy of the document and a queue of their own unconfirmed operations. They hold a WebSocket to a gateway. A directory says which document server owns each open document; the gateway forwards each operation there. The document server orders operations, transforms them, appends them to the operation log and broadcasts them. Presence, the cursors and selections of the people in the document, is kept only in the document server’s memory and broadcast, never stored. Snapshots are made from the log, and history, search and exports read the log later.</desc>
+<rect class="n" x="10" y="44" width="110" height="56" rx="6"/>
+<text class="tb mid" x="65" y="59.5">Editors</text>
+<text class="ts mid" x="65" y="76.5">local copy,</text>
+<text class="ts mid" x="65" y="93.5">offline queue</text>
+<rect class="n sig" x="160" y="44" width="120" height="56" rx="6"/>
+<text class="tb mid" x="220" y="68">Gateways</text>
+<text class="ts mid" x="220" y="85">WebSockets</text>
+<rect class="n sig" x="320" y="44" width="150" height="56" rx="6"/>
+<text class="tb mid" x="395" y="68">Document server</text>
+<text class="ts mid" x="395" y="85">one per open document</text>
+<rect class="n store" x="510" y="44" width="204" height="56" rx="6"/>
+<text class="tb mid" x="612" y="68">Operation log</text>
+<text class="ts mid" x="612" y="85">every operation, in order</text>
+<rect class="n store" x="160" y="150" width="120" height="50" rx="6"/>
+<text class="tb mid" x="220" y="171">Directory</text>
+<text class="ts mid" x="220" y="188">document → server</text>
+<rect class="n" x="320" y="150" width="150" height="50" rx="6"/>
+<text class="tb mid" x="395" y="171">Presence</text>
+<text class="ts mid" x="395" y="188">memory only</text>
+<rect class="n store" x="510" y="150" width="92" height="50" rx="6"/>
+<text class="tb mid" x="556" y="171">Snapshots</text>
+<text class="ts mid" x="556" y="188">every N ops</text>
+<rect class="n async" x="622" y="150" width="92" height="50" rx="6"/>
+<text class="tb mid" x="668" y="171">History</text>
+<text class="ts mid" x="668" y="188">search, export</text>
+<path class="e sig both" d="M120 72H160"/>
+<path class="e sig both" d="M280 72H320"/>
+<path class="e store" d="M470 72H510"/>
+<path class="e store" d="M220 100V150"/>
+<text class="ts" x="226" y="128">who owns it</text>
+<path class="e sig both" d="M395 100V150"/>
+<text class="ts" x="401" y="128">cursors</text>
+<path class="e async" d="M556 100V150"/>
+<path class="e async" d="M668 100V150"/>
+<text class="ts" x="10" y="236">Solid: on the path of every keystroke. Dashed: later.</text>
+<text class="ts" x="10" y="254">The document server holds the document in memory, orders every operation and</text>
+<text class="ts" x="10" y="270">broadcasts it. If it fails, another loads the latest snapshot and the log after it.</text>
+</svg>
+</div>
+<figcaption>Every operation on a document passes through the one server that owns it, which gives operations a single order. Presence travels the same connections but is never stored.</figcaption>
+</figure>
+
+<p>Everyone in a document connects, through any gateway (<x-ref to="realtime-communication#gateway"></x-ref>), to the one <b>document server</b> that holds it. A directory, kept by a coordination service with leases, says which server that is; the first person to open a document makes a server load it from the latest snapshot and the log after it. The document server does what the sequencer does in <x-ref to="hld-stock-exchange#sequencing"></x-ref>: it puts every operation in one order and gives it a revision number. Then it makes each operation fit that order, which is the subject of the first deep dive, appends it to the log and broadcasts it.</p>
+
+<figure class="fig wide" id="fig-edit-path">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f992t f992d">
+<title id="f992t">Two concurrent edits, ordered and transformed by the server</title>
+<desc id="f992d">The document reads “Ship it Friday”, revision 0. Alice inserts “on ” before Friday and sees “Ship it on Friday”; at the same time Bob deletes “it ” and sees “Ship Friday”. Bob’s delete reaches the server first and becomes revision 1. Alice’s insert, made at revision 0, is transformed past the delete: position 8 becomes 5, and it becomes revision 2. The server sends Bob the acknowledgment and the moved insert, and Alice the delete and her acknowledgment. All three end with “Ship on Friday”. The operations are the chapter’s code’s output.</desc>
+<text class="tb mid" x="70" y="20">Alice</text>
+<line class="axis" x1="70" y1="28" x2="70" y2="238"/>
+<text class="tb mid" x="360" y="20">Server</text>
+<line class="axis" x1="360" y1="28" x2="360" y2="238"/>
+<text class="tb mid" x="650" y="20">Bob</text>
+<line class="axis" x1="650" y1="28" x2="650" y2="238"/>
+<g data-s="1" data-packet="none">
+<rect class="n sig" x="78" y="44" width="140" height="22" rx="4"/>
+<text class="ts mid" x="148" y="59">1. insert “on ” at 8</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n sig" x="526.4" y="72" width="115.6" height="22" rx="4"/>
+<text class="ts mid" x="584.2" y="87">2. delete 3 at 5</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M649 114H361"/>
+<text class="ts mid" x="505.0" y="108">3. delete 3 at 5, on rev 0</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M71 142H359"/>
+<text class="ts mid" x="215.0" y="136">4. insert at 8, on rev 0</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n store" x="274.75" y="156" width="170.5" height="22" rx="4"/>
+<text class="ts mid" x="360" y="171">5. transform: 8 becomes 5</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M361 198H649"/>
+<text class="ts mid" x="505.0" y="192">6. ack 1; rev 2: insert at 5</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M359 226H71"/>
+<text class="ts mid" x="215.0" y="220">7. rev 1: delete 3 at 5; ack 2</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Alice: Ship it on Friday; Server: Ship it Friday; Bob: Ship it Friday">Alice types “on ” before Friday. Her editor shows it at once and sends it; she does not wait for the server.</li>
+  <li data-msg="none" data-state="Alice: Ship it on Friday; Server: Ship it Friday; Bob: Ship Friday">At the same moment Bob deletes “it ”. Both edits were made on revision 0.</li>
+  <li data-state="Alice: Ship it on Friday; Server: Ship Friday; Bob: Ship Friday">Bob’s operation arrives first. Nothing happened since revision 0, so it applies as it is: revision 1.</li>
+  <li>Alice’s arrives, also made on revision 0. Applied as it is, “on ” would land inside “Friday”.</li>
+  <li data-msg="none" data-state="Alice: Ship it on Friday; Server: Ship on Friday; Bob: Ship Friday">The server transforms it past revision 1: three characters before position 8 are gone, so the insert moves to 5. It becomes revision 2.</li>
+  <li data-state="Alice: Ship it on Friday; Server: Ship on Friday; Bob: Ship on Friday">Bob gets the acknowledgment of his delete and Alice’s insert, already moved. He applies it as it is.</li>
+  <li data-state="Alice: Ship on Friday; Server: Ship on Friday; Bob: Ship on Friday">Alice gets Bob’s delete. She transforms it past her own insert, which the delete does not touch, applies it, and then her acknowledgment arrives.</li>
+</ol>
+<figcaption>Each editor applies its own edits at once. The server puts all operations in one order and transforms each past what its author had not seen, so every copy reaches the same text.</figcaption>
+</figure>
+
+<h2 id="ot">Step 6a: Operational transformation</h2>
+<p><dfn>Operational transformation</dfn> (OT) is a technique for concurrent editing in which an operation made on an older version of a document is rewritten, before it is applied, to account for the operations it did not see, so that it has the effect its author intended. In the figure above, Bob’s delete removed three characters before position 8, so Alice’s insert at 8 is transformed into an insert at 5.</p>
+<p>The chapter’s code represents an operation as a walk over the whole text: a positive number keeps that many characters, a string inserts it, and a negative number deletes that many. Alice’s insert on the 14-character text is <code>[8, "on ", 6]</code>; Bob’s delete is <code>[5, -3, 6]</code>. Transforming two such operations walks both at once.</p>
+<pre data-lang="ts" data-title="transform: two operations on the same text, made to apply one after the other">
+// Given a and b made on the same document, returns [a', b'] such that
+// apply(apply(doc, a), b') === apply(apply(doc, b), a'). When both insert at the same place, a's text goes first.
+export function transform(a: Op, b: Op): [Op, Op] {
+  const a2: Op = [], b2: Op = [];
+  let i = 0, j = 0;
+  let x: Part | undefined = a[0], y: Part | undefined = b[0];
+  const nextA = () => { i += 1; x = a[i]; }, nextB = () => { j += 1; y = b[j]; };
+  while (x !== undefined || y !== undefined) {
+    if (typeof x === "string") { push(a2, x); push(b2, x.length); nextA(); continue; }   // a inserts: b keeps it
+    if (typeof y === "string") { push(a2, y.length); push(b2, y); nextB(); continue; }   // b inserts: a keeps it
+    if (x === undefined || y === undefined) throw new Error("operations of different lengths");
+    if (x > 0 && y > 0) {                       // both keep
+      const n = Math.min(x, y); push(a2, n); push(b2, n);
+      x -= n; y -= n; if (x === 0) nextA(); if (y === 0) nextB();
+    } else if (x < 0 && y < 0) {                // both delete the same characters: nothing left to do
+      const n = Math.min(-x, -y);
+      x += n; y += n; if (x === 0) nextA(); if (y === 0) nextB();
+    } else if (x < 0) {                         // a deletes what b keeps
+      const n = Math.min(-x, y as number); push(a2, -n);
+      x += n; y = (y as number) - n; if (x === 0) nextA(); if (y === 0) nextB();
+    } else {                                    // b deletes what a keeps
+      const n = Math.min(x, -(y as number)); push(b2, -n);
+      x -= n; y = (y as number) + n; if (x === 0) nextA(); if (y === 0) nextB();
+    }
+  }
+  return [a2, b2];
+}
+</pre>
+<p>The function must satisfy one property: applying <code>a</code> and then the transformed <code>b</code> gives the same text as applying <code>b</code> and then the transformed <code>a</code>. The test checked it on 20,000 random pairs of inserts and deletes, and it held for every one. When both insert at the same place, one of them must go first in both orders; here it is the first argument, which the server always gives to the operation arriving later, so every copy breaks ties the same way.</p>
+<p>The client is simple because of the server. A client keeps at most one operation in flight; edits made while waiting for its acknowledgment are combined into one operation that waits its turn. Each operation arriving from the server is transformed past the client’s own unacknowledged ones and applied. This arrangement goes back to the Jupiter system of 1995, whose authors adapted an earlier, fully distributed algorithm and observed that the central server made it much simpler: with one order decided in one place, only the property above is needed. Without a server, operations can meet in many orders, and OT needs a second, much harder property as well.</p>
+<p>The test simulated 200 runs of four people each making 30 edits, an edit every 300 ms on average, over connections with 100 ms of delay each way and messages in order on each connection. With transformation, every copy matched the server in all 200 runs. Applying each edit at the position where it was typed, the obvious approach, left the copies different in all 200.</p>
+
+<figure class="fig wide" id="fig-ot-cost">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-labelledby="f994t f994d">
+<title id="f994t">Server transformations for each operation, by network delay</title>
+<desc id="f994d">Ten people each making two edits a second for a minute, in the chapter’s simulation. For each one-way delay, operations sent and transformations per operation at the server: 10 ms, 1,200 operations, 0.35 each; 25 ms, 1,192 operations, 0.92 each; 50 ms, 1,176 operations, 1.83 each; 100 ms, 1,091 operations, 3.63 each; 200 ms, 845 operations, 6.42 each; 300 ms, 646 operations, 7.56 each; 500 ms, 422 operations, 8.22 each; 1000 ms, 223 operations, 8.37 each.</desc>
+<text class="tb" x="10" y="18">Transformations at the server per operation, ten people editing at once</text>
+<line class="grid" x1="60" y1="210.0" x2="700" y2="210.0"/>
+<text class="ts end" x="52" y="214.0">0</text>
+<line class="grid" x1="60" y1="176.0" x2="700" y2="176.0"/>
+<text class="ts end" x="52" y="180.0">2</text>
+<line class="grid" x1="60" y1="142.0" x2="700" y2="142.0"/>
+<text class="ts end" x="52" y="146.0">4</text>
+<line class="grid" x1="60" y1="108.0" x2="700" y2="108.0"/>
+<text class="ts end" x="52" y="112.0">6</text>
+<line class="grid" x1="60" y1="74.0" x2="700" y2="74.0"/>
+<text class="ts end" x="52" y="78.0">8</text>
+<line class="grid" x1="60" y1="40.0" x2="700" y2="40.0"/>
+<text class="ts end" x="52" y="44.0">10</text>
+<path class="line" d="M90.0 204.1 L172.9 194.3 L255.7 178.9 L338.6 148.3 L421.4 100.9 L504.3 81.4 L587.1 70.2 L670.0 67.7"/>
+<circle class="dot" cx="90.0" cy="204.1" r="4"/>
+<text class="ts mid" x="90.0" y="228">10 ms</text>
+<text class="ts tb end" x="82.0" y="194.1">0.35</text>
+<circle class="dot" cx="172.9" cy="194.3" r="4"/>
+<text class="ts mid" x="172.9" y="228">25 ms</text>
+<circle class="dot" cx="255.7" cy="178.9" r="4"/>
+<text class="ts mid" x="255.7" y="228">50 ms</text>
+<circle class="dot" cx="338.6" cy="148.3" r="4"/>
+<text class="ts mid" x="338.6" y="228">100 ms</text>
+<text class="ts tb end" x="330.6" y="138.3">3.63</text>
+<circle class="dot" cx="421.4" cy="100.9" r="4"/>
+<text class="ts mid" x="421.4" y="228">200 ms</text>
+<circle class="dot" cx="504.3" cy="81.4" r="4"/>
+<text class="ts mid" x="504.3" y="228">300 ms</text>
+<circle class="dot" cx="587.1" cy="70.2" r="4"/>
+<text class="ts mid" x="587.1" y="228">500 ms</text>
+<circle class="dot" cx="670.0" cy="67.7" r="4"/>
+<text class="ts mid" x="670.0" y="228">1,000 ms</text>
+<text class="ts tb end" x="662.0" y="57.7">8.37</text>
+<text class="ts mid" x="380.0" y="248">one-way network delay for every editor</text>
+<rect class="hit" x="60" y="30" width="60" height="200" data-tip="10 ms each way|1,200 operations sent|0.35 transformations each (420 in all)"/>
+<rect class="hit" x="142.857" y="30" width="60" height="200" data-tip="25 ms each way|1,192 operations sent|0.92 transformations each (1,099 in all)"/>
+<rect class="hit" x="225.714" y="30" width="60" height="200" data-tip="50 ms each way|1,176 operations sent|1.83 transformations each (2,150 in all)"/>
+<rect class="hit" x="308.571" y="30" width="60" height="200" data-tip="100 ms each way|1,091 operations sent|3.63 transformations each (3,957 in all)"/>
+<rect class="hit" x="391.429" y="30" width="60" height="200" data-tip="200 ms each way|845 operations sent|6.42 transformations each (5,421 in all)"/>
+<rect class="hit" x="474.286" y="30" width="60" height="200" data-tip="300 ms each way|646 operations sent|7.56 transformations each (4,885 in all)"/>
+<rect class="hit" x="557.143" y="30" width="60" height="200" data-tip="500 ms each way|422 operations sent|8.22 transformations each (3,470 in all)"/>
+<rect class="hit" x="640" y="30" width="60" height="200" data-tip="1,000 ms each way|223 operations sent|8.37 transformations each (1,867 in all)"/>
+</svg>
+</div>
+<figcaption>Measured. The slower the network, the more operations each one must be moved past. Editors combine keystrokes while waiting, so fewer operations are sent, each moved past more.</figcaption>
+</figure>
+
+<p>The server’s work grows with delay. With ten people each making two edits a second, each operation was transformed past 0.35 others at 10 ms of delay, 3.63 at 100 ms and 8.37 at a second. Fewer operations were sent as the delay grew, 1,200 at 10 ms but 223 at a second, because clients combined their keystrokes while waiting. The extreme case is a person returning from offline: someone away for ten minutes while others made 20 edits a second has one combined operation to transform past 12,000. It is a burst of work, not a correctness problem, and the server can do it before taking the next operation.</p>
+
+<h2 id="crdt">Step 6b: CRDTs</h2>
+<p>A <dfn>CRDT</dfn>, a conflict-free replicated data type, is a data structure designed so that replicas can apply each other’s changes in any order and still converge, with no central server deciding an order. For text, the idea is to stop using positions. Every character gets an id that never changes, made of a counter and the replica that created it, and an insert says which id it goes after. A delete marks its character as deleted but keeps it, because other changes may still refer to it: a tombstone, as in <x-ref to="storage-engines#lsm"></x-ref>.</p>
+
+<figure class="fig wide" id="fig-crdt">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-labelledby="f993t f993d">
+<title id="f993t">A sequence CRDT: characters with ids, inserts after ids, deletes as tombstones</title>
+<desc id="f993d">Two replicas, A and B, of a document. A typed “cat”: characters with ids 1@A, 2@A and 3@A. Then, at the same time, A inserts “s” after 3@A with id 4@A, while B deletes “c”, which stays as a tombstone, and inserts “b” at the start with id 4@B. Each replica then applies the other’s changes. Because each insert names the character it follows, nothing needs to be moved, and both show “bats”. These are the chapter’s code’s states.</desc>
+<text class="tb" x="10" y="20">Replica A</text>
+<text class="tb" x="370" y="20">Replica B</text>
+<path class="e none dash" d="M360 10V140"/>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n " x="10" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="39" y="64">c</text>
+<text class="ts mid" x="39" y="81">1@A</text>
+<rect class="n " x="76" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="105" y="64">a</text>
+<text class="ts mid" x="105" y="81">2@A</text>
+<rect class="n " x="142" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="171" y="64">t</text>
+<text class="ts mid" x="171" y="81">3@A</text>
+<text class="ts tb" x="10" y="112">shows “cat”</text>
+<text class="ts" x="10" y="130">3 items, 0 deleted</text>
+<rect class="n " x="370" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="399" y="64">c</text>
+<text class="ts mid" x="399" y="81">1@A</text>
+<rect class="n " x="436" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="465" y="64">a</text>
+<text class="ts mid" x="465" y="81">2@A</text>
+<rect class="n " x="502" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="531" y="64">t</text>
+<text class="ts mid" x="531" y="81">3@A</text>
+<text class="ts tb" x="370" y="112">shows “cat”</text>
+<text class="ts" x="370" y="130">3 items, 0 deleted</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n " x="10" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="39" y="64">c</text>
+<text class="ts mid" x="39" y="81">1@A</text>
+<rect class="n " x="76" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="105" y="64">a</text>
+<text class="ts mid" x="105" y="81">2@A</text>
+<rect class="n " x="142" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="171" y="64">t</text>
+<text class="ts mid" x="171" y="81">3@A</text>
+<rect class="n sig" x="208" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="237" y="64">s</text>
+<text class="ts mid" x="237" y="81">4@A</text>
+<text class="ts tb" x="10" y="112">shows “cats”</text>
+<text class="ts" x="10" y="130">4 items, 0 deleted</text>
+<rect class="n " x="370" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="399" y="64">c</text>
+<text class="ts mid" x="399" y="81">1@A</text>
+<rect class="n " x="436" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="465" y="64">a</text>
+<text class="ts mid" x="465" y="81">2@A</text>
+<rect class="n " x="502" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="531" y="64">t</text>
+<text class="ts mid" x="531" y="81">3@A</text>
+<text class="ts tb" x="370" y="112">shows “cat”</text>
+<text class="ts" x="370" y="130">3 items, 0 deleted</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n " x="10" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="39" y="64">c</text>
+<text class="ts mid" x="39" y="81">1@A</text>
+<rect class="n " x="76" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="105" y="64">a</text>
+<text class="ts mid" x="105" y="81">2@A</text>
+<rect class="n " x="142" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="171" y="64">t</text>
+<text class="ts mid" x="171" y="81">3@A</text>
+<rect class="n " x="208" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="237" y="64">s</text>
+<text class="ts mid" x="237" y="81">4@A</text>
+<text class="ts tb" x="10" y="112">shows “cats”</text>
+<text class="ts" x="10" y="130">4 items, 0 deleted</text>
+<rect class="n ghost" x="370" y="40" width="58" height="48" rx="6"/>
+<text class="ts mid" x="399" y="64">c</text>
+<text class="ts mid" x="399" y="81">1@A</text>
+<path class="x" d="M392 52l14 14"/>
+<rect class="n " x="436" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="465" y="64">a</text>
+<text class="ts mid" x="465" y="81">2@A</text>
+<rect class="n " x="502" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="531" y="64">t</text>
+<text class="ts mid" x="531" y="81">3@A</text>
+<text class="ts tb" x="370" y="112">shows “at”</text>
+<text class="ts" x="370" y="130">3 items, 1 deleted</text>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n " x="10" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="39" y="64">c</text>
+<text class="ts mid" x="39" y="81">1@A</text>
+<rect class="n " x="76" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="105" y="64">a</text>
+<text class="ts mid" x="105" y="81">2@A</text>
+<rect class="n " x="142" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="171" y="64">t</text>
+<text class="ts mid" x="171" y="81">3@A</text>
+<rect class="n " x="208" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="237" y="64">s</text>
+<text class="ts mid" x="237" y="81">4@A</text>
+<text class="ts tb" x="10" y="112">shows “cats”</text>
+<text class="ts" x="10" y="130">4 items, 0 deleted</text>
+<rect class="n sig" x="370" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="399" y="64">b</text>
+<text class="ts mid" x="399" y="81">4@B</text>
+<rect class="n ghost" x="436" y="40" width="58" height="48" rx="6"/>
+<text class="ts mid" x="465" y="64">c</text>
+<text class="ts mid" x="465" y="81">1@A</text>
+<path class="x" d="M458 52l14 14"/>
+<rect class="n " x="502" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="531" y="64">a</text>
+<text class="ts mid" x="531" y="81">2@A</text>
+<rect class="n " x="568" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="597" y="64">t</text>
+<text class="ts mid" x="597" y="81">3@A</text>
+<text class="ts tb" x="370" y="112">shows “bat”</text>
+<text class="ts" x="370" y="130">4 items, 1 deleted</text>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<rect class="n sig" x="10" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="39" y="64">b</text>
+<text class="ts mid" x="39" y="81">4@B</text>
+<rect class="n ghost" x="76" y="40" width="58" height="48" rx="6"/>
+<text class="ts mid" x="105" y="64">c</text>
+<text class="ts mid" x="105" y="81">1@A</text>
+<path class="x" d="M98 52l14 14"/>
+<rect class="n " x="142" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="171" y="64">a</text>
+<text class="ts mid" x="171" y="81">2@A</text>
+<rect class="n " x="208" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="237" y="64">t</text>
+<text class="ts mid" x="237" y="81">3@A</text>
+<rect class="n " x="274" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="303" y="64">s</text>
+<text class="ts mid" x="303" y="81">4@A</text>
+<text class="ts tb" x="10" y="112">shows “bats”</text>
+<text class="ts" x="10" y="130">5 items, 1 deleted</text>
+<rect class="n " x="370" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="399" y="64">b</text>
+<text class="ts mid" x="399" y="81">4@B</text>
+<rect class="n ghost" x="436" y="40" width="58" height="48" rx="6"/>
+<text class="ts mid" x="465" y="64">c</text>
+<text class="ts mid" x="465" y="81">1@A</text>
+<path class="x" d="M458 52l14 14"/>
+<rect class="n " x="502" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="531" y="64">a</text>
+<text class="ts mid" x="531" y="81">2@A</text>
+<rect class="n " x="568" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="597" y="64">t</text>
+<text class="ts mid" x="597" y="81">3@A</text>
+<text class="ts tb" x="370" y="112">shows “bat”</text>
+<text class="ts" x="370" y="130">4 items, 1 deleted</text>
+</g>
+<g class="hide" data-s="6">
+<rect class="n " x="10" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="39" y="64">b</text>
+<text class="ts mid" x="39" y="81">4@B</text>
+<rect class="n ghost" x="76" y="40" width="58" height="48" rx="6"/>
+<text class="ts mid" x="105" y="64">c</text>
+<text class="ts mid" x="105" y="81">1@A</text>
+<path class="x" d="M98 52l14 14"/>
+<rect class="n " x="142" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="171" y="64">a</text>
+<text class="ts mid" x="171" y="81">2@A</text>
+<rect class="n " x="208" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="237" y="64">t</text>
+<text class="ts mid" x="237" y="81">3@A</text>
+<rect class="n " x="274" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="303" y="64">s</text>
+<text class="ts mid" x="303" y="81">4@A</text>
+<text class="ts tb" x="10" y="112">shows “bats”</text>
+<text class="ts" x="10" y="130">5 items, 1 deleted</text>
+<rect class="n " x="370" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="399" y="64">b</text>
+<text class="ts mid" x="399" y="81">4@B</text>
+<rect class="n ghost" x="436" y="40" width="58" height="48" rx="6"/>
+<text class="ts mid" x="465" y="64">c</text>
+<text class="ts mid" x="465" y="81">1@A</text>
+<path class="x" d="M458 52l14 14"/>
+<rect class="n " x="502" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="531" y="64">a</text>
+<text class="ts mid" x="531" y="81">2@A</text>
+<rect class="n " x="568" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="597" y="64">t</text>
+<text class="ts mid" x="597" y="81">3@A</text>
+<rect class="n sig" x="634" y="40" width="58" height="48" rx="6"/>
+<text class="tb mid" x="663" y="64">s</text>
+<text class="ts mid" x="663" y="81">4@A</text>
+<text class="ts tb" x="370" y="112">shows “bats”</text>
+<text class="ts" x="370" y="130">5 items, 1 deleted</text>
+</g>
+<text class="ts" x="10" y="166">Each box: a character and its id, a counter and the replica that made it. An insert names the id</text>
+<text class="ts" x="10" y="182">it goes after. Two inserts after the same id are ordered by id, the higher first, on every replica.</text>
+<text class="ts" x="10" y="198">Dashed: a tombstone. Deleted characters stay, so that later inserts can still refer to them.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="A: cat; B: cat">Both replicas hold “cat”, typed on A. Each character has an id that will never change: 1@A, 2@A, 3@A.</li>
+  <li data-msg="none" data-state="A: cats; B: cat">A types “s” at the end. The change says “insert s, id 4@A, after 3@A”: an id, not a position.</li>
+  <li data-msg="none" data-state="A: cats; B: at">At the same time B deletes “c”. The character stays, marked deleted, because other changes may refer to it.</li>
+  <li data-msg="none" data-state="A: cats; B: bat">B types “b” at the start: “insert b, id 4@B, after nothing”. Its counter is 4 because B has seen ids up to 3.</li>
+  <li data-msg="none" data-state="A: bats; B: bat">A receives B’s two changes. The delete marks 1@A; the insert goes at the start. Nothing is transformed.</li>
+  <li data-msg="none" data-state="A: bats; B: bats">B receives A’s insert after 3@A and puts it after the “t”. Both replicas show “bats”, whatever the order of arrival.</li>
+</ol>
+<figcaption>A CRDT gives every character a permanent id, so a change means the same thing on every replica in any order. The price is metadata, and deleted characters that stay as tombstones.</figcaption>
+</figure>
+
+<p>Two inserts after the same character are ordered by their ids, the higher first, on every replica, and because counters follow Lamport’s rule (<x-ref to="distributed-fundamentals#logical"></x-ref>), anything typed after a character inside one of them has a higher id still, so a single comparison skips it. That is the RGA algorithm, and the chapter’s version is under a hundred lines. A change that refers to a character not yet received waits until it arrives.</p>
+<p>The test ran 300 random sessions of four replicas, 200 steps each, delivering changes in random order and some of them twice. All four replicas ended with the same text in every session. It also checked a known weakness of some text CRDTs: two people typing “hello” and “world” at the same place at the same moment. Some algorithms interleave such words letter by letter (Kleppmann and others, 2019); in RGA each letter goes after the previous one, so the words stay whole: “aworldhellob”. The OT editor gave the same text, because waiting edits are combined into one operation.</p>
+
+<figure class="fig wide" id="fig-metadata">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-labelledby="f995t f995d">
+<title id="f995t">What a CRDT keeps for each character shown</title>
+<desc id="f995d">A session of 13,000 keystrokes by three people left 10,448 characters shown and 11,724 kept, 1,276 of them deleted, in 2,840 runs typed in a row. Estimated bytes per character shown: plain text 1; every character with its own ids, 20.2; runs stored together, 5.7.</desc>
+<text class="tb" x="10" y="18">Bytes per character shown, after 13,000 keystrokes by three people</text>
+<text class="ts end" x="250" y="49">Plain text</text>
+<rect class="bar mute" x="260" y="36" width="18.2" height="18" rx="2"/>
+<text class="ts tb" x="286.2" y="49">1.0</text>
+<text class="ts end" x="250" y="83">A CRDT, each character with its ids</text>
+<rect class="bar " x="260" y="70" width="367.2" height="18" rx="2"/>
+<text class="ts tb" x="635.2" y="83">20.2</text>
+<text class="ts end" x="250" y="117">A CRDT, runs stored together</text>
+<rect class="bar store" x="260" y="104" width="104.4" height="18" rx="2"/>
+<text class="ts tb" x="372.4" y="117">5.7</text>
+<text class="ts" x="10" y="152">Measured: 11,724 items, 1,276 tombstones, 2,840 runs. Assumed sizes: an id or a reference 8 bytes,</text>
+<text class="ts" x="10" y="170">a character 1 byte, a deleted flag 1 byte. A run shares one id and one reference for all its characters.</text>
+<rect class="hit" x="10" y="34" width="700" height="24" data-tip="Plain text|1.0 bytes per character shown"/>
+<rect class="hit" x="10" y="68" width="700" height="24" data-tip="A CRDT, each character with its ids|20.2 bytes per character shown"/>
+<rect class="hit" x="10" y="102" width="700" height="24" data-tip="A CRDT, runs stored together|5.7 bytes per character shown"/>
+</svg>
+</div>
+<figcaption>Measured counts, estimated sizes. Storing ids for every character multiplies the document twenty times; storing runs, as Yjs does, brings it to a few bytes per character.</figcaption>
+</figure>
+
+<p>The cost is metadata. After 13,000 keystrokes by three people, with backspaces and jumps, the document showed 10,448 characters but kept 11,724, of which 1,276 were deleted. Stored naively, with ids for every character, that is about 20 bytes per character shown. Characters typed in a row by one person form runs, 2,840 of them here, and storing a run once, as Yjs does, brings it to about 6. Tombstones can only be dropped when every replica has seen the delete, which a system with offline clients rarely knows; Yjs instead discards a deleted run’s content and keeps only its length.</p>
+<table>
+<thead><tr><th></th><th>Operational transformation</th><th>Text CRDT</th></tr></thead>
+<tbody>
+<tr><th>Needs a central server</th><td>Yes, for a simple and correct design</td><td>No: peers can merge directly</td></tr>
+<tr><th>Offline for a long time</th><td>Works; the server transforms the backlog on return</td><td>Natural: merge whenever changes arrive</td></tr>
+<tr><th>Metadata</th><td>Little on clients; the server keeps the recent log</td><td>Ids and tombstones on every replica: about 6 to 20 bytes per character here</td></tr>
+<tr><th>Ordering</th><td>The server’s, so there is one history</td><td>Any; the result is the same</td></tr>
+<tr><th>Used by</th><td>Google Docs, since 2010</td><td>Yjs and Automerge, often still with a server for storage and access control</td></tr>
+</tbody>
+</table>
+<p>For a product with a server, which is almost every product, both work. OT keeps clients light and gives one authoritative history; a CRDT makes offline and peer-to-peer editing natural and lets the server relay and store without understanding the edits.</p>
+
+<h2 id="presence">Step 6c: Cursors and presence</h2>
+<p>Presence here is who is in the document and where their cursors and selections are, the same idea as in <x-ref to="hld-chat#presence"></x-ref> at a finer grain. It has three properties that set it apart from edits.</p>
+<ul>
+  <li><b>It is not stored.</b> A cursor position is useless a second later. The document server keeps the latest one per person in memory and broadcasts it; nothing goes to the log, and a lost update is replaced by the next one.</li>
+  <li><b>It must move with the text.</b> A cursor at position 8 is wrong once someone deletes three characters before it. With OT, each client transforms other people’s cursors past every operation it applies, like an insert of nothing; with a CRDT, a cursor is stored as the id of the character it follows, and needs no updating.</li>
+  <li><b>It is the larger stream.</b> Every update goes to everyone else, so messages grow with the square of the people. With ten people the calculator’s defaults give 180 operations and 360 cursor updates a second out of one server. So updates are limited to a few a second per person and combined, only changes are sent, and beyond some number of people, Google Docs uses 100, newcomers get a view without presence or editing.</li>
+</ul>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A document server</th><td>Others’ edits pause for seconds; typing continues locally</td><td>Its lease expires; another server loads the snapshot and the log, clients reconnect and resend unacknowledged operations, recognized by their numbers</td></tr>
+<tr><th>Two servers both think they own a document</th><td>Nothing, if the log refuses one</td><td>Each append names the revision it expects, so the stale server’s appends fail (<x-ref to="consensus#fencing"></x-ref>)</td></tr>
+<tr><th>A gateway</th><td>A brief reconnect</td><td>Reconnect with backoff to any gateway (<x-ref to="realtime-communication#reconnect"></x-ref>), then resume from the last revision seen</td></tr>
+<tr><th>A person offline for a day</th><td>Their edits merge on return, transformed past everything since</td><td>A long backlog is transformed in one burst; a base older than the kept log is refused, and the client rebases on a snapshot</td></tr>
+<tr><th>The log is slow</th><td>Acknowledgments slow; typing does not</td><td>The server keeps ordering in memory and batches appends</td></tr>
+<tr><th>A document grows huge</th><td>Slow to open</td><td>Snapshots more often; load the visible part first</td></tr>
+</tbody>
+</table>
+<p><b>At ten times the people</b>, 500 million a day, there are ten times as many open documents, each still small: more document servers and gateways, and a log of over 100 TB a day before compaction. Nothing about one document changes. <b>At a hundred times</b>, the pressure is the log and its history, so operations are compacted sooner into snapshots and coarse versions. The one thing that does not scale out is a single document with thousands of editors, which is why products cap editors per document and serve everyone else a read-only stream.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li>Google wrote on 22 September 2010 that the new Google Docs uses operational transformation, that edits reduce to inserting text, deleting text and applying styles, and that a document is displayed by replaying its revision log from the beginning.</li>
+  <li>Google Docs lets up to 100 people with view, edit or comment access work on a file at the same time; beyond that, only the owner and some editors can edit (help page, checked October 2026).</li>
+  <li>Jupiter (Nichols and others, UIST 1995) introduced the central-server form of OT used here.</li>
+  <li>Figma described its multiplayer system on 16 October 2019: not OT, and inspired by CRDTs without being one, with the server as the authority, the last value received winning for each property, a separate process for each document, and WebSockets to the clients.</li>
+  <li>Yjs implements the YATA algorithm (Nicolaescu and others, 2016). Its internals document says consecutive characters inserted in order by one client are stored as a single item, deleted items are flagged, and with garbage collection their content is discarded (checked October 2026).</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Bold, italics, headings</th><td>Operations that set attributes on a range, transformed like deletes; or marks attached to character ids</td><td>The server’s order, the log</td></tr>
+<tr><th>Comments on a passage</th><td>Anchors that move with the text, like cursors, stored with the document</td><td>Edits</td></tr>
+<tr><th>Suggestion mode</th><td>Edits kept as proposals, applied or dropped later as new operations</td><td>Everything is still an operation in the log</td></tr>
+<tr><th>Undo</th><td>Undo the person’s own last operation, transformed past everything since, as a new operation</td><td>Nobody else’s edits are undone</td></tr>
+<tr><th>Peer-to-peer, no server</th><td>A CRDT, with changes exchanged directly and stored by any peer</td><td>Convergence</td></tr>
+<tr><th>A thousand viewers of a live document</th><td>A read-only stream, fanned out through gateways, without presence</td><td>The editors’ path</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Say early why positions alone fail, with a two-person example. Draw clients with a local copy, gateways and one server per document that orders operations, with a log and snapshots. Spend the deep dives on transformation with a central server and on how a CRDT avoids positions; compare them in a sentence each. Then cursors and presence, with the square-law fan-out, and the takeover of a document when its server dies.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Sending edits as positions and applying them unchanged</th><td>Copies differ: all 200 simulated runs</td><td>Transform with a server’s order, or use a CRDT</td></tr>
+<tr><th>Locking paragraphs</th><td>People wait for each other</td><td>Apply local edits at once and reconcile</td></tr>
+<tr><th>Last writer wins on the whole document</th><td>Someone’s typing disappears every second</td><td>Merge operations, not versions</td></tr>
+<tr><th>OT without a central order</th><td>A much harder algorithm, easy to get wrong</td><td>One server per document</td></tr>
+<tr><th>Storing presence in the log</th><td>Most of the log is cursor moves</td><td>Presence in memory only, throttled</td></tr>
+<tr><th>Cursors as plain positions</th><td>Cursors jump after others’ edits</td><td>Transform them, or anchor them to character ids</td></tr>
+<tr><th>Ignoring CRDT metadata</th><td>Twenty bytes for each character shown</td><td>Store runs; discard deleted content</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="replication#multi-leader"></x-ref>: every editor as a leader, and the ways to resolve conflicts.</li>
+  <li><x-ref to="distributed-fundamentals#logical"></x-ref>: the Lamport counters behind CRDT ids.</li>
+  <li><x-ref to="realtime-communication#gateway"></x-ref>: the connection tier every keystroke crosses.</li>
+  <li><x-ref to="hld-file-sync#conflicts"></x-ref>: merging whole files, when live merging is not needed.</li>
+  <li><x-ref to="hld-stock-exchange#sequencing"></x-ref>: another design built on one order decided in one place.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Positions change meaning when others edit; any design must account for that or copies diverge.</li>
+  <li>With one server per document, OT is simple: the server orders operations and transforms each past what its author had not seen.</li>
+  <li>The transformation must make both orders agree; test it on many random pairs, and the whole system in a simulated network.</li>
+  <li>The server’s work per operation grows with delay; editors combine keystrokes while waiting.</li>
+  <li>A CRDT gives characters permanent ids and inserts after ids, so changes merge in any order, at the cost of ids and tombstones.</li>
+  <li>Presence is ephemeral, must move with the text, and grows with the square of the people: throttle it, never store it.</li>
+  <li>A snapshot plus the log rebuilds any revision, and lets another server take over a document.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>The text is “abc”. Ann inserts “X” at 0 while Bo deletes the “c” at 2. What must Ann’s copy do with Bo’s delete, and Bo’s with Ann’s insert?</summary><p>Ann’s copy reads “Xabc”, so Bo’s delete must move to position 3. Bo’s copy reads “ab”, and Ann’s insert at 0 is unaffected by a delete after it. Both end with “Xab”.</p></details>
+<details><summary>Why does a central server make operational transformation much easier?</summary><p>The server decides one order for all operations, so each client only needs to transform incoming operations past its own unacknowledged ones, and the server only needs to transform each operation past those its author had not seen. That needs only the property that both orders of two operations agree. Without a single order, operations can meet in many different orders and a second, much harder property is needed.</p></details>
+<details><summary>Why does a client keep only one operation in flight?</summary><p>So that the server always knows exactly which revision each operation was made on, and the client has a single pending operation to transform incoming ones against. Edits made meanwhile are combined into one waiting operation, which also reduces how many operations are sent when the network is slow.</p></details>
+<details><summary>In a CRDT, why are deleted characters kept?</summary><p>Because changes made elsewhere may refer to them: an insert after a character that has since been deleted must still find its place. Removing the tombstone is safe only when every replica has seen the delete, which a system with offline clients rarely knows.</p></details>
+<details><summary>Two inserts arrive saying “after id 3@A”. How do all replicas agree on their order?</summary><p>By comparing the inserts’ own ids: the higher counter first, and the higher replica name on a tie. Every replica uses the same rule, so they agree without coordinating, in whatever order the inserts arrived.</p></details>
+<details><summary>Why are cursor updates not written to the operation log?</summary><p>They are valid for a moment and are replaced by the next one, so storing them adds most of the log’s volume for nothing. They also grow with the square of the people. They are held in memory, broadcast and throttled.</p></details>
+<details><summary>A document server crashes. How do the editors continue without losing anything acknowledged?</summary><p>Its lease on the document expires and another server loads the latest snapshot and the log after it. Acknowledged operations are in the log. Clients reconnect, learn the revision, and resend their unacknowledged operations with the same sequence numbers, so any that had arrived are recognized instead of applied twice.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>John Day-Richter, <a href="https://drive.googleblog.com/2010/09/whats-different-about-new-google-docs_22.html">What’s different about the new Google Docs: Conflict resolution</a>, Google Drive Blog, 22 September 2010.</li>
+  <li>David A. Nichols, Pavel Curtis, Michael Dixon and John Lamping, <a href="https://uist.acm.org/uist1995/abstracts/Nichols.html">High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System</a>, UIST 1995.</li>
+  <li>Evan Wallace, <a href="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/">How Figma’s multiplayer technology works</a>, Figma, 16 October 2019.</li>
+  <li>Petru Nicolaescu, Kevin Jahns, Michael Derntl and Ralf Klamma, <a href="https://dl.eusset.eu/handle/20.500.12015/4549">Near Real-Time Peer-to-Peer Shared Editing on Extensible Data Types</a>, GROUP 2016. The YATA algorithm behind Yjs.</li>
+  <li>Yjs, <a href="https://github.com/yjs/yjs/blob/main/INTERNALS.md">Yjs internals</a>, checked October 2026. Items, runs and garbage collection.</li>
+  <li>Martin Kleppmann, Victor B. F. Gomes, Dominic P. Mulligan and Alastair R. Beresford, <a href="https://martin.kleppmann.com/2019/03/25/papoc-interleaving-anomalies.html">Interleaving anomalies in collaborative text editors</a>, PaPoC 2019.</li>
+  <li>Google, <a href="https://support.google.com/a/users/answer/9305685?hl=en">Share files from Google Drive</a> (collaboration limits), Google Workspace help, checked October 2026.</li>
+</ol>
+</section>

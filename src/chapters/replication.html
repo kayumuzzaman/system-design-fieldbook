@@ -1,0 +1,514 @@
+<!--meta
+{ "description": "Database replication explained: leader and follower replication, synchronous and asynchronous commits, replication lag and read-your-writes, failover and split brain, multi-leader conflicts, leaderless quorums, and how managed databases combine them.",
+  "lede": "A database on one machine is one hardware fault away from being unavailable, and one disk failure away from being gone. Replication keeps copies on several machines. Making copies is the easy part. Keeping them the same while the data changes and machines fail is where every interesting problem in this chapter comes from.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">Why keep copies</h2>
+<p><dfn>Replication</dfn> means keeping the same data on more than one machine. Each copy is a <dfn>replica</dfn>. There are three reasons to do it, and a system usually wants more than one of them.</p>
+<ul>
+  <li><b>Availability.</b> If one machine fails, another has the data and can take over. This is the redundancy from <x-ref to="availability-and-reliability#redundancy"></x-ref>, applied to the hardest component to make redundant.</li>
+  <li><b>Read capacity.</b> Queries can be spread across the copies. Most applications read far more than they write, so this goes a long way.</li>
+  <li><b>Distance.</b> A copy near the users answers them faster than one on another continent.</li>
+</ul>
+<p>If data never changed, replication would be a file copy. All the difficulty is in handling changes. A write arrives at one machine and must reach the others across a network that delays and drops messages, while any of the machines may fail at any moment. Three designs exist, distinguished by where writes are accepted: at one node, at several, or at any.</p>
+
+<h2 id="leader-follower">Leader and followers</h2>
+<p>The most common design by far has one replica, the <dfn>leader</dfn> (also called the primary), accept all writes. The others, the <dfn>followers</dfn> (replicas, standbys or secondaries), receive a stream of the leader’s changes and apply them in the same order. Reads can be served by any of them.</p>
+
+<figure class="fig wide" id="fig-leader-follower">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f201t f201d">
+<title id="f201t">Leader and follower replication</title>
+<desc id="f201d">An application sends all writes to one leader. The leader sends a log of its changes to three followers, one of them in another region. The application can send reads to any of the copies.</desc>
+<rect class="n" x="10" y="76" width="110" height="50" rx="6"/>
+<text class="tb mid" x="65" y="105.5">Application</text>
+<rect class="n sig" x="250" y="20" width="170" height="56" rx="6"/>
+<text class="tb mid" x="335" y="44">Leader</text>
+<text class="ts mid" x="335" y="61">accepts all writes</text>
+<rect class="n store" x="540" y="20" width="170" height="50" rx="6"/>
+<text class="tb mid" x="625" y="41">Follower 1</text>
+<text class="ts mid" x="625" y="58">read-only copy</text>
+<rect class="n store" x="540" y="96" width="170" height="50" rx="6"/>
+<text class="tb mid" x="625" y="117">Follower 2</text>
+<text class="ts mid" x="625" y="134">read-only copy</text>
+<rect class="n store" x="540" y="172" width="170" height="50" rx="6"/>
+<text class="tb mid" x="625" y="193">Follower 3</text>
+<text class="ts mid" x="625" y="210">in another region</text>
+<g data-s="1">
+<path class="e sig" d="M120 92 250 54"/>
+<text class="ts mid" x="176" y="62">writes</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M420 40H540"/>
+<path class="e async" d="M420 54 540 116"/>
+<path class="e async" d="M420 68 540 190"/>
+<text class="ts mid" x="470" y="32">change log</text>
+</g>
+<g data-s="3">
+<path class="e dash" d="M120 110 C300 130 420 126 540 124"/>
+<path class="e dash" d="M120 118 C260 190 420 200 540 200"/>
+<text class="ts mid" x="300" y="150">reads can go to any copy</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li>The application sends every write to the leader, which puts all changes into one agreed order.</li>
+  <li data-msg="change log">The leader sends its change log to each follower, and each follower replays it in the same order.</li>
+  <li data-msg="read">Reads can go to any copy, which spreads the read load. A follower may be slightly behind the leader.</li>
+</ol>
+<figcaption>One leader takes the writes, which gives every change a single agreed order. Followers replay that order.</figcaption>
+</figure>
+
+<p>What travels to the followers is the write-ahead log from <x-ref to="storage-engines#wal"></x-ref>, or a translation of it. Since the log is a complete, ordered record of every change, a follower that applies it ends up with the same data as the leader. There are two forms.</p>
+<ul>
+  <li><b>Physical replication</b> ships the log as it is, describing changes to bytes in pages. It is simple and exact, and the follower must run the same database version, since it is a byte-level copy.</li>
+  <li><b>Logical replication</b> ships changes as rows: “in table photos, the row with id 871 now has like_count 101”. It works across versions, can copy a subset of tables, and can feed systems that are not databases at all, which is the basis of <x-ref to="change-data-capture"></x-ref>.</li>
+</ul>
+<p>The appeal of a single leader is that it avoids the hardest problem in replication. With one place where writes happen, there is one order of events and no possibility of two copies accepting conflicting changes. The price is that the leader is special: all writes depend on it, and when it fails something must replace it.</p>
+
+<h2 id="sync-async">When is a write “committed”?</h2>
+<p>The most consequential setting in a replicated database is whether the leader waits for followers before telling the client that a write succeeded.</p>
+
+<figure class="fig wide" id="fig-sync-async">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f202t f202d">
+<title id="f202t">Asynchronous and synchronous replication compared as message sequences</title>
+<desc id="f202d">With asynchronous replication the client sends a write, the leader replies that it is committed, and the leader sends the change to the follower some time later. If the leader fails between those two moments the write is lost. With synchronous replication the client sends a write, the leader sends the change to the follower, the follower confirms it has received it, and only then does the leader reply that it is committed.</desc>
+<g data-scene="async">
+<text class="tl" x="10" y="18">Asynchronous</text>
+<text class="ts mid" x="40" y="42">Client</text>
+<text class="ts mid" x="180" y="42">Leader</text>
+<text class="ts mid" x="320" y="42">Follower</text>
+<g class="hide" data-s="2">
+<rect x="180" y="104" width="140" height="46" fill="var(--fault-tint)"/>
+</g>
+<line class="axis" x1="40" y1="50" x2="40" y2="190"/>
+<line class="axis" x1="180" y1="50" x2="180" y2="190"/>
+<line class="axis" x1="320" y1="50" x2="320" y2="190"/>
+<g data-s="1">
+<path class="e sig" d="M41 74H179"/>
+<text class="ts mid" x="110.0" y="68">write</text>
+</g>
+<g data-s="2">
+<path class="e" d="M179 104H41"/>
+<text class="ts mid" x="110.0" y="98">committed</text>
+</g>
+<g data-s="3">
+<path class="e async" d="M181 150H319"/>
+<text class="ts mid" x="250.0" y="144">log, some time later</text>
+<text class="ts" x="10" y="212">The client is told “committed” before any</text>
+<text class="ts" x="10" y="228">follower has the change. If the leader dies</text>
+<text class="ts" x="10" y="244">in the shaded interval, the write is lost.</text>
+</g>
+</g>
+<path class="e none dash" d="M360 8V256"/>
+<g data-scene="sync">
+<text class="tl" x="380" y="18">Synchronous</text>
+<text class="ts mid" x="410" y="42">Client</text>
+<text class="ts mid" x="550" y="42">Leader</text>
+<text class="ts mid" x="690" y="42">Follower</text>
+<line class="axis" x1="410" y1="50" x2="410" y2="190"/>
+<line class="axis" x1="550" y1="50" x2="550" y2="190"/>
+<line class="axis" x1="690" y1="50" x2="690" y2="190"/>
+<g data-s="1">
+<path class="e sig" d="M411 74H549"/>
+<text class="ts mid" x="480.0" y="68">write</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M551 104H689"/>
+<text class="ts mid" x="620.0" y="98">log</text>
+</g>
+<g data-s="3">
+<path class="e" d="M689 134H551"/>
+<text class="ts mid" x="620.0" y="128">received</text>
+</g>
+<g data-s="4">
+<path class="e" d="M549 164H411"/>
+<text class="ts mid" x="480.0" y="158">committed</text>
+<text class="ts" x="380" y="212">The client is told “committed” only after a</text>
+<text class="ts" x="380" y="228">follower has it. No acknowledged write is lost,</text>
+<text class="ts" x="380" y="244">and every write waits for the follower.</text>
+</g>
+</g>
+
+</svg>
+</div>
+<ol class="steps" data-scene="async" data-label="Asynchronous">
+  <li data-state="On the leader: not yet; On the follower: not yet; Client told: nothing">The client sends a write to the leader.</li>
+  <li data-state="On the leader: yes; On the follower: not yet; Client told: committed">The leader commits it locally and answers at once. From this moment the write exists on one machine only.</li>
+  <li data-msg="log" data-state="On the leader: yes; On the follower: yes; Client told: committed">The change reaches the follower some time later. If the leader had died in the shaded interval, a write the client was told had succeeded would be lost.</li>
+</ol>
+<ol class="steps" data-scene="sync" data-label="Synchronous">
+  <li data-state="On the leader: not yet; On the follower: not yet; Client told: nothing">The client sends a write to the leader.</li>
+  <li data-state="On the leader: yes; On the follower: not yet; Client told: nothing">The leader sends the change to a follower before answering anyone.</li>
+  <li data-state="On the leader: yes; On the follower: yes; Client told: nothing">The follower confirms that it has stored the change.</li>
+  <li data-state="On the leader: yes; On the follower: yes; Client told: committed">Only then is the client told the write is committed. No acknowledged write can be lost, and every write waits for the follower.</li>
+</ol>
+<figcaption>The same write under the two modes. The difference is whether the acknowledgment to the client comes before or after a second machine has the data.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th></th><th>Asynchronous</th><th>Synchronous</th></tr></thead>
+<tbody>
+<tr><th>Write latency</th><td>Local disk only</td><td>Local disk plus a round trip to a follower</td></tr>
+<tr><th>If the leader is lost</th><td>The most recent writes, acknowledged to clients, may be gone</td><td>Every acknowledged write exists on another machine</td></tr>
+<tr><th>If a follower is slow or down</th><td>No effect on writes</td><td>Writes wait, or stop</td></tr>
+<tr><th>Typical use</th><td>Read replicas, distant regions, most default setups</td><td>Data that must not be lost: payments, orders</td></tr>
+</tbody>
+</table>
+<p>Fully synchronous replication to every follower would mean that any single follower’s failure halts all writes, so nobody runs that. The practical arrangement, sometimes called <dfn>semi-synchronous</dfn>, waits for one follower out of several, or for a majority. One slow follower then does no harm, and every acknowledged write still exists in two places.</p>
+<p>In the vocabulary of <x-ref to="availability-and-reliability#rto-rpo"></x-ref>, this setting is your recovery point objective. Asynchronous replication has a small, non-zero window of data loss on failover. Synchronous replication has none and pays for it on every write. The round trip costs under a millisecond to a follower in the same building, one or two milliseconds across availability zones in a region, and tens of milliseconds between regions, which is why synchronous replication across continents is rare.</p>
+
+<h2 id="lag">Replication lag, and what users see</h2>
+<p>An asynchronous follower is always a little behind the leader. The delay is <dfn>replication lag</dfn>. Normally it is milliseconds. Under heavy writes, during a large batch job, or over a slow link, it can grow to seconds or minutes. A system that reads from followers is therefore <dfn>eventually consistent</dfn>: if writes stopped, all copies would become identical, and at any given moment they may differ.</p>
+
+<figure class="fig wide" id="fig-lag">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f203t f203d">
+<title id="f203t">A user fails to see her own comment because of replication lag</title>
+<desc id="f203d">Ana posts a comment, which goes to the leader and is saved. She reloads the page, and that read is sent to a follower that has not yet received the change. The page comes back without her comment. Shortly afterward the change arrives at the follower.</desc>
+<text class="tb mid" x="90" y="20">Ana’s browser</text>
+<text class="tb mid" x="360" y="20">Leader</text>
+<text class="tb mid" x="630" y="20">Follower</text>
+<g class="hide" data-s="2">
+<rect x="360" y="52" width="270" height="110" fill="var(--async-tint)"/>
+</g>
+<line class="axis" x1="90" y1="28" x2="90" y2="212"/>
+<line class="axis" x1="360" y1="28" x2="360" y2="212"/>
+<line class="axis" x1="630" y1="28" x2="630" y2="212"/>
+<g data-s="1">
+<path class="e sig" d="M91 52H359"/>
+<text class="ts mid" x="225.0" y="46">1. post comment</text>
+</g>
+<g data-s="2">
+<path class="e" d="M359 78H91"/>
+<text class="ts mid" x="225.0" y="72">2. saved</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M91 112 C250 112 500 112 629 112"/>
+<text class="ts mid" x="225" y="104">3. reload the page: this read goes to the follower</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M629 138 C500 138 250 138 91 138"/>
+<text class="ts mid" x="225" y="154">4. comments, without the new one</text>
+</g>
+<g data-s="5">
+<path class="e async" d="M361 162H629"/>
+<text class="ts mid" x="495.0" y="156">5. the change arrives</text>
+</g>
+<g data-s="2">
+<text class="ts" x="638" y="100">lag</text>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="236">During the shaded interval the follower is behind. Ana wrote a comment and, a moment later, cannot see it.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Comment on the leader: not yet; On the follower: not yet">Ana posts a comment. The write goes to the leader.</li>
+  <li data-state="Comment on the leader: saved; On the follower: not yet">The leader saves it and confirms. The follower does not have it yet. The shaded interval is the replication lag.</li>
+  <li data-msg="load comments">Ana’s page reloads to show the comment. This read happens to be sent to the follower.</li>
+  <li data-msg="comments, one missing" data-state="Comment on the leader: saved; On the follower: not yet; Ana sees: her comment missing">The follower returns the comments it has, without the new one. To Ana, her comment has vanished.</li>
+  <li data-msg="log" data-state="Comment on the leader: saved; On the follower: saved">A moment later the change arrives at the follower. Nothing was lost, but the user watched the system contradict itself.</li>
+</ol>
+<figcaption>The most common symptom of replication lag. The write succeeded, and the user’s next page view says otherwise.</figcaption>
+</figure>
+
+<p>Users notice lag in three specific ways, and each has a named guarantee that prevents it.</p>
+<table>
+<thead><tr><th>What the user experiences</th><th>Guarantee that prevents it</th><th>How to provide it</th></tr></thead>
+<tbody>
+<tr><td>“I saved it and it is gone.”</td><td><dfn>Read-your-writes</dfn>: a user always sees their own changes</td><td>For a short time after a user writes, send that user’s reads to the leader. Or record the log position of their write and read only from followers that have reached it.</td></tr>
+<tr><td>“The comment was there, and after a refresh it vanished.”</td><td><dfn>Monotonic reads</dfn>: a user never sees time go backward</td><td>Send each user’s reads to the same follower, for example chosen by a hash of the user ID</td></tr>
+<tr><td>“I can see the reply and not the question it answers.”</td><td><dfn>Consistent prefix</dfn>: changes are seen in the order they happened</td><td>Keep related data on the same replica set, so one log orders it</td></tr>
+</tbody>
+</table>
+<p>The simplest policy that works for most products is to read from the leader anything where staleness would be visible or harmful to the person asking, such as their own profile, their cart or their just-posted comment, and to read from followers everything shared and tolerant, such as other people’s feeds, search results and counts. <x-ref to="consistency-models"></x-ref> places these guarantees in the wider picture.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Adding read replicas and routing all reads to them without changing any code. It works in testing, where lag is zero. In production, any code that writes and then immediately reads back, such as “create the order, then load it to render the confirmation page”, fails intermittently in a way that depends on load.</p></div>
+
+<h2 id="failover">Failover</h2>
+<p>When a follower fails, little happens. It restarts, asks the leader for everything since the last position it applied, and catches up. When the leader fails, a follower must be promoted to take its place. This is <dfn>failover</dfn>, and it has three steps, each with a way to go wrong.</p>
+<ol>
+  <li><b>Decide that the leader is dead.</b> The only evidence available is that it has stopped responding, and a leader that is slow, overloaded or cut off by a network fault looks the same as one that has crashed. A short timeout causes failovers when nothing was wrong. A long one extends every real outage.</li>
+  <li><b>Choose a new leader.</b> It should be the follower with the most complete log. With asynchronous replication even that follower may lack the old leader’s last few writes, and those are lost, although clients were told they had succeeded.</li>
+  <li><b>Redirect everyone.</b> Clients and the other followers must start using the new leader, and, most importantly, the old leader must be prevented from continuing to act as one.</li>
+</ol>
+
+<figure class="fig wide" id="fig-split-brain">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-labelledby="f204t f204d">
+<title id="f204t">Split brain: two leaders accepting writes on either side of a network fault</title>
+<desc id="f204d">Two data centers lose the link between them. The old leader in the East keeps running and accepts writes from clients there, setting a balance to 70. A follower in the West has been promoted to leader and accepts writes from clients there, setting the same balance to 120. The two copies now disagree.</desc>
+<rect class="grp" x="10" y="14" width="300" height="150" rx="8"/>
+<text class="ts" x="20" y="30">Data center East</text>
+<rect class="grp" x="410" y="14" width="300" height="150" rx="8"/>
+<text class="ts" x="420" y="30">Data center West</text>
+<rect class="n" x="40" y="44" width="120" height="46" rx="6"/>
+<text class="tb mid" x="100" y="71.5">Clients</text>
+<rect class="n sig" x="180" y="44" width="110" height="46" rx="6"/>
+<text class="tb mid" x="235" y="63">Old leader</text>
+<text class="ts mid" x="235" y="80">still running</text>
+<g data-s="2">
+<rect class="n sig" x="440" y="44" width="110" height="46" rx="6"/>
+<text class="tb mid" x="495" y="63">New leader</text>
+<text class="ts mid" x="495" y="80">just promoted</text>
+</g>
+<rect class="n" x="570" y="44" width="120" height="46" rx="6"/>
+<text class="tb mid" x="630" y="71.5">Clients</text>
+<g data-s="3">
+<path class="e sig" d="M160 67H180"/>
+<path class="e sig" d="M570 67H550"/>
+</g>
+<g data-s="4">
+<rect class="n fault" x="180" y="110" width="110" height="36" rx="6"/>
+<text class="ts mid" x="235" y="132.5">balance = 70</text>
+<rect class="n fault" x="440" y="110" width="110" height="36" rx="6"/>
+<text class="ts mid" x="495" y="132.5">balance = 120</text>
+<path class="e" d="M235 90V110"/>
+<path class="e" d="M495 90V110"/>
+</g>
+<g data-s="1">
+<path class="e none dash" d="M290 67H440"/>
+<path class="x" d="M352 55l16 24M368 55l-16 24"/>
+<text class="ts mid" x="360" y="104">link down</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="190">Each side believes it is the leader and accepts writes. When the link returns, the two histories conflict</text>
+<text class="ts" x="10" y="206">and no automatic rule can merge them correctly.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Link: down; Leaders: 1">The link between the two data centers fails. Neither side can tell whether the other is down or only unreachable.</li>
+  <li data-state="Link: down; Leaders: 2">The West side cannot reach the leader, concludes that it is dead, and promotes a new one. The old leader is still running.</li>
+  <li data-msg="write">Clients on each side keep writing to the leader they can reach.</li>
+  <li data-msg="" data-state="Link: down; Leaders: 2; Balance: 70 on one side, 120 on the other">The same account now has two different balances. When the link returns the two histories conflict, and no automatic rule can merge them correctly.</li>
+</ol>
+<figcaption>Split brain. The old leader was not dead, only unreachable, and nothing told it to stop.</figcaption>
+</figure>
+
+<p>The situation in the figure is called <dfn>split brain</dfn>, and it is the worst outcome of a failover, because data diverges and has to be reconciled by hand. Preventing it requires that at most one node can believe it is the leader. Two mechanisms do this. Requiring a majority of nodes to agree on who leads means the side of a partition with fewer nodes cannot elect anyone. And <dfn>fencing</dfn> actively stops the old leader, by cutting off its access to storage or by having other systems reject requests that carry an out-of-date leadership number. <x-ref to="consensus"></x-ref> covers how agreement is reached.</p>
+
+<h3 id="github-2018">A case study: GitHub, October 2018</h3>
+<p>On 21 October 2018, routine maintenance on network equipment disconnected GitHub’s main data center on the US East Coast from the rest of its network for 43 seconds. The software managing its MySQL clusters, seeing the East Coast leaders unreachable, promoted followers on the West Coast. That was the system working as designed.</p>
+<p>When the link returned, both sides held writes the other lacked. The East Coast databases had a few seconds of writes that had never been replicated, and the West Coast had been accepting new writes since the failover. Neither could simply be discarded. To protect the data, GitHub kept the West Coast as leader and spent the next day restoring the East Coast replicas from backups and letting them catch up. The site was degraded for 24 hours and 11 minutes, with out-of-date information shown and background work paused. For one of the busiest clusters, 954 writes from the affected seconds had to be reconciled afterward.</p>
+<p>The lessons GitHub drew are worth remembering. A 43-second network fault produced a day-long incident. Automatic failover across regions made the situation worse than waiting would have, since the application was not designed for the latency of a leader on the other coast. And asynchronous replication means an acknowledged write may exist in only one place.</p>
+
+<h2 id="multi-leader">Multiple leaders</h2>
+<p>In <dfn>multi-leader replication</dfn>, more than one node accepts writes, and each sends its changes to the others. The reasons to want this are specific:</p>
+<ul>
+  <li><b>Writes in several regions.</b> Users in Europe and Asia each write to a nearby leader instead of crossing the world.</li>
+  <li><b>Clients that work offline.</b> A calendar or notes app on a phone accepts changes with no connection and synchronizes later. Each device is in effect a leader.</li>
+  <li><b>Real-time collaboration</b>, where several people edit the same document at once.</li>
+</ul>
+<p>The cost is that the problem a single leader avoids comes back: two leaders can accept changes to the same data at the same time. This is a <dfn>write conflict</dfn>, and it is discovered only later, when the changes meet. Something must decide the outcome.</p>
+<table>
+<thead><tr><th>Strategy</th><th>How it works</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><th>Avoid conflicts</th><td>Route all writes for a given record to the same leader, for example each user’s data to their home region</td><td>Breaks down when a user moves or a region fails over</td></tr>
+<tr><th>Last write wins</th><td>Attach a timestamp to each write and keep the latest</td><td>The other write is silently discarded. Clocks on different machines disagree, so “latest” is unreliable.</td></tr>
+<tr><th>Merge automatically</th><td>Use data types designed so that concurrent changes combine, known as CRDTs</td><td>Works for counters, sets and text, and not for arbitrary business rules</td></tr>
+<tr><th>Keep both and ask</th><td>Store the conflicting versions and let the application or the user resolve them</td><td>Complexity moves into every reader</td></tr>
+</tbody>
+</table>
+<p>Multi-leader replication also weakens constraints. Two leaders can each accept a different user registering the same username, since neither sees the other’s write in time. The advice from experienced operators is consistent: avoid it unless one of the three situations above forces it, and then prefer conflict avoidance. <x-ref to="multi-region"></x-ref> and <x-ref to="hld-collaborative-editing"></x-ref> return to these designs.</p>
+
+<h2 id="leaderless">No leader: quorums</h2>
+<p>The third design has no leader at all. Any replica accepts reads and writes, and the client, or a coordinator acting for it, talks to several replicas for each operation. It was made well known by Amazon’s Dynamo paper and is used by Cassandra, ScyllaDB and Riak.</p>
+<p>Three numbers define the behavior. Each piece of data is stored on <i>N</i> replicas. A write is considered successful when <i>W</i> of them confirm it. A read asks <i>R</i> of them and takes the newest value among the answers. If <i>W</i> + <i>R</i> is greater than <i>N</i>, the set of replicas that confirmed any write and the set asked by any later read must share at least one member, so the read is certain to see that write.</p>
+
+<div class="widget" data-widget="quorum">
+<h4>Quorum overlap</h4>
+<p>Choose how many replicas hold each item, how many must confirm a write, and how many a read asks. The picture shows the worst case for the reader.</p>
+<div class="controls">
+  <label>Replicas (N)<input type="number" name="n" value="3" min="1" max="9" step="1"></label>
+  <label>Must confirm a write (W)<input type="number" name="w" value="2" min="1" max="9" step="1"></label>
+  <label>Asked by a read (R)<input type="number" name="r" value="2" min="1" max="9" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 470 88" style="max-width:36rem" role="img" aria-label="Two rows of circles, one per replica. The top row marks the replicas that confirmed a write and the bottom row marks the replicas a later read asks, chosen to overlap as little as possible."><text class="ts" x="0" y="28">A write is acknowledged by</text><text class="ts" x="0" y="68">A later read asks</text><circle class="n sig" cx="190" cy="24" r="10"></circle><circle class="n ghost" cx="190" cy="64" r="10"></circle><path class="e store none" d="M220 35V53"></path><circle class="n sig" cx="220" cy="24" r="10"></circle><circle class="n store" cx="220" cy="64" r="10"></circle><circle class="n ghost" cx="250" cy="24" r="10"></circle><circle class="n store" cx="250" cy="64" r="10"></circle></svg>
+<dl class="results">
+  <div><dt>Read sees the latest write</dt><dd data-out="overlap">Yes, by 1 replica</dd></div>
+  <div><dt>Failures tolerated by writes</dt><dd data-out="wfail">1</dd></div>
+  <div><dt>Failures tolerated by reads</dt><dd data-out="rfail">1</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Every read reaches at least one replica that holds the latest acknowledged write, because W + R = 4 is greater than N = 3. Writes continue with 1 of 3 replicas down, and reads with 1 down.</p>
+</div>
+
+<p>The common configuration is <i>N</i> = 3 with <i>W</i> = 2 and <i>R</i> = 2, which tolerates one failed replica for both reads and writes. The numbers are a dial. <i>W</i> = 1 gives the fastest writes and loses the guarantee. <i>R</i> = 1 with <i>W</i> = <i>N</i> gives fast reads and writes that fail if any replica is down. Cassandra lets each query choose its own level.</p>
+<h3 id="repair">Bringing replicas back in line</h3>
+<p>Since a write may miss some replicas, the system needs ways to bring them up to date. Dynamo-style stores use three, each covering what the one before it misses.</p>
+<ul>
+  <li><b>Hinted handoff.</b> When a replica is unreachable, its write is given to another node, which stores it with a note saying whose it is, the hint, and delivers it when the owner returns. If such stand-in nodes are allowed to count toward <i>W</i>, the arrangement is called a <dfn>sloppy quorum</dfn>. It keeps writes available during an outage, and it weakens the overlap guarantee, because a read that asks the proper replicas may not reach the stand-in.</li>
+  <li><b>Read repair.</b> When a read receives different versions from the replicas it asked, the coordinator returns the newest and writes it back to the stale ones. This heals data that is read, and never touches data that is not.</li>
+  <li><b>Anti-entropy.</b> A background process compares whole replicas and copies whatever differs. It catches rarely read data and hints that were lost.</li>
+</ul>
+<p>Comparing two replicas key by key would mean sending all the data across the network to find out that nearly all of it matches. Replicas compare summaries instead, arranged as a <dfn>Merkle tree</dfn>. Each leaf is the hash of one range of keys. Each node above is the hash of its two children, so the single hash at the root summarizes everything beneath it.</p>
+
+<figure class="fig wide" id="fig-merkle">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 248" role="img" aria-labelledby="f20mt f20md">
+<title id="f20mt">Two replicas comparing Merkle trees to find the one key range that differs</title>
+<desc id="f20md">Each replica has a tree of hashes over four key ranges. The root hashes differ. The left halves have the same hash, so keys 0 to 499 are skipped. The right halves differ. Of their children, the hash for keys 750 to 999 matches and the hash for keys 500 to 749 does not, so only that range needs to be compared and copied.</desc>
+<text class="tb mid" x="180" y="16">Replica A</text>
+<path class="e none" d="M180 54L90 84"/>
+<path class="e none" d="M180 54L270 84"/>
+<path class="e none" d="M90 112L45 142"/>
+<path class="e none" d="M90 112L135 142"/>
+<path class="e none" d="M270 112L225 142"/>
+<path class="e none" d="M270 112L315 142"/>
+<rect class="n fault" x="142" y="26" width="76" height="28" rx="4"/>
+<text class="ts mid" x="180" y="45">71d0</text>
+<rect class="n store" x="52" y="84" width="76" height="28" rx="4"/>
+<text class="ts mid" x="90" y="103">b3a9</text>
+<rect class="n fault" x="232" y="84" width="76" height="28" rx="4"/>
+<text class="ts mid" x="270" y="103">5e17</text>
+<rect class="n ghost" x="7" y="142" width="76" height="28" rx="4"/>
+<text class="ts mid" x="45" y="161">9c2e</text>
+<rect class="n ghost" x="97" y="142" width="76" height="28" rx="4"/>
+<text class="ts mid" x="135" y="161">04bf</text>
+<rect class="n fault" x="187" y="142" width="76" height="28" rx="4"/>
+<text class="ts mid" x="225" y="161">d81a</text>
+<rect class="n store" x="277" y="142" width="76" height="28" rx="4"/>
+<text class="ts mid" x="315" y="161">6f33</text>
+<text class="ts mid" x="45" y="188">keys 0–249</text>
+<text class="ts mid" x="135" y="188">250–499</text>
+<text class="ts mid" x="225" y="188">500–749</text>
+<text class="ts mid" x="315" y="188">750–999</text>
+<text class="tb mid" x="540" y="16">Replica B</text>
+<path class="e none" d="M540 54L450 84"/>
+<path class="e none" d="M540 54L630 84"/>
+<path class="e none" d="M450 112L405 142"/>
+<path class="e none" d="M450 112L495 142"/>
+<path class="e none" d="M630 112L585 142"/>
+<path class="e none" d="M630 112L675 142"/>
+<rect class="n fault" x="502" y="26" width="76" height="28" rx="4"/>
+<text class="ts mid" x="540" y="45">c44e</text>
+<rect class="n store" x="412" y="84" width="76" height="28" rx="4"/>
+<text class="ts mid" x="450" y="103">b3a9</text>
+<rect class="n fault" x="592" y="84" width="76" height="28" rx="4"/>
+<text class="ts mid" x="630" y="103">e902</text>
+<rect class="n ghost" x="367" y="142" width="76" height="28" rx="4"/>
+<text class="ts mid" x="405" y="161">9c2e</text>
+<rect class="n ghost" x="457" y="142" width="76" height="28" rx="4"/>
+<text class="ts mid" x="495" y="161">04bf</text>
+<rect class="n fault" x="547" y="142" width="76" height="28" rx="4"/>
+<text class="ts mid" x="585" y="161">27c5</text>
+<rect class="n store" x="637" y="142" width="76" height="28" rx="4"/>
+<text class="ts mid" x="675" y="161">6f33</text>
+<text class="ts mid" x="405" y="188">keys 0–249</text>
+<text class="ts mid" x="495" y="188">250–499</text>
+<text class="ts mid" x="585" y="188">500–749</text>
+<text class="ts mid" x="675" y="188">750–999</text>
+<path class="e none dash" d="M360 8V196"/>
+<text class="ts" x="10" y="220">1. The root hashes differ, so something differs.   2. The left halves match (b3a9), so 500 keys are skipped without being read.</text>
+<text class="ts" x="10" y="236">3. The right halves differ. Of their children, 6f33 matches and one does not: only keys 500–749 need to be compared and copied.</text>
+</svg>
+</div>
+<figcaption>Red marks the hashes that differ and green the ones compared and found equal. The dashed nodes are never looked at.</figcaption>
+</figure>
+
+<p>Two replicas exchange root hashes. If they are equal, the replicas are identical and the comparison is over. If not, they compare the children and descend only into the branches that differ. The work is in proportion to how much the replicas differ, not to how much data they hold. A tree over a million key ranges is about twenty levels deep, so a single differing range is found by comparing a few dozen hashes. Cassandra builds these trees when a repair is run, and the same structure verifies data in Git, in ZFS and in blockchains.</p>
+<p>Leaderless systems have no failover, which is their main attraction: a node failing requires no election and no promotion, and the others simply carry on. The costs are subtler than they first appear. Two clients writing the same key at the same time produce a conflict, exactly as in the multi-leader case, and the usual resolution is last write wins. Even with overlapping quorums, edge cases around failed writes and concurrent operations mean the guarantee is weaker than a single leader’s. These systems suit data where each key is written independently and occasional overwrites are acceptable, and they are a poor fit for anything that needs transactions.</p>
+
+<h2 id="consensus-replication">Replication built on consensus</h2>
+<p>Most distributed databases designed in the last decade take a fourth route that combines the best of the above. Each piece of data has a small group of replicas, typically three or five, that run a <dfn>consensus protocol</dfn> such as Raft. There is a leader, so writes have one order. A write is committed when a majority of the group has it, so no acknowledged write is lost when a minority fails. And if the leader fails, the group elects a new one by itself, with the majority rule making split brain impossible.</p>
+<p>This is what CockroachDB, YugabyteDB, TiDB, Google Spanner and etcd do, and MongoDB’s replica sets work in a closely related way. The price is that every write waits for a majority, and that at least three nodes are needed to tolerate one failure. <x-ref to="consensus"></x-ref> explains the protocol.</p>
+
+<h2 id="practice">What managed databases give you</h2>
+<p>If you use a cloud provider’s database service, replication is configured by choosing options, and it helps to know what each option is underneath.</p>
+<table>
+<thead><tr><th>Option</th><th>What it is</th><th>What it is for</th></tr></thead>
+<tbody>
+<tr><th>Standby in another zone</th><td>A synchronous follower, with automatic failover in a minute or two</td><td>Availability. Usually it does not serve reads.</td></tr>
+<tr><th>Read replica</th><td>An asynchronous follower</td><td>Read capacity. Subject to lag.</td></tr>
+<tr><th>Cross-region replica</th><td>An asynchronous follower far away</td><td>Disaster recovery, and reads near distant users</td></tr>
+<tr><th>Shared distributed storage</th><td>The database’s storage layer itself is replicated. Amazon Aurora keeps six copies across three zones and needs four to confirm a write.</td><td>Durability and fast failover without copying whole databases</td></tr>
+</tbody>
+</table>
+<p>Three practical points apply whichever you use.</p>
+<ul>
+  <li><b>Replicas scale reads and not writes.</b> Every follower must apply every write the leader does. If the leader is saturated by writes, adding followers does nothing for it. The answer to write load is <x-ref to="partitioning"></x-ref>.</li>
+  <li><b>Monitor lag</b> and alert on it. A follower that is minutes behind is serving wrong answers, and it is a poor candidate for failover.</li>
+  <li><b>Practice failover.</b> A failover that has never been exercised will not work as documented the first time it is needed. Check what your application does in the seconds when the leader changes: connections break, and transactions in flight fail and need retrying.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> Replication is not a backup. A mistaken <code>DELETE</code>, a bad migration or an application bug that corrupts rows is replicated to every copy within seconds, faithfully. Recovery from mistakes needs backups that can be restored to a point in time before the mistake (<x-ref to="disaster-recovery"></x-ref>).</p></div>
+<div class="note interview"><p><span class="label">In an interview.</span> Say “a leader with two replicas, one synchronous in another zone for failover and one asynchronous for reads”, and then address the consequence: “reads from the replica may be slightly stale, so a user’s own data is read from the leader”. Mentioning lag and read-your-writes without being asked distinguishes a design that has met production from one that has not.</p></div>
+
+<h2 id="choosing">Choosing</h2>
+<table>
+<thead><tr><th>Design</th><th>Writes go to</th><th>Conflicts</th><th>Failover</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><th>Single leader</th><td>One node</td><td>None</td><td>Needed, and delicate</td><td>The default for nearly everything</td></tr>
+<tr><th>Multi-leader</th><td>Several nodes</td><td>Yes, resolved after the fact</td><td>Simple per region</td><td>Writes in several regions, offline clients, collaboration</td></tr>
+<tr><th>Leaderless</th><td>Any node</td><td>Yes, usually last write wins</td><td>None needed</td><td>High availability for simple key-based writes</td></tr>
+<tr><th>Consensus groups</th><td>An elected leader</td><td>None</td><td>Automatic and safe</td><td>Correctness matters and extra write latency is acceptable</td></tr>
+</tbody>
+</table>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Reading from a replica straight after writing</b> and assuming the write is there.</li>
+  <li><b>Treating replicas as a way to scale writes.</b></li>
+  <li><b>Assuming asynchronous replication loses nothing on failover.</b></li>
+  <li><b>Automatic failover with aggressive timeouts</b> and no protection against two leaders.</li>
+  <li><b>Never testing failover</b>, including how the application reconnects.</li>
+  <li><b>No monitoring of replication lag.</b></li>
+  <li><b>Using multi-leader replication for convenience</b> and discovering conflicts in production.</li>
+  <li><b>Relying on timestamps from different machines</b> to order writes.</li>
+  <li><b>Calling replication a backup.</b></li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="storage-engines"></x-ref>: the log that replication ships.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: redundancy, failover, RTO and RPO.</li>
+  <li><x-ref to="partitioning"></x-ref>: splitting data, which is combined with replication in every large system.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: why a slow node and a dead node cannot be told apart, and why clocks disagree.</li>
+  <li><x-ref to="consistency-models"></x-ref> and <x-ref to="consensus"></x-ref>: the guarantees and the protocol behind safe failover.</li>
+  <li><x-ref to="multi-region"></x-ref>: replication across the world.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Replication provides availability, read capacity and proximity. The difficulty is keeping copies consistent while data changes.</li>
+  <li>A single leader gives writes one order and avoids conflicts. It is the default, and it requires failover.</li>
+  <li>Asynchronous replication is fast and can lose recent acknowledged writes. Synchronous replication loses none and adds latency to each write.</li>
+  <li>Followers lag. Decide which reads may be stale, and send the rest to the leader.</li>
+  <li>Failover is the dangerous moment: writes can be lost, and two nodes can both believe they lead unless a majority rule or fencing prevents it.</li>
+  <li>Multi-leader and leaderless designs accept writes in several places and must resolve conflicts afterward.</li>
+  <li>With N replicas, a write quorum W and a read quorum R overlap when W + R is greater than N.</li>
+  <li>Replicas scale reads, not writes, and replication is not a backup.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A user updates their display name and the next page still shows the old one. Refreshing a few seconds later shows the new one. What is happening and how would you fix it?</summary><p>The write went to the leader and the following read was served by a follower that had not yet received it. This is a read-your-writes violation caused by replication lag. Send the user’s reads of their own data to the leader for a short time after they write, or track the log position of the write and read only from a follower that has reached it.</p></details>
+<details><summary>With asynchronous replication, the leader fails and a follower is promoted. A customer says their order was confirmed and now does not exist. Is that possible?</summary><p>Yes. The leader acknowledged the order before sending it to any follower, and failed before it was replicated. The promoted follower never had it. Preventing this needs synchronous replication to at least one follower for writes that must not be lost.</p></details>
+<details><summary>Why can a leader that is merely slow cause more damage than one that has crashed?</summary><p>A crashed leader stops accepting writes. A slow or disconnected one may be declared dead and replaced while it is still running, and it can keep accepting writes from clients that still reach it. Two leaders then diverge, which is split brain. Fencing or a majority requirement is needed to stop the old one.</p></details>
+<details><summary>A cluster stores each item on 5 replicas. Writes wait for 3 confirmations and reads ask 2 replicas. Can a read miss the latest write?</summary><p>Yes. W + R is 5, which is not greater than N = 5, so the two replicas asked by the read can be exactly the two that the write did not reach. Asking 3 replicas would guarantee an overlap.</p></details>
+<details><summary>Your leader’s CPU is saturated, and analysis shows most of the load is writes. Will adding three read replicas help?</summary><p>Not much. Moving reads elsewhere frees a little capacity, and the write load stays entirely on the leader. Each replica also has to apply the same writes. Write load is reduced by doing fewer or cheaper writes, by a larger machine, or by partitioning the data across several leaders.</p></details>
+<details><summary>Two regions each have a leader, and a user changes their email address in both at nearly the same moment. What decides the result under last write wins, and why is that fragile?</summary><p>The write with the later timestamp is kept and the other is discarded without notice. The timestamps come from two different machines whose clocks are not perfectly synchronized, so “later” may not reflect the real order, and one user’s change vanishes either way.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 5, “Replication”. The three-way division used here follows it.</li>
+  <li>GitHub, <a href="https://github.blog/news-insights/company-news/oct21-post-incident-analysis/">October 21 post-incident analysis</a>, October 2018.</li>
+  <li>Giuseppe DeCandia and others, <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon’s Highly Available Key-value Store</a>, SOSP 2007. Quorums, read repair and hinted handoff.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/warm-standby.html">Log-Shipping Standby Servers</a> and <a href="https://www.postgresql.org/docs/current/logical-replication.html">Logical Replication</a>.</li>
+  <li>MySQL documentation, <a href="https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html">Semisynchronous Replication</a>.</li>
+  <li>Alexandre Verbitski and others, <a href="https://www.amazon.science/publications/amazon-aurora-design-considerations-for-high-throughput-cloud-native-relational-databases">Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases</a>, SIGMOD 2017. Six copies across three zones.</li>
+  <li>Apache Cassandra documentation, <a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html">Dynamo</a>. Tunable consistency levels.</li>
+  <li>Marc Shapiro and others, <a href="https://inria.hal.science/inria-00555588">A comprehensive study of Convergent and Commutative Replicated Data Types</a>, 2011. The origin of CRDTs.</li>
+  <li>Diego Ongaro and John Ousterhout, <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a>, 2014. Raft.</li>
+</ol>
+</section>

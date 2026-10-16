@@ -1,0 +1,410 @@
+<!--meta
+{ "description": "How databases store data on disk: pages and the buffer pool, the write-ahead log and crash recovery, B-tree engines, LSM trees with memtables, SSTables, compaction and Bloom filters, and the read, write and space trade-off between them.",
+  "lede": "Underneath every database is a storage engine, the part that turns “store this” and “find that” into bytes on a disk. There are two dominant designs, and the choice between them explains why some databases write quickly and others read quickly. This chapter builds both from the simplest possible starting point.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="job">What a storage engine has to do</h2>
+<p>A <dfn>storage engine</dfn> is the component of a database that writes data to durable storage and reads it back. The layers above it parse queries, plan them and manage transactions. The engine’s job sounds simple, and three facts about hardware make it hard.</p>
+<ul>
+  <li><b>Memory is fast and forgets.</b> Anything held only in RAM is gone after a crash or a power cut.</li>
+  <li><b>Disks remember and are slow.</b> Even a fast SSD takes around a thousand times longer to read than memory does (<x-ref to="estimation#latency-numbers"></x-ref>).</li>
+  <li><b>Sequential access is much cheaper than random access.</b> Writing to the end of a file is the cheapest operation a disk offers. Changing small pieces scattered through a large file is the most expensive. The gap was enormous on spinning disks and is smaller, and still real, on SSDs.</li>
+</ul>
+<p>Every design in this chapter is a way of getting durability out of the slow device while doing as much work as possible in memory and in sequential order.</p>
+
+<h2 id="simplest">The simplest database that works</h2>
+<p>Start with a key-value store built from two parts. Writes append a record to the end of a file. An in-memory hash table maps each key to the position of its latest record in that file.</p>
+
+<figure class="fig wide" id="fig-log-index">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f181t f181d">
+<title id="f181t">An append-only log with an in-memory hash index</title>
+<desc id="f181d">A file on disk holds five records in the order they were written: ana equals 12, ben equals 7, ana equals 15, chi equals 3, chi equals 4. A hash table in memory maps ana to the third record, ben to the second and chi to the fifth. The first and fourth records are superseded and are no longer referenced.</desc>
+<text class="tl" x="10" y="18">In memory: a hash table from key to position</text>
+<rect class="n sig" x="10" y="30" width="104" height="30" rx="5"/>
+<text class="ts mid" x="62" y="49.5">ana → record 3</text>
+<rect class="n sig" x="130" y="30" width="104" height="30" rx="5"/>
+<text class="ts mid" x="182" y="49.5">ben → record 2</text>
+<rect class="n sig" x="250" y="30" width="104" height="30" rx="5"/>
+<text class="ts mid" x="302" y="49.5">chi → record 5</text>
+<rect class="n sunk" x="10" y="104" width="108" height="34" rx="3"/>
+<text class="ts mid" x="64" y="125.5">ana = 12</text>
+<rect class="n" x="126" y="104" width="108" height="34" rx="3"/>
+<text class="ts mid" x="180" y="125.5">ben = 7</text>
+<rect class="n" x="242" y="104" width="108" height="34" rx="3"/>
+<text class="ts mid" x="296" y="125.5">ana = 15</text>
+<rect class="n sunk" x="358" y="104" width="108" height="34" rx="3"/>
+<text class="ts mid" x="412" y="125.5">chi = 3</text>
+<rect class="n" x="474" y="104" width="108" height="34" rx="3"/>
+<text class="ts mid" x="528" y="125.5">chi = 4</text>
+<rect class="n ghost" x="590" y="104" width="108" height="34" rx="6"/>
+<text class="ts mid" x="644" y="125.5">next write</text>
+<path class="e sig" d="M62 60 296 104"/>
+<path class="e sig" d="M182 60 180 104"/>
+<path class="e sig" d="M302 60 528 104"/>
+<text class="tl" x="10" y="162">On disk: one file, only ever appended to</text>
+<text class="ts" x="10" y="186">Writing appends a record and updates the table. Reading looks up the position and makes one disk read.</text>
+<text class="ts" x="10" y="203">Older records for the same key (shaded) are dead weight until a cleanup pass removes them.</text>
+</svg>
+</div>
+<figcaption>A log and an index. This is a real design, used by the Bitcask engine, and it is the seed of everything else in the chapter.</figcaption>
+</figure>
+
+<p>This is fast. A write is one sequential append, and a read is one hash lookup and one disk read. Its limits point directly at the two mainstream designs:</p>
+<ul>
+  <li><b>Every key must fit in memory</b>, since the index lives there.</li>
+  <li><b>Range queries are impossible.</b> A hash table has no order, so “all keys between <code>a</code> and <code>c</code>” means checking every key.</li>
+  <li><b>The file grows forever</b> unless a background process rewrites it without the dead records.</li>
+</ul>
+<p>To support ranges, the data must be kept sorted. There are two ways to keep data sorted on disk. One keeps a sorted structure and modifies it in place, which is the B-tree. The other never modifies anything, writes small sorted files and merges them later, which is the LSM tree. Before either, one mechanism that both rely on.</p>
+
+<h2 id="wal">The write-ahead log</h2>
+<p>Suppose an engine changes its data files directly, and the machine loses power halfway through writing a page. The file now contains half of the old page and half of the new. Or the engine has made three of the five changes that belong to one transaction. There is no way to tell afterward what state the file is in.</p>
+<p>The solution used by essentially every database is the <dfn>write-ahead log</dfn> (WAL). The rule is in the name: before changing anything else, append a description of the change to a log file and make sure it has reached the disk.</p>
+
+<figure class="fig wide" id="fig-wal">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-labelledby="f182t f182d">
+<title id="f182t">The path of a write through the buffer pool, the write-ahead log and the data files</title>
+<desc id="f182d">A client sends a write. First the page is changed in the buffer pool in memory. Second a description of the change is appended to the write-ahead log on disk and flushed. Third the client is told the commit succeeded. Fourth, some time later, the changed pages are written to the data files on disk in batches.</desc>
+<rect class="n" x="10" y="70" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="99.5">Client</text>
+<rect class="grp" x="170" y="14" width="250" height="76" rx="8"/>
+<text class="ts" x="180" y="30">memory</text>
+<rect class="n sig" x="200" y="38" width="190" height="40" rx="6"/>
+<text class="tb mid" x="295" y="54">Buffer pool</text>
+<text class="ts mid" x="295" y="71">pages being changed</text>
+<rect class="grp" x="170" y="104" width="540" height="100" rx="8"/>
+<text class="ts" x="180" y="120">disk</text>
+<rect class="n async" x="200" y="128" width="190" height="56" rx="6"/>
+<text class="tb mid" x="295" y="143.5">Write-ahead log</text>
+<text class="ts mid" x="295" y="160.5">append only,</text>
+<text class="ts mid" x="295" y="177.5">flushed at commit</text>
+<rect class="n store" x="500" y="128" width="190" height="56" rx="6"/>
+<text class="tb mid" x="595" y="143.5">Data files</text>
+<text class="ts mid" x="595" y="160.5">pages, written</text>
+<text class="ts mid" x="595" y="177.5">later in batches</text>
+<g data-s="1">
+<path class="e sig" d="M110 86 200 62"/>
+<text class="tb mid" x="150" y="62">1</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M110 104 200 150"/>
+<text class="tb mid" x="150" y="142">2</text>
+</g>
+<g data-s="3">
+<path class="e dash" d="M200 170 C150 190 110 160 82 120"/>
+<text class="tb mid" x="124" y="178">3</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M390 58 C470 58 595 70 595 128"/>
+<text class="tb mid" x="520" y="62">4</text>
+</g>
+<text class="ts" x="10" y="228">1. Change the page in memory.  2. Append a description of the change to the log and flush it to disk.</text>
+<text class="ts" x="10" y="245">3. Tell the client the commit succeeded.  4. Some time later, write the changed pages to the data files.</text>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="change" data-state="Page in memory: changed; Log on disk: not yet; Data files: old; Client: waiting">The change is made to the page in memory, in the buffer pool.</li>
+  <li data-msg="log record" data-state="Page in memory: changed; Log on disk: written; Data files: old; Client: waiting">A description of the change is appended to the write-ahead log and flushed to disk. This is one short, sequential write.</li>
+  <li data-msg="committed" data-state="Page in memory: changed; Log on disk: written; Data files: old; Client: told it committed">The client is told the commit succeeded. Only the log has reached the disk, and that is enough to survive a crash.</li>
+  <li data-msg="changed pages" data-state="Page in memory: changed; Log on disk: written; Data files: new; Client: told it committed">Some time later the changed pages themselves are written to the data files, in batches.</li>
+</ol>
+<figcaption>A commit waits only for the log. The slow, scattered writes to the data files happen later, in the background.</figcaption>
+</figure>
+
+<p>This ordering gives the two ACID properties that <x-ref to="transactions#acid"></x-ref> said depend on the log.</p>
+<ul>
+  <li><b>Durability.</b> Once the log record is on disk, the change cannot be lost, even though the data file has not been touched. After a crash, the database reads the log from the last known-good point and reapplies everything in it. This is <dfn>crash recovery</dfn>.</li>
+  <li><b>Atomicity.</b> A transaction counts as committed only when its commit record is in the log. During recovery, changes from transactions with no commit record are discarded.</li>
+</ul>
+<p>It also makes commits fast. The log is written sequentially, so the only disk work a commit must wait for is one small append. The data files, which need random writes, are updated lazily. Periodically the database performs a <dfn>checkpoint</dfn>: it writes all changed pages to the data files, after which the older part of the log is no longer needed and can be recycled.</p>
+<p>The step that costs time is forcing the log onto the physical disk. Operating systems buffer writes in memory, and a program must make a specific call, <code>fsync</code>, to wait until the data is truly stored. That call can take from a fraction of a millisecond to several milliseconds. Databases soften the cost with <dfn>group commit</dfn>, in which transactions that commit at nearly the same moment share one flush.</p>
+<div class="note production"><p><span class="label">In production.</span> Databases let you trade durability for speed here, and the setting is worth knowing. PostgreSQL’s <code>synchronous_commit = off</code> acknowledges commits before the flush, risking the last fraction of a second of transactions in a crash while never corrupting the database. MySQL’s <code>innodb_flush_log_at_trx_commit</code> offers similar choices. Relaxing it is reasonable for data you could afford to lose, such as activity logs, and a mistake for payments.</p></div>
+<p>The log has a second life that matters a great deal later. Because it is a complete, ordered record of every change, shipping it to another machine and replaying it there produces an identical copy of the database. That is how <x-ref to="replication"></x-ref> works, and reading the log from outside is the basis of <x-ref to="change-data-capture"></x-ref>.</p>
+
+<h2 id="btree-engine">B-tree engines: update in place</h2>
+<p><x-ref to="indexes-and-queries#btree"></x-ref> described the B-tree as a structure for finding rows. As a storage engine it works like this. The database file is divided into fixed-size pages. Each page is a node of the tree. To change a row, the engine finds the page that holds it, modifies the page in memory, logs the change, and eventually writes the whole page back to the same place on disk.</p>
+<p>The memory in which pages are held is the <dfn>buffer pool</dfn>, and it is the main lever on a database’s performance. When the pages a workload uses often, called its working set, fit in the buffer pool, most reads never touch the disk. When they do not fit, pages are constantly evicted and read back, and performance falls sharply. The first question about a slow database is often how the size of its data compares with its memory.</p>
+<p>Updating in place has consequences worth understanding.</p>
+<ul>
+  <li><b>Reads are efficient and predictable.</b> Each key lives in exactly one place. A lookup descends the tree once.</li>
+  <li><b>Writes are random.</b> Rows that are inserted in no particular order land on pages all over the file, and each of those pages must eventually be written back whole. Changing 100 bytes can mean writing an 8 KB page.</li>
+  <li><b>Pages split.</b> When a page is full, half its contents move to a new page. Over time pages end up partly empty and the file is larger than its contents. This is fragmentation.</li>
+  <li><b>Torn pages must be guarded against.</b> A crash during a page write can leave it half written, and the log entry describing a small change cannot repair a page that is physically broken. PostgreSQL therefore puts a full copy of each page in the log the first time the page changes after a checkpoint. MySQL writes pages twice, first to a separate area.</li>
+</ul>
+<p>B-tree engines have been refined for fifty years and run most of the world’s transactional databases: PostgreSQL, MySQL’s InnoDB, SQL Server, Oracle and SQLite.</p>
+
+<h2 id="lsm">LSM trees: never update, merge later</h2>
+<p>The <dfn>log-structured merge tree</dfn> (LSM tree) takes the opposite approach. It never changes a file once written. All writes go to memory and to a log, and sorted files are produced and combined in the background.</p>
+
+<figure class="fig wide" id="fig-lsm">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 286" role="img" aria-labelledby="f183t f183d">
+<title id="f183t">The structure of an LSM tree and the paths of a write and a read</title>
+<desc id="f183d">A write goes to an in-memory sorted structure called the memtable and is also appended to a write-ahead log on disk. When the memtable is full it is flushed to disk as a new sorted file in level 0. Background compaction merges files into larger sorted files in level 1 and then level 2, each level holding about ten times as much as the one above. A read checks the memtable first and then files from newest to oldest.</desc>
+<rect class="n" x="10" y="30" width="90" height="40" rx="6"/>
+<text class="tb mid" x="55" y="54.5">Write</text>
+<rect class="grp" x="150" y="10" width="300" height="70" rx="8"/>
+<text class="ts" x="160" y="26">memory</text>
+<rect class="n sig" x="210" y="32" width="200" height="38" rx="6"/>
+<text class="tb mid" x="310" y="47">Memtable</text>
+<text class="ts mid" x="310" y="64">sorted</text>
+<rect class="n async" x="500" y="32" width="210" height="38" rx="6"/>
+<text class="tb mid" x="605" y="47">Write-ahead log</text>
+<text class="ts mid" x="605" y="64">on disk, append only</text>
+<g data-scene="write">
+<g data-s="1">
+<path class="e sig" d="M100 50H210"/>
+<path class="e async" d="M410 50H500"/>
+</g>
+</g>
+<rect class="grp" x="150" y="98" width="560" height="176" rx="8"/>
+<text class="ts" x="330" y="114">disk: sorted files that are never modified</text>
+<text class="ts" x="160" y="141">Level 0</text>
+<rect class="n store" x="280" y="124" width="62" height="26" rx="3"/>
+<rect class="n store" x="348" y="124" width="62" height="26" rx="3"/>
+<rect class="n store" x="416" y="124" width="62" height="26" rx="3"/>
+<text class="ts" x="160" y="191">Level 1</text>
+<rect class="n store" x="280" y="174" width="62" height="26" rx="3"/>
+<rect class="n store" x="348" y="174" width="62" height="26" rx="3"/>
+<rect class="n store" x="416" y="174" width="62" height="26" rx="3"/>
+<rect class="n store" x="484" y="174" width="62" height="26" rx="3"/>
+<rect class="n store" x="552" y="174" width="62" height="26" rx="3"/>
+<text class="ts" x="160" y="241">Level 2</text>
+<rect class="n store" x="280" y="224" width="62" height="26" rx="3"/>
+<rect class="n store" x="348" y="224" width="62" height="26" rx="3"/>
+<rect class="n store" x="416" y="224" width="62" height="26" rx="3"/>
+<rect class="n store" x="484" y="224" width="62" height="26" rx="3"/>
+<rect class="n store" x="552" y="224" width="62" height="26" rx="3"/>
+<rect class="n store" x="620" y="224" width="62" height="26" rx="3"/>
+<g data-scene="write">
+<g data-s="2">
+<path class="e store" d="M311 70V124"/>
+<text class="ts" x="319" y="93">flush when full</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M311 150V174"/>
+<text class="ts" x="319" y="166">compaction merges files into the next level</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M311 200V224"/>
+<text class="ts" x="319" y="216">each level holds about ten times more</text>
+</g>
+</g>
+<g data-scene="read">
+<g data-s="1">
+<circle class="n async" cx="430" cy="30" r="10"/>
+<text class="ts tb mid" x="430" y="34">1</text>
+</g>
+<g data-s="2">
+<circle class="n async" cx="256" cy="137" r="10"/>
+<text class="ts tb mid" x="256" y="141">2</text>
+</g>
+<g data-s="3">
+<circle class="n async" cx="256" cy="187" r="10"/>
+<text class="ts tb mid" x="256" y="191">3</text>
+</g>
+<g data-s="4">
+<circle class="n async" cx="256" cy="237" r="10"/>
+<text class="ts tb mid" x="256" y="241">4</text>
+</g>
+<g data-s="1">
+<text class="ts" x="10" y="128">A read checks</text>
+<text class="ts" x="10" y="144">1, then 2, 3 and 4,</text>
+<text class="ts" x="10" y="160">and stops at the</text>
+<text class="ts" x="10" y="176">first match.</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="write" data-label="A write">
+  <li data-msg="write">A write goes to two places: it is appended to a log on disk for safety, and inserted into the memtable, a sorted structure in memory.</li>
+  <li data-msg="flush">When the memtable is full it is written out as one sorted file at level 0, and a fresh memtable takes over.</li>
+  <li data-msg="compact">In the background, compaction merges files into the next level and drops values that have been overwritten.</li>
+  <li data-msg="compact">Each level holds about ten times more than the one above it.</li>
+</ol>
+<ol class="steps" data-scene="read" data-label="A read">
+  <li>A read checks the memtable first, because it holds the newest data.</li>
+  <li>If the key is not there, it checks the files at level 0.</li>
+  <li>Still not found, so it goes one level down, to the older files at level 1.</li>
+  <li>Then level 2. The read stops at the first match, because the first match is the newest value.</li>
+</ol>
+<figcaption>An LSM tree. Writes touch only memory and one sequential log. The sorting and merging that a B-tree does at write time is deferred to the background.</figcaption>
+</figure>
+
+<p>The parts, in the order a write meets them:</p>
+<ol>
+  <li><b>The memtable.</b> An in-memory structure that keeps recent writes sorted by key. A write inserts into it and appends to a write-ahead log for safety, and is then complete. No data file is touched.</li>
+  <li><b>Flush.</b> When the memtable reaches a size limit, typically tens of megabytes, it is written to disk in one sequential pass as a sorted, immutable file called an <dfn>SSTable</dfn> (sorted string table). A fresh memtable takes over.</li>
+  <li><b>Compaction.</b> Flushes produce many files with overlapping key ranges. A background process repeatedly merges files into larger ones, discarding values that have been overwritten.</li>
+</ol>
+
+<figure class="fig wide" id="fig-compaction">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-labelledby="f184t f184d">
+<title id="f184t">Compaction merges two sorted files and discards overwritten and deleted entries</title>
+<desc id="f184d">A newer file contains b equals 7, a deletion marker for d, and f equals 3. An older file contains a equals 1, b equals 2, d equals 9 and e equals 5. Merging them in key order and keeping only the newest entry for each key gives a equals 1, b equals 7, e equals 5 and f equals 3.</desc>
+<text class="ts" x="10" y="18">Newer file</text>
+<text class="ts" x="10" y="78">Older file</text>
+<text class="ts" x="10" y="168">Merged file</text>
+<rect class="n sig" x="110" y="2" width="92" height="30" rx="3"/>
+<text class="ts mid" x="156" y="21.5">b = 7</text>
+<rect class="n fault" x="210" y="2" width="92" height="30" rx="3"/>
+<text class="ts mid" x="256" y="21.5">d: deleted</text>
+<rect class="n sig" x="310" y="2" width="92" height="30" rx="3"/>
+<text class="ts mid" x="356" y="21.5">f = 3</text>
+<rect class="n" x="110" y="60" width="92" height="30" rx="3"/>
+<text class="ts mid" x="156" y="79.5">a = 1</text>
+<rect class="n sunk" x="210" y="60" width="92" height="30" rx="3"/>
+<text class="ts mid" x="256" y="79.5">b = 2</text>
+<rect class="n sunk" x="310" y="60" width="92" height="30" rx="3"/>
+<text class="ts mid" x="356" y="79.5">d = 9</text>
+<rect class="n" x="410" y="60" width="92" height="30" rx="3"/>
+<text class="ts mid" x="456" y="79.5">e = 5</text>
+<rect class="n" x="110" y="150" width="92" height="30" rx="3"/>
+<text class="ts mid" x="156" y="169.5">a = 1</text>
+<rect class="n sig" x="210" y="150" width="92" height="30" rx="3"/>
+<text class="ts mid" x="256" y="169.5">b = 7</text>
+<rect class="n" x="310" y="150" width="92" height="30" rx="3"/>
+<text class="ts mid" x="356" y="169.5">e = 5</text>
+<rect class="n sig" x="410" y="150" width="92" height="30" rx="3"/>
+<text class="ts mid" x="456" y="169.5">f = 3</text>
+<path class="e" d="M330 96V150"/>
+<text class="ts" x="340" y="128">merge in key order, keeping only the newest entry for each key</text>
+<text class="ts" x="10" y="206">The old value of b and the deleted d disappear. Both inputs are sorted, so the merge reads each once, front to back.</text>
+
+</svg>
+</div>
+<figcaption>Compaction is a merge of sorted inputs, the same operation as the merge step of merge sort, done entirely with sequential reads and writes.</figcaption>
+</figure>
+
+<p>Two details follow from never modifying files. An update is simply a newer entry for the same key, and the older one is ignored and later discarded. A delete cannot remove anything, so it writes a marker called a <dfn>tombstone</dfn> that hides older values until compaction removes both.</p>
+<p>Reads are where the bill arrives. A key might be in the memtable or in any of several files, so a read checks them from newest to oldest until it finds the key. Two structures keep this tolerable. Each file has a small index of where key ranges begin, so only one block of the file needs reading. And each file has a <dfn>Bloom filter</dfn>, a compact structure that can say “this key is definitely not in this file”, which lets most files be skipped without any disk access. <x-ref to="probabilistic-structures"></x-ref> explains how it works.</p>
+<aside class="sn"><b>Two ways to compact</b>Leveled compaction keeps each level as one sorted run with no overlaps, which makes reads fast and space use tight at the cost of rewriting data many times. Size-tiered compaction merges files of similar size and rewrites data less often, which favors writes and uses more space temporarily. Databases let you choose per table, according to whether it is read more or written more.</aside>
+<p>LSM trees are the engine of write-heavy and very large databases: RocksDB and LevelDB as embeddable libraries, Cassandra, ScyllaDB, HBase and Bigtable, and, through RocksDB or engines modeled on it, the distributed SQL databases CockroachDB, TiDB and YugabyteDB. This is the reason the wide-column stores in <x-ref to="data-models#wide-column"></x-ref> can absorb so many writes.</p>
+
+<h2 id="tradeoffs">The trade-off between them</h2>
+<p>Neither design is better. Each moves cost from one place to another, and a useful vocabulary for the costs is <dfn>amplification</dfn>: how much more work the engine does than the application asked for.</p>
+<ul>
+  <li><b>Write amplification</b>: bytes written to disk per byte of data written by the application.</li>
+  <li><b>Read amplification</b>: disk reads needed to answer one query.</li>
+  <li><b>Space amplification</b>: bytes on disk per byte of live data.</li>
+</ul>
+<table>
+<thead><tr><th></th><th>B-tree</th><th>LSM tree</th></tr></thead>
+<tbody>
+<tr><th>Write pattern</th><td>Random: pages all over the file</td><td>Sequential: appends, flushes and merges</td></tr>
+<tr><th>Write throughput</th><td>Good</td><td>Higher, especially for inserts in random key order</td></tr>
+<tr><th>Point reads</th><td>One descent of the tree</td><td>Possibly several files, mitigated by Bloom filters</td></tr>
+<tr><th>Range scans</th><td>Efficient: follow the leaves</td><td>Must merge results from several files</td></tr>
+<tr><th>Space</th><td>Fragmentation leaves pages partly empty</td><td>Compact and compresses well, with temporary overhead during compaction</td></tr>
+<tr><th>Latency consistency</th><td>Steady</td><td>Can stall or slow when compaction falls behind the write rate</td></tr>
+<tr><th>Background work</th><td>Checkpoints, cleanup of old row versions</td><td>Compaction, which competes with queries for disk and CPU</td></tr>
+<tr><th>Deletes</th><td>Space is reusable at once</td><td>Tombstones linger until compacted, and many of them slow reads</td></tr>
+</tbody>
+</table>
+<p>A known result puts the situation compactly: an engine can be optimized for at most two of fast reads, fast writes and low space use, and the third suffers. B-trees lean toward reads. LSM trees lean toward writes and space.</p>
+<p>The practical guidance is short. For a general transactional workload with mixed reads and writes, B-tree engines are the well-trodden path, and they are what the default relational databases give you. Consider an LSM engine when writes dominate, when the data is much larger than memory, or when storage cost matters enough that compression is decisive. Time-series data, event logs, messaging history and metrics are the typical cases.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Using an LSM-based store as a queue. Rows are inserted, read once and deleted, so the table fills with tombstones. Each read then has to step over thousands of deletion markers to find the few live rows, and latency climbs although the table is nearly empty. Among Cassandra users this is a well-known pattern to avoid.</p></div>
+
+<h2 id="column">Column files and compression</h2>
+<p>Both designs above store data by row. <x-ref to="data-models#oltp-olap"></x-ref> explained that analytical systems store data by column instead. At the storage level, a column store writes each column’s values together in large immutable files, which makes strong compression possible because neighboring values are alike.</p>
+<ul>
+  <li><b>Dictionary encoding</b> replaces repeated values, such as country names, with small integers.</li>
+  <li><b>Run-length encoding</b> stores “the value BD, 40,000 times” instead of 40,000 copies.</li>
+  <li><b>Delta encoding</b> stores the differences between successive values, which are tiny for timestamps and counters.</li>
+</ul>
+<p>A column that compresses to a tenth of its size is also ten times faster to scan, since reading from disk is the bottleneck. Apache Parquet is the common open file format built this way, and it is what most data lakes are made of. Column files are slow to update one row at a time, so these systems borrow the LSM idea: new data is written in small batches and merged in the background.</p>
+
+<h2 id="memory-engines">Engines that live in memory</h2>
+<p>Redis, Valkey and Memcached keep the whole data set in RAM, which removes the disk from the read path and is where their speed comes from. Durability, if wanted, uses the same ideas in simpler form. Redis offers two mechanisms that can be combined:</p>
+<ul>
+  <li><b>Snapshots.</b> Periodically write the entire data set to a file. Compact and fast to load, and everything since the last snapshot is lost in a crash.</li>
+  <li><b>An append-only file.</b> Log every write, as a write-ahead log does. By default the log is flushed to disk once a second, so a crash loses at most about a second of writes.</li>
+</ul>
+<p>This is why a cache can be configured to be reasonably durable, and why the default configuration of an in-memory store should not be trusted with data you cannot rebuild until you have checked which of these is on.</p>
+
+<h2 id="durability">How durable is “durable”?</h2>
+<p>The write-ahead log protects against the process or machine stopping. It does not protect against everything, and a designer should know the gaps.</p>
+<ul>
+  <li><b>The disk itself can fail</b>, taking the log and the data with it. Protection against that is a copy on another machine, which is replication.</li>
+  <li><b>Storage can silently corrupt data.</b> Databases keep checksums on pages to detect it. Detection is not repair. Repair needs another copy.</li>
+  <li><b>The flush may not do what it says.</b> Some drives and virtual disks acknowledge a flush before the data is safe. In 2018 PostgreSQL developers found that when a flush failed on Linux, the kernel could discard the failed data and report success on the next attempt, so the database believed data was stored that was not. The behavior was fixed, and the episode is a reminder that durability rests on layers the database does not control.</li>
+  <li><b>Mistakes are durable too.</b> A <code>DELETE</code> without a <code>WHERE</code> clause is faithfully logged and replicated. Only backups, with the ability to restore to a point in time, protect against that. <x-ref to="disaster-recovery"></x-ref> covers them.</li>
+</ul>
+<p>For a system design, the working position is that a single machine’s disk gives protection against restarts, replication gives protection against hardware loss, and backups give protection against people and software.</p>
+
+<h2 id="using">What this means when you design</h2>
+<ul>
+  <li><b>Size memory against the working set.</b> A database whose hot data fits in RAM behaves completely differently from one whose data does not.</li>
+  <li><b>Insert order matters for B-trees.</b> Keys that increase over time keep writes on a few hot pages. Random keys spread them across the whole tree.</li>
+  <li><b>Batch your writes.</b> Because of group commit, a thousand rows in one transaction cost little more than one row. A thousand separate commits pay for a thousand flushes.</li>
+  <li><b>Match the engine to the workload</b> when you have the choice, and know which one your database uses when you do not.</li>
+  <li><b>Expect background work.</b> Vacuum, checkpoints and compaction all consume disk and CPU. Capacity plans need room for them, and a database running at the limit of its disk has no room to compact.</li>
+</ul>
+<div class="note interview"><p><span class="label">In an interview.</span> You are rarely asked to design a storage engine. You are asked to justify a database choice, and this is where the justification comes from: “write-heavy and append-mostly, so a store built on an LSM tree”, or “needs transactions and varied reads, so a B-tree engine such as PostgreSQL’s”. If asked how a database survives a crash, the answer is the write-ahead log: changes are logged and flushed before they are acknowledged, and replayed on restart.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Assuming a write is on disk because the call returned.</b> It depends on the flush settings of the database and of everything beneath it.</li>
+  <li><b>Turning off durable commits to pass a benchmark</b> and leaving it that way for data that matters.</li>
+  <li><b>Committing row by row</b> in a bulk load.</li>
+  <li><b>Running with far less memory than the working set</b> and tuning queries when the problem is disk reads.</li>
+  <li><b>Queue-like delete patterns on an LSM store.</b></li>
+  <li><b>Filling the disk.</b> Both designs need free space to do their background work, and LSM compaction needs the most.</li>
+  <li><b>Treating replication or the log as a backup.</b> Neither undoes a mistaken change.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="indexes-and-queries"></x-ref>: the B-tree from the query’s point of view.</li>
+  <li><x-ref to="transactions"></x-ref>: the guarantees that the log and row versions exist to provide.</li>
+  <li><x-ref to="replication"></x-ref>: sending the log to other machines.</li>
+  <li><x-ref to="probabilistic-structures"></x-ref>: Bloom filters in detail.</li>
+  <li><x-ref to="event-streaming"></x-ref>: a system whose entire design is an append-only log.</li>
+  <li><x-ref to="hld-key-value-store"></x-ref>: building a store from these parts.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Storage engines exist to get durability from a slow device while doing most work in memory and in sequential order.</li>
+  <li>The write-ahead log records every change and is flushed before a commit is acknowledged. It provides durability, atomicity and the basis for replication.</li>
+  <li>B-tree engines keep one sorted structure and update pages in place: efficient, predictable reads and random writes.</li>
+  <li>LSM trees buffer writes in memory, flush sorted immutable files and merge them in the background: very fast writes, compact storage, and reads that may consult several files.</li>
+  <li>The costs are write, read and space amplification. No design minimizes all three.</li>
+  <li>The buffer pool is the main performance lever. Know whether your working set fits in memory.</li>
+  <li>One machine’s log protects against restarts. Hardware loss needs replication and mistakes need backups.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A database acknowledges a commit and the server loses power a millisecond later, before the changed page was written to its data file. Is the change lost?</summary><p>No, provided the commit was flushed to the write-ahead log, which is the normal setting. On restart the database replays the log from the last checkpoint and reapplies the change to the page.</p></details>
+<details><summary>Why can an LSM tree accept writes faster than a B-tree?</summary><p>A write goes to an in-memory structure and one sequential log append, and nothing else happens at write time. A B-tree must find and modify the specific page for each key, and those pages are scattered, so its disk writes are random. The LSM tree defers the organizing work to background merges that use sequential I/O.</p></details>
+<details><summary>How does an LSM tree handle a delete, given that its files are never modified?</summary><p>It writes a tombstone, a marker saying the key is deleted. Reads that find the tombstone treat the key as absent. The old value and the tombstone are physically removed later, when compaction merges the files that contain them.</p></details>
+<details><summary>What does a Bloom filter save in an LSM read?</summary><p>Disk reads of files that do not contain the key. The filter is small enough to keep in memory and can say for certain that a key is absent from a file, so the read skips that file entirely.</p></details>
+<details><summary>A bulk import of a million rows takes an hour when each row is committed separately and a minute as batches of a thousand. Why?</summary><p>Each commit waits for the log to be flushed to disk. A million commits means a million flushes. Batching reduces that to a thousand flushes for the same data, and the rest of the work is cheap by comparison.</p></details>
+<details><summary>Your database has replicas in three zones. Do you still need backups?</summary><p>Yes. Replication copies every change, including a mistaken delete or a bug that corrupts data, to all replicas within seconds. Only a backup that can be restored to a time before the mistake recovers from it.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i> (O’Reilly), chapter 3, “Storage and Retrieval”. The progression from log to LSM tree to B-tree used here follows its approach.</li>
+  <li>Alex Petrov, <i>Database Internals</i> (O’Reilly), part I. The detailed treatment of both designs.</li>
+  <li>Patrick O’Neil and others, <a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">The Log-Structured Merge-Tree (LSM-Tree)</a>, Acta Informatica, 1996.</li>
+  <li>Justin Sheehy and David Smith, Bitcask: A Log-Structured Hash Table for Fast Key/Value Data, Basho, 2010. Summarized at <a href="https://highscalability.com/riaks-bitcask-a-log-structured-hash-table-for-fast-keyvalue/">High Scalability</a>.</li>
+  <li>RocksDB wiki, <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Overview">RocksDB Overview</a> and <a href="https://github.com/facebook/rocksdb/wiki/Compaction">Compaction</a>.</li>
+  <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/wal-intro.html">Write-Ahead Logging</a> and <a href="https://www.postgresql.org/docs/current/wal-async-commit.html">Asynchronous Commit</a>.</li>
+  <li>Manos Athanassoulis and others, <a href="https://stratos.seas.harvard.edu/publications/designing-access-methods-rum-conjecture">Designing Access Methods: The RUM Conjecture</a>, EDBT 2016. The three-way trade-off.</li>
+  <li>Jonathan Corbet, <a href="https://lwn.net/Articles/752063/">PostgreSQL’s fsync() surprise</a>, LWN, April 2018.</li>
+  <li>Redis documentation, <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">Redis persistence</a>.</li>
+  <li>Apache Cassandra documentation, <a href="https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/tombstones.html">Tombstones</a>.</li>
+</ol>
+</section>

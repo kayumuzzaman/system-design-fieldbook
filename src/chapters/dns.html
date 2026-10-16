@@ -1,0 +1,389 @@
+<!--meta
+{ "description": "DNS in depth for system design: the namespace and zones, record types, caching and TTLs, how to migrate with DNS, encrypted DNS, DNS-based traffic steering, service discovery, DNSSEC, common attacks, and how DNS fails in production.",
+  "lede": "DNS turns names into addresses, and it does so for every request your system makes or receives. It is also a cache you do not control, the first place traffic is steered, and a frequent cause of outages. This chapter covers how it is built and how to use it without being surprised.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="what">A database with no center</h2>
+<p><x-ref to="journey-of-a-request#dns">Chapter 2</x-ref> showed one lookup: a resolver walking from the root servers to the <code>.com</code> servers to the servers for <code>example.com</code>. This chapter looks at the system behind that walk, because its design explains both why DNS scales so well and why its failures are so wide.</p>
+<p>The Domain Name System dates from 1983, when the single file that listed every host on the network stopped being manageable. It replaced the file with a database that has three properties worth keeping in mind throughout:</p>
+<ul>
+  <li><b>It is hierarchical.</b> Names form a tree, and responsibility for each branch is handed to whoever runs it.</li>
+  <li><b>It is distributed.</b> No server holds everything. Each knows its own branch and where to send you for the branches below.</li>
+  <li><b>It is cached.</b> Every answer comes with a lifetime, and everyone who sees an answer may reuse it until that lifetime ends.</li>
+</ul>
+
+<h2 id="namespace">Names, zones and delegation</h2>
+<p>A domain name is read from right to left. In <code>www.example.com</code>, the rightmost label <code>com</code> is the <dfn>top-level domain</dfn> (TLD), <code>example</code> is registered beneath it, and <code>www</code> is a name its owner chose. Above them all is the unnamed <dfn>root</dfn>, sometimes written as a trailing dot.</p>
+
+<figure class="fig wide" id="fig-tree">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 266" role="img" aria-labelledby="f81t f81d">
+<title id="f81t">The DNS namespace as a tree divided into zones</title>
+<desc id="f81d">The root is at the top. Beneath it are top-level domains such as com, org and bd. Beneath com is example, and beneath example are www and api. The tree is divided into zones: the root zone, the com zone, and the example.com zone, each run by a different organization. Each zone points to the zones below it.</desc>
+<rect class="n ghost" x="262" y="6" width="196" height="50" rx="8"/>
+<rect class="n ghost" x="92" y="78" width="136" height="50" rx="8"/>
+<rect class="n ghost" x="24" y="148" width="272" height="112" rx="8"/>
+<path class="e none" d="M330 46 176 88M360 48V88M390 46 544 88M160 120V160M140 192 96 222M180 192 224 222M560 120V160"/>
+<rect class="n" x="312" y="16" width="96" height="30" rx="6"/><text class="tb mid" x="360" y="36">root</text>
+<rect class="n sig" x="112" y="88" width="96" height="30" rx="6"/><text class="tb mid" x="160" y="108">com</text>
+<rect class="n" x="312" y="88" width="96" height="30" rx="6"/><text class="tb mid" x="360" y="108">org</text>
+<rect class="n" x="512" y="88" width="96" height="30" rx="6"/><text class="tb mid" x="560" y="108">bd</text>
+<rect class="n store" x="112" y="162" width="96" height="30" rx="6"/><text class="tb mid" x="160" y="182">example</text>
+<rect class="n store" x="48" y="222" width="96" height="30" rx="6"/><text class="tb mid" x="96" y="242">www</text>
+<rect class="n store" x="176" y="222" width="96" height="30" rx="6"/><text class="tb mid" x="224" y="242">api</text>
+<rect class="n" x="512" y="160" width="96" height="30" rx="6"/><text class="tb mid" x="560" y="180">gov</text>
+<text class="ts" x="468" y="28">the root zone</text><text class="ts" x="468" y="44">lists every top-level domain</text>
+<text class="ts" x="238" y="142">the com zone, run by its registry</text>
+<text class="ts" x="306" y="212">the example.com zone,</text><text class="ts" x="306" y="228">run by whoever registered the name</text>
+</svg>
+</div>
+<figcaption>The namespace is one tree, cut into zones that are run independently. A zone holds the records for its own names and pointers to the zones delegated below it.</figcaption>
+</figure>
+
+<p>A <dfn>zone</dfn> is a part of the tree managed as one unit by one organization. Where one zone ends and another begins there is a <dfn>delegation</dfn>: the parent zone holds <code>NS</code> records naming the servers that are authoritative for the child. The referrals a resolver follows are exactly these delegations.</p>
+<p>Several parties are involved in getting a name to work, and it helps to know which is which when something breaks.</p>
+<table>
+<thead><tr><th>Party</th><th>Role</th><th>Example</th></tr></thead>
+<tbody>
+<tr><th>Registry</th><td>Runs a top-level domain and its zone</td><td>The operator of <code>.com</code></td></tr>
+<tr><th>Registrar</th><td>Sells names in that TLD and tells the registry which name servers a name uses</td><td>The company you bought the domain from</td></tr>
+<tr><th>Registrant</th><td>Holds the name</td><td>You</td></tr>
+<tr><th>Authoritative DNS provider</th><td>Hosts your zone and answers queries for it</td><td>A managed DNS service, or your own servers</td></tr>
+<tr><th>Recursive resolver</th><td>Looks names up on behalf of users and caches the answers</td><td>An internet provider’s resolver, or a public one such as <code>1.1.1.1</code>, <code>8.8.8.8</code> or <code>9.9.9.9</code></td></tr>
+<tr><th>Stub resolver</th><td>The small client in an operating system that asks a recursive resolver</td><td>What your code calls when it resolves a hostname</td></tr>
+</tbody>
+</table>
+<p>The registrar and the DNS provider are often the same company and need not be. Keeping the distinction clear matters because they fail separately: a lapsed registration takes the name away entirely, while a DNS provider outage leaves the name registered and unanswered.</p>
+
+<h2 id="records">Records</h2>
+<p>A zone is a list of <dfn>resource records</dfn>. Each has a name, a type, a time to live and a value. Written in the traditional zone file format, a small zone looks like this:</p>
+<pre data-lang="text" data-title="A zone file for example.com">
+$ORIGIN example.com.
+$TTL 3600
+@      IN SOA   ns1.example.com. hostmaster.example.com. (
+                2026101001 7200 900 1209600 300 )
+@      IN NS    ns1.example.com.
+@      IN NS    ns2.example.net.
+@      IN A     203.0.113.10
+@      IN AAAA  2001:db8::10
+www    IN CNAME example.com.
+api    IN A     203.0.113.20
+@      IN MX    10 mail.example.com.
+@      IN TXT   "v=spf1 mx -all"
+@      IN CAA   0 issue "letsencrypt.org"
+</pre>
+<p>The <code>@</code> stands for the zone’s own name, called the <dfn>apex</dfn>. These are the record types a system designer meets:</p>
+<table>
+<thead><tr><th>Type</th><th>Value</th><th>Purpose and notes</th></tr></thead>
+<tbody>
+<tr><th><code>A</code>, <code>AAAA</code></th><td>An IPv4 or IPv6 address</td><td>The basic answer. A name may have several, and resolvers return them all.</td></tr>
+<tr><th><code>CNAME</code></th><td>Another name</td><td>An alias: “look up that name instead”. Used to point a name at a CDN or load balancer. A name with a <code>CNAME</code> may hold no other records.</td></tr>
+<tr><th><code>NS</code></th><td>A name server</td><td>Which servers are authoritative for a zone. Present in the zone and in its parent.</td></tr>
+<tr><th><code>SOA</code></th><td>Zone metadata</td><td>One per zone. Its last field controls how long “no such name” answers are cached.</td></tr>
+<tr><th><code>MX</code></th><td>A mail server and a priority</td><td>Where email for the domain is delivered.</td></tr>
+<tr><th><code>TXT</code></th><td>Free text</td><td>Proof of domain ownership for third-party services, and the email authentication policies SPF, DKIM and DMARC.</td></tr>
+<tr><th><code>SRV</code></th><td>A host, a port and a weight</td><td>Locating a service, including its port. Common in internal service discovery.</td></tr>
+<tr><th><code>CAA</code></th><td>A certificate authority</td><td>Which authorities may issue certificates for the domain. Others must refuse.</td></tr>
+<tr><th><code>HTTPS</code></th><td>Connection parameters</td><td>Tells a browser before it connects that HTTP/3 is available, along with other hints.</td></tr>
+<tr><th><code>PTR</code></th><td>A name</td><td>The reverse mapping, from address to name. Used by mail servers and in logs.</td></tr>
+<tr><th><code>DS</code>, <code>DNSKEY</code>, <code>RRSIG</code></th><td>Keys and signatures</td><td>DNSSEC, described later in the chapter.</td></tr>
+</tbody>
+</table>
+<aside class="sn"><b>The apex problem</b>The rule that a <code>CNAME</code> cannot share a name with other records collides with the apex, which must hold <code>SOA</code> and <code>NS</code> records. So <code>example.com</code> itself cannot be a <code>CNAME</code> to a CDN, though <code>www.example.com</code> can. DNS providers work around it with a feature called ALIAS, ANAME or CNAME flattening: the provider looks up the target itself and returns plain address records.</aside>
+
+<h2 id="caching">Caching and TTL</h2>
+<p>The whole system depends on caching. Without it the root servers would be asked about every page view on Earth. With it they are asked rarely, because resolvers remember.</p>
+<p>Every record carries a <dfn>time to live</dfn> (TTL) in seconds. Whoever receives the record may reuse it for that long without asking again. An answer passes through several caches on its way to your code: the recursive resolver, the operating system, sometimes the browser, and sometimes the application runtime. Each keeps its own copy and counts its own lifetime down.</p>
+<p>The TTL is a dial that the zone’s owner sets, and it trades two things against each other.</p>
+<table>
+<thead><tr><th></th><th>Short TTL, such as 60 seconds</th><th>Long TTL, such as a day</th></tr></thead>
+<tbody>
+<tr><th>A change takes effect</th><td>Within about a minute</td><td>Over the following day</td></tr>
+<tr><th>Queries to your DNS provider</th><td>Many, which may cost more</td><td>Few</td></tr>
+<tr><th>Lookup delay for users</th><td>More requests pay for a fresh lookup</td><td>Almost always answered from cache</td></tr>
+<tr><th>If your DNS provider is down</th><td>Names stop resolving within a minute</td><td>Cached answers carry most users through a short outage</td></tr>
+<tr><th>Suits</th><td>Records used for failover or traffic steering</td><td>Records that almost never change, such as <code>NS</code> and <code>MX</code></td></tr>
+</tbody>
+</table>
+<p>The fourth row is easy to overlook. A short TTL makes you agile and also makes you dependent on your DNS provider answering at every moment. Five minutes is a common middle value for records in front of services.</p>
+<p>Failed lookups are cached too. If a name does not exist, the resolver remembers that for a period set in the zone’s <code>SOA</code> record. This <dfn>negative caching</dfn> has a practical consequence: if you look up a new name before creating its record, you may be told it does not exist for several minutes after you add it.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Talking about “DNS propagation” as if changes were pushed around the world. Nothing is pushed. Your authoritative servers have the new record within seconds. What takes time is every cache that holds the old answer waiting for its TTL to expire. You control that wait, and only in advance, by what TTL the old record had.</p></div>
+
+<h3 id="migration">Changing a record without an outage</h3>
+<p>The right procedure follows directly, and it applies whenever a name must move to a new address: a new load balancer, a new CDN, a new data center.</p>
+
+<figure class="fig" id="fig-migration">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 186" role="img" aria-labelledby="f82t f82d">
+<title id="f82t">Moving a name to a new address in four steps</title>
+<desc id="f82d">A timeline. First the TTL is lowered from one day to five minutes. After waiting at least one day for the old TTL to expire everywhere, the record is changed. Within about five minutes nearly all traffic has moved to the new server. After a day of stable operation the TTL is raised again and the old server is retired.</desc>
+<path class="e" d="M20 60H704"/>
+<g data-s="1">
+<circle class="dot" cx="70" cy="60" r="6"/>
+</g>
+<g data-s="2">
+<circle class="dot" cx="300" cy="60" r="6"/>
+</g>
+<g data-s="3">
+<circle class="dot" cx="400" cy="60" r="6"/>
+</g>
+<g data-s="4">
+<circle class="dot" cx="620" cy="60" r="6"/>
+</g>
+<g data-s="1">
+<text class="tb mid" x="70" y="26">1 Lower the TTL</text>
+<text class="ts mid" x="70" y="42">1 day to 5 minutes</text>
+</g>
+<g data-s="2">
+<text class="tb mid" x="300" y="26">2 Change the record</text>
+<text class="ts mid" x="300" y="42">old address to new</text>
+</g>
+<g data-s="4">
+<text class="tb mid" x="620" y="26">4 Raise the TTL</text>
+<text class="ts mid" x="620" y="42">retire the old server</text>
+</g>
+<g data-s="2">
+<text class="ts mid" x="185" y="80">wait at least the old TTL</text>
+</g>
+<g data-s="3">
+<text class="ts" x="408" y="80">3 Watch: about 5 minutes</text>
+</g>
+<text class="ts" x="20" y="116">Traffic to the old server</text>
+<g data-s="1">
+<rect class="bar mute" x="180" y="104" width="230" height="16"/>
+</g>
+<g data-s="3">
+<path d="M410 104h60l-60 16z" class="bar mute"/>
+</g>
+<text class="ts" x="20" y="148">Traffic to the new server</text>
+<g data-s="2">
+<path d="M300 152h110v-16z" class="bar"/>
+</g>
+<g data-s="4">
+<rect class="bar" x="412" y="136" width="288" height="16"/>
+<text class="ts" x="180" y="174">Both servers must work between steps 2 and 4. A few clients ignore TTLs and arrive late.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Record: old address; TTL: 5 minutes; Caches may hold: old address, for a day">A day or more before the move, lower the record’s TTL from one day to five minutes. Caches around the world still hold the old, long-lived answer.</li>
+  <li data-state="Record: new address; TTL: 5 minutes; Caches may hold: old address, for 5 minutes">Wait at least as long as the old TTL, so that every cache now holds a five-minute answer. Then change the record to the new address. Traffic begins to arrive at the new server.</li>
+  <li data-state="Record: new address; TTL: 5 minutes; Caches may hold: new address">Watch for about five minutes while caches expire and traffic moves across. If something is wrong, changing the record back takes effect just as quickly.</li>
+  <li data-state="Record: new address; TTL: 1 day; Caches may hold: new address">Once the old server is quiet, raise the TTL again and retire it. A few clients ignore TTLs and arrive late, so both servers must work between steps 2 and 4.</li>
+</ol>
+<figcaption>Moving a name. The lower TTL has to be in place for at least as long as the old TTL before the change, or caches will still hold the long-lived answer.</figcaption>
+</figure>
+
+<ol>
+  <li><b>Lower the TTL</b> well ahead of time, and wait at least as long as the old TTL so that every cache has picked up the short one.</li>
+  <li><b>Change the record.</b> Keep the old destination running and serving correctly.</li>
+  <li><b>Watch traffic move</b> over the next few minutes. If something is wrong, changing back takes effect just as fast.</li>
+  <li><b>Raise the TTL</b> again once you are confident, and only then retire the old destination.</li>
+</ol>
+<p>Expect a thin tail of traffic at the old address for hours or days. Some resolvers and client libraries hold answers longer than the TTL allows, and long-lived connections opened before the change simply stay open.</p>
+
+<h2 id="wire">On the wire, and encrypted DNS</h2>
+<p>A classic DNS query is a single small packet sent over UDP to port 53, answered by a single packet. No connection is set up, which is why a lookup can cost one round trip. When an answer is too large to fit safely in one packet, the server says so and the client asks again over TCP.</p>
+<p>Classic DNS is unencrypted. Anyone on the path, such as a Wi-Fi operator or an internet provider, can see which names a device looks up and can alter the answers. Three newer transports wrap the same queries in encryption:</p>
+<table>
+<thead><tr><th>Name</th><th>Runs over</th><th>Port</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>DNS over TLS (DoT)</th><td>TCP with TLS</td><td class="r">853</td><td>Common for system-wide settings on phones and in resolvers talking to each other.</td></tr>
+<tr><th>DNS over HTTPS (DoH)</th><td>HTTPS</td><td class="r">443</td><td>Built into browsers. Looks like ordinary web traffic, so it is hard to block or inspect.</td></tr>
+<tr><th>DNS over QUIC (DoQ)</th><td>QUIC</td><td class="r">853</td><td>The newest. Avoids the head-of-line blocking of the TCP-based options.</td></tr>
+</tbody>
+</table>
+<p>These protect the conversation between a device and its resolver. They do not prove that the answer is the one the domain’s owner published. That is the job of DNSSEC, covered below. For a designer, the main effect of encrypted DNS is on corporate networks, where security tools that relied on reading DNS queries no longer see them when a browser uses its own resolver.</p>
+
+<h2 id="steering">DNS as a traffic director</h2>
+<p>An authoritative server is free to give different answers to different questions about the same name. That makes DNS the first place where traffic can be steered, before any connection exists.</p>
+
+<figure class="fig wide" id="fig-steering">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f83t f83d">
+<title id="f83t">An authoritative DNS server steering users to different regions</title>
+<desc id="f83d">An authoritative DNS server checks the health of two regions, Frankfurt and Singapore. A resolver in Europe asks for the address of app.example.com and is given Frankfurt’s address. A resolver in Asia asks the same question and is given Singapore’s address.</desc>
+<rect class="n" x="10" y="36" width="168" height="48" rx="6"/><text class="tb mid" x="94" y="57">Resolver in Europe</text><text class="ts mid" x="94" y="74">asks for app.example.com</text>
+<rect class="n" x="10" y="150" width="168" height="48" rx="6"/><text class="tb mid" x="94" y="171">Resolver in Asia</text><text class="ts mid" x="94" y="188">asks for app.example.com</text>
+<rect class="n sig" x="278" y="78" width="168" height="78" rx="6"/><text class="tb mid" x="362" y="104">Authoritative DNS</text><text class="ts mid" x="362" y="122">policy: nearest region</text><text class="ts mid" x="362" y="138">that passes its health check</text>
+<rect class="n" x="544" y="36" width="166" height="48" rx="6"/><text class="tb mid" x="627" y="57">Frankfurt region</text><text class="ts mid" x="627" y="74">198.51.100.10</text>
+<rect class="n" x="544" y="150" width="166" height="48" rx="6"/><text class="tb mid" x="627" y="171">Singapore region</text><text class="ts mid" x="627" y="188">203.0.113.20</text>
+<path class="e sig both" d="M178 66 278 100"/><path class="e sig both" d="M178 168 278 134"/>
+<path class="e dash" d="M446 100 544 66"/><path class="e dash" d="M446 134 544 168"/>
+<text class="ts" x="196" y="46">answer: 198.51.100.10</text>
+<text class="ts" x="196" y="200">answer: 203.0.113.20</text>
+<text class="ts mid" x="496" y="120">health checks</text>
+<text class="ts" x="10" y="228">If Singapore fails its health check, the next resolver in Asia is given Frankfurt’s address.</text>
+</svg>
+</div>
+<figcaption>DNS-based steering. The same question gets a different answer depending on where it comes from and which regions are healthy.</figcaption>
+</figure>
+
+<p>Managed DNS services offer a standard set of policies:</p>
+<table>
+<thead><tr><th>Policy</th><th>The answer depends on</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><th>Round robin</th><td>Nothing. Several addresses are returned in rotating order.</td><td>Crude spreading of load across a few servers</td></tr>
+<tr><th>Weighted</th><td>Configured proportions, such as 95 to 5</td><td>Shifting a share of traffic to a new version or provider</td></tr>
+<tr><th>Latency or geolocation</th><td>Where the query appears to come from</td><td>Sending users to the nearest region, or keeping a country’s users in that country</td></tr>
+<tr><th>Failover</th><td>Health checks run by the DNS provider</td><td>Replacing a failed region’s address with a standby</td></tr>
+</tbody>
+</table>
+<p>DNS steering is simple and works for any protocol, which is why nearly every multi-region system uses it at the top level. It is also blunt, and its limits decide where other tools are needed.</p>
+<ul>
+  <li><b>It acts on resolvers, not on users.</b> The authoritative server sees the address of the recursive resolver, which may be far from the person asking. An extension called EDNS Client Subnet lets a resolver pass along part of the user’s address, and not all resolvers send it.</li>
+  <li><b>It is only as fast as the TTL.</b> With a five-minute TTL, a failed region keeps receiving traffic from caches for up to five minutes after the DNS provider notices, and longer from clients that ignore the TTL.</li>
+  <li><b>It cannot see load.</b> One answer handed to a large provider’s resolver may be used by a million users, and another by ten. DNS decides per lookup and has no idea how many requests follow each one.</li>
+  <li><b>It knows nothing about requests.</b> It cannot route by URL path, retry a failed request or drain a server gracefully.</li>
+</ul>
+<p>The alternatives make different trade-offs, and large systems combine them.</p>
+<table>
+<thead><tr><th></th><th>DNS steering</th><th>Anycast</th><th>Load balancer</th></tr></thead>
+<tbody>
+<tr><th>Decides</th><td>Per lookup, per resolver</td><td>Per packet, by network routing</td><td>Per connection or per request</td></tr>
+<tr><th>Reacts to failure in</th><td>The TTL, plus detection time</td><td>Seconds to minutes</td><td>Seconds</td></tr>
+<tr><th>Aware of server load</th><td>No</td><td>No</td><td>Yes</td></tr>
+<tr><th>Scope</th><td>Global, between regions or providers</td><td>Global, between sites of one network</td><td>Within a region or site</td></tr>
+<tr><th>Covered in</th><td>This chapter</td><td><x-ref to="ip-and-routing#anycast">Chapter 7</x-ref></td><td><x-ref to="proxies-and-load-balancers"></x-ref></td></tr>
+</tbody>
+</table>
+<p>A typical arrangement uses DNS or anycast to choose a region and a load balancer inside the region to choose a server.</p>
+
+<h2 id="internal">DNS inside your system</h2>
+<p>DNS is also how services find each other internally. Instead of configuring a service with the addresses of its dependencies, you give it a name, and the name is kept pointing at whatever instances are currently healthy. In Kubernetes, for example, every service receives a name of the form <code>orders.shop.svc.cluster.local</code>, resolved by a DNS server that runs inside the cluster.</p>
+<p>Networks commonly use <dfn>split-horizon DNS</dfn> as well: the same name resolves to a private address for clients inside the network and to a public one, or to nothing, for clients outside.</p>
+<p>Using DNS for discovery brings its caching behavior into your own failure handling, and three problems recur.</p>
+<ul>
+  <li><b>Clients that cache too long.</b> Some language runtimes and HTTP libraries resolve a name once and keep the answer for the life of the process, or for a fixed period that ignores the TTL. After a failover they keep calling an address that is gone. Check what your runtime does and configure it.</li>
+  <li><b>Connection pools that never look again.</b> A pool of open connections has no reason to consult DNS. If a database fails over to a new address, existing connections must break and be re-established before the new answer matters. Set a maximum lifetime on pooled connections so they are refreshed periodically.</li>
+  <li><b>Lookups that multiply.</b> Resolver settings can turn one logical lookup into several. Kubernetes’ default search configuration makes a lookup for an external name such as <code>api.partner.com</code> try several internal suffixes first, so one call can cost several queries. Under load the cluster’s DNS server becomes a bottleneck that nobody thought to monitor.</li>
+</ul>
+<p>Richer discovery mechanisms exist for cases where DNS is too coarse, and <x-ref to="service-communication"></x-ref> covers them.</p>
+
+<h2 id="security">Security</h2>
+<p>DNS was designed without authentication. A resolver accepts an answer if it appears to come from the right server and matches a question it asked. Several attacks follow from that.</p>
+<table>
+<thead><tr><th>Attack</th><th>How it works</th><th>Defense</th></tr></thead>
+<tbody>
+<tr><th>Cache poisoning</th><td>An attacker races the real server with forged answers. If one is accepted, the resolver caches a false address and gives it to every user.</td><td>Randomized query ports and identifiers, which resolvers adopted after a 2008 disclosure showed how practical the attack was. DNSSEC.</td></tr>
+<tr><th>Registrar or account takeover</th><td>The attacker gets into the account that controls the domain and repoints it.</td><td>Strong authentication on registrar and DNS accounts, registry lock for important domains.</td></tr>
+<tr><th>Subdomain takeover</th><td>A <code>CNAME</code> still points at a cloud resource you deleted. The attacker creates a resource with that name and now serves content on your subdomain.</td><td>Remove DNS records when you remove what they point to. Audit for dangling records.</td></tr>
+<tr><th>Denial of service</th><td>A flood aimed at a domain’s authoritative servers, so that nobody can resolve it.</td><td>Anycast DNS providers with large capacity. A second provider.</td></tr>
+<tr><th>Amplification</th><td>The attacker sends small queries with a victim’s address forged as the source. Servers send large answers to the victim.</td><td>Mostly a concern for whoever runs open resolvers. Rate limiting of responses.</td></tr>
+</tbody>
+</table>
+
+<h3 id="dnssec">DNSSEC</h3>
+<p><dfn>DNSSEC</dfn> adds digital signatures to DNS so that a resolver can verify an answer is exactly what the zone’s owner published. Each zone signs its records with its own key. Its parent zone publishes a signed fingerprint of that key. Following those links upward leads to the root, whose key every validating resolver is configured to trust.</p>
+
+<figure class="fig wide" id="fig-dnssec">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 132" role="img" aria-labelledby="f84t f84d">
+<title id="f84t">The DNSSEC chain of trust</title>
+<desc id="f84d">A validating resolver holds the root zone’s key as its trust anchor. The root zone signs a fingerprint of the com zone’s key. The com zone signs a fingerprint of the example.com zone’s key. The example.com zone signs its own address records. A resolver can therefore verify an address record by following signatures back to the root.</desc>
+<rect class="n" x="8" y="24" width="160" height="84" rx="6"/><text class="tb mid" x="88" y="48">Resolver</text><text class="ts mid" x="88" y="68">trusts one key:</text><text class="ts mid" x="88" y="84">the root’s</text>
+<rect class="n sig" x="192" y="24" width="160" height="84" rx="6"/><text class="tb mid" x="272" y="48">Root zone</text><text class="ts mid" x="272" y="68">signs a fingerprint of</text><text class="ts mid" x="272" y="84">the com zone’s key</text>
+<rect class="n sig" x="376" y="24" width="160" height="84" rx="6"/><text class="tb mid" x="456" y="48">com zone</text><text class="ts mid" x="456" y="68">signs a fingerprint of</text><text class="ts mid" x="456" y="84">example.com’s key</text>
+<rect class="n store" x="560" y="24" width="152" height="84" rx="6"/><text class="tb mid" x="636" y="48">example.com zone</text><text class="ts mid" x="636" y="68">signs its own</text><text class="ts mid" x="636" y="84">address records</text>
+<path class="e sig" d="M168 66H192"/><path class="e sig" d="M352 66H376"/><path class="e sig" d="M536 66H560"/>
+<text class="ts mid" x="360" y="126">Each link is a signature that the resolver checks. One broken link and the answer is rejected.</text>
+</svg>
+</div>
+<figcaption>The chain of trust. A resolver that trusts the root’s key can verify any signed record by checking one signature per level of the tree.</figcaption>
+</figure>
+
+<aside class="sn"><b>Changing the key at the top</b>The root zone’s master key is replaced only rarely, in a ceremony planned years ahead, because every validating resolver in the world must learn the new key first. The second replacement in the system’s history is scheduled for 11 October 2026. The first was in October 2018, after a year’s postponement to give operators more time.</aside>
+<p>DNSSEC proves that an answer is authentic and unmodified. It does not hide queries, which is what encrypted DNS is for, and it does not protect the connection made afterward, which is what TLS is for. It also adds an operational risk of its own: if signatures expire or keys are rotated incorrectly, validating resolvers treat the whole zone as forged and it disappears for their users. Adoption is partial for that reason, and whether to sign a zone is a judgment about which risk worries you more.</p>
+
+<h2 id="failures">How DNS fails</h2>
+<p>When DNS fails, everything that depends on names fails with it, including tools you would use to diagnose the problem. Three incidents show the range.</p>
+<ul>
+  <li><b>An attack on a provider.</b> On 21 October 2016 a flood of traffic from compromised home devices hit Dyn, a managed DNS provider. Its customers’ servers were fine. Their names could not be resolved, and for much of a day large sites were unreachable for many users.</li>
+  <li><b>A self-inflicted withdrawal.</b> In the Facebook outage of October 2021, described in <x-ref to="ip-and-routing#bgp">Chapter 7</x-ref>, the company’s DNS servers took themselves off the internet when they lost contact with its data centers.</li>
+  <li><b>A configuration error at a resolver.</b> On 14 July 2025 Cloudflare’s public resolver <code>1.1.1.1</code> was unreachable for 62 minutes. An earlier configuration change had mistakenly tied the resolver’s address blocks to an unrelated service, and a routine update that evening withdrew those blocks from the internet worldwide. People whose devices used only that resolver could not look up any name. The same resolver reached through DNS over HTTPS mostly kept working, because that path uses a different hostname and different addresses.</li>
+</ul>
+<p>To these add the AWS incident of October 2025 from <x-ref to="availability-and-reliability#aws-2025">Chapter 6</x-ref>, in which automation left a service’s endpoint with no records at all. In every case the application servers were healthy and unreachable.</p>
+<p>The defenses are unglamorous and effective.</p>
+<table>
+<thead><tr><th>Risk</th><th>Defense</th></tr></thead>
+<tbody>
+<tr><th>Your authoritative provider is down</th><td>Use two providers for important zones, serving the same records. Avoid very short TTLs on records that do not need them.</td></tr>
+<tr><th>The registration lapses or is stolen</th><td>Auto-renew, more than one contact, strong authentication, registry lock.</td></tr>
+<tr><th>A bad record is published</th><td>Manage zones as reviewed code. Validate changes before applying. Keep TTLs short during a change so a mistake can be undone quickly.</td></tr>
+<tr><th>A resolver your servers depend on is down</th><td>Configure at least two resolvers run by different operators. Run a local caching resolver that can serve expired answers for a while if it cannot reach anyone.</td></tr>
+<tr><th>Your own tools depend on the names that are broken</th><td>Keep an access path for emergencies that does not need your DNS: known addresses, a separate domain, or a separate provider.</td></tr>
+</tbody>
+</table>
+<div class="note production"><p><span class="label">In production.</span> Monitor DNS as a user would: resolve your important names from several networks and several public resolvers, and alert when the answer is missing or unexpected. Also alert on the calendar. Domain registrations and DNSSEC signatures expire on known dates, and both have taken down well-run services.</p></div>
+
+<h2 id="tools">A small toolkit</h2>
+<p>The <code>dig</code> command asks DNS questions and shows exactly what came back. These six uses cover most debugging.</p>
+<pre data-lang="sh">
+# The address a name resolves to, nothing else
+dig +short www.example.com A
+
+# The full answer, including the remaining TTL in seconds
+dig www.example.com A +noall +answer
+
+# Ask one specific resolver, to compare what different caches hold
+dig @1.1.1.1 www.example.com A
+
+# Ask the authoritative server directly, to see the truth with no cache involved
+dig @ns1.example.com www.example.com A
+
+# Follow the delegations from the root, as a resolver would
+dig +trace www.example.com
+
+# Reverse lookup: which name is registered for this address
+dig -x 203.0.113.10
+</pre>
+<p>The comparison between the third and fourth commands is the one to remember. If the authoritative server gives the new answer and a resolver gives the old one, nothing is broken. You are looking at a cache, and the TTL in the output tells you how long it has left.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> DNS usually enters a design in one sentence, “DNS routes users to the nearest region”, and a good interviewer will push on it. Be ready with the limits: failover is bounded by the TTL, the decision is made per resolver and cannot see load, and so a load balancer or anycast layer is still needed underneath. Mention that the DNS provider itself must not be a single point of failure.</p></div>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>Caching.</b> DNS is the oldest large-scale cache in everyday use, and it shows every trade-off of <x-ref to="caching"></x-ref> in miniature: freshness against load, and the difficulty of invalidating copies you do not hold.</li>
+  <li><b>Availability.</b> DNS failover is one of the standard ways to move between regions. Its recovery time is part of your RTO. See <x-ref to="multi-region"></x-ref>.</li>
+  <li><b>Email.</b> Mail delivery and anti-spoofing rest entirely on DNS records: <code>MX</code>, and the <code>TXT</code> records for SPF, DKIM and DMARC.</li>
+  <li><b>Certificates.</b> Certificate authorities check control of a domain through DNS, and <code>CAA</code> records limit who may issue. <x-ref to="http-and-tls"></x-ref> covers the rest of that process.</li>
+  <li><b>Law and governance.</b> Who may hold a name, and what happens in a dispute, is decided by registries and by ICANN’s policies. A domain is rented, never owned.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>DNS is a hierarchical, distributed, cached database. The tree is cut into zones, each run independently and delegated from its parent.</li>
+  <li>A record has a name, type, TTL and value. Know <code>A</code>, <code>AAAA</code>, <code>CNAME</code>, <code>NS</code>, <code>MX</code>, <code>TXT</code>, and that a <code>CNAME</code> cannot sit at the zone apex.</li>
+  <li>Changes are not pushed. Old answers live in caches until their TTL expires, so lower the TTL in advance of any planned change.</li>
+  <li>A short TTL buys agility and makes you depend on your DNS provider being up at every moment.</li>
+  <li>DNS can steer traffic by weight, location and health. It decides per resolver, reacts no faster than the TTL and cannot see load.</li>
+  <li>Inside a system, watch for clients and connection pools that never re-resolve.</li>
+  <li>DNSSEC authenticates answers, and encrypted DNS hides queries. They solve different problems.</li>
+  <li>DNS outages make healthy servers unreachable. Use two providers, two resolvers, and an emergency path that does not need your own names.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A record has a TTL of 86,400 seconds. You change it at noon and cut the TTL to 300 in the same edit. When can you be confident that almost all users see the new value?</summary><p>At about noon the next day. Caches that fetched the record just before the change hold the old value with the old one-day lifetime. The new, shorter TTL applies only to answers fetched after the change. The TTL should have been lowered a day earlier.</p></details>
+<details><summary>Why can <code>www.example.com</code> be a <code>CNAME</code> to a CDN while <code>example.com</code> cannot?</summary><p>A name that has a <code>CNAME</code> may have no other records, and the apex of a zone must carry <code>SOA</code> and <code>NS</code> records. Providers offer ALIAS or CNAME flattening to get the same effect, by resolving the target themselves and answering with address records.</p></details>
+<details><summary>You use DNS failover with a 60-second TTL to move users from a failed region to a healthy one. Give three reasons some users are still sent to the failed region after two minutes.</summary><p>The DNS provider needs time to detect the failure before it changes the answer. Some resolvers and client libraries keep answers longer than the TTL. And clients with open connections or pooled connections keep using the old address without looking it up again.</p></details>
+<details><summary>A service calls a database by hostname. The database fails over to a standby with a new address and DNS is updated at once, yet the service keeps failing for ten minutes. What are the likely causes?</summary><p>The service’s runtime or driver cached the old address beyond the TTL, or its connection pool keeps trying to reuse connections to the old address without resolving the name again. Bounded DNS caching in the runtime and a maximum connection lifetime in the pool address both.</p></details>
+<details><summary>Does DNSSEC stop your internet provider from seeing which sites you look up?</summary><p>No. DNSSEC signs answers so that tampering can be detected. The queries and answers still travel in the clear. Hiding them requires an encrypted transport such as DNS over HTTPS or DNS over TLS.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc1034">RFC 1034</a> and <a href="https://www.rfc-editor.org/rfc/rfc1035">RFC 1035</a>: the DNS specification, 1987. <a href="https://www.rfc-editor.org/rfc/rfc2308">RFC 2308</a>: negative caching. <a href="https://www.rfc-editor.org/rfc/rfc8484">RFC 8484</a>: DNS over HTTPS. <a href="https://www.rfc-editor.org/rfc/rfc9250">RFC 9250</a>: DNS over QUIC. <a href="https://www.rfc-editor.org/rfc/rfc9460">RFC 9460</a>: the <code>HTTPS</code> record.</li>
+  <li>ICANN, <a href="https://www.icann.org/en/blogs/details/preparing-for-the-root-zone-ksk-rollover-what-you-need-to-know-27-07-2026-en">“Preparing for the Root Zone KSK Rollover: What You Need to Know”</a>, July 2026. The rollover scheduled for 11 October 2026.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/cloudflare-1-1-1-1-incident-on-july-14-2025/">“Cloudflare 1.1.1.1 incident on July 14, 2025”</a>.</li>
+  <li>Meta Engineering, <a href="https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/">“More details about the October 4 outage”</a>, 2021.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy.html">Choosing a routing policy</a>, Amazon Route 53 documentation. A concrete catalog of DNS steering policies.</li>
+  <li>Kubernetes documentation, <a href="https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/">DNS for Services and Pods</a>.</li>
+  <li>Cloudflare Learning Center, <a href="https://www.cloudflare.com/learning/dns/what-is-dns/">What is DNS?</a> A clear introduction with further articles on each record type.</li>
+</ol>
+</section>

@@ -1,0 +1,455 @@
+<!--meta
+{ "description": "HTTP and TLS for system design: methods and their safety and idempotency, status codes, cookies, HTTP caching with Cache-Control and ETags, how HTTP/1.1, HTTP/2 and HTTP/3 differ, the TLS 1.3 handshake, certificates and revocation, and where to terminate TLS.",
+  "lede": "HTTP is the contract nearly every system exposes, and TLS is what makes that contract safe to use over a network you do not control. This chapter covers the parts of both that shape designs: which requests can be retried, what may be cached and for how long, and where encryption begins and ends.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="contract">One meaning, three encodings</h2>
+<p>HTTP is best understood as two things that happen to share a name. The first is a set of <b>semantics</b>: what a method means, what a status code means, how caching and content negotiation work. The second is a <b>wire format</b>, the way a message is turned into bytes, and there are three of those in use: HTTP/1.1, HTTP/2 and HTTP/3.</p>
+<p>The semantics are the same across all three versions. A <code>GET</code> that returns <code>200</code> with a <code>Cache-Control</code> header means the same thing whether it traveled as text over TCP or as binary frames over QUIC. That is why an application can sit behind a load balancer that speaks HTTP/3 to browsers and HTTP/1.1 to the application, and nothing in the application has to know.</p>
+<p>This chapter takes the semantics first, because they are what you design with, then the versions, then TLS.</p>
+
+<h2 id="methods">Methods and what they promise</h2>
+<p>A method does more than name an action. Each one makes promises about its effects, and every intermediary between the client and your code relies on those promises to decide what it may do.</p>
+<ul>
+  <li>A method is <dfn>safe</dfn> if it only reads. The client is not asking for anything to change.</li>
+  <li>A method is <dfn>idempotent</dfn> if making the same request several times leaves the server in the same state as making it once.</li>
+  <li>A method is <dfn>cacheable</dfn> if a stored response may be used to answer a later request.</li>
+</ul>
+<table>
+<thead><tr><th>Method</th><th>Meaning</th><th>Safe</th><th>Idempotent</th><th>Cacheable</th></tr></thead>
+<tbody>
+<tr><th><code>GET</code></th><td>Read a resource</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><th><code>HEAD</code></th><td>Read only the headers</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><th><code>OPTIONS</code></th><td>Ask what is allowed</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+<tr><th><code>QUERY</code></th><td>Read, with the query in the request body</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><th><code>PUT</code></th><td>Replace a resource with this representation</td><td>No</td><td>Yes</td><td>No</td></tr>
+<tr><th><code>DELETE</code></th><td>Remove a resource</td><td>No</td><td>Yes</td><td>No</td></tr>
+<tr><th><code>POST</code></th><td>Create something, or run an action</td><td>No</td><td>No</td><td>Rarely</td></tr>
+<tr><th><code>PATCH</code></th><td>Change part of a resource</td><td>No</td><td>Not necessarily</td><td>No</td></tr>
+</tbody>
+</table>
+<aside class="sn"><b>A new method</b><code>QUERY</code> was standardized in June 2026 as RFC 10008, the first addition to the core methods in many years. It fills a long-standing gap: a read whose parameters are too large or too structured for a URL. Until now such searches were sent with <code>POST</code>, which told every cache and retry mechanism, wrongly, that they were unsafe to repeat. Support in servers, proxies and client libraries will take time to spread.</aside>
+<p>These properties decide real behavior:</p>
+<ul>
+  <li><b>Retries.</b> When a connection breaks mid-request, the client cannot tell whether the server acted. Browsers, proxies and client libraries retry idempotent methods automatically and leave the others alone. If your <code>GET</code> handler changes something, an automatic retry will change it twice.</li>
+  <li><b>Caching and prefetching.</b> Caches store responses to safe methods. Browsers and crawlers may fetch a <code>GET</code> link before anyone clicks it. A “delete” link implemented as a <code>GET</code> will eventually be followed by a crawler.</li>
+  <li><b>Making <code>POST</code> retryable.</b> Creating a payment is naturally a <code>POST</code>, and it must not happen twice. The standard remedy is for the client to send a unique key with the request so the server can recognize a repeat. <x-ref to="api-styles"></x-ref> shows the pattern.</li>
+</ul>
+
+<h2 id="status">Status codes that carry design decisions</h2>
+<p><x-ref to="journey-of-a-request#http">Chapter 2</x-ref> introduced the five classes. Within them, a few specific codes encode decisions worth making deliberately.</p>
+<table>
+<thead><tr><th>Code</th><th>Use it when</th><th>Why the distinction matters</th></tr></thead>
+<tbody>
+<tr><th><code>201 Created</code></th><td>A request created a resource. Include its URL in a <code>Location</code> header.</td><td>The client learns where the new thing lives without a second call.</td></tr>
+<tr><th><code>202 Accepted</code></th><td>The work was queued and is not done yet.</td><td>Honest signalling for asynchronous processing. Return a URL where progress can be checked.</td></tr>
+<tr><th><code>204 No Content</code></th><td>It worked and there is nothing to return.</td><td>Common for <code>DELETE</code> and for updates.</td></tr>
+<tr><th><code>301</code> and <code>308</code></th><td>The resource has moved permanently.</td><td>Browsers and search engines remember it. <code>308</code> guarantees the method is preserved. A wrong permanent redirect is hard to take back.</td></tr>
+<tr><th><code>302</code> and <code>307</code></th><td>Go elsewhere for now.</td><td>Not remembered. <code>307</code> guarantees the method is preserved.</td></tr>
+<tr><th><code>304 Not Modified</code></th><td>The client’s cached copy is still good.</td><td>Saves sending the body. Explained under caching below.</td></tr>
+<tr><th><code>401</code> against <code>403</code></th><td><code>401</code>: we do not know who you are. <code>403</code>: we know, and you may not.</td><td>A client should respond to the first by logging in, and to the second by giving up.</td></tr>
+<tr><th><code>404</code> against <code>410</code></th><td><code>404</code>: nothing here. <code>410</code>: it existed and is gone for good.</td><td>Crawlers and clients stop asking after a <code>410</code>.</td></tr>
+<tr><th><code>409 Conflict</code></th><td>The request is valid but clashes with current state, such as a duplicate or a stale update.</td><td>Tells the client to refetch and decide, not simply to retry.</td></tr>
+<tr><th><code>422</code> against <code>400</code></th><td><code>400</code>: the request is malformed. <code>422</code>: well-formed, and the content breaks a rule.</td><td>Separates client bugs from user input errors.</td></tr>
+<tr><th><code>429 Too Many Requests</code></th><td>The client exceeded a rate limit. Add <code>Retry-After</code>.</td><td>A well-behaved client slows down. A <code>500</code> would invite an immediate retry.</td></tr>
+<tr><th><code>502</code>, <code>503</code>, <code>504</code></th><td><code>502</code>: a proxy got a bad answer from the server behind it. <code>503</code>: the server is overloaded or down for maintenance. <code>504</code>: the proxy gave up waiting.</td><td>They point at different places. <code>504</code> means look at latency behind the proxy, and <code>502</code> usually means the backend crashed or closed the connection.</td></tr>
+</tbody>
+</table>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Returning <code>200 OK</code> with an error described in the body. Monitoring, load balancers, caches and retry logic all read the status code and nothing else. A failure dressed as a success is counted as healthy, may be cached, and will never be retried.</p></div>
+
+<h2 id="headers">Headers, by the job they do</h2>
+<p>There are hundreds of headers. They fall into a few groups, and knowing the groups is enough to find the right one when you need it.</p>
+<table>
+<thead><tr><th>Job</th><th>Headers</th><th>What they do</th></tr></thead>
+<tbody>
+<tr><th>Describe the body</th><td><code>Content-Type</code>, <code>Content-Length</code>, <code>Content-Encoding</code></td><td>Format, size and compression of what is being sent.</td></tr>
+<tr><th>Negotiate</th><td><code>Accept</code>, <code>Accept-Encoding</code>, <code>Accept-Language</code></td><td>The client lists what it can handle, and the server chooses.</td></tr>
+<tr><th>Cache</th><td><code>Cache-Control</code>, <code>ETag</code>, <code>Last-Modified</code>, <code>Vary</code>, <code>Age</code></td><td>Whether, where and how long a response may be reused.</td></tr>
+<tr><th>Make it conditional</th><td><code>If-None-Match</code>, <code>If-Match</code>, <code>If-Modified-Since</code></td><td>“Only if it changed” for reads, and “only if it has not changed” for writes.</td></tr>
+<tr><th>Identify the caller</th><td><code>Authorization</code>, <code>Cookie</code>, <code>Set-Cookie</code></td><td>Credentials and session state. See <x-ref to="authentication"></x-ref>.</td></tr>
+<tr><th>Control browsers</th><td><code>Access-Control-*</code>, <code>Content-Security-Policy</code>, <code>Strict-Transport-Security</code></td><td>Which other sites may call this one, what a page may load, and whether plain HTTP is ever allowed.</td></tr>
+<tr><th>Describe the path taken</th><td><code>X-Forwarded-For</code>, <code>Forwarded</code>, <code>Via</code>, <code>traceparent</code></td><td>The original client address, the proxies passed, and an identifier for tracing a request across services.</td></tr>
+<tr><th>Ask for part</th><td><code>Range</code>, <code>Content-Range</code>, <code>Accept-Ranges</code></td><td>Fetching a slice of a large file, for resuming downloads and seeking in video.</td></tr>
+</tbody>
+</table>
+<p><code>If-Match</code> deserves a note because it solves a common problem cheaply. Two people load the same record, both edit it, and the second save silently overwrites the first. If the client sends the <code>ETag</code> it loaded in an <code>If-Match</code> header with its update, the server can refuse with <code>412 Precondition Failed</code> when the record has changed in between. This is optimistic concurrency control, done in HTTP. <x-ref to="transactions"></x-ref> covers the idea in general.</p>
+
+<h3 id="cookies">Cookies</h3>
+<p>HTTP is stateless, and <dfn>cookies</dfn> are how browsers carry state anyway. A server sends <code>Set-Cookie</code>, and the browser returns that cookie on every later request to the same site. Since cookies are sent automatically, their attributes are security controls:</p>
+<table>
+<thead><tr><th>Attribute</th><th>Effect</th><th>Use</th></tr></thead>
+<tbody>
+<tr><th><code>Secure</code></th><td>Sent only over HTTPS</td><td>Always, for anything sensitive</td></tr>
+<tr><th><code>HttpOnly</code></th><td>Invisible to JavaScript</td><td>Session cookies, so that an injected script cannot steal them</td></tr>
+<tr><th><code>SameSite</code></th><td>Whether the cookie is sent on requests that start from another site</td><td><code>Lax</code> or <code>Strict</code>, to block cross-site request forgery</td></tr>
+<tr><th><code>Max-Age</code>, <code>Expires</code></th><td>Lifetime. Without one the cookie ends with the browser session.</td><td>Keep sessions as short as the product tolerates</td></tr>
+<tr><th><code>Domain</code>, <code>Path</code></th><td>Which hosts and paths receive it</td><td>As narrow as possible</td></tr>
+</tbody>
+</table>
+<p>Cookies also have a performance cost that is easy to forget. Every cookie for a site is attached to every request to it, including requests for images and scripts. Large cookies inflate every request, which is one reason static files are often served from a separate, cookie-free domain or a CDN.</p>
+
+<h2 id="caching">HTTP caching</h2>
+<p>Caching is the most valuable feature of HTTP for anyone designing for scale, because a response served from a cache costs your servers nothing. Caches exist at several points: in the browser, in CDNs and other shared proxies, and sometimes in a reverse proxy in front of your own application. All of them follow the same rules, which the response headers control.</p>
+<p>The rules rest on two ideas. <dfn>Freshness</dfn>: for how long may a stored response be reused without asking? <dfn>Validation</dfn>: when that time is up, how can the cache check cheaply whether its copy is still good?</p>
+
+<figure class="fig wide" id="fig-cache-flow">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 248" role="img" aria-labelledby="f101t f101d">
+<title id="f101t">How an HTTP cache decides what to do with a request</title>
+<desc id="f101d">A request arrives at a cache. If no response is stored, the cache fetches it from the origin, stores it and serves it. If one is stored and still fresh, the cache serves it with no network traffic. If it is stored but stale, the cache asks the origin whether it has changed. If not, the origin answers 304 and the stored copy is reused. If so, the origin sends a new response that replaces the stored copy.</desc>
+<rect class="n" x="8" y="98" width="132" height="52" rx="6"/>
+<text class="tb mid" x="74" y="120">A request</text>
+<text class="ts mid" x="74" y="137">reaches a cache</text>
+<g data-s="1">
+<rect class="n" x="176" y="98" width="140" height="52" rx="24"/>
+<text class="tb mid" x="246" y="120">Is a response</text>
+<text class="tb mid" x="246" y="137">stored?</text>
+</g>
+<g data-s="3">
+<rect class="n" x="352" y="98" width="140" height="52" rx="24"/>
+<text class="tb mid" x="422" y="120">Is it</text>
+<text class="tb mid" x="422" y="137">still fresh?</text>
+</g>
+<g data-s="5">
+<rect class="n sig" x="528" y="98" width="184" height="52" rx="24"/>
+<text class="tb mid" x="620" y="120">Ask the origin:</text>
+<text class="tb mid" x="620" y="137">has it changed?</text>
+</g>
+<g data-s="2">
+<rect class="n" x="166" y="192" width="160" height="46" rx="6"/>
+<text class="tb mid" x="246" y="212">Fetch from the origin</text>
+<text class="ts mid" x="246" y="229">store it, then serve it</text>
+</g>
+<g data-s="4">
+<rect class="n store" x="342" y="10" width="160" height="46" rx="6"/>
+<text class="tb mid" x="422" y="30">Serve the stored copy</text>
+<text class="ts mid" x="422" y="47">no network at all</text>
+</g>
+<g data-s="6">
+<rect class="n store" x="528" y="10" width="184" height="46" rx="6"/>
+<text class="tb mid" x="620" y="30">304 Not Modified</text>
+<text class="ts mid" x="620" y="47">reuse the copy, no body sent</text>
+</g>
+<g data-s="7">
+<rect class="n" x="528" y="192" width="184" height="46" rx="6"/>
+<text class="tb mid" x="620" y="212">200 with a new body</text>
+<text class="ts mid" x="620" y="229">replace the stored copy</text>
+</g>
+<g data-s="1">
+<path class="e" d="M140 124H176"/>
+</g>
+<g data-s="3">
+<path class="e" d="M316 124H352"/>
+</g>
+<g data-s="5">
+<path class="e" d="M492 124H528"/>
+</g>
+<g data-s="2">
+<path class="e" d="M246 150V192"/>
+</g>
+<g data-s="4">
+<path class="e store" d="M422 98V56"/>
+</g>
+<g data-s="6">
+<path class="e store" d="M620 98V56"/>
+</g>
+<g data-s="7">
+<path class="e" d="M620 150V192"/>
+</g>
+<g data-s="3">
+<text class="ts" x="322" y="116">yes</text>
+</g>
+<g data-s="5">
+<text class="ts" x="498" y="116">no</text>
+</g>
+<g data-s="2">
+<text class="ts" x="254" y="176">no</text>
+</g>
+<g data-s="4">
+<text class="ts" x="430" y="82">yes</text>
+</g>
+<g data-s="6">
+<text class="ts" x="628" y="82">no</text>
+</g>
+<g data-s="7">
+<text class="ts" x="628" y="176">yes</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="request">A request reaches a cache. The cache first checks whether it holds a stored response for it.</li>
+  <li>If it holds nothing, it fetches the response from the origin, stores it, and serves it.</li>
+  <li>If it holds one, it checks whether that copy is still fresh, using the lifetime the origin gave it.</li>
+  <li>A fresh copy is served at once, with no network request at all.</li>
+  <li>A stale copy is not thrown away. The cache asks the origin whether the resource has changed, quoting the validator it stored with the copy.</li>
+  <li>If nothing has changed, the origin answers 304 Not Modified with no body, and the cache reuses its copy.</li>
+  <li>If it has changed, the origin sends 200 with the new body, which replaces the stored copy.</li>
+</ol>
+<figcaption>The decision every HTTP cache makes. The green outcomes are the cheap ones: no request to your servers, or a request answered with headers only.</figcaption>
+</figure>
+
+<p>Freshness is set with <code>Cache-Control</code>. Its directives combine, and these are the ones that matter:</p>
+<table>
+<thead><tr><th>Directive</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><th><code>max-age=N</code></th><td>Fresh for N seconds from when it was generated.</td></tr>
+<tr><th><code>s-maxage=N</code></th><td>The same, for shared caches such as CDNs only. Overrides <code>max-age</code> there.</td></tr>
+<tr><th><code>public</code></th><td>Any cache may store it.</td></tr>
+<tr><th><code>private</code></th><td>Only the user’s own browser may store it. For anything personalized.</td></tr>
+<tr><th><code>no-cache</code></th><td>May be stored, and must be revalidated with the origin before each use. The name misleads.</td></tr>
+<tr><th><code>no-store</code></th><td>Must not be stored anywhere. For sensitive data.</td></tr>
+<tr><th><code>immutable</code></th><td>Will never change while fresh, so do not revalidate even on reload.</td></tr>
+<tr><th><code>stale-while-revalidate=N</code></th><td>After it goes stale, it may still be served for N more seconds while the cache fetches a new copy in the background.</td></tr>
+<tr><th><code>stale-if-error=N</code></th><td>If the origin is failing, a stale copy may be served for N more seconds.</td></tr>
+</tbody>
+</table>
+<p>Validation uses an <dfn>ETag</dfn>, an opaque identifier for one version of a response, such as a hash of its content or a version number. The cache sends it back in <code>If-None-Match</code>. If the current version has the same tag, the server answers <code>304 Not Modified</code> with no body.</p>
+<pre data-lang="ts" data-title="A handler that supports validation and shared caching">
+declare function loadPhoto(id: string): Promise<{ id: string; version: number }>;
+
+export async function GET(request: Request): Promise<Response> {
+  const id = new URL(request.url).pathname.split('/').pop()!;
+  const photo = await loadPhoto(id);
+  const etag = `"${photo.version}"`;
+
+  // The caller already holds this version: answer with headers only.
+  if (request.headers.get('If-None-Match') === etag) {
+    return new Response(null, { status: 304, headers: { ETag: etag } });
+  }
+
+  return Response.json(photo, {
+    headers: {
+      ETag: etag,
+      // A CDN may reuse this for 60 s, then serve it stale for up to 5 min while it refetches.
+      'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300',
+    },
+  });
+}
+</pre>
+<p>Four recipes cover most of what a web system serves.</p>
+<table>
+<thead><tr><th>Content</th><th>Header</th><th>Reasoning</th></tr></thead>
+<tbody>
+<tr><th>Files with a hash in the name, such as <code>app.3f9a2c.js</code></th><td><code>public, max-age=31536000, immutable</code></td><td>The content of that URL never changes. A new build produces a new name. Cache for a year.</td></tr>
+<tr><th>HTML pages</th><td><code>no-cache</code></td><td>Always check, so users get new deployments at once. With an <code>ETag</code>, the check usually costs a <code>304</code>.</td></tr>
+<tr><th>Public API data that tolerates slight staleness</th><td><code>public, s-maxage=60, stale-while-revalidate=300</code></td><td>The CDN absorbs nearly all the traffic, and users never wait for a refresh.</td></tr>
+<tr><th>Personal or sensitive responses</th><td><code>private, no-store</code></td><td>Must never be stored in a shared cache or left on disk.</td></tr>
+</tbody>
+</table>
+<p>The first recipe is worth dwelling on, since it sidesteps the hardest problem in caching. You cannot reliably tell every browser in the world to discard a cached file. You can make the problem disappear by never changing a file in place: put a fingerprint of the content in its name, cache it forever, and refer to the new name when the content changes.</p>
+<aside class="sn"><b><code>Vary</code></b>One URL can have several representations: compressed or not, English or Bengali. The <code>Vary</code> header names the request headers that select between them, so a cache stores each separately. <code>Vary: Accept-Encoding</code> is routine. Varying on a header with many values, such as <code>User-Agent</code> or <code>Cookie</code>, splits the cache into so many variants that it stops being useful.</aside>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Sending a personalized response without <code>private</code>. If a shared cache stores one user’s account page and serves it to the next visitor, you have a data breach caused by a missing header. Make responses uncacheable by default in your framework and opt specific public ones in. Never rely on a cache’s guess.</p></div>
+<p><x-ref to="cdn-and-edge"></x-ref> continues this from the cache’s side, and <x-ref to="caching"></x-ref> treats caching beyond HTTP.</p>
+
+<h2 id="versions">The three versions, under the hood</h2>
+<p>Each version of HTTP changed how messages share a connection, to remove a bottleneck in the version before.</p>
+
+<figure class="fig wide" id="fig-versions">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f102t f102d">
+<title id="f102t">How three responses, A, B and C, travel in each HTTP version</title>
+<desc id="f102d">In HTTP/1.1 the three responses are sent one after another on a connection. In HTTP/2 they are cut into frames and interleaved on one TCP connection, and a single lost packet holds back every frame behind it. In HTTP/3 each response has its own stream, and a lost packet on stream B holds back only stream B.</desc>
+<text class="tb" x="10" y="38">HTTP/1.1</text><text class="ts" x="10" y="55">one at a time</text>
+<rect class="n" x="170" y="22" width="170" height="30" rx="4"/><text class="mid" x="255" y="42">response A</text>
+<rect class="n" x="344" y="22" width="170" height="30" rx="4"/><text class="mid" x="429" y="42">response B</text>
+<rect class="n" x="518" y="22" width="170" height="30" rx="4"/><text class="mid" x="603" y="42">response C</text>
+<text class="tb" x="10" y="112">HTTP/2</text><text class="ts" x="10" y="129">frames interleaved on</text><text class="ts" x="10" y="145">one TCP connection</text>
+<rect class="n" x="170" y="100" width="41" height="30" rx="4"/><text class="mid" x="190.5" y="120">A</text>
+<rect class="n" x="213.5" y="100" width="41" height="30" rx="4"/><text class="mid" x="234" y="120">B</text>
+<rect class="n" x="257" y="100" width="41" height="30" rx="4"/><text class="mid" x="277.5" y="120">C</text>
+<rect class="n" x="300.5" y="100" width="41" height="30" rx="4"/><text class="mid" x="321" y="120">A</text>
+<rect class="n fault" x="344" y="100" width="41" height="30" rx="4"/><text class="mid tb" x="364.5" y="120">B</text>
+<rect class="n async" x="387.5" y="100" width="41" height="30" rx="4"/><text class="mid" x="408" y="120">C</text>
+<rect class="n async" x="431" y="100" width="41" height="30" rx="4"/><text class="mid" x="451.5" y="120">A</text>
+<rect class="n async" x="474.5" y="100" width="41" height="30" rx="4"/><text class="mid" x="495" y="120">B</text>
+<rect class="n async" x="518" y="100" width="41" height="30" rx="4"/><text class="mid" x="538.5" y="120">C</text>
+<rect class="n async" x="561.5" y="100" width="41" height="30" rx="4"/><text class="mid" x="582" y="120">A</text>
+<rect class="n async" x="605" y="100" width="41" height="30" rx="4"/><text class="mid" x="625.5" y="120">B</text>
+<rect class="n async" x="648.5" y="100" width="41" height="30" rx="4"/><text class="mid" x="669" y="120">C</text>
+<text class="ts mid" x="364.5" y="92">lost</text>
+<text class="ts" x="170" y="150">Every frame behind the lost packet waits, whichever response it belongs to.</text>
+<text class="tb" x="10" y="196">HTTP/3</text><text class="ts" x="10" y="213">one stream each,</text><text class="ts" x="10" y="229">over QUIC</text>
+<rect class="n" x="170" y="180" width="128" height="22" rx="4"/><text class="ts mid" x="234" y="195">A</text>
+<rect class="n" x="300.5" y="180" width="128" height="22" rx="4"/><text class="ts mid" x="364.5" y="195">A</text>
+<rect class="n" x="431" y="180" width="128" height="22" rx="4"/><text class="ts mid" x="495" y="195">A</text>
+<rect class="n" x="561.5" y="180" width="128" height="22" rx="4"/><text class="ts mid" x="625.5" y="195">A</text>
+<rect class="n" x="170" y="208" width="128" height="22" rx="4"/><text class="ts mid" x="234" y="223">B</text>
+<rect class="n fault" x="300.5" y="208" width="128" height="22" rx="4"/><text class="ts mid tb" x="364.5" y="223">B lost</text>
+<rect class="n async" x="431" y="208" width="128" height="22" rx="4"/><text class="ts mid" x="495" y="223">B waits</text>
+<rect class="n async" x="561.5" y="208" width="128" height="22" rx="4"/><text class="ts mid" x="625.5" y="223">B waits</text>
+<rect class="n" x="170" y="236" width="128" height="22" rx="4"/><text class="ts mid" x="234" y="251">C</text>
+<rect class="n" x="300.5" y="236" width="128" height="22" rx="4"/><text class="ts mid" x="364.5" y="251">C</text>
+<rect class="n" x="431" y="236" width="128" height="22" rx="4"/><text class="ts mid" x="495" y="251">C</text>
+<rect class="n" x="561.5" y="236" width="128" height="22" rx="4"/><text class="ts mid" x="625.5" y="251">C</text>
+<text class="ts" x="170" y="274">Only stream B waits. A and C are delivered as they arrive.</text>
+</svg>
+</div>
+<figcaption>Three responses on one connection. HTTP/2 interleaves them and is exposed to TCP’s head-of-line blocking. HTTP/3 gives each its own stream, so a loss stalls one response only.</figcaption>
+</figure>
+
+<h3>HTTP/1.1</h3>
+<p>Messages are text. A connection carries one request at a time: the next cannot start until the previous response has finished. Browsers compensate by opening up to six connections per site, each paying for its own handshakes and slow start. Developers compensated with tricks, such as merging many small files into one and spreading resources across several hostnames to get more connections. It remains the common language between proxies and application servers, where connections are short and plentiful.</p>
+
+<h3>HTTP/2</h3>
+<p>Messages are split into binary <dfn>frames</dfn>, and each request and response pair is a numbered <dfn>stream</dfn>. Frames from many streams are interleaved on a single connection, so dozens of requests proceed at once without waiting for each other. Headers, which repeat almost unchanged from one request to the next, are compressed against a table both sides remember.</p>
+<p>One connection per site means one handshake and one congestion window that warms up and stays warm. The 1.1 workarounds become unnecessary, and some turn harmful. The weakness, described in <x-ref to="transport-protocols#hol">Chapter 9</x-ref>, is that all streams share one TCP byte stream, so one lost packet stalls them all.</p>
+
+<h3>HTTP/3</h3>
+<p>The same streams and frames, moved onto QUIC. Each stream is delivered independently, connection setup takes one round trip including encryption, and connections survive a change of network. For a user on a good fixed connection the difference from HTTP/2 is small. On a lossy mobile network it can be large.</p>
+<p>Two more features of the modern protocol are worth knowing:</p>
+<ul>
+  <li><b>Early hints.</b> A server can send an interim <code>103</code> response naming files the page will need, before the real response is ready, so the browser starts fetching them while the server is still working.</li>
+  <li><b>Compression.</b> Text responses are compressed with gzip or Brotli, and newer browsers also accept Zstandard. A 2025 standard additionally lets a browser use a file it already has, such as last week’s version of a script, as a dictionary for compressing the new one, which can shrink an update to a small fraction of its size.</li>
+</ul>
+<div class="note production"><p><span class="label">In production.</span> Which version is used between the browser and your edge is decided by your CDN or load balancer settings, and turning on HTTP/3 there is normally a switch. The hop from the edge to your servers is separate and is often plain HTTP/1.1 with keep-alive, which is fine. One case needs care: gRPC requires HTTP/2 all the way to the application, so every proxy on that path must support it.</p></div>
+
+<h2 id="tls">TLS</h2>
+<p>TLS gives a connection three properties. <b>Confidentiality</b>: nobody on the path can read it. <b>Integrity</b>: nobody can alter it undetected. <b>Authentication</b>: the client knows which server it is talking to. HTTPS is HTTP over a connection with those properties.</p>
+<p>The current version is TLS 1.3, published in 2018. Its predecessors 1.0 and 1.1 are formally deprecated, and 1.2 remains in use for older clients. Version 1.3 removed a long list of options that had caused vulnerabilities and cut the handshake to one round trip.</p>
+
+<h3 id="handshake">The handshake</h3>
+<ol>
+  <li><b>ClientHello.</b> The client sends the versions and ciphers it supports, a freshly generated public value for key agreement, the hostname it wants (the <dfn>SNI</dfn>, server name indication), and the application protocols it speaks, such as HTTP/2 (the <dfn>ALPN</dfn> list).</li>
+  <li><b>ServerHello.</b> The server chooses among those and sends its own public value. Both sides can now compute the same secret keys, which nobody watching the exchange can derive.</li>
+  <li><b>Certificate and proof.</b> Encrypted under those keys, the server sends its certificate chain and a signature over the handshake made with the certificate’s private key. That signature proves it owns the certificate.</li>
+  <li><b>Finished.</b> Each side confirms it saw the same handshake. The client can send its first request together with its confirmation.</li>
+</ol>
+<p>The keys come from a fresh exchange for every connection and are discarded afterward. This property is <dfn>forward secrecy</dfn>: if a server’s long-term private key is stolen next year, traffic recorded today still cannot be decrypted.</p>
+
+<h3 id="certificates">Certificates and trust</h3>
+<p>A <dfn>certificate</dfn> is a signed statement: “this public key belongs to <code>www.example.com</code>”. The signer is a <dfn>certificate authority</dfn> (CA). Browsers and operating systems ship with a list of root authorities they trust, and trust is extended from those roots through a chain.</p>
+
+<figure class="fig" id="fig-chain">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 176" role="img" aria-labelledby="f103t f103d">
+<title id="f103t">A certificate chain</title>
+<desc id="f103d">A root certificate, kept in the browser’s or operating system’s trust store, signs an intermediate certificate. The intermediate signs the leaf certificate for www.example.com. The server sends the leaf and the intermediate during the handshake, and the browser checks the signatures back to a root it already trusts.</desc>
+<rect class="n" x="8" y="32" width="204" height="70" rx="6"/><text class="tb mid" x="110" y="58">Root certificate</text><text class="ts mid" x="110" y="76">belongs to the authority</text><text class="ts mid" x="110" y="92">kept offline, lasts decades</text>
+<rect class="n" x="258" y="32" width="204" height="70" rx="6"/><text class="tb mid" x="360" y="58">Intermediate certificate</text><text class="ts mid" x="360" y="76">the authority’s working key</text><text class="ts mid" x="360" y="92">signs customers’ certificates</text>
+<rect class="n sig" x="508" y="32" width="204" height="70" rx="6"/><text class="tb mid" x="610" y="58">Leaf certificate</text><text class="ts mid" x="610" y="76">for www.example.com</text><text class="ts mid" x="610" y="92">lasts days to months</text>
+<path class="e" d="M212 67H258"/><path class="e" d="M462 67H508"/>
+<text class="ts mid" x="235" y="58">signs</text><text class="ts mid" x="485" y="58">signs</text>
+<path class="e none" d="M8 118v8H212v-8"/><text class="ts mid" x="110" y="146">already in the browser or</text><text class="ts mid" x="110" y="162">operating system</text>
+<path class="e none sig" d="M258 118v8H712v-8"/><text class="ts mid" x="485" y="146">sent by the server in the handshake</text>
+</svg>
+</div>
+<figcaption>A chain of trust. The browser accepts the leaf because it can follow signatures back to a root it already holds.</figcaption>
+</figure>
+
+<p>Before accepting a certificate, the client checks four things: the name on it matches the hostname requested, the current date is within its validity period, the signatures chain to a trusted root, and it has not been revoked. A failure of any check produces the full-page browser warning, and for an API client, a refused connection.</p>
+<p>To obtain a certificate you prove to an authority that you control the domain, by serving a file it asks for or by creating a DNS record. The <dfn>ACME</dfn> protocol automates this exchange, which is what lets a server or a CDN obtain and renew certificates with no human involved.</p>
+<p>The fourth check, revocation, has never worked well, and the industry’s answer is reshaping how certificates are operated.</p>
+<ul>
+  <li><b>Online revocation checking is being retired.</b> The protocol for asking an authority “is this certificate still valid?” leaked browsing activity to the authority and often failed open. Let’s Encrypt, the largest authority, switched its service for it off in August 2025.</li>
+  <li><b>Lifetimes are shrinking in its place.</b> A certificate that expires soon does not need to be revoked. The maximum lifetime of a public certificate fell to 200 days in March 2026, and falls to 100 days in March 2027 and 47 days in March 2029. Let’s Encrypt made certificates that last about six days generally available in January 2026, and plans to cut its default from 90 days to 45.</li>
+  <li><b>Issuance is public.</b> Authorities must record every certificate in public <dfn>Certificate Transparency</dfn> logs. You can watch those logs for certificates issued for your domains that you did not request.</li>
+</ul>
+<p>The consequence for design is simple and firm: certificates must be issued and renewed by automation, and their expiry must be monitored. At 47 days, a manual process is an outage on a schedule.</p>
+<aside class="sn"><b>Two changes in progress</b>The hostname in the ClientHello has always been sent unencrypted, which reveals the site being visited. <i>Encrypted Client Hello</i>, standardized in March 2026 as RFC 9849, hides it. Separately, key exchange is moving to a hybrid that resists future quantum computers, which <x-ref to="journey-of-a-request#tls">Chapter 2</x-ref> covered. Both are handled by browsers and by your CDN or TLS library, so staying current is mostly a matter of keeping those updated.</aside>
+
+<h3 id="termination">Where TLS ends</h3>
+<p>Somebody has to decrypt the traffic, and where that happens is an architectural decision.</p>
+
+<figure class="fig" id="fig-termination">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 246" role="img" aria-labelledby="f104t f104d">
+<title id="f104t">Three places to terminate TLS</title>
+<desc id="f104d">First option: TLS ends at the load balancer, and traffic to the application travels unencrypted inside the private network. Second option: the load balancer decrypts, inspects and encrypts again for the application. Third option: the load balancer forwards the encrypted bytes untouched, and the application decrypts.</desc>
+<text class="tb" x="10" y="40">Terminate at</text><text class="tb" x="10" y="57">the edge</text>
+<rect class="n" x="176" y="20" width="96" height="44" rx="6"/><text class="mid" x="224" y="47">Client</text>
+<rect class="n" x="392" y="20" width="124" height="44" rx="6"/><text class="mid" x="454" y="47">Load balancer</text>
+<rect class="n" x="604" y="20" width="108" height="44" rx="6"/><text class="mid" x="658" y="47">Application</text>
+<text class="tb" x="10" y="116">Terminate and</text><text class="tb" x="10" y="133">re-encrypt</text>
+<rect class="n" x="176" y="96" width="96" height="44" rx="6"/><text class="mid" x="224" y="123">Client</text>
+<rect class="n" x="392" y="96" width="124" height="44" rx="6"/><text class="mid" x="454" y="123">Load balancer</text>
+<rect class="n" x="604" y="96" width="108" height="44" rx="6"/><text class="mid" x="658" y="123">Application</text>
+<text class="tb" x="10" y="192">Pass through</text>
+<rect class="n" x="176" y="172" width="96" height="44" rx="6"/><text class="mid" x="224" y="199">Client</text>
+<rect class="n ghost" x="392" y="172" width="124" height="44" rx="6"/><text class="mid" x="454" y="192">Load balancer</text>
+<text class="ts mid" x="454" y="208">cannot read it</text>
+<rect class="n" x="604" y="172" width="108" height="44" rx="6"/><text class="mid" x="658" y="199">Application</text>
+<path class="e sig" d="M272 42H392"/><text class="ts mid" x="332" y="34">TLS</text>
+<path class="e dash" d="M516 42H604"/><text class="ts mid" x="560" y="34">plain HTTP</text>
+<path class="e sig" d="M272 118H392"/><text class="ts mid" x="332" y="110">TLS</text>
+<path class="e sig" d="M516 118H604"/><text class="ts mid" x="560" y="110">TLS again</text>
+<path class="e sig none" d="M272 194H392"/><path class="e sig" d="M516 194H604"/><text class="ts mid" x="332" y="186">one TLS connection</text><text class="ts mid" x="560" y="186">end to end</text>
+</svg>
+</div>
+<figcaption>Three termination patterns. Blue segments are encrypted. The first is the simplest, the second is the common default where traffic inside the network must also be protected, and the third keeps the load balancer from seeing anything.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Pattern</th><th>Advantages</th><th>Costs</th></tr></thead>
+<tbody>
+<tr><th>Terminate at the edge</th><td>Certificates live in one place. The balancer can route by URL, cache and compress. Application servers do no cryptography.</td><td>Traffic is readable inside your network. Often unacceptable under security or compliance rules.</td></tr>
+<tr><th>Terminate and re-encrypt</th><td>All of the above, with encryption on every hop.</td><td>Certificates to manage on the application servers too, usually from an internal authority.</td></tr>
+<tr><th>Pass through</th><td>End-to-end encryption. The balancer sees nothing.</td><td>The balancer can route only by address and port. No path routing, caching or request-level features.</td></tr>
+</tbody>
+</table>
+<p>Inside a system, TLS is also used in both directions. With <dfn>mutual TLS</dfn> (mTLS), the client presents a certificate as well, so each service proves its identity to the other. It is the basis of most zero-trust service-to-service security, and it is usually set up by a service mesh, as <x-ref to="service-communication"></x-ref> describes.</p>
+<p>Two response headers finish the job on the public side. <code>Strict-Transport-Security</code> tells a browser to use only HTTPS for your site from now on, so that a user who types the bare domain is never sent over plain HTTP. And every HTTP endpoint that remains should do nothing except redirect to HTTPS.</p>
+
+<h2 id="tools">Looking at real traffic</h2>
+<p>Two commands show most of what this chapter described.</p>
+<pre data-lang="sh">
+# Everything about one request: the TLS version, the HTTP version negotiated, all headers
+curl -sv -o /dev/null https://www.example.com/
+
+# Only the response headers, to check caching and security settings
+curl -sI https://www.example.com/app.3f9a2c.js
+
+# The certificate a server presents: who it is for, who issued it, when it expires
+openssl s_client -connect www.example.com:443 -servername www.example.com </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+</pre>
+<p>The browser’s developer tools show the same information per request, including the protocol version and whether a response came from cache. Checking the <code>Cache-Control</code> header of your own site’s main page and of one of its scripts takes a minute and often turns up a surprise.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> HTTP knowledge is rarely asked about directly and is noticed constantly. Use the right method and status code when you sketch an API. Say which responses are cacheable and with what lifetime. When you draw the load balancer, say where TLS terminates and whether internal traffic is encrypted. When you mention retries, tie them to idempotency. Each of these takes one sentence and shows you have built real services.</p></div>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>API design.</b> Methods, status codes and conditional requests are the vocabulary of REST. <x-ref to="api-styles"></x-ref> builds on them.</li>
+  <li><b>Security.</b> TLS secures the channel. Who the caller is and what they may do are separate questions, in <x-ref to="authentication"></x-ref> and <x-ref to="authorization"></x-ref>. The cryptographic building blocks are explained in <x-ref to="cryptography-in-practice"></x-ref>.</li>
+  <li><b>Front-end engineering.</b> Bundling, fingerprinted file names, preloading and image formats are all strategies for working with HTTP caching and connection behavior.</li>
+  <li><b>Reliability.</b> Idempotency decides what can be retried, and <code>stale-if-error</code> lets a cache hide an origin outage. See <x-ref to="resilience-patterns"></x-ref>.</li>
+  <li><b>Operations.</b> Certificate automation and expiry monitoring are operational work with a history of causing outages. See <x-ref to="observability"></x-ref>.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>HTTP’s semantics are shared by all versions. Versions differ only in how messages are carried.</li>
+  <li>Safe methods only read, and idempotent methods can be repeated. Intermediaries retry, cache and prefetch on the strength of those promises, so keep them.</li>
+  <li>Choose status codes for what clients and monitoring will do with them. Never report a failure as <code>200</code>.</li>
+  <li>Caching is controlled by freshness, through <code>Cache-Control</code>, and validation, through <code>ETag</code>. Fingerprint static files and cache them for a year, revalidate HTML, and mark personal data <code>private</code> or <code>no-store</code>.</li>
+  <li>HTTP/1.1 sends one message at a time per connection. HTTP/2 multiplexes streams over one TCP connection. HTTP/3 moves those streams to QUIC and removes head-of-line blocking.</li>
+  <li>TLS 1.3 provides confidentiality, integrity and server identity in one round trip, with forward secrecy.</li>
+  <li>Certificates chain to trusted roots. Their lifetimes are shrinking toward 47 days, so issuance and renewal must be automated.</li>
+  <li>Decide where TLS terminates: at the edge, at the edge with re-encryption, or passed through to the application.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A client sends <code>PUT /users/42</code> with a new profile and the connection drops before any response arrives. Is it safe to send the request again? What if it had been <code>POST /payments</code>?</summary><p><code>PUT</code> is idempotent: sending the same full replacement twice leaves the same result, so retrying is safe. <code>POST /payments</code> is not, and a blind retry could charge twice. It needs a mechanism such as an idempotency key that lets the server recognize the repeat.</p></details>
+<details><summary>Your site’s JavaScript bundle is served as <code>/app.js</code> with <code>Cache-Control: max-age=86400</code>. You deploy a fix. What goes wrong, and how should it be set up?</summary><p>Browsers that fetched the old file keep using it for up to a day, possibly alongside new HTML that expects the new code. Name the file by a hash of its content, cache it for a year with <code>immutable</code>, and serve the HTML that refers to it with <code>no-cache</code>, so each deployment points at new file names.</p></details>
+<details><summary>What is the difference between <code>no-cache</code> and <code>no-store</code>?</summary><p><code>no-cache</code> allows a response to be stored and requires the cache to revalidate it with the origin before every use. <code>no-store</code> forbids storing it at all. The first is right for HTML you want always current, the second for sensitive data.</p></details>
+<details><summary>A user reports seeing another customer’s order page. The application code is correct. What configuration error could cause this?</summary><p>A shared cache, such as a CDN or reverse proxy, stored a personalized response and served it to someone else. The response lacked <code>Cache-Control: private</code> or <code>no-store</code>, or the cache was configured to ignore cookies when building its cache key.</p></details>
+<details><summary>Your load balancer terminates TLS and forwards plain HTTP to application servers in a private subnet. Give one argument for this design and one against.</summary><p>For: certificates and cryptographic work are in one place, and the balancer can use every request-level feature. Against: anyone who gains a foothold inside the network can read all traffic, including credentials, and many compliance regimes require encryption in transit everywhere. Re-encrypting to the servers addresses that.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc9110">RFC 9110: HTTP Semantics</a> and <a href="https://www.rfc-editor.org/rfc/rfc9111">RFC 9111: HTTP Caching</a>, 2022. <a href="https://www.rfc-editor.org/rfc/rfc5861">RFC 5861</a>: the stale-content extensions.</li>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc10008.html">RFC 10008: The HTTP QUERY Method</a>, June 2026.</li>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc9113">RFC 9113: HTTP/2</a>, <a href="https://www.rfc-editor.org/rfc/rfc9114">RFC 9114: HTTP/3</a>, <a href="https://www.rfc-editor.org/rfc/rfc8297">RFC 8297: Early Hints</a> and <a href="https://www.rfc-editor.org/rfc/rfc9842">RFC 9842: Compression Dictionary Transport</a>, 2025.</li>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446: TLS 1.3</a>, <a href="https://www.rfc-editor.org/rfc/rfc8555">RFC 8555: ACME</a> and <a href="https://www.rfc-editor.org/rfc/rfc9849">RFC 9849: TLS Encrypted Client Hello</a>, March 2026.</li>
+  <li>Let’s Encrypt, <a href="https://letsencrypt.org/2024/12/05/ending-ocsp/">“Ending OCSP Support in 2025”</a> and its <a href="https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability">announcement that six-day and IP address certificates are generally available</a>, January 2026.</li>
+  <li>DigiCert, <a href="https://www.digicert.com/blog/tls-certificate-lifetimes-will-officially-reduce-to-47-days">“TLS Certificate Lifetimes Will Officially Reduce to 47 Days”</a>, 2025.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching">HTTP caching</a>. The most readable reference on the caching rules.</li>
+  <li>Mark Nottingham, <a href="https://www.mnot.net/cache_docs/">Caching Tutorial for Web Authors and Webmasters</a>.</li>
+</ol>
+</section>

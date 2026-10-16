@@ -1,0 +1,638 @@
+<!--meta
+{ "description": "A high-level design of a real-time game leaderboard: a relational record of matches and totals, a sorted set (a skip list with spans and a hash map) for ranks in logarithmic time, packed scores for fair ties, idempotent writes with ZADD GT, monthly boards, the relational alternative measured on PostgreSQL, Redis measured for memory and latency, sharding by hash and by score range, and percentiles for the long tail.",
+  "lede": "Showing the top ten players is easy. Telling one player among fifty million that they are 1,532nd, a second after their match ends, is not: a rank depends on everyone else’s score, and the obvious query counts them. This chapter designs a leaderboard around a data structure that keeps counts as it goes, measures it against a relational database on a million players, and works out what changes when one machine is not enough.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the leaderboard of an online game. Players earn points for each match they finish. The game shows the top 10 players of the month, each player’s own rank with the five players above and below, and updates both within a second of a match ending. Boards start again every month, and past months stay viewable.</p></div>
+<p>A <dfn>leaderboard</dfn> is a list of players ordered by score, where any player can ask for their position. The top of the list is a cheap query in any database. The position of one player in the middle is not, because it is defined by how many players have more points, and the obvious way to know that is to count them. With fifty million players and thousands of score changes a second, the design needs an index that answers “how many are ahead of me?” without counting. In the terms of <x-ref to="hld-method#shapes"></x-ref>, this is a ranking problem: the rank of one player among millions, updated with every score.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Record each match’s points, reported by game servers</th><td>Yes</td></tr>
+<tr><th>The top 10 of the current month</th><td>Yes</td></tr>
+<tr><th>A player’s rank, points, and the five players on either side</th><td>Yes</td></tr>
+<tr><th>Equal points: whoever reached them first ranks higher</th><td>Yes</td></tr>
+<tr><th>A new board each month; past months viewable</th><td>Yes</td></tr>
+<tr><th>Friends-only and regional boards</th><td>Follow-up questions</td></tr>
+<tr><th>Detecting cheating</th><td>No: scores come only from game servers</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>50 million players on the monthly board; 10 million play each day, 10 matches each</td></tr>
+<tr><th>Latency</th><td>Under 50 ms for a board view; a new score reflected within a second</td></tr>
+<tr><th>Availability</th><td>99.9%; matches must be recorded even when the board is down</td></tr>
+<tr><th>Durability</th><td>No match result lost; the board itself can be rebuilt</td></tr>
+<tr><th>Consistency</th><td>A player sees their own new score at once; others may lag by a second</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">score updates: 10 million × 10 ÷ 86,400 s ≈ 1,160 a second, about 5,800 at an evening peak of five times that<br>
+board views: 10 million × 5 ÷ 86,400 s ≈ 580 a second, 2,900 at the peak; each is three reads, so about 8,700 reads a second<br>
+memory: 50 million players × 109 bytes (measured on Redis, below) ≈ 5.5 GB for one month’s board<br>
+database: 100 million match results a day × about 100 bytes ≈ 10 GB a day</div>
+<p>Every number here fits one machine (<x-ref to="estimation#method"></x-ref>). A few thousand writes and reads a second is light work for an in-memory store, and 5.5 GB of board fits in its memory with room for last month’s while it is archived. The difficult part is not volume but the shape of the question: the design must answer a rank without touching the players ahead. Scaling out comes later, as a follow-up, when the board outgrows memory or must live in several regions.</p>
+
+<div class="widget" data-widget="board92">
+<h4>Size of a leaderboard</h4>
+<p>Writes, reads and memory for one monthly board kept in a sorted set.</p>
+<div class="controls">
+  <label>Players on the board, millions<input type="number" name="players" value="50" min="0.01" max="5000" step="1"></label>
+  <label>Daily players, millions<input type="number" name="daily" value="10" min="0.01" max="5000" step="1"></label>
+  <label>Matches per player a day<input type="number" name="matches" value="10" min="0" max="500" step="1"></label>
+  <label>Board views per player a day<input type="number" name="views" value="5" min="0" max="500" step="1"></label>
+  <label>Peak over average<input type="number" name="peak" value="5" min="1" max="50" step="0.5"></label>
+</div>
+<dl class="results">
+  <div><dt>Score updates at the peak</dt><dd data-out="writes">5,787 a second</dd></div>
+  <div><dt>Sorted set reads at the peak</dt><dd data-out="reads">8,681 a second</dd></div>
+  <div><dt>Memory for the board</dt><dd data-out="memory">5.45 GB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">A board of 50 million players takes about 5.45 GB at 109 bytes each. That fits one in-memory node with a replica, and 14.5 thousand commands a second at the peak is light work for it.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="From game servers, with service credentials">
+POST /v1/scores
+{ "match_id": "m-88412", "finished_at": "2026-10-13T19:02:11Z",
+  "results": [ { "player": "ana", "points": 30 }, { "player": "ben", "points": 10 } ] }
+
+200 OK
+{ "results": [ { "player": "ana", "total": 4210, "rank": 1532 }, { "player": "ben", "total": 980, "rank": 2104377 } ] }
+</pre>
+<pre data-lang="http" data-title="From players’ apps">
+GET /v1/boards/2026-10/top?limit=10
+GET /v1/boards/2026-10/players/ana?around=5
+
+200 OK
+{ "rank": 1532, "points": 4210,
+  "above": [ { "rank": 1527, "player": "zoe", "points": 4245 }, … ],
+  "below": [ { "rank": 1533, "player": "kai", "points": 4205 }, … ] }
+
+GET /v1/boards/2026-09/players/ana                → last month’s final rank
+</pre>
+<p>Scores come only from game servers, which know the result of the match; a player’s app never reports its own points, which removes the easiest kind of cheating. The match id makes the write idempotent (<x-ref to="idempotency-and-delivery#natural"></x-ref>): a game server that times out and sends the result again gets the same answer, and the points count once. The board is addressed by month, so “this month” is a name the server resolves, and last month’s board is the same API with another name. Ranks are counted from 1 in the API, though the store counts from 0.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Store</th></tr></thead>
+<tbody>
+<tr><th>Match results</th><td>match id, player</td><td>Points, time; the id is unique, so a repeat is refused</td><td>Relational, the record of what happened (<x-ref to="transactions"></x-ref>)</td></tr>
+<tr><th>Monthly totals</th><td>month, player</td><td>Points so far, when they were reached</td><td>Same database, updated in the same transaction</td></tr>
+<tr><th>The board</th><td><code>board:2026-10</code>, then player</td><td>One packed number per player: points and time</td><td>A sorted set in an in-memory store, with a replica</td></tr>
+<tr><th>Profiles</th><td>player</td><td>Name, avatar, country</td><td>Profile service, cached</td></tr>
+<tr><th>Past boards</th><td>month</td><td>Final ranks and points</td><td>Database or object storage, written at month end</td></tr>
+</tbody>
+</table>
+<p>The split is the one in <x-ref to="caching#what"></x-ref>: the database is the system of record and the sorted set is derived from it. Everything in the set can be rebuilt from the monthly totals, so the set can live in memory without its own durability, and a lost node costs minutes of rebuild, not lost scores.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 326" role="img" aria-labelledby="f921t f921d">
+<title id="f921t">A leaderboard: totals in a database, ranks in a sorted set</title>
+<desc id="f921d">Game servers report each finished match to a score service, which records the match and the player’s new monthly total in a relational database in one transaction, then writes the total into the month’s sorted set in an in-memory store with a replica. Players’ apps call a stateless leaderboard service, which reads the top of the board, the player’s rank and neighbors from the sorted set, and names from a profile cache. Off the request path, a reconciliation job compares the sorted set with the database, and at the end of the month an archive job saves the final board.</desc>
+<text class="tb" x="10" y="18">Writes: one match result at a time, from trusted game servers</text>
+<rect class="n " x="10" y="32" width="110" height="50" rx="6"/>
+<text class="tb mid" x="65" y="54.0">Game servers</text>
+<text class="ts mid" x="65" y="71.0">match ended</text>
+<rect class="n sig" x="180" y="32" width="150" height="50" rx="6"/>
+<text class="tb mid" x="255" y="54.0">Score service</text>
+<text class="ts mid" x="255" y="71.0">validate, record</text>
+<rect class="n store" x="400" y="32" width="150" height="50" rx="6"/>
+<text class="tb mid" x="475" y="54.0">Match database</text>
+<text class="ts mid" x="475" y="71.0">results, totals</text>
+<rect class="n store" x="400" y="118" width="150" height="54" rx="6"/>
+<text class="tb mid" x="475" y="142.0">Sorted set</text>
+<text class="ts mid" x="475" y="159.0">board:2026-10</text>
+<rect class="n store" x="590" y="118" width="120" height="54" rx="6"/>
+<text class="tb mid" x="650" y="142.0">Replica</text>
+<text class="ts mid" x="650" y="159.0">for reads</text>
+<path class="e sig both" d="M120 57H180"/>
+<text class="ts mid" x="150" y="51">result</text>
+<path class="e store" d="M330 57H400"/>
+<text class="ts mid" x="365" y="51">1. commit</text>
+<path class="e store" d="M255 82V145H400"/>
+<text class="ts mid" x="330" y="139">2. ZADD GT total</text>
+<path class="e async" d="M550 145H590"/>
+<path class="e async both" d="M475 82V118"/>
+<text class="ts" x="483" y="104">reconcile hourly</text>
+<path class="e none dash" d="M10 196H710"/>
+<text class="tb" x="10" y="218">Reads: the top, my rank, my neighbors</text>
+<rect class="n " x="10" y="234" width="110" height="50" rx="6"/>
+<text class="tb mid" x="65" y="264.0">Players’ apps</text>
+<rect class="n sig" x="180" y="234" width="150" height="50" rx="6"/>
+<text class="tb mid" x="255" y="256.0">Leaderboard API</text>
+<text class="ts mid" x="255" y="273.0">stateless</text>
+<rect class="n sig" x="400" y="234" width="150" height="50" rx="6"/>
+<text class="tb mid" x="475" y="256.0">Profile cache</text>
+<text class="ts mid" x="475" y="273.0">names, avatars</text>
+<path class="e sig both" d="M120 259H180"/>
+<text class="ts mid" x="150" y="253">GET</text>
+<path class="e sig both" d="M330 259H400"/>
+<path class="e sig both" d="M300 234V200H650V172"/>
+<text class="ts mid" x="470" y="212">ZREVRANGE, ZREVRANK</text>
+<text class="ts" x="590" y="264">Month end: archive</text>
+<text class="ts" x="590" y="280">the final board, keep</text>
+<text class="ts" x="590" y="296">it a week, then delete</text>
+</svg>
+</div>
+<figcaption>The database is the record of what happened; the sorted set is a fast index over it, rebuilt from the database if it is ever lost.</figcaption>
+</figure>
+
+<p><b>Writes.</b> A score service receives match results from game servers. In one database transaction it inserts the match, which fails harmlessly if the id is already there, and adds the points to each player’s monthly total. Then it writes each new total into the month’s sorted set. It writes the total, not the increment, and only if it is higher than what the set holds, which the next deep dives show is what makes retries safe.</p>
+<p><b>Reads.</b> A stateless leaderboard service answers board views with three commands on the sorted set, usually on its replica: the top ten, the player’s rank, and the range around it. Names come from a profile cache, since a board shows the same few thousand top players to everyone.</p>
+<p><b>Housekeeping.</b> A reconciliation job compares the sorted set with the database totals every hour and repairs differences (<x-ref to="distributed-transactions#reconciliation"></x-ref>). At the start of a month the service writes to a new key. A week later an archive job saves the old board’s final ranks and deletes the key.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 468" role="img" aria-labelledby="f922t f922d">
+<title id="f922t">A match ends, then Ana opens the leaderboard</title>
+<desc id="f922d">Two sequences. A match ends: the game server posts the result with its match id; the score service inserts it into the database, where the match id is unique, and adds the points to Ana’s monthly total in the same transaction, giving 4,210; then it writes that total with ZADD GT to the sorted set and replies with her rank. Ana opens the board: the app asks the API for the board around her; the API reads the top 10, her rank and the five players on either side from the sorted set, then their names from the profile cache, and returns one response.</desc>
+<text class="tb" x="10" y="16">A match ends</text>
+<g data-scene="write">
+<text class="tb mid" x="50" y="36">Game server</text>
+<line class="axis" x1="50" y1="44" x2="50" y2="208"/>
+<text class="tb mid" x="210" y="36">Score service</text>
+<line class="axis" x1="210" y1="44" x2="210" y2="208"/>
+<text class="tb mid" x="380" y="36">Database</text>
+<line class="axis" x1="380" y1="44" x2="380" y2="208"/>
+<text class="tb mid" x="550" y="36">Sorted set</text>
+<line class="axis" x1="550" y1="44" x2="550" y2="208"/>
+<g data-s="1">
+<path class="e sig" d="M51 66H209"/>
+<text class="ts mid" x="130.0" y="60">1. POST /scores m-88412: ana +30</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M211 94H379"/>
+<text class="ts mid" x="295.0" y="88">2. insert match; total += 30</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M379 122H211"/>
+<text class="ts mid" x="295.0" y="116">3. total 4,210</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M211 150H549"/>
+<text class="ts mid" x="380.0" y="144">4. ZADD GT board ana 4,210…</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M209 178H51"/>
+<text class="ts mid" x="130.0" y="172">5. ana: rank 1,532</text>
+</g>
+</g>
+<path class="e none dash" d="M10 222H710"/>
+<text class="tb" x="10" y="244">Ana opens the board</text>
+<g data-scene="read">
+<text class="tb mid" x="50" y="264">Ana’s app</text>
+<line class="axis" x1="50" y1="272" x2="50" y2="460"/>
+<text class="tb mid" x="210" y="264">Leaderboard API</text>
+<line class="axis" x1="210" y1="272" x2="210" y2="460"/>
+<text class="tb mid" x="380" y="264">Sorted set</text>
+<line class="axis" x1="380" y1="272" x2="380" y2="460"/>
+<text class="tb mid" x="550" y="264">Profile cache</text>
+<line class="axis" x1="550" y1="272" x2="550" y2="460"/>
+<g data-s="1">
+<path class="e sig" d="M51 294H209"/>
+<text class="ts mid" x="130.0" y="288">1. GET board, around me</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M211 322H379"/>
+<text class="ts mid" x="295.0" y="316">2. ZREVRANGE 0 9</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M211 350H379"/>
+<text class="ts mid" x="295.0" y="344">3. ZREVRANK ana → 1,531</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M211 378H379"/>
+<text class="ts mid" x="295.0" y="372">4. ZREVRANGE 1,526 1,536</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M211 406H549"/>
+<text class="ts mid" x="380.0" y="400">5. names of 21 players</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M209 434H51"/>
+<text class="ts mid" x="130.0" y="428">6. top 10, rank 1,532, neighbors</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="write" data-label="A match ends">
+  <li data-msg="POST /v1/scores" data-state="Database, ana: 4,180; sorted set, ana: 4,180">The game server reports the match with its id. Players never report their own scores.</li>
+  <li data-msg="BEGIN … COMMIT" data-state="Database, ana: 4,210; sorted set, ana: 4,180">One transaction: insert the match, whose id is unique, and add the points to Ana’s total for the month.</li>
+  <li data-msg="4,210">A retried request would fail the unique id, add nothing, and read the same total.</li>
+  <li data-msg="ZADD GT" data-state="Database, ana: 4,210; sorted set, ana: 4,210">It writes the total, packed with the time, only if it is higher than what the set holds.</li>
+  <li data-msg="200 OK">The reply carries the new rank, for the end-of-match screen.</li>
+</ol>
+<ol class="steps" data-scene="read" data-label="Ana opens the board">
+  <li data-msg="GET ?around=5">The app asks for the board around Ana in one request.</li>
+  <li data-msg="ZREVRANGE">It asks the sorted set for the top ten, best first.</li>
+  <li data-msg="ZREVRANK">Ana’s position from the top. The store counts from zero and returns 1,531, so she is 1,532nd.</li>
+  <li data-msg="ZREVRANGE">The five players above her and the five below.</li>
+  <li data-msg="MGET">Names and avatars for everyone on the screen, in one call.</li>
+  <li data-msg="200 OK">One response. All the reads are logarithmic in the size of the board.</li>
+</ol>
+<figcaption>A write records the match once and then sets a total; a read is three commands on the sorted set. Neither scans the board.</figcaption>
+</figure>
+
+<h2 id="sorted-sets">Step 6a: A rank without counting</h2>
+<p>Start with the relational version, since many games begin there. A table of players with an index on the score answers the top ten by reading the first ten index entries, and the players around someone by reading five entries on each side. A rank is the problem:</p>
+<pre data-lang="sql" data-title="A rank, by counting">
+SELECT count(*) + 1 FROM scores WHERE score > $1;   -- $1: the player's own score
+</pre>
+<p>The index gives the order, but a B-tree does not record how many entries lie before a given one (<x-ref to="indexes-and-queries#btree"></x-ref>), so the database walks every entry above the player and counts. The chapter ran this on PostgreSQL 16 with a million players and an index on the score. The top ten took 0.08 ms and a player’s neighbors 0.14 ms. The rank took 0.05 ms for the 10th player, 1.5 ms for the 10,000th, 14 ms for the 100,000th and 78 ms for the 999,000th: proportional to the rank. A window function, <code>rank() OVER (ORDER BY score DESC)</code>, ranks everyone to find one player, and took 912 ms.</p>
+
+<figure class="fig wide" id="fig-sql">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 284" role="img" aria-labelledby="f924t f924d">
+<title id="f924t">A rank by counting rows, against a sorted set</title>
+<desc id="f924d">Execution time on PostgreSQL 16.15, one run, for SELECT count(*) + 1 FROM scores WHERE score &gt; the player’s score, on a table of 1,000,000 players with an index on the score: rank 10: 0.052 ms, rank 1,000: 0.193 ms, rank 10,000: 1.452 ms, rank 100,000: 14.397 ms, rank 500,000: 44.173 ms, rank 999,000: 77.565 ms. For comparison, a ZREVRANK on Redis 7.0.15 took 57 microseconds including the round trip, for any rank among 1,000,000.</desc>
+<text class="tb" x="10" y="18">Time to find one player’s rank among 1,000,000, milliseconds</text>
+<line class="grid" x1="150.0" y1="30" x2="150.0" y2="250"/>
+<text class="ts mid" x="150.0" y="266">0</text>
+<line class="grid" x1="267.5" y1="30" x2="267.5" y2="250"/>
+<text class="ts mid" x="267.5" y="266">20</text>
+<line class="grid" x1="385.0" y1="30" x2="385.0" y2="250"/>
+<text class="ts mid" x="385.0" y="266">40</text>
+<line class="grid" x1="502.5" y1="30" x2="502.5" y2="250"/>
+<text class="ts mid" x="502.5" y="266">60</text>
+<line class="grid" x1="620.0" y1="30" x2="620.0" y2="250"/>
+<text class="ts mid" x="620.0" y="266">80</text>
+<text class="ts end" x="140" y="54">rank 10</text>
+<rect class="bar" x="150" y="42" width="1.5" height="16" rx="3"/>
+<text class="ts tb" x="159.5" y="55">0.052 ms</text>
+<rect class="hit" x="0" y="40" width="720" height="24" data-tip="PostgreSQL, counting the rows above rank 10|0.052 ms (one run)"/>
+<text class="ts end" x="140" y="84">rank 1,000</text>
+<rect class="bar" x="150" y="72" width="1.5" height="16" rx="3"/>
+<text class="ts tb" x="159.5" y="85">0.193 ms</text>
+<rect class="hit" x="0" y="70" width="720" height="24" data-tip="PostgreSQL, counting the rows above rank 1,000|0.193 ms (one run)"/>
+<text class="ts end" x="140" y="114">rank 10,000</text>
+<rect class="bar" x="150" y="102" width="8.5" height="16" rx="3"/>
+<text class="ts tb" x="166.5" y="115">1.452 ms</text>
+<rect class="hit" x="0" y="100" width="720" height="24" data-tip="PostgreSQL, counting the rows above rank 10,000|1.452 ms (one run)"/>
+<text class="ts end" x="140" y="144">rank 100,000</text>
+<rect class="bar" x="150" y="132" width="84.6" height="16" rx="3"/>
+<text class="ts tb" x="242.6" y="145">14.397 ms</text>
+<rect class="hit" x="0" y="130" width="720" height="24" data-tip="PostgreSQL, counting the rows above rank 100,000|14.397 ms (one run)"/>
+<text class="ts end" x="140" y="174">rank 500,000</text>
+<rect class="bar" x="150" y="162" width="259.5" height="16" rx="3"/>
+<text class="ts tb" x="417.5" y="175">44.173 ms</text>
+<rect class="hit" x="0" y="160" width="720" height="24" data-tip="PostgreSQL, counting the rows above rank 500,000|44.173 ms (one run)"/>
+<text class="ts end" x="140" y="204">rank 999,000</text>
+<rect class="bar" x="150" y="192" width="455.7" height="16" rx="3"/>
+<text class="ts tb" x="613.7" y="205">77.565 ms</text>
+<rect class="hit" x="0" y="190" width="720" height="24" data-tip="PostgreSQL, counting the rows above rank 999,000|77.565 ms (one run)"/>
+<text class="ts end" x="140" y="234">sorted set, any rank</text>
+<rect class="bar store" x="150" y="222" width="1.5" height="16" rx="3"/>
+<text class="ts tb" x="159.5" y="235">0.057 ms, including the network round trip</text>
+<rect class="hit" x="0" y="220" width="720" height="24" data-tip="Redis 7.0.15 ZREVRANK|57 microseconds per call, one at a time (one run)|a PING took 35"/>
+</svg>
+</div>
+<figcaption>Counting the rows above a player is quick at the top and slow at the bottom: a B-tree knows the order but not how many entries come before a given one. The sorted set’s spans do.</figcaption>
+</figure>
+
+<p>There is a relational design that works, with a different promise: compute every rank in one pass every few minutes into a table keyed by player. Rebuilding that table for a million players took 1.9 seconds, and reading a rank from it 0.05 ms. At fifty million players the rebuild would take on the order of a hundred seconds by the same rate, so ranks would be a few minutes old. For a game that shows ranks on a profile page, that is a fine design. For one that shows a new rank at the end of every match, it is not.</p>
+<p>The structure that answers ranks directly is a <dfn>sorted set</dfn>: a collection of unique members, each with a numeric score, kept in score order so that a member’s position, its score and the members at any range of positions can all be found in logarithmic time. Redis documents its sorted sets as a hash table, from member to score, beside a skip list ordered by score; adding a member costs O(log <i>n</i>), and so does finding its rank.</p>
+<p>A <dfn>skip list</dfn> is a sorted linked list with extra levels: every node is in the bottom list, about a quarter of them also in the list above, a quarter of those in the one above that, and so on, chosen at random as nodes are inserted. A search runs along the top level until the next step would go too far, drops a level and continues, and so skips most of the list. The detail that turns it into a rank index is that each pointer records how many nodes it jumps, its span. Adding up the spans on the way down gives the position without visiting the nodes skipped.</p>
+
+<figure class="fig wide" id="fig-skiplist">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f923t f923d">
+<title id="f923t">Finding Ana’s rank in a skip list with spans</title>
+<desc id="f923d">Ten players in ascending order of points: Ben 120, Chi 340, Dev 410, Eve 560, Fay 700, Gus 820, Ana 905, Hal 990, Ivy 1,200 and Jo 1,500. Each has a tower of one to three levels; every pointer records how many places it jumps. To find Ana, the search starts at the top level of the head and jumps to Eve, 4 places; the next jump would pass Ana, so it goes down a level and jumps to Gus, 2 more; then down again and one more to Ana. 4 + 2 + 1 = 7 is her place from the bottom, so 10 − 7 = 3 players are above her: she is fourth.</desc>
+<text class="tb" x="10" y="16">Ascending by points; each pointer is labeled with how many places it jumps</text>
+<rect class="n " x="12" y="139" width="36" height="22" rx="3"/>
+<rect class="n " x="12" y="95" width="36" height="22" rx="3"/>
+<rect class="n " x="12" y="51" width="36" height="22" rx="3"/>
+<text class="tb mid" x="30" y="180">head</text>
+<rect class="n " x="92" y="139" width="36" height="22" rx="3"/>
+<text class="tb mid" x="110" y="180">Ben</text>
+<text class="ts mid" x="110" y="196">120</text>
+<rect class="n " x="150" y="139" width="36" height="22" rx="3"/>
+<rect class="n " x="150" y="95" width="36" height="22" rx="3"/>
+<text class="tb mid" x="168" y="180">Chi</text>
+<text class="ts mid" x="168" y="196">340</text>
+<rect class="n " x="208" y="139" width="36" height="22" rx="3"/>
+<text class="tb mid" x="226" y="180">Dev</text>
+<text class="ts mid" x="226" y="196">410</text>
+<rect class="n " x="266" y="139" width="36" height="22" rx="3"/>
+<rect class="n " x="266" y="95" width="36" height="22" rx="3"/>
+<rect class="n " x="266" y="51" width="36" height="22" rx="3"/>
+<text class="tb mid" x="284" y="180">Eve</text>
+<text class="ts mid" x="284" y="196">560</text>
+<rect class="n " x="324" y="139" width="36" height="22" rx="3"/>
+<text class="tb mid" x="342" y="180">Fay</text>
+<text class="ts mid" x="342" y="196">700</text>
+<rect class="n " x="382" y="139" width="36" height="22" rx="3"/>
+<rect class="n " x="382" y="95" width="36" height="22" rx="3"/>
+<text class="tb mid" x="400" y="180">Gus</text>
+<text class="ts mid" x="400" y="196">820</text>
+<rect class="n sig" x="440" y="139" width="36" height="22" rx="3"/>
+<text class="tb mid" x="458" y="180">Ana</text>
+<text class="ts mid" x="458" y="196">905</text>
+<rect class="n " x="498" y="139" width="36" height="22" rx="3"/>
+<rect class="n " x="498" y="95" width="36" height="22" rx="3"/>
+<rect class="n " x="498" y="51" width="36" height="22" rx="3"/>
+<text class="tb mid" x="516" y="180">Hal</text>
+<text class="ts mid" x="516" y="196">990</text>
+<rect class="n " x="556" y="139" width="36" height="22" rx="3"/>
+<text class="tb mid" x="574" y="180">Ivy</text>
+<text class="ts mid" x="574" y="196">1,200</text>
+<rect class="n " x="614" y="139" width="36" height="22" rx="3"/>
+<rect class="n " x="614" y="95" width="36" height="22" rx="3"/>
+<text class="tb mid" x="632" y="180">Jo</text>
+<text class="ts mid" x="632" y="196">1,500</text>
+<path class="e" d="M48 150H92"/>
+<text class="ts mid" x="70" y="145">1</text>
+<path class="e" d="M128 150H150"/>
+<text class="ts mid" x="139" y="145">1</text>
+<path class="e" d="M186 150H208"/>
+<text class="ts mid" x="197" y="145">1</text>
+<path class="e" d="M244 150H266"/>
+<text class="ts mid" x="255" y="145">1</text>
+<path class="e" d="M302 150H324"/>
+<text class="ts mid" x="313" y="145">1</text>
+<path class="e" d="M360 150H382"/>
+<text class="ts mid" x="371" y="145">1</text>
+<path class="e" d="M418 150H440"/>
+<text class="ts mid" x="429" y="145">1</text>
+<path class="e" d="M476 150H498"/>
+<text class="ts mid" x="487" y="145">1</text>
+<path class="e" d="M534 150H556"/>
+<text class="ts mid" x="545" y="145">1</text>
+<path class="e" d="M592 150H614"/>
+<text class="ts mid" x="603" y="145">1</text>
+<text class="ts" x="660" y="154">→ end</text>
+<path class="e" d="M48 106H150"/>
+<text class="ts mid" x="99" y="101">2</text>
+<path class="e" d="M186 106H266"/>
+<text class="ts mid" x="226" y="101">2</text>
+<path class="e" d="M302 106H382"/>
+<text class="ts mid" x="342" y="101">2</text>
+<path class="e" d="M418 106H498"/>
+<text class="ts mid" x="458" y="101">2</text>
+<path class="e" d="M534 106H614"/>
+<text class="ts mid" x="574" y="101">2</text>
+<text class="ts" x="660" y="110">→ end</text>
+<path class="e" d="M48 62H266"/>
+<text class="ts mid" x="157" y="57">4</text>
+<path class="e" d="M302 62H498"/>
+<text class="ts mid" x="400" y="57">4</text>
+<text class="ts" x="660" y="66">→ end</text>
+<g data-s="1" data-packet="none">
+<path class="e sig" style="stroke-width:3" d="M48 69H266"/>
+</g>
+<g data-s="3" data-packet="none">
+<path class="e sig" style="stroke-width:3" d="M284 73V95"/>
+</g>
+<g data-s="4" data-packet="none">
+<path class="e sig" style="stroke-width:3" d="M302 113H382"/>
+</g>
+<g data-s="5" data-packet="none">
+<path class="e sig" style="stroke-width:3" d="M400 117V139"/>
+</g>
+<g data-s="6" data-packet="none">
+<path class="e sig" style="stroke-width:3" d="M418 157H440"/>
+</g>
+<g data-s="2" data-packet="none">
+<path class="x" d="M486 56l10 10M496 56l-10 10"/>
+</g>
+<g data-s="7" data-packet="none">
+<text class="ts mid tb" x="458" y="212">4 + 2 + 1 = 7 from the bottom; 10 − 7 = 3 above: 4th</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Places counted: 4">Start at the top level of the head. The first pointer jumps 4 places, to Eve, with 560 points, not past Ana’s 905: take it.</li>
+  <li data-msg="none" data-state="Places counted: 4">The next pointer at this level leads to Hal, 990, which is past Ana. Do not take it.</li>
+  <li data-msg="none" data-state="Places counted: 4">Go down one level, still at Eve.</li>
+  <li data-msg="none" data-state="Places counted: 6">This pointer jumps 2 places to Gus, 820, still not past Ana: take it.</li>
+  <li data-msg="none" data-state="Places counted: 6">The next one at this level would reach Hal again. Go down.</li>
+  <li data-msg="none" data-state="Places counted: 7">The bottom pointer jumps 1 place, to Ana. Found.</li>
+  <li data-msg="none" data-state="Places counted: 7; ZREVRANK: 3">Ana is 7th from the bottom of 10, so 3 players are above her. ZREVRANK returns 3: she is fourth.</li>
+</ol>
+<figcaption>Each level skips about four times as far as the one below, and the spans let the search count the places it skips without visiting them. A rank costs a few steps per level: about log n in all.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="ZREVRANK: follow the pointers that do not pass the member, adding up their spans">
+// ZREVRANK: 0 for the highest score.
+  revRank(member: string): number | undefined {
+    const score = this.scores.get(member);
+    if (score === undefined) return undefined;
+    this.steps = 0;
+    let rank = 0;
+    let x = this.head;
+    for (let i = this.level - 1; i >= 0; i -= 1) {
+      for (let n = x.next[i]; n && !before(member, score, n); n = x.next[i]) {
+        rank += x.span[i] as number;
+        x = n;
+        this.steps += 1;
+      }
+      if (x.member === member && x !== this.head) return this.count - rank;
+    }
+    return undefined;
+  }
+</pre>
+<p>The chapter’s skip list matched a plain sorted list on 20,000 random operations, including ranks, ranges and counts. Finding a rank took 11.6 steps on average among 1,000 players, 19.3 among 10,000 and 23.4 among 100,000, where counting would take 500, 5,000 and 50,000. Insertion keeps the spans right by adding one to every pointer that passes over the new node, which costs the same as the search.</p>
+<p>On a real Redis 7.0, with a million members, the board used 109 bytes per member, including the hash table and the skip list. A rank took 57 microseconds from a client on the same machine, of which a plain <code>PING</code> took 35: the command itself is a small part of a round trip. One client sending score updates in batches of 100 reached about 90,000 a second, fifteen times the estimate’s peak. These are one run on one machine, and they say that the estimates fit one node with room to spare.</p>
+
+<h2 id="ties">Step 6b: Ties, retries and months</h2>
+<p>A sorted set orders by one number. Equal scores are ordered by member name, which Redis documents, and the reverse commands that leaderboards use reverse that too. The test gave Carol, Alice and Bob 500 points each, reached in that order: by points alone they ranked Carol, Bob, Alice, on the chapter’s skip list and on Redis alike. Nobody would accept losing a tie because of their name.</p>
+<pre data-lang="ts" data-title="Points and the time they were reached, in one exact number">
+export const SLOT = 2 ** 22;
+
+export function packed(points: number, secondsIntoMonth: number): number {
+  if (!Number.isInteger(points) || points < 0 || points >= 2 ** 31) throw new RangeError("points out of range");
+  if (!Number.isInteger(secondsIntoMonth) || secondsIntoMonth < 0 || secondsIntoMonth >= SLOT) throw new RangeError("time out of range");
+  return points * SLOT + (SLOT - 1 - secondsIntoMonth);
+}
+</pre>
+<p>Packing the time into the low bits fixes the order: more points first, and for equal points the earlier time, because the packed value subtracts it. A double holds every integer up to 2<sup>53</sup> exactly, which Redis also documents for scores, and 31 bits of points with 22 bits of time fit in that. With packed scores the test ranked Carol, Alice, Bob. A game that prefers shared ranks, “1, 2, 2, 4”, keeps points alone as the score and computes a rank as one plus the number of players with strictly more points, which a sorted set also counts in logarithmic time.</p>
+<p>Retries are the other trap. Incrementing the set for each match (<code>ZINCRBY</code>) counts a match twice if the request is retried after a timeout, and nothing in the set can tell. The test delivered 50,000 matches with 5% sent twice and some pairs out of order: incrementing left 1,567 of 4,665 players with the wrong score. Writing the total from the database instead, where the match id is unique, with <code>ZADD GT</code>, which only raises a score, left none wrong. A monthly total only grows, so the highest total is the newest, and a late or repeated write cannot lower it (<x-ref to="idempotency-and-delivery#versions"></x-ref>).</p>
+<p>Months are keys. The score service writes to <code>board:2026-10</code> during October and to a new, empty key from the first second of November in the board’s time zone; nothing is reset or deleted at midnight. A game with daily, weekly and monthly boards writes each total to three keys, and keeps a separate total for each in the database.</p>
+
+<h2 id="sharding">Step 6c: When one machine is not enough</h2>
+<p>A board outgrows one node when its memory does, at about ten times the estimate, or when players in several regions each need a nearby copy. Splitting a sorted set is splitting an index whose main question, the rank, involves all of it (<x-ref to="partitioning#strategies"></x-ref>). There are two ways to cut it.</p>
+<p><b>By a hash of the player.</b> Every shard holds an even share of the players, and a score update touches one shard. The top ten is the top ten of each shard, merged: one call per shard, a scatter-gather (<x-ref to="partitioning#harder"></x-ref>). A rank is the sum, over all shards, of how many players there score higher than this one: in the test with eight shards, nine calls per rank, one to find the player’s score and one count per shard. The answers equaled one big board’s on 923 random players. The cost is that every rank waits for the slowest of all shards (<x-ref to="latency-and-throughput#tail-at-scale"></x-ref>).</p>
+<p><b>By score range.</b> Shard 1 holds the lowest scores and shard 8 the highest. A rank is the player’s position in their own shard plus the sizes of the shards above, and the top ten lives in one shard. But scores are not spread evenly, and they move.</p>
+
+<figure class="fig wide" id="fig-shards">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f925t f925d">
+<title id="f925t">Players in each of eight shards split by score range</title>
+<desc id="f925d">Players per shard for a board of 46,276 players split into eight shards by ranges of points. Equal ranges of points, end of month: 45,842, 374, 49, 7, 2, 2, 0, 0; Last month’s eighths, mid-month: 9,400, 7,913, 6,593, 5,308, 4,453, 3,503, 2,825, 1,743; Last month’s eighths, end of month: 5,538, 5,764, 5,886, 5,927, 5,907, 5,667, 5,739, 5,848.</desc>
+<text class="tb" x="10" y="18">Players in each shard, lowest scores on the left</text>
+<text class="tb" x="10" y="40">Equal ranges of points</text>
+<text class="ts" x="10" y="54">end of month</text>
+<rect class="bar " x="10" y="70.6" width="20" height="179.4" rx="2"/>
+<rect class="hit" x="8" y="60" width="24" height="190" data-tip="Equal ranges of points, end of month|shard 1: 45,842 players"/>
+<rect class="bar " x="36" y="248.5" width="20" height="1.5" rx="2"/>
+<rect class="hit" x="34" y="60" width="24" height="190" data-tip="Equal ranges of points, end of month|shard 2: 374 players"/>
+<rect class="bar " x="62" y="248.5" width="20" height="1.5" rx="2"/>
+<rect class="hit" x="60" y="60" width="24" height="190" data-tip="Equal ranges of points, end of month|shard 3: 49 players"/>
+<rect class="bar " x="88" y="248.5" width="20" height="1.5" rx="2"/>
+<rect class="hit" x="86" y="60" width="24" height="190" data-tip="Equal ranges of points, end of month|shard 4: 7 players"/>
+<rect class="bar " x="114" y="248.5" width="20" height="1.5" rx="2"/>
+<rect class="hit" x="112" y="60" width="24" height="190" data-tip="Equal ranges of points, end of month|shard 5: 2 players"/>
+<rect class="bar " x="140" y="248.5" width="20" height="1.5" rx="2"/>
+<rect class="hit" x="138" y="60" width="24" height="190" data-tip="Equal ranges of points, end of month|shard 6: 2 players"/>
+<rect class="bar " x="166" y="248.5" width="20" height="1.5" rx="2"/>
+<rect class="hit" x="164" y="60" width="24" height="190" data-tip="Equal ranges of points, end of month|shard 7: 0 players"/>
+<rect class="bar " x="192" y="248.5" width="20" height="1.5" rx="2"/>
+<rect class="hit" x="190" y="60" width="24" height="190" data-tip="Equal ranges of points, end of month|shard 8: 0 players"/>
+<line class="axis" x1="10" y1="250" x2="212" y2="250"/>
+<text class="ts tb" x="10" y="270">largest: 7.9× the average</text>
+<text class="ts" x="10" y="286">45,842 of 46,276</text>
+<text class="tb" x="250" y="40">Last month’s eighths</text>
+<text class="ts" x="250" y="54">mid-month</text>
+<rect class="bar mute" x="250" y="213.2" width="20" height="36.8" rx="2"/>
+<rect class="hit" x="248" y="60" width="24" height="190" data-tip="Last month’s eighths, mid-month|shard 1: 9,400 players"/>
+<rect class="bar mute" x="276" y="219.0" width="20" height="31.0" rx="2"/>
+<rect class="hit" x="274" y="60" width="24" height="190" data-tip="Last month’s eighths, mid-month|shard 2: 7,913 players"/>
+<rect class="bar mute" x="302" y="224.2" width="20" height="25.8" rx="2"/>
+<rect class="hit" x="300" y="60" width="24" height="190" data-tip="Last month’s eighths, mid-month|shard 3: 6,593 players"/>
+<rect class="bar mute" x="328" y="229.2" width="20" height="20.8" rx="2"/>
+<rect class="hit" x="326" y="60" width="24" height="190" data-tip="Last month’s eighths, mid-month|shard 4: 5,308 players"/>
+<rect class="bar mute" x="354" y="232.6" width="20" height="17.4" rx="2"/>
+<rect class="hit" x="352" y="60" width="24" height="190" data-tip="Last month’s eighths, mid-month|shard 5: 4,453 players"/>
+<rect class="bar mute" x="380" y="236.3" width="20" height="13.7" rx="2"/>
+<rect class="hit" x="378" y="60" width="24" height="190" data-tip="Last month’s eighths, mid-month|shard 6: 3,503 players"/>
+<rect class="bar mute" x="406" y="238.9" width="20" height="11.1" rx="2"/>
+<rect class="hit" x="404" y="60" width="24" height="190" data-tip="Last month’s eighths, mid-month|shard 7: 2,825 players"/>
+<rect class="bar mute" x="432" y="243.2" width="20" height="6.8" rx="2"/>
+<rect class="hit" x="430" y="60" width="24" height="190" data-tip="Last month’s eighths, mid-month|shard 8: 1,743 players"/>
+<line class="axis" x1="250" y1="250" x2="452" y2="250"/>
+<text class="ts tb" x="250" y="270">largest: 1.8× the average</text>
+<text class="ts" x="250" y="286">9,400 of 41,738</text>
+<text class="tb" x="490" y="40">Last month’s eighths</text>
+<text class="ts" x="490" y="54">end of month</text>
+<rect class="bar store" x="490" y="228.3" width="20" height="21.7" rx="2"/>
+<rect class="hit" x="488" y="60" width="24" height="190" data-tip="Last month’s eighths, end of month|shard 1: 5,538 players"/>
+<rect class="bar store" x="516" y="227.4" width="20" height="22.6" rx="2"/>
+<rect class="hit" x="514" y="60" width="24" height="190" data-tip="Last month’s eighths, end of month|shard 2: 5,764 players"/>
+<rect class="bar store" x="542" y="227.0" width="20" height="23.0" rx="2"/>
+<rect class="hit" x="540" y="60" width="24" height="190" data-tip="Last month’s eighths, end of month|shard 3: 5,886 players"/>
+<rect class="bar store" x="568" y="226.8" width="20" height="23.2" rx="2"/>
+<rect class="hit" x="566" y="60" width="24" height="190" data-tip="Last month’s eighths, end of month|shard 4: 5,927 players"/>
+<rect class="bar store" x="594" y="226.9" width="20" height="23.1" rx="2"/>
+<rect class="hit" x="592" y="60" width="24" height="190" data-tip="Last month’s eighths, end of month|shard 5: 5,907 players"/>
+<rect class="bar store" x="620" y="227.8" width="20" height="22.2" rx="2"/>
+<rect class="hit" x="618" y="60" width="24" height="190" data-tip="Last month’s eighths, end of month|shard 6: 5,667 players"/>
+<rect class="bar store" x="646" y="227.5" width="20" height="22.5" rx="2"/>
+<rect class="hit" x="644" y="60" width="24" height="190" data-tip="Last month’s eighths, end of month|shard 7: 5,739 players"/>
+<rect class="bar store" x="672" y="227.1" width="20" height="22.9" rx="2"/>
+<rect class="hit" x="670" y="60" width="24" height="190" data-tip="Last month’s eighths, end of month|shard 8: 5,848 players"/>
+<line class="axis" x1="490" y1="250" x2="692" y2="250"/>
+<text class="ts tb" x="490" y="270">largest: 1.0× the average</text>
+<text class="ts" x="490" y="286">5,927 of 46,276</text>
+</svg>
+</div>
+<figcaption>Equal ranges put nearly everyone in the bottom shard, because few players have high scores. Ranges taken from last month balance at the end of the month and not before, because everyone starts the month at zero.</figcaption>
+</figure>
+
+<p>With eight equal ranges of points, 45,842 of 46,276 players sat in the bottom shard at the end of the month in the test, because few players score high. Ranges chosen from last month’s results, an eighth of the players each, balanced at the end of the month but not at mid-month, when the bottom shard held 1.8 times its share, since everyone starts each month at zero. And 30.8% of all updates moved a player from one shard to the next, a delete and an insert on two machines. Range sharding fits boards whose distribution is stable, and costs a rebalancing job.</p>
+<p>The practical answer for the largest boards is to stop ranking everyone exactly. Exact positions matter to the players near the top. Keep a sorted set of only the players above some threshold, say the top hundred thousand, and tell everyone else their percentile. A histogram of points in buckets that grow by 6% each, updated with every score, did this in the test with an average error of 0.37 percentage points and at most 1.12, for a structure of 200 counters: “top 23%” costs nothing to compute and nobody checks it to the decimal place (<x-ref to="probabilistic-structures#quantiles"></x-ref>).</p>
+<p>Key-value databases meet the same problem in another form. DynamoDB’s documentation uses a leaderboard to introduce global secondary indexes: an index keyed by game title and sorted by top score returns the top scorers of a game. Every write for that game lands on one partition key, so busy games need write sharding, adding a suffix such as 1 to 200 to the key and merging the results of one query per suffix when reading, which is the hash design above.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>The sorted set’s primary</th><td>Ranks pause for seconds</td><td>The replica is promoted (<x-ref to="replication#failover"></x-ref>); writes it missed are repaired by the reconciliation job, or by the next total for each player</td></tr>
+<tr><th>The whole in-memory store, data lost</th><td>An empty board for minutes</td><td>Rebuild from the monthly totals: fifty million writes in batches, minutes at the measured rate; the API shows last hour’s archived top 10 meanwhile</td></tr>
+<tr><th>The database</th><td>Matches not credited for a while</td><td>Game servers queue results and retry; the match id makes the retries safe</td></tr>
+<tr><th>Writing the set after the commit fails</th><td>A rank that lags a score</td><td>The next match writes a higher total; the hourly reconciliation catches players who stopped playing</td></tr>
+<tr><th>A popular streamer’s fans refresh the board</th><td>Nothing</td><td>The top ten is the same for everyone: cache it for a second</td></tr>
+</tbody>
+</table>
+<p>At ten times the players, the board needs about 55 GB, and the choice is between a larger node, hash shards with scatter-gather for ranks, or an exact top board with percentiles below it. At a hundred times, only the last remains reasonable. Writes grow with matches, not players, and a few tens of thousands a second still fit a handful of nodes. Regional boards, one per region, are often what the game wanted in the first place, and they divide the problem by itself.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li>Redis’s documentation (as of October 2026) describes sorted sets as a skip list and a hash table, with O(log n) insertion and rank; names leaderboards as their first use; orders equal scores lexicographically; and states that scores are 64-bit floating point numbers that represent integers exactly between −2<sup>53</sup> and 2<sup>53</sup>.</li>
+  <li>Google Play Games Services (documentation updated 8 October 2026) creates daily, weekly and all-time versions of every leaderboard automatically. Daily boards reset at UTC−7 all year, weekly ones between Saturday and Sunday, and a submitted score replaces a player’s entry only if it is better.</li>
+  <li>Amazon DynamoDB’s documentation (as of October 2026) uses a game-scores table with an index on game title and top score as its example of a global secondary index, notes that such indexes are updated asynchronously, usually within a fraction of a second, and describes write sharding with key suffixes and merged reads.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Friends’ leaderboard</th><td>A few hundred friends: read their totals and sort them in the service, or keep a small sorted set per player updated on each friend’s score</td><td>The global board</td></tr>
+<tr><th>Boards per country</th><td>One more key per country, written with each match</td><td>Packing, ties, retries</td></tr>
+<tr><th>Best single match instead of total</th><td>The database keeps the best; <code>ZADD GT</code> already only raises</td><td>Everything else</td></tr>
+<tr><th>Lower is better, as in a race time</th><td>Use the ascending commands, and pack the time so that earlier wins ties</td><td>The structure</td></tr>
+<tr><th>Show rank changes since yesterday</th><td>A daily snapshot of ranks, archived like month ends</td><td>The live board</td></tr>
+<tr><th>Prizes for the final top 100</th><td>Freeze the board at the deadline, reconcile it against the database, and pay from the database’s totals</td><td>The live path</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Show why the database alone struggles: the top ten is an index read, a rank is a count. Then introduce the sorted set and explain the skip list with spans in a sentence. Spend the rest on what makes it correct: packed scores for ties, totals with <code>ZADD GT</code> for retries, the database as the record and the set as an index you can rebuild. Finish with sharding only if asked, and propose percentiles for the long tail.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Ranking with <code>count(*)</code> or <code>rank() OVER</code> on every view</th><td>78 ms near the bottom of a million players, 912 ms with the window function, in the test</td><td>A sorted set, or a rank table rebuilt every few minutes</td></tr>
+<tr><th>Points alone as the score</th><td>Ties broken by name, in reverse alphabetical order</td><td>Pack the time into the score</td></tr>
+<tr><th><code>ZINCRBY</code> per match</th><td>Retries count twice: 1,567 of 4,665 players wrong in the test</td><td>Totals from the database, written with <code>ZADD GT</code></td></tr>
+<tr><th>The sorted set as the only copy of the scores</th><td>A lost node loses the month</td><td>Record matches in a database; rebuild the set from it</td></tr>
+<tr><th>Clients reporting their own scores</th><td>Anyone can be first</td><td>Only game servers write</td></tr>
+<tr><th>Sharding by equal ranges of points</th><td>Nearly all players in one shard</td><td>Hash shards, or ranges from the real distribution, rebalanced</td></tr>
+<tr><th>Resetting the board with a job at midnight</th><td>A window where the board is half old and half new</td><td>A new key for each period</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="indexes-and-queries#btree"></x-ref>: why an ordered index cannot count.</li>
+  <li><x-ref to="data-models#key-value"></x-ref>: in-memory stores with richer types.</li>
+  <li><x-ref to="idempotency-and-delivery#versions"></x-ref>: writes that only move forward.</li>
+  <li><x-ref to="partitioning#harder"></x-ref>: queries that need every shard.</li>
+  <li><x-ref to="probabilistic-structures#quantiles"></x-ref>: approximate positions in large distributions.</li>
+  <li><x-ref to="hld-ad-click-aggregation"></x-ref>: counting a stream exactly, the other side of scoring.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>The top of a board is an index read; a rank is a count, which a B-tree must do by walking every entry above.</li>
+  <li>A sorted set keeps a hash map and a skip list whose pointers record their spans, so a rank takes about log n steps.</li>
+  <li>Keep matches and totals in a database and treat the sorted set as an index over them that can be rebuilt.</li>
+  <li>Pack points and time into one exact number so that ties go to whoever got there first.</li>
+  <li>Write totals with <code>ZADD GT</code>, not increments, so retries and reordering cannot corrupt the board.</li>
+  <li>A new key per period replaces any reset job.</li>
+  <li>Past one machine: hash shards cost a call to every shard per rank; score ranges skew and move; exact ranks for the top with percentiles below often serves players best.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why is the top ten fast in a relational database but a rank slow, with the same index?</summary><p>The top ten reads the first ten entries of the index in order. A rank needs the number of entries before the player’s, and a B-tree does not store counts, so the database walks and counts them all; the cost grows with the rank.</p></details>
+<details><summary>What does a span in a skip list record, and why does that make rank cheap?</summary><p>How many nodes the pointer jumps over. Summing the spans of the pointers followed during a search gives the member’s position directly, so the search visits about log n nodes rather than every node before the member.</p></details>
+<details><summary>Ana and Ben both have 700 points; Ana got there first. With points as the score, who ranks higher in ZREVRANGE, and how do you fix it?</summary><p>Ben, because equal scores are ordered by member name and the reverse command reverses that. Pack the time into the score, subtracting it so that earlier is higher: points × 2<sup>22</sup> + (2<sup>22</sup> − 1 − seconds into the month).</p></details>
+<details><summary>A game server times out and resends a match result. Walk through why the board stays right.</summary><p>The database refuses the second insert of the same match id, so the total does not change. The service reads the same total and writes it with ZADD GT, which changes nothing because the set already holds it. With ZINCRBY, the points would have been added twice.</p></details>
+<details><summary>Why might ranges taken from last month’s final scores still leave shards unbalanced?</summary><p>Every player starts the month at zero, so early in the month nearly everyone is in the lowest ranges and the top shards are almost empty. The ranges fit only the end of the month, and players keep crossing them as they score.</p></details>
+<details><summary>With eight shards by hash, how many calls does one player’s rank take, and why?</summary><p>Nine: one to the player’s own shard for their score, then one to every shard to count the players with a higher score there. The rank is the sum of the eight counts.</p></details>
+<details><summary>Fifty million players, but only the top few thousand care about their exact position. What design follows?</summary><p>An exact sorted set for players above a threshold, and a histogram of points for everyone, which gives a percentile such as “top 23%” in constant time and small memory. In the test, a 200-bucket histogram was within 0.37 percentage points on average.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Redis, <a href="https://redis.io/docs/latest/develop/data-types/sorted-sets/">Redis sorted sets</a> and <a href="https://redis.io/docs/latest/commands/zadd/">ZADD</a>, documentation, consulted October 2026. Implementation, complexity, ties, score precision and the GT option.</li>
+  <li>William Pugh, <a href="https://cacmb4.acm.org/magazines/1990/6/9630-skip-lists-a-probabilistic-alternative-to-balanced-trees/abstract">Skip Lists: A Probabilistic Alternative to Balanced Trees</a>, <cite>Communications of the ACM</cite> 33(6), June 1990. The original skip list.</li>
+  <li>Google, <a href="https://developer.android.com/games/pgs/leaderboards">Leaderboards</a>, Play Games Services documentation, updated 8 October 2026.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html">Using Global Secondary Indexes in DynamoDB</a> and <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-sharding.html">Using write sharding to distribute workloads evenly</a>, consulted October 2026.</li>
+  <li>PostgreSQL Global Development Group, <a href="https://www.postgresql.org/docs/16/functions-window.html">Window Functions</a>, PostgreSQL 16 documentation. The rank() function measured here.</li>
+</ol>
+</section>

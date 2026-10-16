@@ -1,0 +1,312 @@
+<!--meta
+{ "description": "How to generate unique identifiers in a distributed system: database sequences, UUID versions 4 and 7, Snowflake-style 64-bit IDs, ULIDs and short codes, with collision probabilities, index behavior, clock problems and the JavaScript precision trap.",
+  "lede": "Every row, message, request and file needs a name that nothing else shares. On one database that is a counter. Across many machines that must each create IDs without asking anyone, it becomes a design decision with consequences for storage, performance, security and ordering. This chapter compares the schemes and shows how to choose.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="requirements">What an ID has to do</h2>
+<p>Identifiers have appeared throughout this book: primary keys in <x-ref to="schema-design#keys"></x-ref>, partition keys, idempotency keys, message IDs, trace IDs. The one firm requirement is uniqueness. Beyond that, schemes differ in properties that pull against one another.</p>
+<table>
+<thead><tr><th>Property</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><th>Generated without coordination</th><td>Any server, or the client, can create one with no network call. Essential for availability and for creating IDs offline.</td></tr>
+<tr><th>Small</th><td>IDs are stored in every row, every index and every foreign key. Eight bytes against sixteen is a real difference over billions of rows.</td></tr>
+<tr><th>Roughly ordered by time</th><td>New rows land together in indexes, and sorting by ID approximates sorting by creation time</td></tr>
+<tr><th>Unpredictable</th><td>An outsider cannot guess other valid IDs or learn how many exist</td></tr>
+<tr><th>Convenient to handle</th><td>Safe in URLs, in JSON and in every programming language, and short enough to read out when needed</td></tr>
+</tbody>
+</table>
+<p>No scheme has all five. Time ordering reveals when something was created. Unpredictability needs randomness, which needs bits. Coordination-free generation rules out a simple counter. The question is which properties each use needs.</p>
+
+<h2 id="sequences">Counters in a database</h2>
+<p>The simplest scheme lets the database assign the next number: 1, 2, 3 and so on. Every relational database offers it, as an auto-incrementing column or a sequence. The IDs are small, perfectly ordered and easy to read.</p>
+<p>The limits appear with scale and with exposure.</p>
+<ul>
+  <li><b>One source.</b> Every ID comes from one database, which every insert must reach. With several databases, as after sharding (<x-ref to="partitioning#harder"></x-ref>), their counters collide.</li>
+  <li><b>The ID exists only after the insert.</b> A client cannot name an object before the server has stored it, which rules out the client-chosen IDs that make creation idempotent (<x-ref to="idempotency-and-delivery#natural"></x-ref>).</li>
+  <li><b>They leak information.</b> If your order confirmation shows order 10,482 and next week’s shows 11,907, anyone can work out your sales. If <code>/invoices/1001</code> is yours, <code>/invoices/1002</code> is worth a try.</li>
+</ul>
+<p>Two old techniques stretch counters across machines. Give each database a different starting point and the same step, so that with two databases one issues odd numbers and the other even. Or have each application server claim a block of a thousand IDs at a time from a central counter and hand them out from memory, so that the central counter is contacted rarely. Both work, and both are awkward to change later. For a single database, a counter remains a good internal key. For anything distributed or exposed, the schemes below are better.</p>
+
+<h2 id="uuid">UUIDs</h2>
+<p>A <dfn>UUID</dfn> (universally unique identifier) is a 128-bit value, usually written as 36 characters such as <code>01929f5e-7b1a-7c3e-9d2f-4a6b8c0d1e2f</code>. The standard, most recently revised as RFC 9562 in 2024, defines several versions that fill those bits differently. Two matter today.</p>
+
+<figure class="fig wide" id="fig-layouts">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-labelledby="f311t f311d">
+<title id="f311t">The bit layouts of UUID version 4, UUID version 7 and a Snowflake-style ID, drawn to one scale</title>
+<desc id="f311d">UUID version 4 is 128 bits: 122 random bits and 6 fixed bits that mark the version. UUID version 7 is 128 bits: a 48-bit timestamp in milliseconds since 1970, then 74 random bits, and the same 6 fixed bits. A Snowflake-style ID is 64 bits: one unused bit, a 41-bit timestamp in milliseconds, a 10-bit node number and a 12-bit sequence number.</desc>
+<text class="tb" x="10" y="20">UUID version 4: 128 bits</text>
+<rect class="n" x="10.0" y="28" width="667.2" height="34" rx="3"/>
+<text class="ts mid" x="343.6" y="49">122 random bits</text>
+<rect class="n sunk" x="677.2" y="28" width="32.8" height="34" rx="3"/>
+<text class="ts end" x="710" y="20">6 fixed bits mark the version</text>
+<text class="tb" x="10" y="96">UUID version 7: 128 bits</text>
+<rect class="n sig" x="10.0" y="104" width="262.5" height="34" rx="3"/>
+<text class="ts mid" x="141.2" y="125">48 bits: milliseconds since 1970</text>
+<rect class="n" x="272.5" y="104" width="404.7" height="34" rx="3"/>
+<text class="ts mid" x="474.8" y="125">74 random bits</text>
+<rect class="n sunk" x="677.2" y="104" width="32.8" height="34" rx="3"/>
+<text class="tb" x="10" y="172">Snowflake-style ID: 64 bits</text>
+<rect class="n sunk" x="10.0" y="180" width="5.5" height="34" rx="3"/>
+<rect class="n sig" x="15.5" y="180" width="224.2" height="34" rx="3"/>
+<text class="ts mid" x="127.6" y="201">41 bits: milliseconds</text>
+<rect class="n store" x="239.7" y="180" width="54.7" height="34" rx="3"/>
+<text class="ts mid" x="267.0" y="201">10</text>
+<rect class="n async" x="294.4" y="180" width="65.6" height="34" rx="3"/>
+<text class="ts mid" x="327.2" y="201">12</text>
+<text class="ts" x="372.0" y="194">then 10 bits of node number and 12 bits of sequence.</text>
+<text class="ts" x="372.0" y="210">Half the size. Unique by construction, not by chance.</text>
+<text class="ts" x="10" y="240">Blue marks the timestamp. IDs that begin with one sort by creation time, so new rows land together at the end of an index.</text>
+</svg>
+</div>
+<figcaption>Three common layouts at the same scale. The choice is between randomness, which needs no coordination, and structure, which is compact and ordered.</figcaption>
+</figure>
+
+<h3 id="uuid4">Version 4: random</h3>
+<p>A version 4 UUID is 122 random bits. Any machine can generate one with no coordination, and the chance of two being equal is so small that it is treated as zero. The arithmetic behind that confidence is the birthday problem: with 122 bits, you would need to generate about 100 trillion UUIDs before the chance of even one collision reached one in a billion. To reach an even chance of a collision, you would have to generate a billion per second for about 86 years.</p>
+<p>That assumes a good source of randomness. A broken or poorly seeded random number generator, such as one initialized identically in many copies of a virtual machine, has produced real collisions. Use the platform’s cryptographic generator, which is what <code>crypto.randomUUID()</code> does in JavaScript.</p>
+<p>The weakness of random UUIDs is where they land in an index.</p>
+
+<figure class="fig wide" id="fig-locality">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-labelledby="f312t f312d">
+<title id="f312t">Where inserts land in an index with random IDs and with time-ordered IDs</title>
+<desc id="f312d">Two rows of ten index leaf pages. With random IDs, inserts are written to seven different pages spread across the index. With time-ordered IDs, every insert is written to the last page.</desc>
+<text class="tb" x="10" y="20">Random IDs: each insert lands on a different leaf page</text>
+<rect class="n fault" x="10" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="41" y="83.5">page 1</text>
+<rect class="n" x="80" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="111" y="83.5">page 2</text>
+<rect class="n fault" x="150" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="181" y="83.5">page 3</text>
+<rect class="n fault" x="220" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="251" y="83.5">page 4</text>
+<rect class="n" x="290" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="321" y="83.5">page 5</text>
+<rect class="n fault" x="360" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="391" y="83.5">page 6</text>
+<rect class="n fault" x="430" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="461" y="83.5">page 7</text>
+<rect class="n" x="500" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="531" y="83.5">page 8</text>
+<rect class="n fault" x="570" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="601" y="83.5">page 9</text>
+<rect class="n fault" x="640" y="64" width="62" height="30" rx="3"/>
+<text class="ts mid" x="671" y="83.5">page 10</text>
+<path class="e fault" d="M41 36V64"/>
+<path class="e fault" d="M181 36V64"/>
+<path class="e fault" d="M251 36V64"/>
+<path class="e fault" d="M391 36V64"/>
+<path class="e fault" d="M461 36V64"/>
+<path class="e fault" d="M601 36V64"/>
+<path class="e fault" d="M671 36V64"/>
+<text class="ts end" x="710" y="20">7 of 10 pages written</text>
+<text class="tb" x="10" y="124">Time-ordered IDs: every insert lands on the last page</text>
+<rect class="n" x="10" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="41" y="187.5">page 1</text>
+<rect class="n" x="80" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="111" y="187.5">page 2</text>
+<rect class="n" x="150" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="181" y="187.5">page 3</text>
+<rect class="n" x="220" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="251" y="187.5">page 4</text>
+<rect class="n" x="290" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="321" y="187.5">page 5</text>
+<rect class="n" x="360" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="391" y="187.5">page 6</text>
+<rect class="n" x="430" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="461" y="187.5">page 7</text>
+<rect class="n" x="500" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="531" y="187.5">page 8</text>
+<rect class="n" x="570" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="601" y="187.5">page 9</text>
+<rect class="n store" x="640" y="168" width="62" height="30" rx="3"/>
+<text class="ts mid" x="671" y="187.5">page 10</text>
+<path class="e store" d="M671 140V168"/>
+<text class="ts end" x="710" y="124">1 of 10 pages written</text>
+<text class="ts" x="10" y="222">With random keys, the whole index must stay in memory to be fast, and pages split everywhere. With ordered keys,</text>
+<text class="ts" x="10" y="238">only the newest page is active.</text>
+
+</svg>
+</div>
+<figcaption>The same inserts into a B-tree index. Random keys touch pages everywhere, and ordered keys touch only the end.</figcaption>
+</figure>
+
+<p><x-ref to="indexes-and-queries#clustered"></x-ref> explained the cost. An index is sorted, so each new random key belongs on an arbitrary page. Once the index is larger than memory, most inserts need a page read from disk first, pages split throughout the tree, and write throughput falls. Ordered keys keep all the activity on the most recent pages.</p>
+
+<h3 id="uuid7">Version 7: time-ordered</h3>
+<p><dfn>UUID version 7</dfn> fixes this while keeping the format. Its first 48 bits are the current time in milliseconds, and the remaining 74 are random. Two version 7 UUIDs created at different milliseconds sort in order of creation. Within one millisecond, 74 random bits make a collision vanishingly unlikely, and generators may also increment within the millisecond to keep one machine’s IDs strictly increasing.</p>
+<p>It is the sensible default for a new system that wants UUIDs. Support is now widespread: PostgreSQL 18 has a built-in <code>uuidv7()</code> function, and libraries exist for every major language. Two cautions apply to all UUIDs.</p>
+<ul>
+  <li><b>Store them as 16 bytes.</b> Use the database’s UUID or binary type. Stored as text they take 36 bytes, and every index on them more than doubles.</li>
+  <li><b>A version 7 UUID reveals its creation time</b> to anyone who sees it. If that is sensitive, as it might be for a user ID that reveals when an account was opened, use version 4 for that field.</li>
+</ul>
+
+<h2 id="snowflake">Snowflake-style IDs</h2>
+<p>When 16 bytes is too many, or IDs must be numeric, the standard design is the one Twitter published in 2010 under the name <dfn>Snowflake</dfn>: a 64-bit integer assembled from three parts.</p>
+<ul>
+  <li><b>A timestamp</b>, 41 bits of milliseconds since a starting date the system chooses.</li>
+  <li><b>A node number</b>, 10 bits identifying the machine or process generating the ID.</li>
+  <li><b>A sequence number</b>, 12 bits that count up within one millisecond on one node.</li>
+</ul>
+<p>Uniqueness is guaranteed by construction, with no randomness and no coordination at generation time. Two IDs from different nodes differ in the node bits. Two from the same node differ in the timestamp or the sequence. The IDs fit in a standard 64-bit integer column and sort roughly by time.</p>
+
+<div class="widget" data-widget="snowflake">
+<h4>Dividing the bits</h4>
+<p>A signed 64-bit integer has 63 usable bits. How they are split decides how long the scheme lasts, how many generators it supports and how fast each can go.</p>
+<div class="controls">
+  <label>Timestamp bits, in milliseconds<input type="number" name="ts" value="41" min="1" max="62" step="1"></label>
+  <label>Node bits<input type="number" name="node" value="10" min="0" max="62" step="1"></label>
+  <label>Sequence bits<input type="number" name="seq" value="12" min="0" max="62" step="1"></label>
+</div>
+<svg viewBox="0 0 100 6" preserveAspectRatio="none" style="height:14px" aria-hidden="true"><rect x="0" y="0" width="100" height="6" style="fill:var(--sunk)"/><rect data-seg x="0.00%" y="0" width="65.08%" height="6" style="fill:var(--sig)"/><rect data-seg x="65.08%" y="0" width="15.87%" height="6" style="fill:var(--store)"/><rect data-seg x="80.95%" y="0" width="19.05%" height="6" style="fill:var(--async)"/></svg>
+<dl class="results">
+  <div><dt>Lifetime before timestamps run out</dt><dd data-out="years">69.7 years</dd></div>
+  <div><dt>Generators at once</dt><dd data-out="nodes">1,024</dd></div>
+  <div><dt>IDs per second, per generator</dt><dd data-out="rate">4.1 million /s</dd></div>
+  <div><dt>Bits used</dt><dd data-out="total">63 of 63</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">This layout uses every available bit. Each added timestamp bit doubles the lifetime, each added node bit doubles the number of generators, and each added sequence bit doubles how many IDs one generator can issue in a millisecond.</p>
+</div>
+
+<pre data-lang="ts" data-title="A Snowflake-style generator">
+const EPOCH = 1735689600000n;               // 1 January 2025, UTC: this system's starting point
+
+class SnowflakeGenerator {
+  private lastMs = -1n;
+  private sequence = 0n;
+
+  constructor(private readonly nodeId: bigint) {
+    if (nodeId < 0n || nodeId > 1023n) throw new Error("nodeId must fit in 10 bits");
+  }
+
+  next(): bigint {
+    let now = BigInt(Date.now());
+    if (now < this.lastMs) throw new Error("clock moved backward; refusing to issue IDs");
+
+    if (now === this.lastMs) {
+      this.sequence = (this.sequence + 1n) & 4095n;       // 12 bits
+      if (this.sequence === 0n) {                         // 4,096 issued this millisecond: wait for the next
+        while (now <= this.lastMs) now = BigInt(Date.now());
+      }
+    } else {
+      this.sequence = 0n;
+    }
+
+    this.lastMs = now;
+    return ((now - EPOCH) << 22n) | (this.nodeId << 12n) | this.sequence;
+  }
+}
+</pre>
+<p>The scheme moves the coordination problem instead of removing it, and three details need care.</p>
+<ul>
+  <li><b>Node numbers must be unique.</b> Two generators with the same node number will eventually issue the same ID. Something has to assign them: static configuration, or a lease from a coordination service at start-up (<x-ref to="membership-and-coordination"></x-ref>). In an environment where instances come and go constantly, this is the hard part.</li>
+  <li><b>The clock must not go backward.</b> <x-ref to="distributed-fundamentals#clocks"></x-ref> showed that it can. If it does, the generator might reissue IDs it produced earlier. The code above refuses to continue. Waiting until the clock catches up is the other common policy.</li>
+  <li><b>The starting date is permanent.</b> Forty-one bits of milliseconds last about 69.7 years from whatever date you choose, so choose a recent one.</li>
+</ul>
+<p>Variations are common. Instagram described generating IDs inside PostgreSQL with 41 bits of time, 13 bits for a logical shard and 10 bits of sequence, so that an ID also says where its row lives. Discord and many others use layouts close to the original.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Sending 64-bit IDs as JSON numbers. JavaScript represents every number as a 64-bit float, which holds integers exactly only up to 9,007,199,254,740,991, about 9 quadrillion. A Snowflake ID is larger. <code>JSON.parse('{"id": 1867812345678901234}').id</code> returns 1867812345678901200, a different ID, with no error. Send large IDs as strings in every API. This is why Twitter’s API has carried both <code>id</code> and <code>id_str</code> fields.</p></div>
+
+<h2 id="other">ULIDs, and short codes</h2>
+<p>A few other formats are worth recognizing.</p>
+<p>A <dfn>ULID</dfn> has the same content as a version 7 UUID, 48 bits of time and 80 of randomness, written as 26 characters in an alphabet that avoids easily confused letters. It sorts correctly as plain text and is more compact in a URL. It predates UUID version 7, which now covers the same need within the standard.</p>
+<p><b>Random strings</b> are used where an ID must be short and unguessable, such as a share link. The safe length depends on how many you will issue, by the same birthday arithmetic. With 8 characters from an alphabet of 62 there are about 218 trillion possibilities, which sounds ample. After a million IDs the chance that some two collide is 0.2%, and after ten million it is 20%. Either check for collisions on insert, which a unique constraint does for you, or use more characters: at 12, the chance after a hundred million IDs is about one in a million.</p>
+<p><b>Encoded counters</b> give the shortest codes of all. A URL shortener can take a sequential number and write it in base 62, using digits and both cases of letters, so that seven characters cover 3.5 trillion values. The result is compact and never collides. It is also sequential underneath, so anyone can enumerate the links unless the number is scrambled first. <x-ref to="hld-url-shortener"></x-ref> works through that design.</p>
+
+<h2 id="comparison">Comparison</h2>
+<table>
+<thead><tr><th>Scheme</th><th>Size</th><th>Coordination</th><th>Time-ordered</th><th>Predictable</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><th>Database sequence</th><td>8 bytes</td><td>One database issues all</td><td>Exactly</td><td>Completely</td><td>Internal keys in a single database</td></tr>
+<tr><th>UUID version 4</th><td>16 bytes</td><td>None</td><td>No</td><td>No</td><td>IDs that must reveal nothing. Tokens and keys.</td></tr>
+<tr><th>UUID version 7</th><td>16 bytes</td><td>None</td><td>To the millisecond</td><td>Time is visible. The rest is random.</td><td>The general default for new systems</td></tr>
+<tr><th>Snowflake-style</th><td>8 bytes</td><td>Unique node numbers</td><td>To the millisecond</td><td>Largely</td><td>Very high volume, numeric IDs, storage-sensitive tables</td></tr>
+<tr><th>Random string</th><td>Varies</td><td>None, with a collision check</td><td>No</td><td>No</td><td>Short public codes and links</td></tr>
+</tbody>
+</table>
+
+<h2 id="security">IDs are names, not locks</h2>
+<p>An unguessable ID is useful, and it is not access control. IDs appear in URLs, logs, browser histories, referrer headers and screenshots. A design in which knowing the ID is sufficient to read the object will leak, sooner or later. Every request must be checked against what the caller is allowed to see (<x-ref to="authorization"></x-ref>). The failure to do so is common enough to have a name, insecure direct object reference, and it is among the most frequent serious flaws found in web applications.</p>
+<p>Where a value really is a secret, such as a password reset link, a session token or an API key, generate it from a cryptographic random source with at least 128 bits, give it an expiry, and store only a hash of it. That is a different job from identifying a row.</p>
+
+<h2 id="ordering">How far to trust the order</h2>
+<p>Time-ordered IDs are sorted by the clocks of the machines that made them, and those clocks disagree (<x-ref to="distributed-fundamentals#skew"></x-ref>). Two IDs generated a few milliseconds apart on different machines may sort in the wrong order. Within one machine the order is reliable, and across machines it is approximate.</p>
+<p>That is enough for the purposes these IDs serve: keeping index inserts together, paginating a feed, giving a rough timeline. It is not enough when exact order affects correctness, such as the sequence of changes to one account. There, use a counter owned by a single authority, such as a per-entity version number or a position in a log (<x-ref to="consensus#log"></x-ref>).</p>
+
+<h2 id="choosing">Choosing</h2>
+<ul>
+  <li><b>A single database, IDs never shown outside:</b> a 64-bit sequence.</li>
+  <li><b>A new system with no special constraints:</b> UUID version 7, stored in a native UUID column.</li>
+  <li><b>IDs created by clients, or offline:</b> a UUID, version 7 or version 4.</li>
+  <li><b>Billions of rows where every byte counts, or a requirement for numeric IDs:</b> Snowflake-style, with a plan for assigning node numbers.</li>
+  <li><b>IDs that must reveal nothing, including creation time:</b> UUID version 4, accepting the index cost, or keep an ordered internal key and expose a random one.</li>
+  <li><b>Short links and codes:</b> a random string with a uniqueness check, or an encoded counter.</li>
+</ul>
+<p>The last option in the fifth item deserves a mention. Many systems use two identifiers for one row: a compact, ordered internal key for joins and indexes, and a random public identifier that appears in URLs and APIs. It costs one extra indexed column and separates the concerns cleanly.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> If you write “id” on a table in a distributed design, be ready to say how it is generated. “Snowflake-style 64-bit IDs: timestamp, node and sequence, so they are unique without coordination and roughly time-ordered, which also lets us paginate by ID” is a complete answer. For a URL shortener or anything with public codes, discuss length against collision probability and whether codes are guessable.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Sequential IDs in public URLs</b>, exposing volume and inviting enumeration.</li>
+  <li><b>Relying on an ID being hard to guess</b> in place of an authorization check.</li>
+  <li><b>Random UUIDs as the primary key of a very large, write-heavy table</b> without measuring the index cost.</li>
+  <li><b>UUIDs stored as text.</b></li>
+  <li><b>64-bit IDs as JSON numbers.</b></li>
+  <li><b>Snowflake generators with duplicate node numbers</b>, or no handling for a clock that goes backward.</li>
+  <li><b>Short random codes with no uniqueness constraint.</b></li>
+  <li><b>Using a non-cryptographic random generator</b> for IDs that must be unpredictable.</li>
+  <li><b>Treating time-ordered IDs as an exact ordering of events</b> across machines.</li>
+  <li><b>A timestamp alone as an ID.</b> Two events in the same millisecond collide.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="schema-design"></x-ref>: surrogate keys and where IDs fit in a schema.</li>
+  <li><x-ref to="indexes-and-queries"></x-ref>: why insertion order matters to an index.</li>
+  <li><x-ref to="partitioning"></x-ref>: why one counter stops working, and IDs that encode a shard.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: the clock behavior that time-based IDs inherit.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: client-generated IDs as the basis of safe retries.</li>
+  <li><x-ref to="authorization"></x-ref>: why an ID is never a permission.</li>
+  <li><x-ref to="hld-url-shortener"></x-ref>: short codes in a full design.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>IDs trade off size, coordination, ordering and predictability. No scheme wins on all of them.</li>
+  <li>Database sequences are small and ordered, come from one place, and leak counts when exposed.</li>
+  <li>Random UUIDs need no coordination and reveal nothing. They scatter inserts across an index.</li>
+  <li>UUID version 7 puts a millisecond timestamp first, keeping new rows together. It is the general default.</li>
+  <li>Snowflake-style IDs pack a timestamp, node number and sequence into 64 bits. They need unique node numbers and a clock that does not run backward.</li>
+  <li>Send 64-bit IDs as strings in JSON. JavaScript numbers cannot hold them.</li>
+  <li>The length of a random code must be chosen from the number you will issue, and backed by a uniqueness check.</li>
+  <li>An ID identifies. It never authorizes, and its order across machines is approximate.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A table with two billion rows uses random version 4 UUIDs as its primary key, and inserts have become slow. Why, and what would you change for new rows?</summary><p>Each new key belongs at a random position in the index, so inserts touch pages across the whole tree. The index no longer fits in memory, so most inserts wait for a disk read, and pages split everywhere. Time-ordered keys such as version 7 UUIDs send all new rows to the end of the index, where the pages are already in memory.</p></details>
+<details><summary>In a Snowflake-style ID with 41 timestamp bits, 10 node bits and 12 sequence bits, what happens if one node needs 10,000 IDs in the same millisecond?</summary><p>The sequence allows 4,096 per millisecond. After issuing those, the generator must wait for the next millisecond before continuing, so the 10,000 take about three milliseconds. If that rate is sustained, give the sequence more bits by taking them from the node number or the timestamp.</p></details>
+<details><summary>An API returns <code>{"id": 9223372036854775807}</code> and a browser client shows a different number. What happened and how should the API change?</summary><p>JavaScript parses JSON numbers as 64-bit floats, which represent integers exactly only up to about 9 quadrillion. The value was rounded to the nearest representable number. The API should return the ID as a string.</p></details>
+<details><summary>You plan to issue 50 million share links using random 8-character codes from 62 symbols. Is that safe?</summary><p>Not without a collision check. There are about 218 trillion possible codes, and the chance of at least one collision already reaches 20% at ten million codes, so at 50 million collisions are effectively certain. Add a unique constraint and retry on conflict, or lengthen the code.</p></details>
+<details><summary>Why is “the order IDs are UUIDs, so nobody can view someone else’s order” not a sufficient security argument?</summary><p>IDs are not secrets. They appear in URLs, logs, emails and referrer headers, and can be shared or leaked. Access must be decided by checking that the authenticated caller owns or may view the order, on every request.</p></details>
+<details><summary>Two events on different servers receive time-ordered IDs, and the one that happened second has the smaller ID. How is that possible?</summary><p>The IDs take their timestamps from each server’s own clock, and the clocks differ by some milliseconds. If the first server’s clock is ahead, its earlier event gets a later timestamp. Time-ordered IDs give an approximate order across machines, which is not suitable where exact order matters.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>K. Davis, B. Peabody and P. Leach, <a href="https://www.rfc-editor.org/rfc/rfc9562">RFC 9562: Universally Unique IDentifiers (UUIDs)</a>, May 2024. Defines versions 4 and 7 and discusses generation and collision resistance.</li>
+  <li>Twitter Engineering, <a href="https://blog.x.com/engineering/en_us/a/2010/announcing-snowflake">Announcing Snowflake</a>, June 2010.</li>
+  <li>Instagram Engineering, <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c">Sharding &amp; IDs at Instagram</a>, 2012. IDs generated in PostgreSQL with an embedded shard number.</li>
+  <li>PostgreSQL Global Development Group, <a href="https://www.postgresql.org/about/news/postgresql-18-released-3142/">PostgreSQL 18 Released</a>, September 2025. The <code>uuidv7()</code> function.</li>
+  <li><a href="https://github.com/ulid/spec">ULID specification</a>.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER">Number.MAX_SAFE_INTEGER</a> and <a href="https://developer.mozilla.org/en-US/docs/Web/API/Crypto/randomUUID">Crypto.randomUUID()</a>.</li>
+  <li>OWASP, <a href="https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/">API1:2023 Broken Object Level Authorization</a>. Why an ID must not serve as a permission.</li>
+  <li>Kellan Elliott-McCrea, <a href="https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/">Ticket Servers: Distributed Unique Primary Keys on the Cheap</a>, Flickr, 2010. Counters across two databases.</li>
+</ol>
+</section>

@@ -1,0 +1,515 @@
+<!--meta
+{ "description": "API design for system design: REST resources, methods and status codes, pagination, errors, versioning and idempotency keys, GraphQL schemas and the N+1 problem, gRPC and Protocol Buffers, and how to choose between REST, GraphQL and gRPC.",
+  "lede": "An API is a promise to other programs, and it is the part of a system that is hardest to change once someone depends on it. This chapter covers the three styles in wide use, the decisions that every API has to make whatever its style, and how to choose.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="contract">An API is a contract</h2>
+<p>An <dfn>application programming interface</dfn> (API) is the set of operations one program offers to others, together with the rules for calling them. Internally, your system can be rearranged whenever you like. The API cannot, because other people’s code is written against it: a mobile app released last year, a partner’s integration, another team’s service.</p>
+<p>That makes API design unlike most engineering work. A slow query can be fixed next week. A badly named field or an operation that cannot be retried safely stays for years. Three qualities are worth aiming for from the start:</p>
+<ul>
+  <li><b>Predictable.</b> Someone who has used one part can guess how the rest behaves.</li>
+  <li><b>Hard to misuse.</b> The obvious way to call it is the correct way, and mistakes produce clear errors.</li>
+  <li><b>Able to evolve.</b> New capabilities can be added without breaking existing callers.</li>
+</ul>
+<p>Three styles dominate today. They differ in what they treat as the basic unit: a resource, a graph of data, or a function call.</p>
+
+<h2 id="rest">REST: resources and representations</h2>
+<p><dfn>REST</dfn> (representational state transfer) is the style of the web itself, described by Roy Fielding in 2000. Its central idea is that an API exposes <dfn>resources</dfn>, each identified by a URL, and that clients act on them using the standard HTTP methods. What travels over the wire is a <dfn>representation</dfn> of a resource’s state, usually JSON.</p>
+<p>For the photo app, the resources and operations might be:</p>
+<table>
+<thead><tr><th>Request</th><th>Meaning</th><th>Success response</th></tr></thead>
+<tbody>
+<tr><td><code>GET /photos</code></td><td>List photos, a page at a time</td><td><code>200</code> with a page of photos</td></tr>
+<tr><td><code>POST /photos</code></td><td>Create a photo</td><td><code>201</code>, with <code>Location: /photos/871</code></td></tr>
+<tr><td><code>GET /photos/871</code></td><td>Read one photo</td><td><code>200</code> with the photo</td></tr>
+<tr><td><code>PATCH /photos/871</code></td><td>Change its caption</td><td><code>200</code> with the updated photo</td></tr>
+<tr><td><code>DELETE /photos/871</code></td><td>Remove it</td><td><code>204</code></td></tr>
+<tr><td><code>GET /photos/871/comments</code></td><td>List its comments</td><td><code>200</code> with a page of comments</td></tr>
+<tr><td><code>POST /photos/871/likes</code></td><td>Like it</td><td><code>201</code> or <code>204</code></td></tr>
+</tbody>
+</table>
+<p>A few conventions carry most of the weight. URLs name things with plural nouns, and the method supplies the verb. Nesting expresses ownership and stops at one level: <code>/photos/871/comments</code> is clear, and five levels deep is not. Because REST uses HTTP as designed, everything from <x-ref to="http-and-tls"></x-ref> applies without extra work: reads are cacheable, methods carry their safety and idempotency promises, and status codes mean what intermediaries expect.</p>
+<aside class="sn"><b>How RESTful is “REST”?</b>Fielding’s definition includes a constraint almost nobody implements: responses should contain links that tell the client what it can do next, so that clients discover the API by following them. Most APIs called REST are better described as “JSON over HTTP with resources and proper methods”. That is a perfectly good design, and it is what this chapter means by the term.</aside>
+<p>Not everything fits the resource mold. Actions such as “cancel this order” or “resend the invoice” are verbs. The usual solutions are to model the action as a resource of its own, <code>POST /orders/55/cancellation</code>, or to accept an action sub-path, <code>POST /orders/55/cancel</code>. Either is fine if applied consistently.</p>
+<p>REST’s structure leaves several decisions open. Every API has to make them, and making them once, consistently, matters more than which option you choose.</p>
+
+<h3 id="pagination">Pagination</h3>
+<p>Any endpoint that returns a list must return it in pages, with a maximum page size enforced by the server. An unbounded list works in testing and takes the service down the day a customer has a million rows. There are two ways to ask for “the next page”.</p>
+
+<figure class="fig wide" id="fig-pagination">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f111t f111d">
+<title id="f111t">Offset pagination compared with cursor pagination when a new item arrives</title>
+<desc id="f111d">A list sorted newest first contains items G to A. The first page returns G, F and E. A new item H then arrives at the top. With offset pagination, the second page skips the first three items, which are now H, G and F, and returns E, D and C, so E is returned twice. With cursor pagination, the second page asks for items after E and returns D, C and B, with no repeat.</desc>
+<g data-scene="offset">
+<text class="tl" x="16" y="22">Offset: “skip 3, take 3”</text>
+<g data-s="1">
+<text class="ts" x="16" y="48">Request 1, before H is added</text>
+<rect class="n sig" x="54" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="71" y="76">G</text>
+<rect class="n sig" x="92" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="109" y="76">F</text>
+<rect class="n sig" x="130" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="147" y="76">E</text>
+<rect class="n" x="168" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="185" y="76">D</text>
+<rect class="n" x="206" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="223" y="76">C</text>
+<rect class="n" x="244" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="261" y="76">B</text>
+<rect class="n" x="282" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="299" y="76">A</text>
+<path class="e sig none" d="M54 90v5H164v-5"/>
+<text class="ts mid" x="109" y="109">page 1</text>
+</g>
+<g data-s="2">
+<text class="ts" x="16" y="134">Request 2, after H is added</text>
+<rect class="n async" x="16" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="33" y="162">H</text>
+<rect class="n sunk" x="54" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="71" y="162">G</text>
+<rect class="n sunk" x="92" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="109" y="162">F</text>
+<rect class="n fault" x="130" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="147" y="162">E</text>
+<rect class="n sig" x="168" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="185" y="162">D</text>
+<rect class="n sig" x="206" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="223" y="162">C</text>
+<rect class="n" x="244" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="261" y="162">B</text>
+<rect class="n" x="282" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="299" y="162">A</text>
+</g>
+<g data-s="3">
+<path class="e none" d="M16 176v5H126v-5"/>
+<text class="ts mid" x="71" y="195">skipped</text>
+<path class="e sig none" d="M130 176v5H240v-5"/>
+<text class="ts mid" x="185" y="195">page 2</text>
+<text class="tb" x="16" y="222">E is returned twice.</text>
+</g>
+</g>
+<g data-scene="cursor">
+<text class="tl" x="376" y="22">Cursor: “3 items after E”</text>
+<g data-s="1">
+<text class="ts" x="376" y="48">Request 1, before H is added</text>
+<rect class="n sig" x="414" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="431" y="76">G</text>
+<rect class="n sig" x="452" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="469" y="76">F</text>
+<rect class="n sig" x="490" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="507" y="76">E</text>
+<rect class="n" x="528" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="545" y="76">D</text>
+<rect class="n" x="566" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="583" y="76">C</text>
+<rect class="n" x="604" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="621" y="76">B</text>
+<rect class="n" x="642" y="56" width="34" height="30" rx="4"/>
+<text class="tb mid" x="659" y="76">A</text>
+<path class="e sig none" d="M414 90v5H524v-5"/>
+<text class="ts mid" x="469" y="109">page 1</text>
+</g>
+<g data-s="2">
+<text class="ts" x="376" y="134">Request 2, after H is added</text>
+<rect class="n async" x="376" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="393" y="162">H</text>
+<rect class="n" x="414" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="431" y="162">G</text>
+<rect class="n" x="452" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="469" y="162">F</text>
+<rect class="n" x="490" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="507" y="162">E</text>
+<rect class="n sig" x="528" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="545" y="162">D</text>
+<rect class="n sig" x="566" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="583" y="162">C</text>
+<rect class="n sig" x="604" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="621" y="162">B</text>
+<rect class="n" x="642" y="142" width="34" height="30" rx="4"/>
+<text class="tb mid" x="659" y="162">A</text>
+</g>
+<g data-s="3">
+<path class="e none" d="M507 176v5"/>
+<text class="ts mid" x="507" y="195">cursor</text>
+<path class="e sig none" d="M528 176v5H638v-5"/>
+<text class="ts mid" x="583" y="195">page 2</text>
+<text class="tb" x="376" y="222">No repeats and no gaps.</text>
+</g>
+</g>
+<line class="grid" x1="360" y1="10" x2="360" y2="224"/>
+
+</svg>
+</div>
+<ol class="steps" data-scene="offset" data-label="Offset">
+  <li data-state="List, newest first: G F E D C B A; Client has: G F E">The list is sorted newest first. The first request skips nothing and takes three items: G, F and E.</li>
+  <li data-state="List, newest first: H G F E D C B A; Client has: G F E">A new item, H, is added at the top. Every other item moves down one place.</li>
+  <li data-state="List, newest first: H G F E D C B A; Client has: G F E, then E D C">The second request says “skip 3, take 3”. The three it skips are now H, G and F, so page 2 starts at E, which the client already has.</li>
+</ol>
+<ol class="steps" data-scene="cursor" data-label="Cursor">
+  <li data-state="List, newest first: G F E D C B A; Client has: G F E; Cursor: after E">The first request takes three items: G, F and E. With them the server returns a cursor that points at E, the last item sent.</li>
+  <li data-state="List, newest first: H G F E D C B A; Client has: G F E; Cursor: after E">H is added at the top, as before.</li>
+  <li data-state="List, newest first: H G F E D C B A; Client has: G F E, then D C B; Cursor: after B">The second request asks for three items after the cursor. Where E now sits in the list does not matter, so the page is D, C and B, with no repeats and no gaps.</li>
+</ol>
+<figcaption>Paging through a list that changes. Counting from the top goes wrong when items are added or removed. Continuing from the last item seen does not.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th></th><th>Offset pagination</th><th>Cursor pagination</th></tr></thead>
+<tbody>
+<tr><th>Request</th><td><code>?limit=20&amp;offset=40</code></td><td><code>?limit=20&amp;after=eyJjcmVh…</code></td></tr>
+<tr><th>Meaning</th><td>Skip 40 rows, return the next 20</td><td>Return the 20 rows after this position</td></tr>
+<tr><th>Jump to page 50</th><td>Yes</td><td>No, only forward and sometimes backward</td></tr>
+<tr><th>When rows are added or removed while paging</th><td>Items repeat or are skipped</td><td>Stable</td></tr>
+<tr><th>Cost of a deep page</th><td>The database reads and discards every skipped row, so it grows with the offset</td><td>Constant: an index seek to the cursor position</td></tr>
+<tr><th>Suits</th><td>Small, slowly changing lists. Admin tables with page numbers.</td><td>Feeds, timelines, large or fast-changing lists, and any export</td></tr>
+</tbody>
+</table>
+<p>A <dfn>cursor</dfn> is the sort position of the last item the client received, encoded as an opaque string. The server decodes it and continues from there. The sort order must be unique, so a tie-breaker such as the ID is added to the main sort key.</p>
+<pre data-lang="ts" data-title="Cursor pagination over (created_at, id)">
+type Photo = { id: string; createdAt: string; url: string };
+type Page<T> = { items: T[]; nextCursor: string | null };
+type Position = Pick<Photo, 'createdAt' | 'id'>;
+interface Db { query<T>(sql: string, params: unknown[]): Promise<T[]> }
+
+// Clients must treat the cursor as opaque, so we are free to change what is inside it.
+const encode = (p: Position) => Buffer.from(JSON.stringify([p.createdAt, p.id])).toString('base64url');
+const decode = (s: string): Position => {
+  const [createdAt, id] = JSON.parse(Buffer.from(s, 'base64url').toString());
+  return { createdAt, id };
+};
+
+export async function listPhotos(db: Db, limit: number, cursor?: string): Promise<Page<Photo>> {
+  const size = Math.min(Math.max(limit, 1), 100);   // the server decides the maximum
+  const after = cursor ? decode(cursor) : null;
+
+  // Fetch one extra row to learn whether another page exists.
+  const rows = await db.query<Photo>(
+    `SELECT id, created_at AS "createdAt", url
+       FROM photos
+      WHERE $1::timestamptz IS NULL OR (created_at, id) < ($1, $2)
+      ORDER BY created_at DESC, id DESC
+      LIMIT $3`,
+    [after?.createdAt ?? null, after?.id ?? null, size + 1],
+  );
+
+  const items = rows.slice(0, size);
+  const last = items.at(-1);
+  return { items, nextCursor: rows.length > size && last ? encode(last) : null };
+}
+</pre>
+
+<h3 id="errors">Errors</h3>
+<p>An error response should let a program decide what to do and let a person understand what happened. That takes three things: the right status code, a stable machine-readable error type, and a human-readable explanation. A standard format exists, called <dfn>problem details</dfn>, and using it saves inventing your own.</p>
+<pre data-lang="http" data-title="An error in the problem details format">
+HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.example.com/problems/caption-too-long",
+  "title": "The caption is too long",
+  "status": 422,
+  "detail": "Captions may have at most 2,200 characters. This one has 2,431.",
+  "instance": "/photos/871",
+  "maxLength": 2200
+}
+</pre>
+<p>Clients branch on <code>type</code>, which never changes, and show <code>detail</code>, which may be reworded freely. Do not put stack traces, SQL or internal hostnames in an error. They help an attacker more than a caller.</p>
+
+<h3 id="idempotency-keys">Safe retries for unsafe operations</h3>
+<p>Networks fail in the middle of requests. A client that sends <code>POST /payments</code> and gets a timeout cannot know whether the payment happened. If it retries, the customer may be charged twice. If it does not, the payment may never have been made.</p>
+<p>The solution is an <dfn>idempotency key</dfn>. The client generates a unique value for each operation it intends, and sends the same value on every attempt.</p>
+<pre data-lang="http">
+POST /payments HTTP/1.1
+Host: api.example.com
+Idempotency-Key: 7f1c9e3a-52d4-4b8e-9a6f-0c2d7e41b3aa
+Content-Type: application/json
+
+{ "orderId": "55", "amount": 4200, "currency": "BDT" }
+</pre>
+<p>The server records each key together with the outcome of the request. When a request arrives with a key it has seen, it returns the recorded outcome and does nothing else. The first attempt and the tenth have the same effect, which is the definition of idempotent. The details that make this correct, such as storing the key in the same transaction as the payment and handling two attempts that arrive at the same moment, are worked through in <x-ref to="idempotency-and-delivery"></x-ref>.</p>
+
+<h3 id="versioning">Versioning and change</h3>
+<p>Sooner or later the API must change. Changes divide into two kinds.</p>
+<table>
+<thead><tr><th>Compatible: existing clients keep working</th><th>Breaking: some existing client fails</th></tr></thead>
+<tbody>
+<tr><td>Adding a new endpoint</td><td>Removing or renaming an endpoint or field</td></tr>
+<tr><td>Adding an optional request field</td><td>Making an optional field required</td></tr>
+<tr><td>Adding a field to a response</td><td>Changing a field’s type or meaning</td></tr>
+<tr><td>Adding a new value where clients were told to expect new ones</td><td>Adding a value to a set clients believed was closed</td></tr>
+<tr><td>Relaxing a validation rule</td><td>Tightening a validation rule</td></tr>
+</tbody>
+</table>
+<p>The first discipline is to prefer compatible changes and to tell clients, in the documentation from day one, to ignore fields they do not recognize. Most evolution can then happen with no version change at all.</p>
+<p>For the breaking changes that remain, there are three common places to put a version:</p>
+<ul>
+  <li><b>In the path</b>, <code>/v2/photos</code>. Visible, easy to route and easy to explain. The most common choice.</li>
+  <li><b>In a header</b>, such as <code>Accept: application/vnd.example.v2+json</code>. Keeps URLs stable and is easier to get wrong.</li>
+  <li><b>By date</b>, where each client is pinned to the API as it was on a given day and the server translates. Fine-grained, and costly to build.</li>
+</ul>
+<p>Whichever you choose, the expensive part is the same: running old and new side by side until the last client has moved, announcing a removal date, and measuring who still calls the old version. A version nobody is able to retire is a permanent cost.</p>
+
+<h3 id="conventions">Smaller conventions that prevent real bugs</h3>
+<ul>
+  <li><b>IDs are strings.</b> Even if they are numbers today. Large integers lose precision in JavaScript, and you may change the scheme.</li>
+  <li><b>Times are UTC in a standard format</b>, such as <code>2026-10-10T08:30:00Z</code>. Never local time without an offset.</li>
+  <li><b>Money is an integer count of the smallest unit, plus a currency code.</b> Floating-point numbers cannot represent most decimal amounts exactly.</li>
+  <li><b>Enumerations may grow.</b> Say so, and have clients handle an unknown value gracefully.</li>
+  <li><b>Lists are wrapped in an object</b>, <code>{ "items": [...], "nextCursor": ... }</code>, so that fields can be added later.</li>
+  <li><b>Limits are stated and enforced</b>: page sizes, request body size, rate limits. A request over the rate limit gets <code>429</code> with a <code>Retry-After</code> header.</li>
+  <li><b>Slow operations answer <code>202</code> at once</b> and return a URL where the client can check on the job. A request that holds a connection for a minute fails in ways that are hard to retry.</li>
+</ul>
+<p>A REST API is normally described in an <dfn>OpenAPI</dfn> document, a machine-readable file listing every endpoint, parameter and response. From it you can generate documentation, client libraries and request validators, and you can check automatically that a change is not a breaking one.</p>
+
+<h2 id="graphql">GraphQL: ask for exactly what you need</h2>
+<p>REST gives each resource its own endpoint with a fixed shape. That causes two inefficiencies for rich clients. A screen that needs a user, their latest photos and the comment count on each must make several requests, some of which can only be made after earlier ones return. And each response includes every field of the resource, although the screen uses three of them. These are called <dfn>under-fetching</dfn> and <dfn>over-fetching</dfn>.</p>
+<p><dfn>GraphQL</dfn>, developed at Facebook and released publicly in 2015, turns the arrangement around. The server publishes a <dfn>schema</dfn>: a typed description of all the data available and how it is connected. The client sends a <dfn>query</dfn> that states exactly which fields it wants, following connections as deep as it needs. One request, one response shaped like the query.</p>
+
+<figure class="fig wide" id="fig-graphql">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f112t f112d">
+<title id="f112t">Loading one screen with REST and with GraphQL</title>
+<desc id="f112d">With REST, the client makes three requests in sequence: for the user, for the user’s photos, and for the comments on a photo. With GraphQL, the client sends one query to a GraphQL server, which fetches from the users, photos and comments data sources itself and returns one combined response.</desc>
+<g data-scene="rest">
+<text class="tl" x="10" y="22">REST: three round trips from the client</text>
+<rect class="n" x="10" y="60" width="78" height="110" rx="6"/>
+<text class="tb mid" x="49" y="120">Client</text>
+<rect class="n" x="268" y="60" width="78" height="110" rx="6"/>
+<text class="tb mid" x="307" y="120">API</text>
+<g data-s="1">
+<path class="e sig both" d="M88 80H268"/>
+<text class="ts mid" x="178" y="73">GET /users/42</text>
+</g>
+<g data-s="2">
+<path class="e sig both" d="M88 116H268"/>
+<text class="ts mid" x="178" y="109">GET /users/42/photos</text>
+</g>
+<g data-s="3">
+<path class="e sig both" d="M88 152H268"/>
+<text class="ts mid" x="178" y="145">GET /photos/871/comments</text>
+<text class="ts" x="10" y="194">Each waits for the one before it,</text>
+<text class="ts" x="10" y="210">over the slowest network in the system.</text>
+</g>
+</g>
+<path class="e none dash" d="M366 10V214"/>
+<g data-scene="graphql">
+<text class="tl" x="386" y="22">GraphQL: one round trip</text>
+<rect class="n" x="386" y="86" width="72" height="58" rx="6"/>
+<text class="tb mid" x="422" y="120">Client</text>
+<rect class="n sig" x="536" y="86" width="74" height="58" rx="6"/>
+<text class="tb mid" x="573" y="112">GraphQL</text>
+<text class="tb mid" x="573" y="129">server</text>
+<g data-s="1">
+<path class="e sig both" d="M458 115H536"/>
+<text class="ts mid" x="497" y="107">one query</text>
+</g>
+<rect class="n store" x="640" y="50" width="72" height="30" rx="5"/>
+<text class="ts mid" x="676" y="70">Users</text>
+<rect class="n store" x="640" y="100" width="72" height="30" rx="5"/>
+<text class="ts mid" x="676" y="120">Photos</text>
+<rect class="n store" x="640" y="150" width="72" height="30" rx="5"/>
+<text class="ts mid" x="676" y="170">Comments</text>
+<g data-s="2">
+<path class="e store" d="M610 100 640 70"/>
+<path class="e store" d="M610 115H640"/>
+<path class="e store" d="M610 130 640 160"/>
+</g>
+<g data-s="3">
+<text class="ts" x="386" y="194">The server gathers the pieces,</text>
+<text class="ts" x="386" y="210">close to the data.</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="rest" data-label="REST">
+  <li data-state="Requests from the client: 1">The client asks for the user.</li>
+  <li data-state="Requests from the client: 2">Only when that answer has arrived can it ask for the user’s photos.</li>
+  <li data-state="Requests from the client: 3">Then it asks for the comments on a photo. That is three round trips, each waiting for the one before it, over the slowest network in the system.</li>
+</ol>
+<ol class="steps" data-scene="graphql" data-label="GraphQL">
+  <li data-state="Requests from the client: 1">The client sends one query that names everything the screen needs.</li>
+  <li data-msg="read">The server gathers the pieces from three sources, which are close to it and quick to reach.</li>
+  <li>One response returns with exactly those fields. The work of combining the data happened next to the data, not across the mobile network.</li>
+</ol>
+<figcaption>The same screen loaded two ways. GraphQL moves the work of combining data from the client, across a slow network, to the server, next to the data.</figcaption>
+</figure>
+
+<pre data-lang="graphql" data-title="A schema, and a query against it">
+type User  { id: ID!  name: String!  photos(first: Int = 10, after: String): PhotoPage! }
+type Photo { id: ID!  url: String!  caption: String  commentCount: Int! }
+type PhotoPage { items: [Photo!]!  nextCursor: String }
+type Query { user(id: ID!): User }
+
+# The client asks for exactly these fields and receives exactly this shape.
+query ProfileScreen {
+  user(id: "42") {
+    name
+    photos(first: 3) {
+      items { url commentCount }
+      nextCursor
+    }
+  }
+}
+</pre>
+<p>The benefits are real, especially where many different clients share one back end. Mobile apps make fewer round trips on slow networks. Front-end teams add a field to a query without waiting for a new endpoint. The schema is a typed contract that tools can check queries against at build time.</p>
+<p>The flexibility is paid for on the server, and each cost needs a deliberate answer.</p>
+<table>
+<thead><tr><th>Cost</th><th>Why it arises</th><th>The usual answer</th></tr></thead>
+<tbody>
+<tr><th>The N+1 problem</th><td>Each field is resolved by its own function. A query for 50 photos and the author of each naively runs 1 query for the photos and 50 for the authors.</td><td>Batching: collect the keys requested during one step and fetch them in a single query. The DataLoader library made this pattern standard.</td></tr>
+<tr><th>Caching is harder</th><td>Queries are usually sent as <code>POST</code> to one URL, so HTTP caches and CDNs cannot tell them apart.</td><td>Persisted queries: the client sends an ID for a query registered in advance, using <code>GET</code>. Caching inside the client library.</td></tr>
+<tr><th>Unbounded cost</th><td>A client can write a query that is cheap to send and enormously expensive to answer, by nesting deeply.</td><td>Limits on depth and on a computed cost per query. Allowing only registered queries in production.</td></tr>
+<tr><th>Authorization everywhere</th><td>Any field can be reached by many paths through the graph.</td><td>Enforce permissions in the data layer under the resolvers, not in each resolver.</td></tr>
+<tr><th>Errors look like successes</th><td>A response can contain partial data and a list of errors, usually with status <code>200</code>.</td><td>Monitoring that reads the response body. Clients that handle partial results.</td></tr>
+</tbody>
+</table>
+<p>GraphQL is a strong choice for a product API consumed by your own web and mobile clients, particularly when several teams build screens against shared data. It is a weaker choice for a simple public API, where REST’s cacheability and familiarity count for more, and for service-to-service calls, where nobody needs flexible queries.</p>
+
+<h2 id="grpc">gRPC: calling a function on another machine</h2>
+<p>The third style does not model resources or graphs. It models <dfn>remote procedure calls</dfn> (RPC): a service exposes functions, and calling one from another machine looks like calling a local function. <dfn>gRPC</dfn>, released by Google in 2015, is the most widely used modern form.</p>
+<p>You start by writing the contract in a <dfn>Protocol Buffers</dfn> file, which defines the messages and the functions.</p>
+<pre data-lang="proto" data-title="photos.proto">
+syntax = "proto3";
+package photos.v1;
+
+service PhotoService {
+  rpc GetPhoto (GetPhotoRequest) returns (Photo);
+  rpc ListPhotos (ListPhotosRequest) returns (ListPhotosResponse);
+  rpc WatchLikes (WatchLikesRequest) returns (stream LikeEvent);   // server streaming
+}
+
+message GetPhotoRequest { string id = 1; }
+
+message Photo {
+  string id = 1;
+  string url = 2;
+  string caption = 3;
+  int64 created_at_ms = 4;
+}
+</pre>
+<p>From this file a compiler generates client and server code in each language you use. Calling the service is then an ordinary typed function call, and a caller that passes the wrong type fails at compile time.</p>
+<p>Three properties make gRPC the common choice between services inside a system.</p>
+<ul>
+  <li><b>Compact and fast.</b> Messages are binary. Field names are not sent, only the small numbers assigned in the file, so payloads are a fraction of the size of the equivalent JSON and cheaper to parse.</li>
+  <li><b>Streaming is built in.</b> Running over HTTP/2, a call can be a single request and response, a stream from the server, a stream from the client, or both at once.</li>
+  <li><b>Deadlines travel with the call.</b> A caller states how long it will wait, and that deadline is passed down through every service the request touches. When time runs out, everyone stops working on a request nobody is waiting for.</li>
+</ul>
+<p>The field numbers also define how the contract may evolve. Adding a field with a new number is compatible: old code ignores it. A number must never be reused for a different meaning, and a field’s type must not change, because old and new code would then read the same bytes differently.</p>
+<p>The costs are mostly at the edges of the system. Browsers cannot speak native gRPC, so a web client needs a translating proxy or a variant protocol. Binary messages cannot be read or sent with <code>curl</code> and a text editor. And because the contract is code, every consumer must regenerate its client when the contract changes.</p>
+<div class="note production"><p><span class="label">In production.</span> gRPC keeps one long-lived HTTP/2 connection per destination and sends every call down it. A load balancer that works at the connection level therefore sends <em>all</em> of a client’s calls to whichever server that one connection landed on, and newly added servers receive nothing. gRPC traffic needs a balancer that understands HTTP/2 and distributes individual requests, or client-side balancing across several connections. <x-ref to="proxies-and-load-balancers"></x-ref> explains the difference.</p></div>
+
+<h2 id="others">Other styles you will meet</h2>
+<ul>
+  <li><b>tRPC</b> and similar tools are RPC for teams whose client and server are both TypeScript. The server’s function types are shared with the client directly, with no schema file and no code generation. Convenient inside one codebase, and not meant for outside consumers.</li>
+  <li><b>JSON-RPC</b> is a minimal convention for RPC with JSON messages: a method name, parameters and an ID. It is the basis of the Model Context Protocol that connects AI models to tools, among other things.</li>
+  <li><b>SOAP</b> is the XML-based RPC of the early 2000s, still running in banking, government and enterprise integration. You are more likely to call one than to build one.</li>
+  <li><b>Webhooks</b> reverse the direction: the server calls the client when something happens. They complement all of the above and are covered in <x-ref to="realtime-communication"></x-ref>.</li>
+</ul>
+
+<h2 id="choosing">Choosing a style</h2>
+<table>
+<thead><tr><th></th><th>REST</th><th>GraphQL</th><th>gRPC</th></tr></thead>
+<tbody>
+<tr><th>Basic unit</th><td>Resource at a URL</td><td>Typed graph, queried</td><td>Function with typed messages</td></tr>
+<tr><th>Payload</th><td>Usually JSON</td><td>JSON</td><td>Protocol Buffers, binary</td></tr>
+<tr><th>Contract</th><td>OpenAPI document, optional</td><td>Schema, required</td><td><code>.proto</code> file, required</td></tr>
+<tr><th>Shape of the response</th><td>Fixed by the server</td><td>Chosen by the client</td><td>Fixed by the contract</td></tr>
+<tr><th>HTTP caching</th><td>Works naturally</td><td>Needs extra work</td><td>Not applicable</td></tr>
+<tr><th>Streaming</th><td>Through separate mechanisms</td><td>Subscriptions</td><td>Built in, both directions</td></tr>
+<tr><th>Works from a browser</th><td>Yes</td><td>Yes</td><td>Only through a proxy</td></tr>
+<tr><th>Easy to explore by hand</th><td>Yes</td><td>Yes, with tooling</td><td>No</td></tr>
+<tr><th>Strongest at</th><td>Public and partner APIs. Simple services.</td><td>Product APIs for many varied clients</td><td>Calls between internal services</td></tr>
+</tbody>
+</table>
+<p>Real systems seldom pick one. A common arrangement uses each where it is strongest.</p>
+
+<figure class="fig wide" id="fig-styles">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f113t f113d">
+<title id="f113t">Where each API style typically sits in one system</title>
+<desc id="f113d">Web and mobile apps call an API gateway using REST or GraphQL. Partner systems call the same gateway using REST and receive webhooks in return. Behind the gateway, internal services call one another using gRPC.</desc>
+<rect class="n" x="10" y="26" width="170" height="52" rx="6"/><text class="tb mid" x="95" y="48">Web and mobile apps</text><text class="ts mid" x="95" y="65">your own clients</text>
+<rect class="n" x="10" y="150" width="170" height="52" rx="6"/><text class="tb mid" x="95" y="172">Partner systems</text><text class="ts mid" x="95" y="189">other companies’ code</text>
+<rect class="n sig" x="300" y="78" width="150" height="72" rx="6"/><text class="tb mid" x="375" y="108">API gateway</text><text class="ts mid" x="375" y="126">or back end for a front end</text>
+<rect class="n" x="570" y="16" width="140" height="42" rx="6"/><text class="tb mid" x="640" y="42">Photo service</text>
+<rect class="n" x="570" y="93" width="140" height="42" rx="6"/><text class="tb mid" x="640" y="119">Feed service</text>
+<rect class="n" x="570" y="170" width="140" height="42" rx="6"/><text class="tb mid" x="640" y="196">Payment service</text>
+<path class="e sig" d="M180 56 300 98"/><text class="ts" x="196" y="50">REST or GraphQL</text>
+<path class="e sig" d="M180 168 300 132"/><text class="ts" x="196" y="140">REST</text>
+<path class="e async" d="M312 150 180 190"/><text class="ts" x="220" y="200">webhooks</text>
+<path class="e sig" d="M450 100 570 40"/><path class="e sig" d="M450 114H570"/><path class="e sig" d="M450 128 570 188"/>
+<text class="ts mid" x="510" y="106">gRPC</text>
+<path class="e sig both" d="M640 58V93"/><path class="e sig both" d="M640 135V170"/>
+</svg>
+</div>
+<figcaption>A common division of labor. Open, cacheable styles face the outside world, and a compact typed one runs between services.</figcaption>
+</figure>
+
+<p>Some rules of thumb for the choice:</p>
+<ul>
+  <li><b>Outsiders will call it:</b> REST. They can use it from any language with no special tooling, and it caches.</li>
+  <li><b>Your own apps with many screens and several client teams:</b> GraphQL is worth its cost. With one client and a few screens, REST endpoints designed for that client are simpler.</li>
+  <li><b>Services calling services:</b> gRPC, for the typed contract, speed, streaming and deadlines.</li>
+  <li><b>Something must be pushed from server to client:</b> none of these alone. See the next chapter.</li>
+</ul>
+<div class="note interview"><p><span class="label">In an interview.</span> When asked to “design the API”, write four or five concrete endpoints with method, path, the key request fields and the response, and say how lists are paginated and how a failed write is retried safely. That is worth more than a discussion of styles. If you choose GraphQL or gRPC, give the reason in one sentence tied to the problem: “the feed screen needs data from four services and I don’t want four round trips from a phone.”</p></div>
+
+<h2 id="mistakes">Mistakes that are expensive later</h2>
+<ul>
+  <li><b>Exposing your database tables as your API.</b> The API then changes whenever the schema does, and internal details become promises. Design the API for its callers and map it to storage behind the scenes.</li>
+  <li><b>Returning unbounded lists.</b> Add pagination and a maximum page size before the first client ships.</li>
+  <li><b>Leaving retries undefined.</b> For every operation that changes something, decide what happens when it is sent twice.</li>
+  <li><b>Inconsistent naming.</b> <code>createdAt</code> in one place, <code>creation_date</code> in another, <code>created</code> in a third. Pick conventions once and enforce them with a linter.</li>
+  <li><b>No plan for removal.</b> If you cannot see who calls an old endpoint, you cannot retire it. Log callers by version from the first day.</li>
+  <li><b>Chatty designs.</b> An API that needs twenty calls to draw one screen multiplies latency and failure. Look at the client’s actual use and offer what it needs in one or two calls.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>Low-level design.</b> An API is an interface in the sense of <x-ref to="solid-principles"></x-ref>: the same advice about small, stable, hard-to-misuse interfaces applies whether the caller is in the same process or on another continent.</li>
+  <li><b>Data storage.</b> Cursor pagination works because of an index on the sort key. See <x-ref to="indexes-and-queries"></x-ref>, which also covers the N+1 problem from the database’s side.</li>
+  <li><b>Security.</b> Every endpoint needs authentication, authorization and input validation. See <x-ref to="authentication"></x-ref> and <x-ref to="threats-and-defenses"></x-ref>.</li>
+  <li><b>Architecture.</b> Service boundaries are API boundaries. A poor split shows up as chatty calls between services, as <x-ref to="monoliths-and-microservices"></x-ref> discusses.</li>
+  <li><b>Technical writing.</b> An API is used through its documentation. Clear names, examples and error messages are part of the design, and the reason some APIs are loved.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>An API is a long-lived contract. Aim for predictable, hard to misuse, and able to evolve.</li>
+  <li>REST exposes resources at URLs and uses HTTP methods, status codes and caching as designed. It is the default for public APIs.</li>
+  <li>Paginate every list. Cursors stay correct and fast on large, changing data, and offsets do not.</li>
+  <li>Give errors a stable machine-readable type. Make unsafe operations retryable with idempotency keys.</li>
+  <li>Prefer compatible changes, and have clients ignore unknown fields. Version only for breaking changes, and plan how old versions are retired.</li>
+  <li>GraphQL lets clients choose the shape of the response in one round trip. The server must handle batching, cost limits, caching and authorization.</li>
+  <li>gRPC offers typed, compact, streaming calls with deadlines, best between internal services, and needs request-level load balancing.</li>
+  <li>Most systems combine styles: REST or GraphQL at the edge, gRPC inside.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>An endpoint returns comments with <code>?offset=100000&amp;limit=20</code> and has become slow. Why, and what would you change?</summary><p>The database must find and discard the first 100,000 rows before returning 20, so the cost grows with the offset. Switch to a cursor on a unique, indexed sort key such as <code>(created_at, id)</code>, so that each page is an index seek to a known position.</p></details>
+<details><summary>A mobile app sends <code>POST /orders</code>, loses signal and retries when it returns. How does the server avoid creating two orders?</summary><p>The app generates an idempotency key when the user confirms the order and sends it with every attempt. The server stores the key with the result, and on a repeat returns the stored result without creating anything.</p></details>
+<details><summary>You want to rename the response field <code>userName</code> to <code>displayName</code>. How can you do it without breaking clients?</summary><p>Add <code>displayName</code> alongside <code>userName</code>, which is a compatible change, and return both. Move clients over, watch usage of the old field, announce a removal date, and remove it only when nothing reads it, or in the next major version.</p></details>
+<details><summary>A GraphQL query for 100 photos with each photo’s author takes two seconds, and the database log shows 101 queries. What is happening and what fixes it?</summary><p>The N+1 problem: one query for the photos and one per photo for its author. Batch the author lookups, so that all the author IDs needed in that step are fetched with a single query.</p></details>
+<details><summary>After adding five servers to a gRPC service, the original servers are still overloaded and the new ones are idle. Why?</summary><p>gRPC clients hold long-lived HTTP/2 connections, and the load balancer is distributing connections, not requests. Existing connections stay where they are. Use a balancer that distributes individual HTTP/2 requests, or client-side load balancing, and have connections recycled periodically.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Roy T. Fielding, <a href="https://ics.uci.edu/~fielding/pubs/dissertation/top.htm"><i>Architectural Styles and the Design of Network-based Software Architectures</i></a>, doctoral dissertation, 2000. Chapter 5 defines REST.</li>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc9457">RFC 9457: Problem Details for HTTP APIs</a>, 2023.</li>
+  <li>IETF HTTP API working group, <a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/">The Idempotency-Key HTTP Header Field</a>, an Internet-Draft.</li>
+  <li>OpenAPI Initiative, <a href="https://spec.openapis.org/oas/latest.html">OpenAPI Specification</a>.</li>
+  <li>GraphQL Foundation, <a href="https://graphql.org/blog/2025-09-08-september-edition/">“Announcing the September 2025 Edition of the GraphQL Specification”</a>, and the <a href="https://spec.graphql.org/">specification</a>.</li>
+  <li>gRPC Authors, <a href="https://grpc.io/docs/what-is-grpc/core-concepts/">Core concepts, architecture and lifecycle</a>, and Google, <a href="https://protobuf.dev/programming-guides/proto3/">Protocol Buffers language guide</a>.</li>
+  <li>Stripe, <a href="https://stripe.com/blog/idempotency">“Designing robust and predictable APIs with idempotency”</a>, 2017.</li>
+  <li>Google, <a href="https://google.aip.dev/">API Improvement Proposals</a>. A large, public set of API design rules with their reasoning.</li>
+</ol>
+</section>

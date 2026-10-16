@@ -1,0 +1,714 @@
+<!--meta
+{ "description": "A rate limiter shared by many servers, designed with the method of chapter 76: requirements and estimates for half a million decisions a second, counters in a sharded store updated by atomic scripts, the read-then-write race measured under load, local shares and periodic syncs and their error, limiting at the edge, the gateway and the service, failing open, failing closed or falling back when the counter store is down, and what Stripe, GitHub, Cloudflare and Envoy do.",
+  "lede": "Chapter 71 built a rate limiter as an object in one process. Put twenty copies of it behind a load balancer and each client gets twenty times its limit. This chapter moves the count into a shared store, measures what goes wrong when the update is not atomic, what it costs to count locally instead, and what the limiter should do on the day the store does not answer.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the rate limiter for a public API. Every API key has limits, such as 100 requests a second, and a request over a limit is refused with status 429. The API runs on many servers.</p></div>
+<p>The algorithms are settled: <x-ref to="resilience-patterns#rate-limiting"></x-ref> compared them, and <x-ref to="lld-rate-limiter"></x-ref> wrote them as tested classes. What is hard is that the count is shared state, read and changed on every request by many servers at once. The check is on the path of every request, so it must cost close to nothing. And the limiter exists to protect the API, so its own failure must not become the API’s outage.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>Limits for each API key, per second and per minute, set by plan</th><td>In scope</td></tr>
+<tr><th>Limits for each client address on routes used before login</th><td>In scope</td></tr>
+<tr><th>A refusal is 429 with <code>Retry-After</code>; every response reports what is left</th><td>In scope</td></tr>
+<tr><th>Rules changed without a deployment</th><td>In scope</td></tr>
+<tr><th>Monthly quotas for billing, limits on concurrent requests, shedding load when servers are overloaded</th><td>Out of scope. Billing needs exact counts, and the other two are covered in <x-ref to="resilience-patterns#load-shedding"></x-ref></td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>500,000 requests a second at peak through 50 gateway servers in one region. 10 million API keys, of which 2 million are active in any minute</td></tr>
+<tr><th>Latency</th><td>The check adds at most 2 ms to 99% of requests</td></tr>
+<tr><th>Accuracy</th><td>A client sending ten times its limit gets at most 5% more than the limit. A client within its limit is not refused</td></tr>
+<tr><th>Availability</th><td>The limiter failing must not refuse legitimate traffic. The API’s own target, 99.99%, is unchanged</td></tr>
+<tr><th>Rule changes</th><td>In effect within 10 seconds</td></tr>
+</tbody>
+</table>
+<p>The accuracy line is the one that decides the design. “Exactly the limit, always” and “never a millisecond added” cannot both hold across many servers, so the requirement says how much error is acceptable, and in which direction.</p>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">decisions   500,000 a second at peak, one script call to the counter store for each
+store       500,000 ÷ (100,000 commands a second for one shard × 50% target) = 10 shards
+memory      2 million active keys × 200 bytes for two counters ≈ 400 MB
+network     500,000 × 150 bytes ≈ 75 MB/s ≈ 600 Mbit/s each way, spread over the shards
+latency     one round trip in a data center, under a millisecond</div>
+<p>The 100,000 commands a second is the planning figure for an in-memory store from <x-ref to="estimation#capacity"></x-ref>; the 200 bytes and 150 bytes are assumptions. The first conclusion is that the store is sized by throughput, not by memory: 400 MB fits on one machine, half a million commands a second does not. The second comes from the calculator: one key cannot be split across shards, so the shard that holds the busiest key carries its whole load.</p>
+
+<div class="widget wide" data-widget="counters78">
+<h4>The counter store</h4>
+<p>How many shards the counters need, and how loaded the busiest one is.</p>
+<div class="controls">
+  <label>Requests a second at peak<input type="number" name="rate" value="500000" min="1" max="1000000000" step="1000"></label>
+  <label>Active keys<input type="number" name="keys" value="2000000" min="1" max="10000000000" step="1000"></label>
+  <label>Bytes of counters for each key<input type="number" name="bytes" value="200" min="10" max="100000" step="10"></label>
+  <label>Commands one shard can run a second<input type="number" name="cap" value="100000" min="100" max="100000000" step="1000"></label>
+  <label>Target use of each shard, %<input type="number" name="use" value="50" min="1" max="100" step="1"></label>
+  <label>Share of requests from the busiest key, %<input type="number" name="hot" value="1" min="0" max="100" step="0.5"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 180" role="img" aria-label="Bars of the load on each shard as a share of one shard’s capacity, with lines at 100% and at the target. The first bar is the shard that holds the busiest key."><text x="10" y="14" class="ts">Commands on each shard, as a share of what one shard can run</text><line x1="104" y1="45" x2="620" y2="45" class="axis" style="stroke-dasharray:4 3"></line><text x="98" y="49" class="ts end">100%</text><line x1="104" y1="92.5" x2="620" y2="92.5" class="grid" style=""></line><text x="98" y="96.5" class="ts end">50% target</text><rect x="111.7" y="88.2" width="36.1" height="51.8" rx="2" class="bar "></rect><rect x="163.3" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><rect x="214.9" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><rect x="266.5" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><rect x="318.1" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><rect x="369.7" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><rect x="421.3" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><rect x="472.9" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><rect x="524.5" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><rect x="576.1" y="93" width="36.1" height="47" rx="2" class="bar store"></rect><circle cx="129.8" cy="82.2" r="4" class="dot"></circle><text x="104" y="158" class="ts">The first bar is the shard that holds the busiest key; the others share the rest evenly.</text><text x="104" y="174" class="ts">Planning figure for one shard: 100 thousand commands a second.</text></svg>
+<dl class="results">
+  <div><dt>Store commands</dt><dd data-out="commands">500 thousand /s</dd></div>
+  <div><dt>Shards</dt><dd data-out="shards">10 shards, each with a replica</dd></div>
+  <div><dt>Memory for counters</dt><dd data-out="memory">400 MB</dd></div>
+  <div><dt>Network to the store</dt><dd data-out="network">600 Mbit/s each way</dd></div>
+  <div><dt>Busiest shard</dt><dd data-out="busiest">54.5% of one shard</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">500 thousand requests a second need one script call each, so 10 shards run them at 50% of capacity, and 400 MB of counters fit easily in memory: the shards are for throughput, not space. The shard holding the busiest key runs at 54.5%, above the target, because one key cannot be spread over shards.</p>
+</div>
+<p>At the defaults, ten shards run at 50% and the one holding a key with 1% of all traffic runs at 54.5%. Raise that key to 25% and its shard needs more than one shard can give, however many are added. Step 6b returns to this.</p>
+
+<h2 id="api">Step 3: The API</h2>
+<p>The limiter has two interfaces: the headers every API client sees, and the call the gateway makes. The first follows <x-ref to="resilience-patterns#rl-practice"></x-ref>.</p>
+<pre data-lang="http" data-title="What a client sees">
+GET /v1/orders
+Authorization: Bearer key_ana…
+
+HTTP/1.1 200 OK
+RateLimit-Policy: "per-second";q=100;w=1
+RateLimit: "per-second";r=37;t=1
+
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+RateLimit: "per-second";r=0;t=1
+</pre>
+<pre data-lang="http" data-title="Rules, as the rules service holds them">
+PUT /internal/rules/plan-pro
+{ "match": { "plan": "pro" },
+  "limits": [ { "name": "per-second", "requests": 100, "window": "1s" },
+              { "name": "per-minute", "requests": 3000, "window": "60s" } ] }
+                           → 200 OK, pushed to every gateway within 10 seconds
+</pre>
+<p>Inside the gateway the decision is one function, <code>check(key, route) → allowed, remaining, retry after</code>, which the gateway calls before forwarding. Keeping it a function of its inputs, as in <x-ref to="lld-rate-limiter#varies"></x-ref>, is what lets the same decision run inside the counter store.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A bucket: tokens and the time they were counted</th><td><code>{key_ana}:per-second</code></td><td>The counter store, an in-memory store sharded by key, each shard with a replica</td><td>Read and changed on every request by every gateway. Losing it costs a few seconds of loose limits, not data</td></tr>
+<tr><th>A window count, for the per-minute limit</th><td><code>{key_ana}:per-minute:29340127</code></td><td>The same shard, with an expiry</td><td>The window number in the key starts a new count each minute. The expiry removes old windows</td></tr>
+<tr><th>Rules</th><td>Plan or key</td><td>A small database behind the rules service, copied into each gateway’s memory</td><td>Read on every request, changed a few times a day</td></tr>
+<tr><th>Refusals</th><td>Key and minute</td><td>Metrics</td><td>To see who is limited, and to tune limits before enforcing them</td></tr>
+</tbody>
+</table>
+<p>The braces matter. In Redis Cluster, a <dfn>hash tag</dfn> is the part of a key name between <code>{</code> and <code>}</code>; when present, only that part decides which shard holds the key. Both of Ana’s counters are therefore on one shard, and one script can check both limits at once, which the check-all-then-charge rule of <x-ref to="lld-rate-limiter#several"></x-ref> needs.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-labelledby="f781t f781d">
+<title id="f781t">Where the limits are checked</title>
+<desc id="f781d">Clients reach the edge, which applies coarse limits per address with counters kept in each data center. The edge passes requests to API gateways, which check the limits for each API key with one script call to a shared counter store of 10 shards, each with a replica, and fall back to a local share of the limit if the store does not answer. Allowed requests go on to the API services, which limit concurrent work. A rules service pushes the rules to the gateways every 10 seconds.</desc>
+<rect class="n" x="10" y="140" width="92" height="52" rx="6"/>
+<text class="tb mid" x="56" y="162">Clients</text>
+<text class="ts mid" x="56" y="179">apps, scripts</text>
+<path class="e sig" d="M102 166H130"/>
+<rect class="n" x="130" y="140" width="120" height="52" rx="6"/>
+<text class="tb mid" x="190" y="162">Edge</text>
+<text class="ts mid" x="190" y="179">limits per address</text>
+<rect class="n async" x="300" y="10" width="130" height="40" rx="6"/>
+<text class="tb mid" x="365" y="34.5">Rules service</text>
+<path class="e async" d="M365 50V70"/>
+<text class="ts" x="373" y="64">every 10 s</text>
+<rect class="n sig" x="300" y="70" width="130" height="52" rx="6"/>
+<text class="tb mid" x="365" y="92">API gateway</text>
+<text class="ts mid" x="365" y="109">limits per key</text>
+<path class="e sig" d="M250 166L300 96"/>
+<path class="e sig" d="M430 96L560 166"/>
+<rect class="n sig" x="300" y="140" width="130" height="52" rx="6"/>
+<text class="tb mid" x="365" y="162">API gateway</text>
+<text class="ts mid" x="365" y="179">limits per key</text>
+<path class="e sig" d="M250 166L300 166"/>
+<path class="e sig" d="M430 166L560 166"/>
+<rect class="n sig" x="300" y="210" width="130" height="52" rx="6"/>
+<text class="tb mid" x="365" y="232">API gateway</text>
+<text class="ts mid" x="365" y="249">limits per key</text>
+<path class="e sig" d="M250 166L300 236"/>
+<path class="e sig" d="M430 236L560 166"/>
+<rect class="n" x="560" y="140" width="150" height="52" rx="6"/>
+<text class="tb mid" x="635" y="162">API services</text>
+<text class="ts mid" x="635" y="179">limit concurrent work</text>
+<rect class="n store" x="300" y="280" width="130" height="44" rx="6"/>
+<text class="tb mid" x="365" y="298">Counter store</text>
+<text class="ts mid" x="365" y="315">10 shards, replicas</text>
+<path class="e sig" d="M365 262V280"/>
+<text class="ts" x="373" y="276">one script per request</text>
+<text class="ts" x="10" y="240">Counters at the edge</text>
+<text class="ts" x="10" y="256">are kept in each</text>
+<text class="ts" x="10" y="272">data center.</text>
+<text class="ts" x="560" y="230">If the store does not answer</text>
+<text class="ts" x="560" y="246">in 5 ms, a gateway uses its</text>
+<text class="ts" x="560" y="262">own share of the limit.</text>
+</svg>
+</div>
+<figcaption>Three places limit requests, each with what it knows: the edge knows addresses, the gateways know API keys, and the services know how busy they are.</figcaption>
+</figure>
+
+<p>The gateways are where API keys are known, so they enforce the per-key limits. The edge has only addresses, and counts them per data center. The services know their own load and limit concurrent work. The rules travel the other way, from the rules service into each gateway’s memory, so that reading a rule never costs a network call.</p>
+
+<figure class="fig wide" id="fig-flow">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 470" role="img" aria-labelledby="f782t f782d">
+<title id="f782t">A request checked against the shared store, and the same request when the store is down</title>
+<desc id="f782d">Two sequences between a client, an API gateway, the counter store and the API service. In the first, the gateway sends one script to the store, which refills Ana’s bucket, takes a token and answers allowed with 37 left; the gateway forwards the request and returns 200 with the remaining count. In the second, the script gets no answer; after 5 ms the gateway decides with its own share of the limit, forwards the request, and after five timeouts in a row stops asking the store for a second.</desc>
+<text class="tb" x="10" y="16">The store answers</text>
+<g data-scene="normal">
+<text class="tb mid" x="60" y="40">Client</text>
+<line class="axis" x1="60" y1="48" x2="60" y2="228"/>
+<text class="tb mid" x="230" y="40">API gateway</text>
+<line class="axis" x1="230" y1="48" x2="230" y2="228"/>
+<text class="tb mid" x="420" y="40">Counter store</text>
+<line class="axis" x1="420" y1="48" x2="420" y2="228"/>
+<text class="tb mid" x="620" y="40">API service</text>
+<line class="axis" x1="620" y1="48" x2="620" y2="228"/>
+<g data-s="1">
+<path class="e sig" d="M61 72H229"/>
+<text class="ts mid" x="145.0" y="66">1. GET /v1/orders, key of Ana</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n " x="238" y="85" width="146.1" height="22" rx="4"/>
+<text class="ts mid" x="311.05" y="100">2. rule: 100 a second</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M231 126H419"/>
+<text class="ts mid" x="325.0" y="120">3. run script on {ana}</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M419 153H231"/>
+<text class="ts mid" x="325.0" y="147">4. allowed, 37 left</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M231 180H619"/>
+<text class="ts mid" x="425.0" y="174">5. GET /v1/orders</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M229 207H61"/>
+<text class="ts mid" x="145.0" y="201">6. 200, RateLimit: r=37</text>
+</g>
+</g>
+<path class="e none dash" d="M10 244H710"/>
+<text class="tb" x="10" y="264">The store does not answer</text>
+<g data-scene="down">
+<text class="tb mid" x="60" y="288">Client</text>
+<line class="axis" x1="60" y1="296" x2="60" y2="452"/>
+<text class="tb mid" x="230" y="288">API gateway</text>
+<line class="axis" x1="230" y1="296" x2="230" y2="452"/>
+<text class="tb mid" x="420" y="288">Counter store</text>
+<line class="axis" x1="420" y1="296" x2="420" y2="452"/>
+<text class="tb mid" x="620" y="288">API service</text>
+<line class="axis" x1="620" y1="296" x2="620" y2="452"/>
+<g data-s="1">
+<path class="e sig" d="M61 320H229"/>
+<text class="ts mid" x="145.0" y="314">1. GET /v1/orders, key of Ana</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M231 348H355.4"/>
+<path class="x" d="M356.4 341l14 14M370.4 341l-14 14"/>
+<text class="ts mid" x="292.7" y="342">2. run script on {ana}</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n fault" x="238" y="362" width="207.1" height="22" rx="4"/>
+<text class="ts mid" x="341.55" y="377">3. no answer in 5 ms: own share</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M231 404H619"/>
+<text class="ts mid" x="425.0" y="398">4. GET /v1/orders</text>
+</g>
+<g data-s="5" data-packet="none">
+<rect class="n fault" x="238" y="418" width="298.6" height="22" rx="4"/>
+<text class="ts mid" x="387.3" y="433">5. 5 timeouts in a row: skip the store for 1 s</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="normal" data-label="The store answers">
+  <li data-msg="GET" data-state="Ana’s bucket in the store: 38 tokens">A request arrives with Ana’s API key. Her limit is 100 requests a second.</li>
+  <li data-msg="none" data-state="Ana’s bucket in the store: 38 tokens">The gateway finds the rule for this key and route in the rules it holds in memory.</li>
+  <li data-msg="script" data-state="Ana’s bucket in the store: 37 tokens">One script refills the bucket for the time passed, takes a token and writes it back. Nothing else runs in between.</li>
+  <li data-msg="allowed" data-state="Ana’s bucket in the store: 37 tokens">The answer comes back in one round trip, about 0.8 ms in the simulation.</li>
+  <li data-msg="GET" data-state="Ana’s bucket in the store: 37 tokens">The request goes on to the service.</li>
+  <li data-msg="200" data-state="Ana’s bucket in the store: 37 tokens">The response tells the client how many requests it has left.</li>
+</ol>
+<ol class="steps" data-scene="down" data-label="The store does not answer">
+  <li data-msg="GET" data-state="Store: unreachable; this gateway’s share for Ana: 5 tokens">The same request, while the counter store is unreachable.</li>
+  <li data-msg="script" data-state="Store: unreachable; this gateway’s share for Ana: 5 tokens">The script is sent, and no answer comes.</li>
+  <li data-msg="none" data-state="Store: unreachable; this gateway’s share for Ana: 4 tokens">After 5 ms the gateway decides alone, with a bucket of 100 ÷ 20 = 5 a second, its share of Ana’s limit.</li>
+  <li data-msg="GET" data-state="Store: unreachable; this gateway’s share for Ana: 4 tokens">The share has room, so the request goes on. Ana is served; an abusive client would still be held to its limit.</li>
+  <li data-msg="none" data-state="Store: skipped for 1 s; this gateway’s share for Ana: 4 tokens">After five timeouts in a row the gateway stops asking for a second, so requests no longer wait the 5 ms.</li>
+</ol>
+<figcaption>Normally the decision costs one round trip to the store. When the store is down it costs the timeout, until the breaker opens, and then nothing; the limit becomes the gateway’s own share.</figcaption>
+</figure>
+
+<p>The second scene is the part of the design an interviewer will press on. Step 6d measures the three things a gateway can do when the store does not answer.</p>
+
+<h2 id="counters">Step 6a: Counting in a shared store</h2>
+<p><x-ref to="lld-rate-limiter#concurrency"></x-ref> showed the race with twenty requests fired at once. Under steady load it does not go away. The chapter’s simulation runs a store that executes one command at a time, 20 gateways that reach it over a network taking 0.2 to 0.6 ms each way, and one client whose requests arrive at random times and land on random gateways, against a token bucket of 100 a second.</p>
+
+<figure class="fig wide" id="fig-race">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f783t f783d">
+<title id="f783t">What the race lets through</title>
+<desc id="f783d">Requests let through per second against requests offered per second, from 100 to 5,000, for one client with a limit of 100 a second spread over 20 servers. Read then write: 100 offered 104.8, 200 offered 119.6, 500 offered 139.9, 1,000 offered 180.2, 2,000 offered 262.3, 5,000 offered 508.6. One script: 100 offered 104.8, 200 offered 101.1, 500 offered 100.0, 1,000 offered 100.0, 2,000 offered 100.0, 5,000 offered 99.9.</desc>
+<text class="tb" x="10" y="18">Requests let through a second, limit 100 a second, 20 servers</text>
+<line class="grid" x1="70" y1="236.0" x2="600" y2="236.0"/>
+<text class="ts end" x="62" y="240.0">0</text>
+<line class="grid" x1="70" y1="199.3" x2="600" y2="199.3"/>
+<text class="ts end" x="62" y="203.3">100</text>
+<line class="grid" x1="70" y1="162.5" x2="600" y2="162.5"/>
+<text class="ts end" x="62" y="166.5">200</text>
+<line class="grid" x1="70" y1="125.8" x2="600" y2="125.8"/>
+<text class="ts end" x="62" y="129.8">300</text>
+<line class="grid" x1="70" y1="89.1" x2="600" y2="89.1"/>
+<text class="ts end" x="62" y="93.1">400</text>
+<line class="grid" x1="70" y1="52.4" x2="600" y2="52.4"/>
+<text class="ts end" x="62" y="56.4">500</text>
+<text class="ts mid" x="70.0" y="254">100</text>
+<text class="ts mid" x="163.9" y="254">200</text>
+<text class="ts mid" x="288.0" y="254">500</text>
+<text class="ts mid" x="382.0" y="254">1,000</text>
+<text class="ts mid" x="475.9" y="254">2,000</text>
+<text class="ts mid" x="600.0" y="254">5,000</text>
+<text class="ts mid" x="335.0" y="276">Requests offered a second (log scale)</text>
+<path class="line" style="stroke:var(--fault)" d="M70.0 197.5 L163.9 192.1 L288.0 184.6 L382.0 169.8 L475.9 139.7 L600.0 49.2"/>
+<circle class="dot" style="fill:var(--fault)" cx="70.0" cy="197.5" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="163.9" cy="192.1" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="288.0" cy="184.6" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="382.0" cy="169.8" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="475.9" cy="139.7" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="600.0" cy="49.2" r="3.5"/>
+<text class="ts" x="608" y="53.2">read, decide, write</text>
+<path class="line" style="stroke:var(--store)" d="M70.0 197.5 L163.9 198.9 L288.0 199.3 L382.0 199.3 L475.9 199.3 L600.0 199.3"/>
+<circle class="dot" style="fill:var(--store)" cx="70.0" cy="197.5" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="163.9" cy="198.9" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="288.0" cy="199.3" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="382.0" cy="199.3" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="475.9" cy="199.3" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="600.0" cy="199.3" r="3.5"/>
+<text class="ts" x="608" y="203.3">one script</text>
+<text class="ts" x="608" y="217.3">100 a second</text>
+<rect class="hit" x="70" y="34" width="46.9537" height="202" data-tip="100 offered a second|read, decide, write: 104.8 let through|one script: 104.8 let through|median decision 1.62 ms and 0.82 ms"/>
+<rect class="hit" x="116.954" y="34" width="109.023" height="202" data-tip="200 offered a second|read, decide, write: 119.6 let through|one script: 101.1 let through|median decision 1.62 ms and 0.81 ms"/>
+<rect class="hit" x="225.977" y="34" width="109.023" height="202" data-tip="500 offered a second|read, decide, write: 139.9 let through|one script: 100.0 let through|median decision 1.62 ms and 0.82 ms"/>
+<rect class="hit" x="335" y="34" width="93.9074" height="202" data-tip="1,000 offered a second|read, decide, write: 180.2 let through|one script: 100.0 let through|median decision 1.62 ms and 0.82 ms"/>
+<rect class="hit" x="428.907" y="34" width="109.023" height="202" data-tip="2,000 offered a second|read, decide, write: 262.3 let through|one script: 100.0 let through|median decision 1.62 ms and 0.82 ms"/>
+<rect class="hit" x="537.931" y="34" width="62.0694" height="202" data-tip="5,000 offered a second|read, decide, write: 508.6 let through|one script: 99.9 let through|median decision 1.62 ms and 0.82 ms"/>
+</svg>
+</div>
+<figcaption>Simulated, ten seconds at each rate. With separate reads and writes, every request that reads before the last one writes sees the same tokens, and the excess grows with the rate. The script holds 100.</figcaption>
+</figure>
+
+<p>Reading, deciding and writing in three steps lets through 180 requests a second when the client sends 1,000, and 509 when it sends 5,000. Each request that reads before the previous one has written sees the same tokens, and the faster the client sends, the more requests fall into that gap. The script holds 100 at every rate. It is also faster, one round trip instead of two: a median decision of 0.82 ms against 1.62 ms.</p>
+<p>The script works because the decision is a pure function of the stored state and the time, so the whole function can be sent to the data. Redis runs a script with all other activity blocked, so its effects either have all happened or have not started. In the simulation the store runs the same function as the gateways would:</p>
+<pre data-lang="ts" data-title="The decision, run inside the store">
+// 2. One script that reads, decides and writes inside the store, using the clock of the store.
+export class AtomicScript<S> implements Limiter {
+  private readonly sim: Sim;
+  private readonly store: CounterStore;
+  private readonly algorithm: Algorithm<S>;
+  constructor(sim: Sim, store: CounterStore, algorithm: Algorithm<S>) {
+    this.sim = sim;
+    this.store = store;
+    this.algorithm = algorithm;
+  }
+  handle(key: string, done: (outcome: Outcome) => void): void {
+    const started = this.sim.now;
+    const algorithm = this.algorithm;
+    this.store.eval<S, boolean>(
+      key,
+      (state, now) => {
+        const { decision, next } = algorithm.decide(state ?? algorithm.start(now), now, 1);
+        return { next, result: decision.allowed };
+      },
+      (allowed) => done({ allowed, ms: this.sim.now - started, by: "store" }),
+    );
+  }
+}
+</pre>
+<p>Three details make this correct in production. The time comes from the store’s own clock, read inside the script, so that gateways whose clocks disagree by a few milliseconds still agree on how many tokens have refilled; a reset time computed from two different clocks is what made GitHub’s reported reset times jump by a second. The decision is read from the shard’s primary, never a replica, because a replica can be behind and answer from a window that has already ended. And every key a script touches is passed to it by name, as Redis requires, which the hash tag keeps on one shard.</p>
+<p>Which algorithm to keep in the store is a question of state and of the operation that changes it.</p>
+<table>
+<thead><tr><th>Algorithm</th><th>Stored for each key</th><th>Update</th><th>In a shared store</th></tr></thead>
+<tbody>
+<tr><th>Fixed window</th><td>One counter with an expiry</td><td>An atomic increment, no script needed</td><td>The cheapest, but up to twice the limit across a window boundary (<x-ref to="resilience-patterns#fixed-window"></x-ref>)</td></tr>
+<tr><th>Sliding window counter</th><td>Two counters</td><td>A script</td><td>Smooths the boundary, approximately</td></tr>
+<tr><th>Token bucket</th><td>Tokens and a time</td><td>A script</td><td>Bursts up to the bucket size; this design’s choice</td></tr>
+<tr><th>GCRA</th><td>One time</td><td>A script</td><td>The same behavior in the smallest state</td></tr>
+<tr><th>Sliding log</th><td>One entry for every request in the window</td><td>A script over a sorted set</td><td>Exact, but its memory grows with the limit</td></tr>
+</tbody>
+</table>
+<p>The memory line of step 2 assumed one or two small numbers for each limit. A sliding log for a limit of 3,000 a minute keeps up to 3,000 entries for each key, and for 2 million active keys that is up to 6 billion entries: the store would then be sized by memory after all. Token buckets keep the estimate true.</p>
+
+<h2 id="local-global">Step 6b: Local and global limits</h2>
+<p>A <dfn>global limit</dfn> is counted once for all servers together, in a shared store; a <dfn>local share</dfn> is the alternative in which each of n servers enforces the limit divided by n, in its own memory, with nothing shared. Local shares cost nothing per request and cannot be raced. The simulation measured what they get wrong.</p>
+
+<figure class="fig wide" id="fig-local">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f784t f784d">
+<title id="f784t">Local shares refuse clients that keep to their limit</title>
+<desc id="f784d">Share of a client’s requests served when it sends exactly its limit, against the number of servers that each enforce an equal share of the limit. Spread at random: 1 servers 100.0%, 2 servers 100.0%, 5 servers 99.0%, 10 servers 97.3%, 20 servers 92.5%, 50 servers 76.2%. On one connection to one server: 1 servers 100.0%, 2 servers 49.3%, 5 servers 19.8%, 10 servers 9.9%, 20 servers 4.9%, 50 servers 2.0%. A client at ten times its limit got 100 a second in every case.</desc>
+<text class="tb" x="10" y="18">Share of requests served, for a client sending exactly its limit</text>
+<line class="grid" x1="70" y1="220.0" x2="560" y2="220.0"/>
+<text class="ts end" x="62" y="224.0">0%</text>
+<line class="grid" x1="70" y1="173.5" x2="560" y2="173.5"/>
+<text class="ts end" x="62" y="177.5">25%</text>
+<line class="grid" x1="70" y1="127.0" x2="560" y2="127.0"/>
+<text class="ts end" x="62" y="131.0">50%</text>
+<line class="grid" x1="70" y1="80.5" x2="560" y2="80.5"/>
+<text class="ts end" x="62" y="84.5">75%</text>
+<line class="grid" x1="70" y1="34.0" x2="560" y2="34.0"/>
+<text class="ts end" x="62" y="38.0">100%</text>
+<text class="ts mid" x="70.0" y="238">1</text>
+<text class="ts mid" x="156.8" y="238">2</text>
+<text class="ts mid" x="271.6" y="238">5</text>
+<text class="ts mid" x="358.4" y="238">10</text>
+<text class="ts mid" x="445.2" y="238">20</text>
+<text class="ts mid" x="560.0" y="238">50</text>
+<text class="ts mid" x="315.0" y="260">Servers, each allowing limit ÷ servers (log scale)</text>
+<path class="line" style="stroke:var(--sig)" d="M70.0 34.0 L156.8 34.0 L271.6 35.8 L358.4 39.1 L445.2 48.0 L560.0 78.2"/>
+<circle class="dot" style="fill:var(--sig)" cx="70.0" cy="34.0" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="156.8" cy="34.0" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="271.6" cy="35.8" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="358.4" cy="39.1" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="445.2" cy="48.0" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="560.0" cy="78.2" r="3.5"/>
+<text class="ts" x="568" y="82.2">requests spread at random</text>
+<path class="line" style="stroke:var(--fault)" d="M70.0 34.0 L156.8 128.3 L271.6 183.2 L358.4 201.6 L445.2 210.8 L560.0 216.3"/>
+<circle class="dot" style="fill:var(--fault)" cx="70.0" cy="34.0" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="156.8" cy="128.3" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="271.6" cy="183.2" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="358.4" cy="201.6" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="445.2" cy="210.8" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="560.0" cy="216.3" r="3.5"/>
+<text class="ts" x="568" y="220.3">all on one connection</text>
+<rect class="hit" x="70" y="34" width="43.41" height="186" data-tip="1 servers|spread at random: 100.0% served|one connection: 100.0% served|ten times the limit: 100 a second let through"/>
+<rect class="hit" x="113.41" y="34" width="100.795" height="186" data-tip="2 servers|spread at random: 100.0% served|one connection: 49.3% served|ten times the limit: 100 a second let through"/>
+<rect class="hit" x="214.205" y="34" width="100.795" height="186" data-tip="5 servers|spread at random: 99.0% served|one connection: 19.8% served|ten times the limit: 100 a second let through"/>
+<rect class="hit" x="315" y="34" width="86.8201" height="186" data-tip="10 servers|spread at random: 97.3% served|one connection: 9.9% served|ten times the limit: 100 a second let through"/>
+<rect class="hit" x="401.82" y="34" width="100.795" height="186" data-tip="20 servers|spread at random: 92.5% served|one connection: 4.9% served|ten times the limit: 100 a second let through"/>
+<rect class="hit" x="502.615" y="34" width="57.3849" height="186" data-tip="50 servers|spread at random: 76.2% served|one connection: 2.0% served|ten times the limit: 100 a second let through"/>
+</svg>
+</div>
+<figcaption>Simulated, ten seconds each. Splitting the limit holds an abusive client to exactly 100 a second, but the variation in how requests are spread refuses well-behaved clients, and a client on one connection gets one share.</figcaption>
+</figure>
+
+<p>Against an abusive client, local shares are exact: 100 a second at every fleet size, because no server can let through more than its share. The error falls on clients that behave. Requests are not spread perfectly evenly, so some servers see more than their share in a given second: a client sending exactly its limit was served 92.5% of the time with 20 servers and 76.2% with 50. A client that keeps one connection to one server, which HTTP/2 encourages, gets one share: 4.9% of its requests with 20 servers. Local shares break the requirement that a client within its limit is not refused.</p>
+<p>Between the two lies counting locally and syncing: each gateway counts what it lets through, and every interval adds its count to the shared one and reads the total back. Decisions are made from memory, on a total up to one interval old.</p>
+
+<figure class="fig wide" id="fig-sync">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f785t f785d">
+<title id="f785t">Counting locally between syncs</title>
+<desc id="f785d">Bars of the requests let through per second for a client sending 1,000 a second against a limit of 100, as the interval between syncs grows: each request: 100.0 let through, 1,090 store commands a second; 10 ms: 110.1 let through, 3,408 store commands a second; 50 ms: 148.9 let through, 683 store commands a second; 100 ms: 195.5 let through, 343 store commands a second; 250 ms: 335.2 let through, 137 store commands a second; 500 ms: 529.2 let through, 69 store commands a second; 1000 ms: 827.4 let through, 36 store commands a second.</desc>
+<text class="tb" x="10" y="18">Let through a second, for a client sending 1,000 against a limit of 100, 20 servers</text>
+<text class="ts end" x="140" y="53">counted on each request</text>
+<rect class="bar store" x="150" y="40" width="36.7" height="17" rx="3"/>
+<text class="ts" x="194.7" y="53">100 a second, 1,090 store commands</text>
+<rect class="hit" x="10" y="37" width="700" height="23" data-tip="counted on each request|100.0 let through a second|1,090 store commands a second|a client at 80% of its limit: 100.0% served"/>
+<text class="ts end" x="140" y="79">sync every 10 ms</text>
+<rect class="bar " x="150" y="66" width="40.4" height="17" rx="3"/>
+<text class="ts" x="198.4" y="79">110 a second, 3,408 store commands</text>
+<rect class="hit" x="10" y="63" width="700" height="23" data-tip="sync every 10 ms|110.1 let through a second|3,408 store commands a second|a client at 80% of its limit: 100.0% served"/>
+<text class="ts end" x="140" y="105">sync every 50 ms</text>
+<rect class="bar " x="150" y="92" width="54.6" height="17" rx="3"/>
+<text class="ts" x="212.6" y="105">149 a second, 683 store commands</text>
+<rect class="hit" x="10" y="89" width="700" height="23" data-tip="sync every 50 ms|148.9 let through a second|683 store commands a second|a client at 80% of its limit: 100.0% served"/>
+<text class="ts end" x="140" y="131">sync every 100 ms</text>
+<rect class="bar " x="150" y="118" width="71.7" height="17" rx="3"/>
+<text class="ts" x="229.7" y="131">196 a second, 343 store commands</text>
+<rect class="hit" x="10" y="115" width="700" height="23" data-tip="sync every 100 ms|195.5 let through a second|343 store commands a second|a client at 80% of its limit: 100.0% served"/>
+<text class="ts end" x="140" y="157">sync every 250 ms</text>
+<rect class="bar fault" x="150" y="144" width="122.9" height="17" rx="3"/>
+<text class="ts" x="280.9" y="157">335 a second, 137 store commands</text>
+<rect class="hit" x="10" y="141" width="700" height="23" data-tip="sync every 250 ms|335.2 let through a second|137 store commands a second|a client at 80% of its limit: 100.0% served"/>
+<text class="ts end" x="140" y="183">sync every 500 ms</text>
+<rect class="bar fault" x="150" y="170" width="194.0" height="17" rx="3"/>
+<text class="ts" x="352.0" y="183">529 a second, 69 store commands</text>
+<rect class="hit" x="10" y="167" width="700" height="23" data-tip="sync every 500 ms|529.2 let through a second|69 store commands a second|a client at 80% of its limit: 100.0% served"/>
+<text class="ts end" x="140" y="209">sync every 1000 ms</text>
+<rect class="bar fault" x="150" y="196" width="303.4" height="17" rx="3"/>
+<text class="ts" x="461.4" y="209">827 a second, 36 store commands</text>
+<rect class="hit" x="10" y="193" width="700" height="23" data-tip="sync every 1000 ms|827.4 let through a second|36 store commands a second|a client at 80% of its limit: 100.0% served"/>
+<line class="axis" x1="150" y1="34" x2="150" y2="218"/>
+<path class="e none dash" d="M186.7 34V218"/>
+<text class="ts" x="190.7" y="232">the limit, 100</text>
+</svg>
+</div>
+<figcaption>Simulated, ten seconds each. The excess is close to the client’s rate times the interval. Syncing every 10 ms cost more store commands than counting each request, because each server synced each key whether or not it had new requests.</figcaption>
+</figure>
+
+<p>The excess is close to the client’s rate times the interval: 49 extra a second at 50 ms, 96 at 100 ms. A client at 80% of its limit was always served in full, so the error runs in the safe direction for well-behaved clients and the wrong direction for abusive ones. The cost surprised: syncing every 10 ms took 3,408 store commands a second against 1,090 for counting every request, because each of 20 gateways synced each key 100 times a second whether or not it had new requests. Syncing saves work only for a key that sends many requests to each gateway within one interval.</p>
+<p>That makes it the right tool for exactly one case, the hot key of step 2. The design counts every request in the store, which meets the accuracy target, and switches a key to local counting with a 10 ms sync when its rate passes a threshold, accepting about 10% excess for that one key. The other remedy is to split a hot key’s counter into several parts on different shards, each holding a share of its limit, with each request sent to one part at random: the local-share trade-off again, with shards in place of servers. Envoy describes the same two-stage arrangement: a local token bucket absorbs large bursts, so that the global rate limit service sees less load.</p>
+
+<h2 id="edge">Step 6c: Where to limit</h2>
+<table>
+<thead><tr><th>Where</th><th>What it knows</th><th>What it limits</th><th>How it counts</th></tr></thead>
+<tbody>
+<tr><th>The edge, a CDN or a firewall</th><td>Addresses, paths, headers</td><td>Floods from addresses, and logins before an account is known</td><td>Locally, in each data center</td></tr>
+<tr><th>The API gateway</th><td>API keys, plans, routes</td><td>Each key’s requests a second and a minute</td><td>Globally, in the counter store</td></tr>
+<tr><th>The service</th><td>Its own queue and work in progress</td><td>Concurrent requests, expensive operations</td><td>Locally, as load shedding (<x-ref to="resilience-patterns#load-shedding"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>Each layer stops what the next cannot afford to see. The edge counts per data center, which is the local-share trade-off at continental scale: an attacker spread over 30 data centers gets up to 30 times the limit. That is acceptable for a coarse flood limit of thousands a second for each address, and is why a limit that must be exact for each customer lives at the gateway, behind the edge, in one region. Limiting in the client is courtesy, never enforcement.</p>
+
+<h2 id="store-down">Step 6d: When the counter store is down</h2>
+<p>A gateway that cannot reach the store has three choices. It can let the request through, which <x-ref to="proxies-and-load-balancers"></x-ref> calls failing open; refuse it; or decide with a local share, as if it were one of n independent limiters. The simulation took the store away for 30 seconds, with a 5 ms timeout on every call, a client sending half its limit and another sending ten times its limit.</p>
+
+<figure class="fig wide" id="fig-outage">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-labelledby="f786t f786d">
+<title id="f786t">The counter store is down for 30 seconds</title>
+<desc id="f786d">Two timelines over 50 seconds, with the counter store down from second 10 to second 40. Left, requests let through each second for a client sending 1,000 a second against a limit of 100: fail open: 1005 a second during the outage; fail closed: 0 a second during the outage; local share: 100 a second during the outage. Right, the share served for a client sending 50 a second: fail open: 100.0% during the outage; fail closed: 0.0% during the outage; local share: 99.9% during the outage.</desc>
+<text class="tb" x="30" y="16">Client at 10 × its limit, let through a second</text>
+<rect class="n sunk" x="124.0" y="44" width="162.0" height="176" rx="0"/>
+<text class="ts mid" x="205.0" y="38">store down</text>
+<line class="grid" x1="70" y1="220.0" x2="340" y2="220.0"/>
+<text class="ts end" x="64" y="224.0">0</text>
+<line class="grid" x1="70" y1="140.0" x2="340" y2="140.0"/>
+<text class="ts end" x="64" y="144.0">500</text>
+<line class="grid" x1="70" y1="60.0" x2="340" y2="60.0"/>
+<text class="ts end" x="64" y="64.0">1000</text>
+<text class="ts mid" x="70.0" y="236">0</text>
+<text class="ts mid" x="124.0" y="236">10</text>
+<text class="ts mid" x="286.0" y="236">40</text>
+<text class="ts mid" x="340.0" y="236">50 s</text>
+<path class="line" style="stroke:var(--fault)" d="M72.7 188.2 L78.1 204.0 L83.5 204.0 L88.9 204.0 L94.3 204.0 L99.7 204.0 L105.1 204.0 L110.5 204.0 L115.9 204.0 L121.3 204.0 L126.7 56.8 L132.1 62.6 L137.5 57.9 L142.9 63.8 L148.3 57.3 L153.7 65.3 L159.1 57.4 L164.5 61.1 L169.9 55.2 L175.3 54.1 L180.7 59.8 L186.1 53.8 L191.5 64.5 L196.9 60.3 L202.3 60.8 L207.7 54.4 L213.1 57.4 L218.5 62.1 L223.9 61.6 L229.3 45.0 L234.7 54.9 L240.1 63.0 L245.5 63.5 L250.9 58.7 L256.3 60.0 L261.7 58.7 L267.1 67.7 L272.5 59.5 L277.9 58.9 L283.3 56.6 L288.7 188.2 L294.1 204.0 L299.5 204.0 L304.9 204.0 L310.3 204.0 L315.7 204.0 L321.1 204.0 L326.5 204.0 L331.9 204.0 L337.3 204.0"/>
+<path class="line" style="stroke:var(--ink-3)" d="M72.7 188.2 L78.1 204.0 L83.5 204.0 L88.9 204.0 L94.3 204.0 L99.7 204.0 L105.1 204.0 L110.5 204.0 L115.9 204.0 L121.3 204.0 L126.7 220.0 L132.1 220.0 L137.5 220.0 L142.9 220.0 L148.3 220.0 L153.7 220.0 L159.1 220.0 L164.5 220.0 L169.9 220.0 L175.3 220.0 L180.7 220.0 L186.1 220.0 L191.5 220.0 L196.9 220.0 L202.3 220.0 L207.7 220.0 L213.1 220.0 L218.5 220.0 L223.9 220.0 L229.3 220.0 L234.7 220.0 L240.1 220.0 L245.5 220.0 L250.9 220.0 L256.3 220.0 L261.7 220.0 L267.1 220.0 L272.5 220.0 L277.9 220.0 L283.3 220.0 L288.7 188.2 L294.1 204.0 L299.5 204.0 L304.9 204.0 L310.3 204.0 L315.7 204.0 L321.1 204.0 L326.5 204.0 L331.9 204.0 L337.3 204.0"/>
+<path class="line" style="stroke:var(--store)" d="M72.7 188.2 L78.1 204.0 L83.5 204.0 L88.9 204.0 L94.3 204.0 L99.7 204.0 L105.1 204.0 L110.5 204.0 L115.9 204.0 L121.3 204.0 L126.7 191.2 L132.1 204.0 L137.5 204.0 L142.9 204.0 L148.3 204.0 L153.7 204.0 L159.1 204.0 L164.5 204.0 L169.9 204.0 L175.3 204.0 L180.7 204.0 L186.1 204.0 L191.5 204.0 L196.9 204.0 L202.3 204.0 L207.7 204.0 L213.1 204.0 L218.5 204.0 L223.9 204.0 L229.3 204.0 L234.7 204.0 L240.1 204.0 L245.5 204.0 L250.9 204.0 L256.3 204.0 L261.7 204.0 L267.1 204.0 L272.5 204.0 L277.9 204.0 L283.3 204.0 L288.7 188.2 L294.1 204.0 L299.5 204.0 L304.9 204.0 L310.3 204.0 L315.7 204.0 L321.1 204.0 L326.5 204.0 L331.9 204.0 L337.3 204.0"/>
+<text class="ts mid" x="205.0" y="83.2">fail open</text>
+<text class="ts mid" x="205.0" y="198.0">local share</text>
+<text class="ts mid" x="205.0" y="214.0">fail closed</text>
+<text class="tb" x="390" y="16">Client at half its limit, share served</text>
+<rect class="n sunk" x="484.0" y="44" width="162.0" height="176" rx="0"/>
+<text class="ts mid" x="565.0" y="38">store down</text>
+<line class="grid" x1="430" y1="220.0" x2="700" y2="220.0"/>
+<text class="ts end" x="424" y="224.0">0%</text>
+<line class="grid" x1="430" y1="149.6" x2="700" y2="149.6"/>
+<text class="ts end" x="424" y="153.6">50%</text>
+<line class="grid" x1="430" y1="79.2" x2="700" y2="79.2"/>
+<text class="ts end" x="424" y="83.2">100%</text>
+<text class="ts mid" x="430.0" y="236">0</text>
+<text class="ts mid" x="484.0" y="236">10</text>
+<text class="ts mid" x="646.0" y="236">40</text>
+<text class="ts mid" x="700.0" y="236">50 s</text>
+<path class="line" style="stroke:var(--fault)" d="M432.7 79.2 L438.1 79.2 L443.5 79.2 L448.9 79.2 L454.3 79.2 L459.7 79.2 L465.1 79.2 L470.5 79.2 L475.9 79.2 L481.3 79.2 L486.7 79.2 L492.1 79.2 L497.5 79.2 L502.9 79.2 L508.3 79.2 L513.7 79.2 L519.1 79.2 L524.5 79.2 L529.9 79.2 L535.3 79.2 L540.7 79.2 L546.1 79.2 L551.5 79.2 L556.9 79.2 L562.3 79.2 L567.7 79.2 L573.1 79.2 L578.5 79.2 L583.9 79.2 L589.3 79.2 L594.7 79.2 L600.1 79.2 L605.5 79.2 L610.9 79.2 L616.3 79.2 L621.7 79.2 L627.1 79.2 L632.5 79.2 L637.9 79.2 L643.3 79.2 L648.7 79.2 L654.1 79.2 L659.5 79.2 L664.9 79.2 L670.3 79.2 L675.7 79.2 L681.1 79.2 L686.5 79.2 L691.9 79.2 L697.3 79.2"/>
+<path class="line" style="stroke:var(--ink-3)" d="M432.7 79.2 L438.1 79.2 L443.5 79.2 L448.9 79.2 L454.3 79.2 L459.7 79.2 L465.1 79.2 L470.5 79.2 L475.9 79.2 L481.3 79.2 L486.7 220.0 L492.1 220.0 L497.5 220.0 L502.9 220.0 L508.3 220.0 L513.7 220.0 L519.1 220.0 L524.5 220.0 L529.9 220.0 L535.3 220.0 L540.7 220.0 L546.1 220.0 L551.5 220.0 L556.9 220.0 L562.3 220.0 L567.7 220.0 L573.1 220.0 L578.5 220.0 L583.9 220.0 L589.3 220.0 L594.7 220.0 L600.1 220.0 L605.5 220.0 L610.9 220.0 L616.3 220.0 L621.7 220.0 L627.1 220.0 L632.5 220.0 L637.9 220.0 L643.3 220.0 L648.7 79.2 L654.1 79.2 L659.5 79.2 L664.9 79.2 L670.3 79.2 L675.7 79.2 L681.1 79.2 L686.5 79.2 L691.9 79.2 L697.3 79.2"/>
+<path class="line" style="stroke:var(--store)" d="M432.7 79.2 L438.1 79.2 L443.5 79.2 L448.9 79.2 L454.3 79.2 L459.7 79.2 L465.1 79.2 L470.5 79.2 L475.9 79.2 L481.3 79.2 L486.7 79.2 L492.1 79.2 L497.5 79.2 L502.9 79.2 L508.3 79.2 L513.7 79.2 L519.1 79.2 L524.5 79.2 L529.9 79.2 L535.3 79.2 L540.7 79.2 L546.1 79.2 L551.5 79.2 L556.9 79.2 L562.3 79.2 L567.7 79.2 L573.1 79.2 L578.5 79.2 L583.9 79.2 L589.3 79.2 L594.7 79.2 L600.1 79.2 L605.5 79.2 L610.9 79.2 L616.3 79.2 L621.7 81.6 L627.1 79.2 L632.5 79.2 L637.9 79.2 L643.3 81.9 L648.7 79.2 L654.1 79.2 L659.5 79.2 L664.9 79.2 L670.3 79.2 L675.7 79.2 L681.1 79.2 L686.5 79.2 L691.9 79.2 L697.3 79.2"/>
+<text class="ts mid" x="565.0" y="71.2">fail open, local share</text>
+<text class="ts mid" x="565.0" y="214.0">fail closed</text>
+<rect class="hit" x="70" y="44" width="5.4" height="176" data-tip="second 0|fail open: abusive 199 let through, normal 38 of 38|fail closed: abusive 199 let through, normal 38 of 38|local share: abusive 199 let through, normal 38 of 38"/>
+<rect class="hit" x="430" y="44" width="5.4" height="176" data-tip="second 0|fail open: abusive 199 let through, normal 38 of 38|fail closed: abusive 199 let through, normal 38 of 38|local share: abusive 199 let through, normal 38 of 38"/>
+<rect class="hit" x="75.4" y="44" width="5.4" height="176" data-tip="second 1|fail open: abusive 100 let through, normal 58 of 58|fail closed: abusive 100 let through, normal 58 of 58|local share: abusive 100 let through, normal 58 of 58"/>
+<rect class="hit" x="435.4" y="44" width="5.4" height="176" data-tip="second 1|fail open: abusive 100 let through, normal 58 of 58|fail closed: abusive 100 let through, normal 58 of 58|local share: abusive 100 let through, normal 58 of 58"/>
+<rect class="hit" x="80.8" y="44" width="5.4" height="176" data-tip="second 2|fail open: abusive 100 let through, normal 56 of 56|fail closed: abusive 100 let through, normal 56 of 56|local share: abusive 100 let through, normal 56 of 56"/>
+<rect class="hit" x="440.8" y="44" width="5.4" height="176" data-tip="second 2|fail open: abusive 100 let through, normal 56 of 56|fail closed: abusive 100 let through, normal 56 of 56|local share: abusive 100 let through, normal 56 of 56"/>
+<rect class="hit" x="86.2" y="44" width="5.4" height="176" data-tip="second 3|fail open: abusive 100 let through, normal 49 of 49|fail closed: abusive 100 let through, normal 49 of 49|local share: abusive 100 let through, normal 49 of 49"/>
+<rect class="hit" x="446.2" y="44" width="5.4" height="176" data-tip="second 3|fail open: abusive 100 let through, normal 49 of 49|fail closed: abusive 100 let through, normal 49 of 49|local share: abusive 100 let through, normal 49 of 49"/>
+<rect class="hit" x="91.6" y="44" width="5.4" height="176" data-tip="second 4|fail open: abusive 100 let through, normal 38 of 38|fail closed: abusive 100 let through, normal 38 of 38|local share: abusive 100 let through, normal 38 of 38"/>
+<rect class="hit" x="451.6" y="44" width="5.4" height="176" data-tip="second 4|fail open: abusive 100 let through, normal 38 of 38|fail closed: abusive 100 let through, normal 38 of 38|local share: abusive 100 let through, normal 38 of 38"/>
+<rect class="hit" x="97" y="44" width="5.4" height="176" data-tip="second 5|fail open: abusive 100 let through, normal 37 of 37|fail closed: abusive 100 let through, normal 37 of 37|local share: abusive 100 let through, normal 37 of 37"/>
+<rect class="hit" x="457" y="44" width="5.4" height="176" data-tip="second 5|fail open: abusive 100 let through, normal 37 of 37|fail closed: abusive 100 let through, normal 37 of 37|local share: abusive 100 let through, normal 37 of 37"/>
+<rect class="hit" x="102.4" y="44" width="5.4" height="176" data-tip="second 6|fail open: abusive 100 let through, normal 62 of 62|fail closed: abusive 100 let through, normal 62 of 62|local share: abusive 100 let through, normal 62 of 62"/>
+<rect class="hit" x="462.4" y="44" width="5.4" height="176" data-tip="second 6|fail open: abusive 100 let through, normal 62 of 62|fail closed: abusive 100 let through, normal 62 of 62|local share: abusive 100 let through, normal 62 of 62"/>
+<rect class="hit" x="107.8" y="44" width="5.4" height="176" data-tip="second 7|fail open: abusive 100 let through, normal 53 of 53|fail closed: abusive 100 let through, normal 53 of 53|local share: abusive 100 let through, normal 53 of 53"/>
+<rect class="hit" x="467.8" y="44" width="5.4" height="176" data-tip="second 7|fail open: abusive 100 let through, normal 53 of 53|fail closed: abusive 100 let through, normal 53 of 53|local share: abusive 100 let through, normal 53 of 53"/>
+<rect class="hit" x="113.2" y="44" width="5.4" height="176" data-tip="second 8|fail open: abusive 100 let through, normal 41 of 41|fail closed: abusive 100 let through, normal 41 of 41|local share: abusive 100 let through, normal 41 of 41"/>
+<rect class="hit" x="473.2" y="44" width="5.4" height="176" data-tip="second 8|fail open: abusive 100 let through, normal 41 of 41|fail closed: abusive 100 let through, normal 41 of 41|local share: abusive 100 let through, normal 41 of 41"/>
+<rect class="hit" x="118.6" y="44" width="5.4" height="176" data-tip="second 9|fail open: abusive 100 let through, normal 58 of 58|fail closed: abusive 100 let through, normal 58 of 58|local share: abusive 100 let through, normal 58 of 58"/>
+<rect class="hit" x="478.6" y="44" width="5.4" height="176" data-tip="second 9|fail open: abusive 100 let through, normal 58 of 58|fail closed: abusive 100 let through, normal 58 of 58|local share: abusive 100 let through, normal 58 of 58"/>
+<rect class="hit" x="124" y="44" width="5.4" height="176" data-tip="second 10|fail open: abusive 1020 let through, normal 38 of 38|fail closed: abusive 0 let through, normal 0 of 38|local share: abusive 180 let through, normal 38 of 38"/>
+<rect class="hit" x="484" y="44" width="5.4" height="176" data-tip="second 10|fail open: abusive 1020 let through, normal 38 of 38|fail closed: abusive 0 let through, normal 0 of 38|local share: abusive 180 let through, normal 38 of 38"/>
+<rect class="hit" x="129.4" y="44" width="5.4" height="176" data-tip="second 11|fail open: abusive 984 let through, normal 50 of 50|fail closed: abusive 0 let through, normal 0 of 50|local share: abusive 100 let through, normal 50 of 50"/>
+<rect class="hit" x="489.4" y="44" width="5.4" height="176" data-tip="second 11|fail open: abusive 984 let through, normal 50 of 50|fail closed: abusive 0 let through, normal 0 of 50|local share: abusive 100 let through, normal 50 of 50"/>
+<rect class="hit" x="134.8" y="44" width="5.4" height="176" data-tip="second 12|fail open: abusive 1013 let through, normal 51 of 51|fail closed: abusive 0 let through, normal 0 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="494.8" y="44" width="5.4" height="176" data-tip="second 12|fail open: abusive 1013 let through, normal 51 of 51|fail closed: abusive 0 let through, normal 0 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="140.2" y="44" width="5.4" height="176" data-tip="second 13|fail open: abusive 976 let through, normal 41 of 41|fail closed: abusive 0 let through, normal 0 of 41|local share: abusive 100 let through, normal 41 of 41"/>
+<rect class="hit" x="500.2" y="44" width="5.4" height="176" data-tip="second 13|fail open: abusive 976 let through, normal 41 of 41|fail closed: abusive 0 let through, normal 0 of 41|local share: abusive 100 let through, normal 41 of 41"/>
+<rect class="hit" x="145.6" y="44" width="5.4" height="176" data-tip="second 14|fail open: abusive 1017 let through, normal 47 of 47|fail closed: abusive 0 let through, normal 0 of 47|local share: abusive 100 let through, normal 47 of 47"/>
+<rect class="hit" x="505.6" y="44" width="5.4" height="176" data-tip="second 14|fail open: abusive 1017 let through, normal 47 of 47|fail closed: abusive 0 let through, normal 0 of 47|local share: abusive 100 let through, normal 47 of 47"/>
+<rect class="hit" x="151" y="44" width="5.4" height="176" data-tip="second 15|fail open: abusive 967 let through, normal 48 of 48|fail closed: abusive 0 let through, normal 0 of 48|local share: abusive 100 let through, normal 48 of 48"/>
+<rect class="hit" x="511" y="44" width="5.4" height="176" data-tip="second 15|fail open: abusive 967 let through, normal 48 of 48|fail closed: abusive 0 let through, normal 0 of 48|local share: abusive 100 let through, normal 48 of 48"/>
+<rect class="hit" x="156.4" y="44" width="5.4" height="176" data-tip="second 16|fail open: abusive 1016 let through, normal 51 of 51|fail closed: abusive 0 let through, normal 0 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="516.4" y="44" width="5.4" height="176" data-tip="second 16|fail open: abusive 1016 let through, normal 51 of 51|fail closed: abusive 0 let through, normal 0 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="161.8" y="44" width="5.4" height="176" data-tip="second 17|fail open: abusive 993 let through, normal 57 of 57|fail closed: abusive 0 let through, normal 0 of 57|local share: abusive 100 let through, normal 57 of 57"/>
+<rect class="hit" x="521.8" y="44" width="5.4" height="176" data-tip="second 17|fail open: abusive 993 let through, normal 57 of 57|fail closed: abusive 0 let through, normal 0 of 57|local share: abusive 100 let through, normal 57 of 57"/>
+<rect class="hit" x="167.2" y="44" width="5.4" height="176" data-tip="second 18|fail open: abusive 1030 let through, normal 48 of 48|fail closed: abusive 0 let through, normal 0 of 48|local share: abusive 100 let through, normal 48 of 48"/>
+<rect class="hit" x="527.2" y="44" width="5.4" height="176" data-tip="second 18|fail open: abusive 1030 let through, normal 48 of 48|fail closed: abusive 0 let through, normal 0 of 48|local share: abusive 100 let through, normal 48 of 48"/>
+<rect class="hit" x="172.6" y="44" width="5.4" height="176" data-tip="second 19|fail open: abusive 1037 let through, normal 62 of 62|fail closed: abusive 0 let through, normal 0 of 62|local share: abusive 100 let through, normal 62 of 62"/>
+<rect class="hit" x="532.6" y="44" width="5.4" height="176" data-tip="second 19|fail open: abusive 1037 let through, normal 62 of 62|fail closed: abusive 0 let through, normal 0 of 62|local share: abusive 100 let through, normal 62 of 62"/>
+<rect class="hit" x="178" y="44" width="5.4" height="176" data-tip="second 20|fail open: abusive 1001 let through, normal 45 of 45|fail closed: abusive 0 let through, normal 0 of 45|local share: abusive 100 let through, normal 45 of 45"/>
+<rect class="hit" x="538" y="44" width="5.4" height="176" data-tip="second 20|fail open: abusive 1001 let through, normal 45 of 45|fail closed: abusive 0 let through, normal 0 of 45|local share: abusive 100 let through, normal 45 of 45"/>
+<rect class="hit" x="183.4" y="44" width="5.4" height="176" data-tip="second 21|fail open: abusive 1039 let through, normal 54 of 54|fail closed: abusive 0 let through, normal 0 of 54|local share: abusive 100 let through, normal 54 of 54"/>
+<rect class="hit" x="543.4" y="44" width="5.4" height="176" data-tip="second 21|fail open: abusive 1039 let through, normal 54 of 54|fail closed: abusive 0 let through, normal 0 of 54|local share: abusive 100 let through, normal 54 of 54"/>
+<rect class="hit" x="188.8" y="44" width="5.4" height="176" data-tip="second 22|fail open: abusive 972 let through, normal 44 of 44|fail closed: abusive 0 let through, normal 0 of 44|local share: abusive 100 let through, normal 44 of 44"/>
+<rect class="hit" x="548.8" y="44" width="5.4" height="176" data-tip="second 22|fail open: abusive 972 let through, normal 44 of 44|fail closed: abusive 0 let through, normal 0 of 44|local share: abusive 100 let through, normal 44 of 44"/>
+<rect class="hit" x="194.2" y="44" width="5.4" height="176" data-tip="second 23|fail open: abusive 998 let through, normal 42 of 42|fail closed: abusive 0 let through, normal 0 of 42|local share: abusive 100 let through, normal 42 of 42"/>
+<rect class="hit" x="554.2" y="44" width="5.4" height="176" data-tip="second 23|fail open: abusive 998 let through, normal 42 of 42|fail closed: abusive 0 let through, normal 0 of 42|local share: abusive 100 let through, normal 42 of 42"/>
+<rect class="hit" x="199.6" y="44" width="5.4" height="176" data-tip="second 24|fail open: abusive 995 let through, normal 45 of 45|fail closed: abusive 0 let through, normal 0 of 45|local share: abusive 100 let through, normal 45 of 45"/>
+<rect class="hit" x="559.6" y="44" width="5.4" height="176" data-tip="second 24|fail open: abusive 995 let through, normal 45 of 45|fail closed: abusive 0 let through, normal 0 of 45|local share: abusive 100 let through, normal 45 of 45"/>
+<rect class="hit" x="205" y="44" width="5.4" height="176" data-tip="second 25|fail open: abusive 1035 let through, normal 38 of 38|fail closed: abusive 0 let through, normal 0 of 38|local share: abusive 100 let through, normal 38 of 38"/>
+<rect class="hit" x="565" y="44" width="5.4" height="176" data-tip="second 25|fail open: abusive 1035 let through, normal 38 of 38|fail closed: abusive 0 let through, normal 0 of 38|local share: abusive 100 let through, normal 38 of 38"/>
+<rect class="hit" x="210.4" y="44" width="5.4" height="176" data-tip="second 26|fail open: abusive 1016 let through, normal 54 of 54|fail closed: abusive 0 let through, normal 0 of 54|local share: abusive 100 let through, normal 54 of 54"/>
+<rect class="hit" x="570.4" y="44" width="5.4" height="176" data-tip="second 26|fail open: abusive 1016 let through, normal 54 of 54|fail closed: abusive 0 let through, normal 0 of 54|local share: abusive 100 let through, normal 54 of 54"/>
+<rect class="hit" x="215.8" y="44" width="5.4" height="176" data-tip="second 27|fail open: abusive 987 let through, normal 51 of 51|fail closed: abusive 0 let through, normal 0 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="575.8" y="44" width="5.4" height="176" data-tip="second 27|fail open: abusive 987 let through, normal 51 of 51|fail closed: abusive 0 let through, normal 0 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="221.2" y="44" width="5.4" height="176" data-tip="second 28|fail open: abusive 990 let through, normal 51 of 51|fail closed: abusive 0 let through, normal 0 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="581.2" y="44" width="5.4" height="176" data-tip="second 28|fail open: abusive 990 let through, normal 51 of 51|fail closed: abusive 0 let through, normal 0 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="226.6" y="44" width="5.4" height="176" data-tip="second 29|fail open: abusive 1094 let through, normal 42 of 42|fail closed: abusive 0 let through, normal 0 of 42|local share: abusive 100 let through, normal 42 of 42"/>
+<rect class="hit" x="586.6" y="44" width="5.4" height="176" data-tip="second 29|fail open: abusive 1094 let through, normal 42 of 42|fail closed: abusive 0 let through, normal 0 of 42|local share: abusive 100 let through, normal 42 of 42"/>
+<rect class="hit" x="232" y="44" width="5.4" height="176" data-tip="second 30|fail open: abusive 1032 let through, normal 46 of 46|fail closed: abusive 0 let through, normal 0 of 46|local share: abusive 100 let through, normal 46 of 46"/>
+<rect class="hit" x="592" y="44" width="5.4" height="176" data-tip="second 30|fail open: abusive 1032 let through, normal 46 of 46|fail closed: abusive 0 let through, normal 0 of 46|local share: abusive 100 let through, normal 46 of 46"/>
+<rect class="hit" x="237.4" y="44" width="5.4" height="176" data-tip="second 31|fail open: abusive 981 let through, normal 47 of 47|fail closed: abusive 0 let through, normal 0 of 47|local share: abusive 100 let through, normal 47 of 47"/>
+<rect class="hit" x="597.4" y="44" width="5.4" height="176" data-tip="second 31|fail open: abusive 981 let through, normal 47 of 47|fail closed: abusive 0 let through, normal 0 of 47|local share: abusive 100 let through, normal 47 of 47"/>
+<rect class="hit" x="242.8" y="44" width="5.4" height="176" data-tip="second 32|fail open: abusive 978 let through, normal 39 of 39|fail closed: abusive 0 let through, normal 0 of 39|local share: abusive 100 let through, normal 39 of 39"/>
+<rect class="hit" x="602.8" y="44" width="5.4" height="176" data-tip="second 32|fail open: abusive 978 let through, normal 39 of 39|fail closed: abusive 0 let through, normal 0 of 39|local share: abusive 100 let through, normal 39 of 39"/>
+<rect class="hit" x="248.2" y="44" width="5.4" height="176" data-tip="second 33|fail open: abusive 1008 let through, normal 41 of 41|fail closed: abusive 0 let through, normal 0 of 41|local share: abusive 100 let through, normal 41 of 41"/>
+<rect class="hit" x="608.2" y="44" width="5.4" height="176" data-tip="second 33|fail open: abusive 1008 let through, normal 41 of 41|fail closed: abusive 0 let through, normal 0 of 41|local share: abusive 100 let through, normal 41 of 41"/>
+<rect class="hit" x="253.6" y="44" width="5.4" height="176" data-tip="second 34|fail open: abusive 1000 let through, normal 45 of 45|fail closed: abusive 0 let through, normal 0 of 45|local share: abusive 100 let through, normal 45 of 45"/>
+<rect class="hit" x="613.6" y="44" width="5.4" height="176" data-tip="second 34|fail open: abusive 1000 let through, normal 45 of 45|fail closed: abusive 0 let through, normal 0 of 45|local share: abusive 100 let through, normal 45 of 45"/>
+<rect class="hit" x="259" y="44" width="5.4" height="176" data-tip="second 35|fail open: abusive 1008 let through, normal 58 of 58|fail closed: abusive 0 let through, normal 0 of 58|local share: abusive 100 let through, normal 57 of 58"/>
+<rect class="hit" x="619" y="44" width="5.4" height="176" data-tip="second 35|fail open: abusive 1008 let through, normal 58 of 58|fail closed: abusive 0 let through, normal 0 of 58|local share: abusive 100 let through, normal 57 of 58"/>
+<rect class="hit" x="264.4" y="44" width="5.4" height="176" data-tip="second 36|fail open: abusive 952 let through, normal 50 of 50|fail closed: abusive 0 let through, normal 0 of 50|local share: abusive 100 let through, normal 50 of 50"/>
+<rect class="hit" x="624.4" y="44" width="5.4" height="176" data-tip="second 36|fail open: abusive 952 let through, normal 50 of 50|fail closed: abusive 0 let through, normal 0 of 50|local share: abusive 100 let through, normal 50 of 50"/>
+<rect class="hit" x="269.8" y="44" width="5.4" height="176" data-tip="second 37|fail open: abusive 1003 let through, normal 55 of 55|fail closed: abusive 0 let through, normal 0 of 55|local share: abusive 100 let through, normal 55 of 55"/>
+<rect class="hit" x="629.8" y="44" width="5.4" height="176" data-tip="second 37|fail open: abusive 1003 let through, normal 55 of 55|fail closed: abusive 0 let through, normal 0 of 55|local share: abusive 100 let through, normal 55 of 55"/>
+<rect class="hit" x="275.2" y="44" width="5.4" height="176" data-tip="second 38|fail open: abusive 1007 let through, normal 47 of 47|fail closed: abusive 0 let through, normal 0 of 47|local share: abusive 100 let through, normal 47 of 47"/>
+<rect class="hit" x="635.2" y="44" width="5.4" height="176" data-tip="second 38|fail open: abusive 1007 let through, normal 47 of 47|fail closed: abusive 0 let through, normal 0 of 47|local share: abusive 100 let through, normal 47 of 47"/>
+<rect class="hit" x="280.6" y="44" width="5.4" height="176" data-tip="second 39|fail open: abusive 1021 let through, normal 53 of 53|fail closed: abusive 0 let through, normal 0 of 53|local share: abusive 100 let through, normal 52 of 53"/>
+<rect class="hit" x="640.6" y="44" width="5.4" height="176" data-tip="second 39|fail open: abusive 1021 let through, normal 53 of 53|fail closed: abusive 0 let through, normal 0 of 53|local share: abusive 100 let through, normal 52 of 53"/>
+<rect class="hit" x="286" y="44" width="5.4" height="176" data-tip="second 40|fail open: abusive 199 let through, normal 49 of 49|fail closed: abusive 199 let through, normal 49 of 49|local share: abusive 199 let through, normal 49 of 49"/>
+<rect class="hit" x="646" y="44" width="5.4" height="176" data-tip="second 40|fail open: abusive 199 let through, normal 49 of 49|fail closed: abusive 199 let through, normal 49 of 49|local share: abusive 199 let through, normal 49 of 49"/>
+<rect class="hit" x="291.4" y="44" width="5.4" height="176" data-tip="second 41|fail open: abusive 100 let through, normal 51 of 51|fail closed: abusive 100 let through, normal 51 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="651.4" y="44" width="5.4" height="176" data-tip="second 41|fail open: abusive 100 let through, normal 51 of 51|fail closed: abusive 100 let through, normal 51 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="296.8" y="44" width="5.4" height="176" data-tip="second 42|fail open: abusive 100 let through, normal 43 of 43|fail closed: abusive 100 let through, normal 43 of 43|local share: abusive 100 let through, normal 43 of 43"/>
+<rect class="hit" x="656.8" y="44" width="5.4" height="176" data-tip="second 42|fail open: abusive 100 let through, normal 43 of 43|fail closed: abusive 100 let through, normal 43 of 43|local share: abusive 100 let through, normal 43 of 43"/>
+<rect class="hit" x="302.2" y="44" width="5.4" height="176" data-tip="second 43|fail open: abusive 100 let through, normal 60 of 60|fail closed: abusive 100 let through, normal 60 of 60|local share: abusive 100 let through, normal 60 of 60"/>
+<rect class="hit" x="662.2" y="44" width="5.4" height="176" data-tip="second 43|fail open: abusive 100 let through, normal 60 of 60|fail closed: abusive 100 let through, normal 60 of 60|local share: abusive 100 let through, normal 60 of 60"/>
+<rect class="hit" x="307.6" y="44" width="5.4" height="176" data-tip="second 44|fail open: abusive 100 let through, normal 50 of 50|fail closed: abusive 100 let through, normal 50 of 50|local share: abusive 100 let through, normal 50 of 50"/>
+<rect class="hit" x="667.6" y="44" width="5.4" height="176" data-tip="second 44|fail open: abusive 100 let through, normal 50 of 50|fail closed: abusive 100 let through, normal 50 of 50|local share: abusive 100 let through, normal 50 of 50"/>
+<rect class="hit" x="313" y="44" width="5.4" height="176" data-tip="second 45|fail open: abusive 100 let through, normal 46 of 46|fail closed: abusive 100 let through, normal 46 of 46|local share: abusive 100 let through, normal 46 of 46"/>
+<rect class="hit" x="673" y="44" width="5.4" height="176" data-tip="second 45|fail open: abusive 100 let through, normal 46 of 46|fail closed: abusive 100 let through, normal 46 of 46|local share: abusive 100 let through, normal 46 of 46"/>
+<rect class="hit" x="318.4" y="44" width="5.4" height="176" data-tip="second 46|fail open: abusive 100 let through, normal 51 of 51|fail closed: abusive 100 let through, normal 51 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="678.4" y="44" width="5.4" height="176" data-tip="second 46|fail open: abusive 100 let through, normal 51 of 51|fail closed: abusive 100 let through, normal 51 of 51|local share: abusive 100 let through, normal 51 of 51"/>
+<rect class="hit" x="323.8" y="44" width="5.4" height="176" data-tip="second 47|fail open: abusive 100 let through, normal 52 of 52|fail closed: abusive 100 let through, normal 52 of 52|local share: abusive 100 let through, normal 52 of 52"/>
+<rect class="hit" x="683.8" y="44" width="5.4" height="176" data-tip="second 47|fail open: abusive 100 let through, normal 52 of 52|fail closed: abusive 100 let through, normal 52 of 52|local share: abusive 100 let through, normal 52 of 52"/>
+<rect class="hit" x="329.2" y="44" width="5.4" height="176" data-tip="second 48|fail open: abusive 100 let through, normal 58 of 58|fail closed: abusive 100 let through, normal 58 of 58|local share: abusive 100 let through, normal 58 of 58"/>
+<rect class="hit" x="689.2" y="44" width="5.4" height="176" data-tip="second 48|fail open: abusive 100 let through, normal 58 of 58|fail closed: abusive 100 let through, normal 58 of 58|local share: abusive 100 let through, normal 58 of 58"/>
+<rect class="hit" x="334.6" y="44" width="5.4" height="176" data-tip="second 49|fail open: abusive 100 let through, normal 60 of 60|fail closed: abusive 100 let through, normal 60 of 60|local share: abusive 100 let through, normal 60 of 60"/>
+<rect class="hit" x="694.6" y="44" width="5.4" height="176" data-tip="second 49|fail open: abusive 100 let through, normal 60 of 60|fail closed: abusive 100 let through, normal 60 of 60|local share: abusive 100 let through, normal 60 of 60"/>
+</svg>
+</div>
+<figcaption>Simulated, 20 gateways, a 5 ms timeout. Failing open lets the abusive client through; failing closed refuses everyone; a local share of the limit keeps both clients close to their normal treatment.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>During the outage</th><th>Client at half its limit, served</th><th>Client at 10 × its limit, let through</th><th>Decisions that waited 5 ms</th></tr></thead>
+<tbody>
+<tr><th>Fail open</th><td>100%</td><td>1,005 a second</td><td>100%</td></tr>
+<tr><th>Fail closed</th><td>0%</td><td>0</td><td>100%</td></tr>
+<tr><th>Local share</th><td>99.9%</td><td>100 a second</td><td>100%</td></tr>
+<tr><th>Local share and a breaker</th><td>99.9%</td><td>100 a second</td><td>2.4%</td></tr>
+</tbody>
+</table>
+<p>Failing closed turns a counter store outage into an API outage, which the availability requirement forbids. Failing open keeps the API up and removes the protection for exactly as long as the store is down, which is acceptable when load shedding stands behind it, and is what Stripe recommends. The local share keeps both: the well-behaved client was served, and the abusive one was held to its limit, because local shares are exact against abuse. Their weakness, refusing clients concentrated on one server, matters little for 30 seconds.</p>
+<p>The timeout needs a breaker. Without one, every request waited the full 5 ms for an answer that would not come, which breaks the 2 ms latency target for the whole outage. With a breaker that skips the store for a second after five timeouts in a row, 2.4% of decisions waited (<x-ref to="resilience-patterns#circuit-breaker"></x-ref>). The timeout itself should be short: Envoy’s default for its rate limit call is 20 ms. Last, the store’s state is disposable. A shard that restarts empty gives every key on it a full bucket, a few seconds of loose limits, so the store needs replicas for availability but no backups.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A shard of the counter store</th><td>Nothing</td><td>Its replica is promoted. Counts lost in the switch give some keys a little extra for one window</td></tr>
+<tr><th>The whole counter store</th><td>Nothing, for keys within their limits</td><td>Gateways fall back to local shares, with a breaker</td></tr>
+<tr><th>The rules service</th><td>Nothing</td><td>Gateways keep the last rules they received. New plans wait</td></tr>
+<tr><th>A gateway</th><td>Requests in flight fail</td><td>The load balancer stops sending to it. No limit state is lost, because none lived there</td></tr>
+<tr><th>One key floods the API</th><td>That key gets 429s</td><td>Its shard is the busiest; past a threshold the key is counted locally with a sync (step 6b)</td></tr>
+<tr><th>A bad rule, such as a limit of 1</th><td>Many 429s at once</td><td>New rules run in shadow mode first, counting what they would refuse without refusing it</td></tr>
+</tbody>
+</table>
+<p>At ten times the load, 5 million decisions a second need 100 shards at the planning figure, and the busiest-key problem grows with the customers: more keys cross the threshold for local counting. At a hundred times, the API is likely in several regions, and one global count across regions would add a cross-region round trip, tens of milliseconds (<x-ref to="estimation#latency-numbers"></x-ref>), to every request. Each region then enforces its own share of a key’s limit, and shares are moved between regions every few seconds according to where the key’s traffic is: a local share, with regions in place of servers.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Stripe</b> described four limiters in 2017: a request rate limiter per user, a concurrent request limiter, and two load shedders. They use token buckets in Redis, launch each limiter in a dark mode that only reports what it would block, and say that if the limiter fails, requests should not be affected.</li>
+  <li><b>GitHub</b> moved its API rate limiter from a shared Memcached cluster to sharded, replicated Redis with Lua scripts in 2021. Two bugs followed: a reset time computed from Ruby’s clock and Redis’s expiry moved by a second between requests, and a check read from a replica saw an expired window. They fixed both by storing the reset time with the counter and reusing the check’s answer for the headers.</li>
+  <li><b>Cloudflare</b>’s rate limiting rules count in each data center separately, and its documentation says it does not support global counters across its network (checked October 2026).</li>
+  <li><b>Envoy</b> calls an external global rate limit service over gRPC, whose reference implementation uses Redis, with a default timeout of 20 ms. It recommends a local token bucket in front to reduce the load on that service (checked October 2026).</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“Limit across three regions, as one limit”</th><td>A share of each key’s limit for each region, rebalanced every few seconds from the regions’ recent counts</td><td>The script inside each region</td></tr>
+<tr><th>“Charge some calls more than others”</th><td>The script takes a cost, as the token bucket of chapter 71 already does</td><td>The store, the keys</td></tr>
+<tr><th>“Limit concurrent requests, not rate”</th><td>A counter incremented at the start and decremented at the end, with an expiry so that a crashed gateway’s requests are eventually released</td><td>The shard layout</td></tr>
+<tr><th>“Monthly quotas for billing”</th><td>An exact count from the request log, aggregated later, as in <x-ref to="hld-url-shortener#analytics"></x-ref>; the rate limiter is not the ledger</td><td>The real-time limits</td></tr>
+<tr><th>“Let a customer burst for a minute”</th><td>A larger bucket for that plan: the burst is the bucket size, the rate is the refill</td><td>Everything else</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Spend the first minutes on where the limit is enforced and how exact it must be, because those two answers choose the design. Draw the gateway and the counter store, then go straight to the race and the script. Keep time for the two questions an interviewer is most likely to ask: what happens with many gateways and no shared store, and what happens when the store is down.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>A limiter in each server’s memory with the full limit</th><td>A client gets the limit once for every server</td><td>A shared count, or a share of the limit on each server</td></tr>
+<tr><th>Read the count, decide, write it back</th><td>1.8 times the limit at ten times the load, in the simulation</td><td>One atomic script, or an atomic increment</td></tr>
+<tr><th>Each gateway’s own clock in the decision</th><td>Gateways disagree on refills and reset times</td><td>The store’s clock, read inside the script</td></tr>
+<tr><th>Reading counts from a replica</th><td>Decisions on stale windows</td><td>Read and write on the primary</td></tr>
+<tr><th>Failing closed when the store is down</th><td>A store outage becomes an API outage</td><td>Fail open, or fall back to local shares</td></tr>
+<tr><th>No timeout or breaker on the store call</th><td>Every request waits through an outage</td><td>A timeout of a few milliseconds and a breaker</td></tr>
+<tr><th>Enforcing a new limit on day one</th><td>Legitimate customers refused by a guess</td><td>Shadow mode first, then enforce</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="resilience-patterns"></x-ref>: the algorithms, load shedding and circuit breakers.</li>
+  <li><x-ref to="lld-rate-limiter"></x-ref>: the same limiter as tested classes in one process.</li>
+  <li><x-ref to="transactions"></x-ref>: why read, decide, write needs to be one step.</li>
+  <li><x-ref to="partitioning#hot-keys"></x-ref>: the busiest key on one shard.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref>: the gateway, and failing open.</li>
+  <li><x-ref to="hld-method"></x-ref>: the seven steps this chapter follows.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A limit kept in each server’s memory is multiplied by the number of servers. The count must be shared, or the limit divided.</li>
+  <li>Reading, deciding and writing in separate calls lets through more the faster a client sends: 180 a second against a limit of 100 at 1,000 offered, in the simulation.</li>
+  <li>One script that decides inside the store holds the limit exactly, in one round trip, with the store’s clock.</li>
+  <li>The counter store is sized by commands a second, not memory, and the busiest key’s shard carries that key alone.</li>
+  <li>Local shares are exact against abuse and refuse clients that behave; syncing local counts lets through roughly the client’s rate times the interval in excess.</li>
+  <li>Limit addresses at the edge, keys at the gateway, and concurrent work in the service.</li>
+  <li>When the store is down, fall back to local shares behind a short timeout and a breaker; failing closed turns the limiter into the outage.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Twenty gateways each run the limiter of chapter 71 in memory with a limit of 100 a second. What does a client get?</summary><p>Up to 2,000 a second, 100 from each gateway, if its requests are spread across all of them. The limit has to be counted in one shared place, or each gateway must enforce only its share, 5 a second.</p></details>
+<details><summary>Why does the read-then-write limiter let through more requests the faster the client sends?</summary><p>Every request that reads the state before the previous request has written its result sees the same tokens. The gap between a read and its write is a round trip, so the more requests arrive within one round trip, the more pass on the same tokens.</p></details>
+<details><summary>Why should the script read the time from the store rather than receive it from the gateway?</summary><p>Gateways’ clocks differ by small amounts. If each sends its own time, refills and reset times depend on which gateway handled the request, and a request with a slightly older time can even make the bucket go backwards. One clock, the store’s, gives every decision the same reference.</p></details>
+<details><summary>Local shares hold an abusive client to its limit exactly. Why are they still not enough?</summary><p>They refuse clients that keep to their limit whenever their requests are spread unevenly: 7.5% of requests with 20 servers in the simulation, and 95% of the requests of a client on one connection.</p></details>
+<details><summary>Syncing local counts every 10 ms used more store commands than counting every request. Why, and when does syncing help?</summary><p>Each gateway synced each key every 10 ms whether or not it had new requests, which for keys sending a few requests a second to each gateway is more work than one command per request. Syncing helps only for a key that sends many requests to each gateway within an interval: a hot key.</p></details>
+<details><summary>The counter store is down. Compare failing open and falling back to local shares.</summary><p>Both keep the API up. Failing open also lets an abusive client through at its full rate, 1,005 a second in the simulation. Local shares held it to 100 while serving the well-behaved client 99.9% of the time.</p></details>
+<details><summary>Why does the limiter’s store need replicas but no backups?</summary><p>Its contents are short-lived counts that rebuild themselves within one window. Losing them gives some keys a little extra for a few seconds. Replicas keep the store available; backups would protect data nobody needs.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Paul Tarjan, <a href="https://stripe.com/blog/rate-limiters">“Scaling your API with rate limiters”</a>, Stripe, 30 March 2017.</li>
+  <li>Robert Mosolgo, <a href="https://github.blog/engineering/infrastructure/how-we-scaled-github-api-sharded-replicated-rate-limiter-redis/">“How we scaled the GitHub API with a sharded, replicated rate limiter in Redis”</a>, GitHub Blog, 5 April 2021.</li>
+  <li>Cloudflare, <a href="https://developers.cloudflare.com/waf/rate-limiting-rules/request-rate/">“Request rate calculation”</a>, Cloudflare WAF documentation, checked October 2026.</li>
+  <li>Envoy, <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/other_features/global_rate_limiting">“Global rate limiting”</a> and the <a href="https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ratelimit/v3/rate_limit.proto">HTTP rate limit filter reference</a>, checked October 2026.</li>
+  <li>Redis, <a href="https://redis.io/docs/latest/develop/programmability/eval-intro/">“Scripting with Lua”</a> and the <a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">Redis Cluster specification</a> on hash tags, checked October 2026.</li>
+</ol>
+</section>

@@ -1,0 +1,581 @@
+<!--meta
+{ "description": "What happens when you type a URL and press Enter: DNS resolution, TCP and QUIC connections, the TLS 1.3 handshake, HTTP/1.1, HTTP/2 and HTTP/3, load balancers, application servers, databases and browser rendering, with a latency budget and the failure modes of each step.",
+  "lede": "You type an address and press Enter, and a page appears about a third of a second later. This chapter follows that request through every machine it touches, because each stop is a component you will later design around.",
+  "updated": "2026-10-16" }
+-->
+
+<h2 id="overview">One request, nine steps</h2>
+<p>Take the photo app from the previous chapter and assume it lives at <code>https://www.example.com</code>. You type <code>https://www.example.com/photos/42</code> into a browser and press <kbd>Enter</kbd>. Before any of your application code runs, the browser has to find out which machine to talk to, open a connection to it, and agree on how to encrypt the conversation. After your code runs, the answer has to travel back and be turned into pixels.</p>
+<p><x-fig to="fig-path"></x-fig> shows the whole trip. The rest of the chapter walks through it one step at a time. For each step you will see what happens, how long it takes, and what it looks like when it fails.</p>
+
+<figure class="fig wide" id="fig-path">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 244" role="img" aria-labelledby="f21t f21d">
+<title id="f21t">The path of one web request</title>
+<desc id="f21d">A browser first asks a DNS resolver for an address. It then connects to a CDN edge, which forwards the request to a load balancer, which picks an application server. The application server reads from a cache and a database. The response returns along the same path.</desc>
+<rect class="n" x="10" y="92" width="96" height="56" rx="6"/>
+<text class="tb mid" x="58" y="118">Browser</text>
+<text class="ts mid" x="58" y="135">your device</text>
+<rect class="n sig" x="150" y="14" width="112" height="44" rx="6"/>
+<text class="tb mid" x="206" y="41">DNS resolver</text>
+<rect class="n sig" x="150" y="92" width="112" height="56" rx="6"/>
+<text class="tb mid" x="206" y="118">CDN edge</text>
+<text class="ts mid" x="206" y="135">TLS ends here</text>
+<rect class="n sig" x="302" y="92" width="112" height="56" rx="6"/>
+<text class="tb mid" x="358" y="125">Load balancer</text>
+<rect class="n" x="454" y="92" width="112" height="56" rx="6"/>
+<text class="tb mid" x="510" y="118">App server</text>
+<text class="ts mid" x="510" y="135">your code</text>
+<rect class="n store" x="606" y="58" width="104" height="44" rx="6"/>
+<text class="tb mid" x="658" y="85">Cache</text>
+<rect class="n store" x="606" y="138" width="104" height="44" rx="6"/>
+<text class="tb mid" x="658" y="165">Database</text>
+<g data-s="1">
+<path class="e sig" d="M58 92V36H150"/>
+</g>
+<g data-s="2">
+<path class="e sig" d="M106 120H150"/>
+</g>
+<g data-s="4">
+<path class="e sig" d="M262 120H302"/>
+</g>
+<g data-s="5">
+<path class="e sig" d="M414 120H454"/>
+</g>
+<g data-s="7">
+<path class="e store both" d="M566 110 606 88"/>
+<path class="e store both" d="M566 130 606 152"/>
+</g>
+<g data-s="1">
+<text class="ts" x="10" y="180">1 Look up the name</text>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="197">2 Open a connection</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="214">3 Agree on encryption</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="231">4 Send the HTTP request</text>
+</g>
+<g data-s="5">
+<text class="ts" x="302" y="180">5 Pick a healthy server</text>
+</g>
+<g data-s="6">
+<text class="ts" x="454" y="180">6 Run the application code</text>
+</g>
+<g data-s="7">
+<text class="ts" x="606" y="204">7 Read or write data</text>
+</g>
+<g data-s="8">
+<text class="ts" x="302" y="214">8 The response returns along the same path</text>
+</g>
+<g data-s="9">
+<text class="ts" x="302" y="231">9 The browser turns it into a page</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="DNS query">The browser asks a DNS resolver for the address that belongs to the name in the URL.</li>
+  <li data-msg="connect">It opens a connection to that address. For a large site this is usually a CDN edge near the user.</li>
+  <li>Browser and edge agree on encryption keys, so that nobody on the path can read or change what follows.</li>
+  <li data-msg="HTTP request">The browser sends the HTTP request. The edge passes on what it cannot answer from its own cache.</li>
+  <li data-msg="HTTP request">A load balancer picks one healthy application server out of many.</li>
+  <li>The application server runs your code.</li>
+  <li data-msg="read or write">The code reads from a cache and a database, and may write to them.</li>
+  <li>The response returns along the same path, back to the browser.</li>
+  <li>The browser turns the response into a page.</li>
+</ol>
+<figcaption>The path of one request. Steps 1 to 4 happen before your servers see anything, and on a first visit they often take longer than your own code does.</figcaption>
+</figure>
+
+<h2 id="url">Before step 1: reading the address</h2>
+<p>The address you typed is a <dfn>URL</dfn> (uniform resource locator), and each of its parts answers a different question for a different machine.</p>
+
+<figure class="fig" id="fig-url">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 118" role="img" aria-labelledby="f22t f22d">
+<title id="f22t">The parts of a URL</title>
+<desc id="f22d">The URL https://www.example.com:443/photos/42?size=large#comments divided into scheme, host, port, path, query and fragment.</desc>
+<text x="86" y="62" textLength="547.2" lengthAdjust="spacing" style="font-family:var(--mono);font-size:16px">https://www.example.com:443/photos/42?size=large#comments</text>
+<path class="e none" d="M316 42V36H345V42"/>
+<text class="ts mid" x="330" y="26">port: which service on that machine</text>
+<path class="e none sig" d="M86 70V76H134V70"/>
+<path class="e none sig" d="M163 70V76H307V70"/>
+<path class="e none" d="M345 70V76H441V70"/>
+<path class="e none" d="M451 70V76H547V70"/>
+<path class="e none" d="M556 70V76H633V70"/>
+<text class="tb mid" x="110" y="93">scheme</text><text class="ts mid" x="110" y="109">which protocol</text>
+<text class="tb mid" x="235" y="93">host</text><text class="ts mid" x="235" y="109">which machine, via DNS</text>
+<text class="tb mid" x="393" y="93">path</text><text class="ts mid" x="393" y="109">which resource</text>
+<text class="tb mid" x="499" y="93">query</text><text class="ts mid" x="499" y="109">extra parameters</text>
+<text class="tb mid" x="594" y="93">fragment</text><text class="ts mid" x="594" y="109">browser only</text>
+</svg>
+</div>
+<figcaption>The parts of a URL. Only the host is needed to find the server. The path and query travel inside the encrypted request. The fragment never leaves the browser.</figcaption>
+</figure>
+
+<p>The <b>scheme</b> <code>https</code> says to speak HTTP over an encrypted connection. The <b>host</b> names the machine. The <b>port</b> selects one program on that machine, and is usually left out because <code>https</code> implies port 443 and <code>http</code> implies port 80. The <b>path</b> and <b>query</b> are passed to the server, which decides what they mean. The <b>fragment</b> after <code>#</code> is used by the browser alone, typically to scroll to a section.</p>
+<aside class="sn"><b>HTTPS is now the assumed default</b>Chrome 154, released on 22 September 2026, turns on “Always Use Secure Connections” for everyone, so the browser asks permission before the first visit to a public site that lacks HTTPS. By Google’s count about 95% of Chrome navigations already use HTTPS. Design every public endpoint for HTTPS only.</aside>
+<p>If you type only <code>example.com</code>, the browser fills in the rest. Modern browsers try <code>https://</code> first. A site can also tell browsers to refuse plain HTTP for it in future, using a response header called HSTS (HTTP Strict Transport Security).</p>
+
+<h2 id="dns">Step 1: find the address with DNS</h2>
+<p>Machines on the internet are reached by numeric <dfn>IP addresses</dfn> such as <code>203.0.113.10</code>, and people prefer names. The <dfn>Domain Name System</dfn> (DNS) is the distributed database that maps one to the other. No single server holds the whole mapping. It is split into a hierarchy, and a lookup walks down that hierarchy from the right-hand end of the name.</p>
+<p>The browser first checks whether it already knows the answer, in its own cache or the operating system’s. If not, it asks a <dfn>recursive resolver</dfn>, a server run by your internet provider or by a public service, whose job is to chase the answer on your behalf.</p>
+
+<figure class="fig wide" id="fig-dns">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 296" role="img" aria-labelledby="f23t f23d">
+<title id="f23t">A DNS lookup with an empty cache</title>
+<desc id="f23d">Your device asks a recursive resolver for example.com. The resolver asks a root server, which refers it to the .com servers. It asks a .com server, which refers it to example.com’s own servers. It asks one of those, receives the IP address, and returns it to your device.</desc>
+<rect class="n" x="8" y="116" width="144" height="64" rx="6"/>
+<text class="tb mid" x="80" y="144">Your device</text>
+<text class="ts mid" x="80" y="161">browser and OS caches</text>
+<rect class="n sig" x="250" y="100" width="130" height="92" rx="6"/>
+<text class="tb mid" x="315" y="134">Recursive</text>
+<text class="tb mid" x="315" y="151">resolver</text>
+<text class="ts mid" x="315" y="171">caches every answer</text>
+<rect class="n" x="544" y="16" width="168" height="52" rx="6"/>
+<text class="tb mid" x="628" y="38">Root servers</text>
+<text class="ts mid" x="628" y="55">know who runs .com</text>
+<rect class="n" x="544" y="120" width="168" height="52" rx="6"/>
+<text class="tb mid" x="628" y="142">.com servers</text>
+<text class="ts mid" x="628" y="159">know example.com’s servers</text>
+<rect class="n" x="544" y="224" width="168" height="52" rx="6"/>
+<text class="tb mid" x="628" y="246">Authoritative servers</text>
+<text class="ts mid" x="628" y="263">hold example.com’s records</text>
+<g data-s="1">
+<path class="e sig" d="M152 136H250"/>
+</g>
+<g data-s="8">
+<path class="e sig" d="M250 162H152"/>
+</g>
+<g data-s="2">
+<path class="e sig" d="M380 110 544 34"/>
+</g>
+<g data-s="3">
+<path class="e" d="M544 56 380 122"/>
+</g>
+<g data-s="4">
+<path class="e sig" d="M380 140 544 136"/>
+</g>
+<g data-s="5">
+<path class="e" d="M544 156 380 152"/>
+</g>
+<g data-s="6">
+<path class="e sig" d="M380 170 544 238"/>
+</g>
+<g data-s="7">
+<path class="e" d="M544 262 380 182"/>
+</g>
+<g>
+<g data-s="1">
+<circle class="n" cx="201" cy="136" r="9"/><text class="ts tb mid" x="201" y="140">1</text>
+</g>
+<g data-s="8">
+<circle class="n" cx="201" cy="162" r="9"/><text class="ts tb mid" x="201" y="166">8</text>
+</g>
+<g data-s="2">
+<circle class="n" cx="452" cy="78" r="9"/><text class="ts tb mid" x="452" y="82">2</text>
+</g>
+<g data-s="3">
+<circle class="n" cx="488" cy="81" r="9"/><text class="ts tb mid" x="488" y="85">3</text>
+</g>
+<g data-s="4">
+<circle class="n" cx="444" cy="139" r="9"/><text class="ts tb mid" x="444" y="143">4</text>
+</g>
+<g data-s="5">
+<circle class="n" cx="496" cy="155" r="9"/><text class="ts tb mid" x="496" y="159">5</text>
+</g>
+<g data-s="6">
+<circle class="n" cx="452" cy="196" r="9"/><text class="ts tb mid" x="452" y="200">6</text>
+</g>
+<g data-s="7">
+<circle class="n" cx="488" cy="230" r="9"/><text class="ts tb mid" x="488" y="234">7</text>
+</g>
+</g>
+<g data-s="3">
+<text class="ts" x="544" y="86">3 “ask the .com servers”</text>
+</g>
+<g data-s="5">
+<text class="ts" x="544" y="190">5 “ask ns1.example.com”</text>
+</g>
+<g data-s="7">
+<text class="ts" x="544" y="292">7 “203.0.113.10, valid 300 s”</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="example.com?" data-state="Resolver knows: nothing yet; Your device: waiting">Your device asks its recursive resolver for the address of example.com.</li>
+  <li data-msg="example.com?">The resolver has nothing cached, so it starts at the top and asks a root server.</li>
+  <li data-msg="ask the .com servers" data-state="Resolver knows: who runs .com; Your device: waiting">The root server does not know the address. It knows who runs .com, and refers the resolver there.</li>
+  <li data-msg="example.com?">The resolver asks a .com server the same question.</li>
+  <li data-msg="ask ns1.example.com" data-state="Resolver knows: example.com’s name servers; Your device: waiting">The .com server refers it on again, to example.com’s own name servers.</li>
+  <li data-msg="example.com?">The resolver asks one of those authoritative servers.</li>
+  <li data-msg="203.0.113.10" data-state="Resolver knows: 203.0.113.10, for 300 s; Your device: waiting">This server holds the record and answers: 203.0.113.10, valid for 300 seconds.</li>
+  <li data-msg="203.0.113.10" data-state="Resolver knows: 203.0.113.10, for 300 s; Your device: has the address">The resolver caches the answer and returns it to your device. The next lookup of this name stops at step 1.</li>
+</ol>
+<figcaption>A lookup with nothing cached. The resolver asks the same question three times, to servers that each know one more label of the name. Blue arrows are questions and gray arrows are answers.</figcaption>
+</figure>
+
+<ol>
+  <li>Your device asks the resolver: what is the address of <code>www.example.com</code>?</li>
+  <li>The resolver asks a <dfn>root server</dfn>. Root servers do not know the answer.</li>
+  <li>The root server replies with a referral: these servers handle everything ending in <code>.com</code>.</li>
+  <li>The resolver asks one of the <code>.com</code> servers, called <dfn>top-level domain</dfn> (TLD) servers.</li>
+  <li>The TLD server replies with another referral: these are the name servers for <code>example.com</code>.</li>
+  <li>The resolver asks one of those. They are <dfn>authoritative</dfn>: they hold the records the domain’s owner published.</li>
+  <li>The authoritative server replies with the address and a <dfn>time to live</dfn> (TTL), the number of seconds the answer may be reused.</li>
+  <li>The resolver stores the answer for that long and returns it to your device, which caches it too.</li>
+</ol>
+<aside class="sn"><b>Thirteen names, about two thousand machines</b>There are 13 root server names, <code>a</code> to <code>m.root-servers.net</code>, run by 12 organizations. Each name is served from many places at once by a routing technique called anycast. The operators’ site, root-servers.org, listed about 1,950 instances in December 2025.</aside>
+<p>That is four round trips for one name, which sounds slow. In practice the resolver almost always has the <code>.com</code> referral cached, and for a popular site it has the final answer too, so a typical lookup is one short exchange with the resolver or none at all. Caching is what makes DNS fast, and it is also why a DNS change does not take effect everywhere at once: every cache keeps the old answer until its TTL runs out.</p>
+<p>A DNS answer is a <dfn>record</dfn>, and there are several types. You will meet these often:</p>
+<table>
+<thead><tr><th>Record</th><th>Maps a name to</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><th><code>A</code></th><td>An IPv4 address</td><td>The basic name-to-address lookup</td></tr>
+<tr><th><code>AAAA</code></th><td>An IPv6 address</td><td>The same, for IPv6</td></tr>
+<tr><th><code>CNAME</code></th><td>Another name</td><td>Pointing <code>www</code> at a CDN or load balancer’s name</td></tr>
+<tr><th><code>NS</code></th><td>The name servers for a zone</td><td>Delegation: the referrals in steps 3 and 5</td></tr>
+<tr><th><code>MX</code></th><td>A mail server</td><td>Routing email for the domain</td></tr>
+<tr><th><code>TXT</code></th><td>Free text</td><td>Proving domain ownership, email anti-spoofing rules</td></tr>
+<tr><th><code>HTTPS</code></th><td>Connection hints</td><td>Telling browsers in advance that HTTP/3 is available</td></tr>
+</tbody>
+</table>
+<p>You can watch the whole walk yourself. The <code>dig</code> tool, with <code>+trace</code>, plays the resolver’s part and prints every referral:</p>
+<pre data-lang="sh">
+# Follow the delegation chain from the root, as a resolver would
+dig +trace www.example.com
+</pre>
+<div class="note production"><p><span class="label">In production.</span> DNS is a dependency of everything, including your own internal services, and it is easy to forget because it nearly always works. In October 2025 a fault in the automation that manages DNS records for Amazon DynamoDB left that service’s regional endpoint in northern Virginia with no addresses at all. Clients could not find a healthy service, and the effects spread to other AWS services that depend on it for about fourteen and a half hours. <x-ref to="availability-and-reliability"></x-ref> returns to this incident.</p></div>
+<p>DNS does more than look up one fixed address. An authoritative server can give different answers to different askers, which makes it the first place traffic is steered: toward the nearest region, away from a data center that is down, or 5% to a new version. <x-ref to="dns"></x-ref> covers this in full.</p>
+
+<h2 id="ip">Between the steps: addresses and packets</h2>
+<p>With an address in hand, the browser can send data. On the internet, data travels as <dfn>packets</dfn>: small chunks, typically up to about 1,500 bytes, each stamped with the address it came from and the address it is going to. No machine along the way knows the whole route. Each <dfn>router</dfn> looks at the destination address and forwards the packet one hop closer. Packets of the same request may take different routes, arrive out of order, or not arrive at all. The Internet Protocol (IP) promises only a best effort.</p>
+<aside class="sn"><b>IPv6 reached half</b>Google measures the share of its users who reach it over IPv6. That share passed 50% for the first time on 28 March 2026, eighteen years after measurement began. It still dips below half on working days, when more traffic comes from corporate networks. In practice a public service should answer on both protocols.</aside>
+<p>There are two versions of IP in use. <b>IPv4</b> addresses are 32 bits, written as four numbers like <code>203.0.113.10</code>, which allows about 4.3 billion addresses. That is fewer than the number of devices now connected, so addresses are shared and rationed. <b>IPv6</b> addresses are 128 bits, written in hexadecimal like <code>2001:db8::10</code>, and are in no danger of running out. <x-ref to="ip-and-routing"></x-ref> explains how the two coexist.</p>
+
+<h2 id="tcp">Step 2: open a connection</h2>
+<p>An application wants more than best effort. It wants every byte to arrive, once, in order. The <dfn>Transmission Control Protocol</dfn> (TCP) provides that on top of IP by numbering bytes, acknowledging what arrives, and resending what does not.</p>
+<p>Before TCP carries data, both sides exchange three small packets, known as the <dfn>three-way handshake</dfn>. The client sends <code>SYN</code> (“I want to talk, my numbering starts here”), the server answers <code>SYN-ACK</code> (“agreed, mine starts here”), and the client replies <code>ACK</code>. The client can send data together with that final packet, so the handshake costs one <dfn>round trip</dfn>: the time for a packet to travel there and for the reply to come back.</p>
+<p>Round-trip time is set mostly by distance. Light in optical fiber covers roughly 200 kilometers per millisecond, so a server 3,000 km away cannot be reached and heard from in less than about 30 ms, and real routes are longer than straight lines. Every round trip in this chapter costs that much, which is why so much engineering goes into removing round trips and into moving servers closer to users.</p>
+<p>The alternative to TCP is <dfn>UDP</dfn> (User Datagram Protocol), which adds almost nothing to IP: no handshake, no resending, no ordering. For a long time that made UDP the choice for things like video calls and DNS queries, and TCP the choice for everything else. That changed with <dfn>QUIC</dfn>, a newer transport that runs on top of UDP and rebuilds reliability there, with encryption included. It appears in the next step.</p>
+
+<h2 id="tls">Step 3: agree on encryption with TLS</h2>
+<p>A TCP connection is a plain pipe. Anyone on the path, such as a café’s Wi-Fi router, could read or alter what passes through it. <dfn>Transport Layer Security</dfn> (TLS) wraps the pipe so that three things hold: nobody else can read the contents, nobody can change them unnoticed, and the browser knows it is talking to the real <code>example.com</code>.</p>
+<p>The third property rests on a <dfn>certificate</dfn>. During the TLS handshake the server presents a certificate that binds its name to a public key, signed by a <dfn>certificate authority</dfn> that the browser already trusts. The server then proves it holds the matching private key. In the same exchange, both sides derive fresh encryption keys that are used for this connection only.</p>
+<p>With the current version, TLS 1.3, the handshake takes one round trip. Added to TCP’s one, that is two round trips before the browser can send its actual request.</p>
+
+<figure class="fig wide" id="fig-handshake">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 268" role="img" aria-labelledby="f24t f24d">
+<title id="f24t">Round trips before the first response, with TCP plus TLS and with QUIC</title>
+<desc id="f24d">Left: with TCP and TLS 1.3, the TCP handshake takes one round trip, the TLS handshake a second, and the HTTP request and response a third. Right: with QUIC, the connection and TLS handshakes share one round trip, and the request and response take the second.</desc>
+<g data-scene="tcp">
+<text class="tl" x="120" y="22">TCP, then TLS 1.3</text>
+<text class="ts" x="120" y="39">HTTP/1.1 and HTTP/2</text>
+</g>
+<g data-scene="quic">
+<text class="tl" x="470" y="22">QUIC, with TLS 1.3 built in</text>
+<text class="ts" x="470" y="39">HTTP/3</text>
+</g>
+<g data-scene="tcp">
+<text class="tb mid" x="120" y="64">Browser</text><text class="tb mid" x="340" y="64">Server</text>
+</g>
+<g data-scene="quic">
+<text class="tb mid" x="470" y="64">Browser</text><text class="tb mid" x="690" y="64">Server</text>
+</g>
+<path class="e none" d="M120 72V250M340 72V250M470 72V250M690 72V250"/>
+<g data-scene="tcp">
+<g data-s="1">
+<path class="e" d="M120 96H340"/><text class="ts mid" x="230" y="90">SYN</text>
+</g>
+<g data-s="2">
+<path class="e" d="M340 122H120"/><text class="ts mid" x="230" y="116">SYN-ACK</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M120 148H340"/><text class="ts mid" x="230" y="142">ACK, TLS hello</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M340 174H120"/><text class="ts mid" x="230" y="168">certificate, keys</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M120 200H340"/><text class="ts mid" x="230" y="194">HTTP request</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M340 226H120"/><text class="ts mid" x="230" y="220">HTTP response</text>
+</g>
+<g data-s="2">
+<text class="ts end" x="110" y="126">1 round trip</text>
+</g>
+<g data-s="4">
+<text class="ts end" x="110" y="178">2 round trips</text>
+</g>
+<g data-s="6">
+<text class="ts end tb" x="110" y="230">3: first bytes</text>
+</g>
+</g>
+<g data-scene="quic">
+<g data-s="1">
+<path class="e sig" d="M470 96H690"/><text class="ts mid" x="580" y="90">QUIC and TLS hello</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M690 122H470"/><text class="ts mid" x="580" y="116">certificate, keys</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M470 148H690"/><text class="ts mid" x="580" y="142">HTTP request</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M690 174H470"/><text class="ts mid" x="580" y="168">HTTP response</text>
+</g>
+<g data-s="2">
+<text class="ts end" x="460" y="126">1 round trip</text>
+</g>
+<g data-s="4">
+<text class="ts end tb" x="460" y="178">2: first bytes</text>
+<text class="ts" x="482" y="214">On a repeat visit the request can</text>
+<text class="ts" x="482" y="230">travel in the very first packet.</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="tcp" data-label="TCP, then TLS">
+  <li data-state="Round trips completed: 0">The browser asks the server to open a TCP connection.</li>
+  <li data-state="Round trips completed: 1">The server agrees. One round trip has passed and no data has moved yet.</li>
+  <li>The browser acknowledges and, in the same packet, starts the TLS handshake.</li>
+  <li data-state="Round trips completed: 2">The server replies with its certificate and key material. That is the second round trip.</li>
+  <li>Only now can the browser send the HTTP request, encrypted.</li>
+  <li data-state="Round trips completed: 3">The first bytes of the response arrive after three round trips.</li>
+</ol>
+<ol class="steps" data-scene="quic" data-label="QUIC">
+  <li data-state="Round trips completed: 0">The browser’s first packet opens the connection and starts the TLS handshake together.</li>
+  <li data-state="Round trips completed: 1">The server answers with its certificate and keys. After one round trip the connection is open and encrypted.</li>
+  <li>The browser sends the HTTP request.</li>
+  <li data-state="Round trips completed: 2">The first bytes arrive after two round trips. On a repeat visit the request can travel in the very first packet.</li>
+</ol>
+<figcaption>Round trips before the first byte of the response. QUIC folds the connection handshake and the TLS handshake into one exchange, which saves a full round trip on every new connection.</figcaption>
+</figure>
+
+<p>QUIC does the transport handshake and the TLS handshake at the same time, so a new connection is ready after one round trip. When the browser has talked to the server before, QUIC and TLS 1.3 can also resume with stored keys and send the request in the very first packet, a mode called 0-RTT. It is restricted to requests that are safe to repeat, because an attacker who captured that first packet could send it again.</p>
+<p>Two changes to TLS are in progress as this is written, and both affect how systems are run.</p>
+<ul>
+  <li><b>Certificates are getting shorter-lived.</b> The industry body that sets the rules, the CA/Browser Forum, voted in April 2025 to cut the maximum lifetime of a public certificate in stages: 200 days from 15 March 2026, 100 days from 15 March 2027, and 47 days from 15 March 2029. It had been 398 days. Renewing by hand does not survive that schedule. Certificate renewal has to be automated, usually with the ACME protocol that Let’s Encrypt introduced.</li>
+  <li><b>Key exchange is moving to post-quantum algorithms.</b> A future quantum computer could break the mathematics behind today’s key exchange, and traffic recorded now could be decrypted then. Browsers and large providers have therefore switched to a hybrid exchange that combines the existing method with a quantum-resistant one, ML-KEM. In September 2026 Cloudflare reported that about 70% of the browser-generated traffic reaching its network already used it.</li>
+</ul>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Treating a certificate as something you install once. An expired certificate takes a site down as completely as a crashed server, and it does so on a date that was known in advance. Monitor expiry dates and automate renewal for every certificate, including the ones on internal services.</p></div>
+
+<h2 id="http">Step 4: send the request with HTTP</h2>
+<p>Now the browser can say what it wants. The language is <dfn>HTTP</dfn> (Hypertext Transfer Protocol), a request-and-response protocol. The client sends a request naming a <dfn>method</dfn> and a path, with <dfn>headers</dfn> carrying extra information. The server sends back a <dfn>status code</dfn>, its own headers, and usually a body.</p>
+<pre data-lang="http" data-title="A request, and the response to it">
+GET /photos/42?size=large HTTP/1.1
+Host: www.example.com
+Accept: text/html
+Accept-Encoding: gzip, br
+Cookie: session=8f3a…
+
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Encoding: br
+Cache-Control: private, max-age=60
+Content-Length: 5123
+
+<!doctype html> …
+</pre>
+<p>The method says what kind of action is wanted. <code>GET</code> reads, <code>POST</code> creates or triggers something, <code>PUT</code> replaces, <code>PATCH</code> changes part, <code>DELETE</code> removes. The first digit of the status code tells you the class of outcome:</p>
+<table>
+<thead><tr><th>Codes</th><th>Meaning</th><th>Examples you will see daily</th></tr></thead>
+<tbody>
+<tr><th>2xx</th><td>It worked</td><td><code>200 OK</code>, <code>201 Created</code>, <code>204 No Content</code></td></tr>
+<tr><th>3xx</th><td>Look elsewhere, or use your copy</td><td><code>301 Moved Permanently</code>, <code>304 Not Modified</code></td></tr>
+<tr><th>4xx</th><td>The client’s request was wrong</td><td><code>400 Bad Request</code>, <code>401 Unauthorized</code>, <code>403 Forbidden</code>, <code>404 Not Found</code>, <code>429 Too Many Requests</code></td></tr>
+<tr><th>5xx</th><td>The server failed</td><td><code>500 Internal Server Error</code>, <code>502 Bad Gateway</code>, <code>503 Service Unavailable</code>, <code>504 Gateway Timeout</code></td></tr>
+</tbody>
+</table>
+<p>The split between 4xx and 5xx matters for operations. A rise in 5xx responses means your system is failing. A rise in 4xx usually means a client is misbehaving. Alerts and availability targets are normally built on the 5xx rate.</p>
+<p>HTTP itself is <dfn>stateless</dfn>: each request stands alone and the protocol remembers nothing between them. Anything that must persist, such as who is logged in, is carried by the client on every request, typically in a cookie or a token. That property is what later allows any one of fifty identical servers to handle any request, and <x-ref to="scalability"></x-ref> builds on it.</p>
+
+<h3 id="http-versions">Three versions in use at once</h3>
+<p>The meaning of HTTP, its methods, headers and status codes, has been stable for decades. What has changed is how requests are packed onto the connection, and each version fixed a specific bottleneck in the one before.</p>
+<table>
+<thead><tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr></thead>
+<tbody>
+<tr><th>Standardized</th><td>1997</td><td>2015</td><td>2022</td></tr>
+<tr><th>Runs on</th><td>TCP</td><td>TCP</td><td>QUIC, over UDP</td></tr>
+<tr><th>Format on the wire</th><td>Text</td><td>Binary frames</td><td>Binary frames</td></tr>
+<tr><th>Requests per connection</th><td>One at a time</td><td>Many at once, as interleaved streams</td><td>Many at once, as independent streams</td></tr>
+<tr><th>If one packet is lost</th><td>That connection’s request waits</td><td>Every stream on the connection waits</td><td>Only the stream it belonged to waits</td></tr>
+<tr><th>Round trips to set up</th><td>2 with TLS 1.3</td><td>2 with TLS 1.3</td><td>1, or 0 on a repeat visit</td></tr>
+<tr><th>Survives a network change</th><td>No</td><td>No</td><td>Yes: connections are not tied to an IP address</td></tr>
+</tbody>
+</table>
+<p>With HTTP/1.1 a connection carries one request at a time, so browsers open up to six connections per site and still queue requests behind each other. HTTP/2 sends many requests over a single connection at once. That removed the queueing in HTTP, and exposed the same problem one layer down: TCP delivers bytes strictly in order, so one lost packet stalls every request sharing the connection until it is resent. This is called <dfn>head-of-line blocking</dfn>. HTTP/3 moves to QUIC, where each stream is ordered separately and a lost packet delays only its own stream.</p>
+<aside class="sn"><b>How a browser learns about HTTP/3</b>A URL does not say which HTTP version to use. The browser usually connects with HTTP/2 first, and the server’s response carries an <code>Alt-Svc</code> header saying “I also speak HTTP/3 here”. The <code>HTTPS</code> DNS record lets the browser know before it connects at all.</aside>
+<p>All three are in everyday use. In October 2026 the survey firm W3Techs found HTTP/3 in use on 40.9% of the websites it tracks. As a designer you rarely pick one. Your CDN or load balancer speaks whatever the browser supports and typically talks plain HTTP/1.1 or HTTP/2 to your servers behind it. <x-ref to="http-and-tls"></x-ref> goes deeper.</p>
+
+<h2 id="edge">Step 5: arrive at the edge</h2>
+<p>The address that DNS returned rarely belongs to the machine that runs your code. It belongs to something placed in front, whose job is to receive traffic and pass it on.</p>
+<p>Often the first stop is a <dfn>content delivery network</dfn> (CDN): a fleet of servers in hundreds of cities, run by a provider. The user’s connection, and its TLS handshake, end at a CDN server near them, which keeps the round trips short. If the CDN holds a fresh copy of what was asked for, such as an image or a stylesheet, it answers at once and your servers never hear about the request. Otherwise it forwards the request to your <dfn>origin</dfn> over a connection it already has open.</p>
+<p>At your origin the request reaches a <dfn>load balancer</dfn>. It holds a list of application servers, checks regularly which of them are healthy, and hands each request to one that is. This single component is what lets you run more than one server, replace servers without downtime, and survive the loss of one. It is covered in <x-ref to="proxies-and-load-balancers"></x-ref>, and the CDN in <x-ref to="cdn-and-edge"></x-ref>.</p>
+
+<h2 id="app">Step 6: run the application code</h2>
+<p>An application server finally receives the request. What happens next is the part you write, and it usually follows the same outline:</p>
+<ol>
+  <li><b>Parse and route.</b> Match the method and path, <code>GET /photos/42</code>, to a handler function.</li>
+  <li><b>Authenticate.</b> Work out who is asking, from the cookie or token.</li>
+  <li><b>Authorize.</b> Check that this user is allowed to see photo 42.</li>
+  <li><b>Validate.</b> Reject input that is malformed before it reaches anything important.</li>
+  <li><b>Do the work.</b> Run the business logic, reading and writing data as needed.</li>
+  <li><b>Respond.</b> Serialize the result as HTML or JSON, set headers, choose a status code.</li>
+</ol>
+<p>How that code is organized into classes and layers is the subject of low-level design, in Parts IX and X. From the outside, what matters is that the server keeps nothing between requests that it cannot afford to lose. If it does, the load balancer’s freedom to choose any server disappears.</p>
+
+<h2 id="data">Step 7: read and write data</h2>
+<p>Almost every request needs data, and fetching it is usually the slowest thing the server does. For photo 42 the handler needs the photo’s metadata and its owner’s name.</p>
+<p>It may first ask a <dfn>cache</dfn>, an in-memory store such as Redis that keeps recently used results. A cache answers in well under a millisecond. If the result is there, that is a <dfn>cache hit</dfn> and the database is not involved. If not, it is a <dfn>cache miss</dfn>: the handler queries the <dfn>database</dfn>, which finds the row using an <dfn>index</dfn> in perhaps a few milliseconds, and the handler stores the result in the cache for the next request.</p>
+<p>The image bytes themselves are not in the database. Large files live in <dfn>object storage</dfn>, and the page contains only a URL pointing at them, which the browser fetches separately, normally through the CDN. Part III is about all of these stores: how they find data quickly, how they keep copies, and how they are split across machines.</p>
+
+<h2 id="response">Step 8: the response travels back</h2>
+<p>The response retraces the path: application server, load balancer, CDN, browser. Two things on the way back are worth knowing because they cost little and save a great deal.</p>
+<p><b>Compression.</b> Text formats such as HTML, CSS, JavaScript and JSON shrink to a fraction of their size with gzip or Brotli. The browser lists what it accepts in <code>Accept-Encoding</code> and the server or CDN compresses accordingly.</p>
+<p><b>Caching headers.</b> The response can say how long it may be reused, and by whom. <code>Cache-Control: public, max-age=31536000</code> lets the browser and every CDN reuse a file for a year without asking. <code>Cache-Control: private, max-age=60</code> lets only the user’s own browser reuse it, for a minute. A response can also carry an <code>ETag</code>, a fingerprint of its content. Later the browser asks “has it changed from this fingerprint?”, and if not the server replies <code>304 Not Modified</code> with no body. The fastest request is the one that is never sent, and these headers are how you arrange that. <x-ref to="caching"></x-ref> treats caching at every layer.</p>
+
+<h2 id="render">Step 9: the browser builds the page</h2>
+<p>The browser now has HTML, and it has more work to do before anything appears.</p>
+<ol>
+  <li>It parses the HTML into a tree of elements, the <dfn>DOM</dfn>.</li>
+  <li>As it parses, it discovers more files to fetch: stylesheets, scripts, fonts, images. Each one is a new request that goes through some or all of the steps above, though usually on a connection that is already open.</li>
+  <li>It parses the CSS and works out which styles apply to which elements.</li>
+  <li>It computes the position and size of everything (layout), then draws it (paint).</li>
+  <li>It runs JavaScript, which may change the DOM and cause parts of this to repeat.</li>
+</ol>
+<p>Some of those files block progress. A stylesheet in the page head holds back the first paint until it arrives, and an ordinary script tag pauses HTML parsing while it downloads and runs. A page can therefore feel slow even when the server answered quickly.</p>
+<aside class="sn"><b>Core Web Vitals</b>Google’s three user-centered measures of this last step are Largest Contentful Paint (main content visible, good at 2.5 s or less), Interaction to Next Paint (response to input, good at 200 ms or less) and Cumulative Layout Shift (how much the page jumps around, good at 0.1 or less). Each is judged at the 75th percentile of real visits.</aside>
+<p>This is where back-end and front-end design meet. A back-end choice, such as returning one large response or several small ones, or rendering HTML on the server or sending JSON for the browser to render, shows up directly in how long the user waits to see something.</p>
+
+<h2 id="budget">Where the time goes</h2>
+<p>Add the steps up for a user whose round trip to the nearest edge server takes 60 ms, with an application that needs 80 ms to produce a response. The numbers are illustrative, and the proportions are typical.</p>
+
+<figure class="fig" id="fig-budget">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-labelledby="f25t f25d">
+<title id="f25t">Time to first byte in three situations</title>
+<desc id="f25d">A first visit over HTTP/2 takes 300 milliseconds: 40 for DNS, 60 for TCP, 60 for TLS and 140 for the request and response. A first visit over HTTP/3 takes 240 milliseconds because the connection and TLS handshakes are combined into 60. A later request on the same connection takes 140 milliseconds because only the request and response remain.</desc>
+<line class="grid" x1="150" x2="150" y1="34" y2="196"/>
+<line class="grid" x1="312.5" x2="312.5" y1="34" y2="196"/>
+<line class="grid" x1="475" x2="475" y1="34" y2="196"/>
+<line class="grid" x1="637.5" x2="637.5" y1="34" y2="196"/>
+<text class="ts mid" x="150" y="214">0</text>
+<text class="ts mid" x="312.5" y="214">100 ms</text>
+<text class="ts mid" x="475" y="214">200 ms</text>
+<text class="ts mid" x="637.5" y="214">300 ms</text>
+<text class="tb" x="10" y="62">First visit</text>
+<text class="ts" x="10" y="78">HTTP/2</text>
+<rect data-tip="DNS lookup|40 ms|13% of the 300 ms total|First visit over HTTP/2" class="bar mute" x="150" y="50" width="63" height="22"/>
+<text class="ts" x="150" y="44">DNS 40</text>
+<rect data-tip="TCP handshake|60 ms|20% of the 300 ms total|First visit over HTTP/2" class="bar mute" x="215" y="50" width="95.5" height="22"/>
+<text class="ts" x="215" y="44">TCP 60</text>
+<rect data-tip="TLS handshake|60 ms|20% of the 300 ms total|First visit over HTTP/2" class="bar mute" x="312.5" y="50" width="95.5" height="22"/>
+<text class="ts" x="312.5" y="44">TLS 60</text>
+<rect data-tip="Request, server work, response|140 ms|47% of the 300 ms total|First visit over HTTP/2" class="bar" x="410" y="50" width="227.5" height="22" rx="0"/>
+<text class="ts" x="410" y="44">request, server work, response 140</text>
+<text class="tb" x="646" y="66">300 ms</text>
+<text class="tb" x="10" y="120">First visit</text>
+<text class="ts" x="10" y="136">HTTP/3</text>
+<rect data-tip="DNS lookup|40 ms|17% of the 240 ms total|First visit over HTTP/3" class="bar mute" x="150" y="108" width="63" height="22"/>
+<text class="ts" x="150" y="102">DNS 40</text>
+<rect data-tip="QUIC and TLS in one handshake|60 ms|25% of the 240 ms total|First visit over HTTP/3" class="bar mute" x="215" y="108" width="95.5" height="22"/>
+<text class="ts" x="215" y="102">QUIC + TLS 60</text>
+<rect data-tip="Request, server work, response|140 ms|58% of the 240 ms total|First visit over HTTP/3" class="bar" x="312.5" y="108" width="227.5" height="22"/>
+<text class="ts" x="312.5" y="102">request, server work, response 140</text>
+<text class="tb" x="548" y="124">240 ms</text>
+<text class="tb" x="10" y="178">Later request</text>
+<text class="ts" x="10" y="194">same connection</text>
+<rect data-tip="Request, server work, response|140 ms|100% of the 140 ms total|Later request, same connection" class="bar" x="150" y="166" width="227.5" height="22"/>
+<text class="ts" x="150" y="160">request, server work, response 140</text>
+<text class="tb" x="386" y="182">140 ms</text>
+</svg>
+</div>
+<figcaption>Time until the first byte of the response arrives, assuming a 60 ms round trip and 80 ms of server work. Gray is connection setup, blue is the request itself. On a first visit, more than half the wait is setup.</figcaption>
+</figure>
+
+<p>Three conclusions follow, and each one becomes a design technique later in the book.</p>
+<ul>
+  <li><b>Setup costs more than the work.</b> On a first visit, 160 of the 300 ms pass before the server has seen the request. Reusing connections, and ending them at an edge server close to the user, removes most of that.</li>
+  <li><b>Distance multiplies.</b> Every phase except server work is counted in round trips. Halve the round-trip time by moving closer and you halve all of them at once.</li>
+  <li><b>The first request is the worst case.</b> Everything after it on the same connection skips steps 1 to 3. Performance that looks fine in a test that reuses one connection can look quite different to a real first-time visitor.</li>
+</ul>
+<p>You can measure these phases against any site with <code>curl</code>. Each value it prints is the time elapsed since the start, so subtract neighbors to get the length of a phase.</p>
+<pre data-lang="sh">
+curl -o /dev/null -s -w "dns        %{time_namelookup}s
+connected  %{time_connect}s
+tls done   %{time_appconnect}s
+first byte %{time_starttransfer}s
+total      %{time_total}s
+" https://www.example.com/
+</pre>
+
+<h2 id="failures">What can fail at each step</h2>
+<p>A design is judged on the bad day as much as the good one. Each step has a characteristic way of failing and a characteristic defense, and from the user’s side many of them look the same: a spinner, then an error page.</p>
+<table>
+<thead><tr><th>Step</th><th>How it fails</th><th>What the user sees</th><th>Usual defense</th></tr></thead>
+<tbody>
+<tr><th>1 DNS</th><td>Records missing or wrong, DNS provider down</td><td>“Site can’t be reached”</td><td>More than one DNS provider, careful change control, sensible TTLs</td></tr>
+<tr><th>2 Connection</th><td>Packets dropped, server at its connection limit</td><td>A long wait, then a timeout</td><td>Timeouts, connection limits and queues that are tuned, capacity headroom</td></tr>
+<tr><th>3 TLS</th><td>Certificate expired or issued for the wrong name</td><td>A full-page security warning</td><td>Automated renewal, expiry monitoring</td></tr>
+<tr><th>5 Edge</th><td>CDN or load balancer misconfigured or overloaded</td><td><code>502</code> or <code>503</code> from the edge</td><td>Staged configuration rollouts, a fallback path to the origin</td></tr>
+<tr><th>5 Load balancer</th><td>Health checks wrongly mark good servers bad</td><td>Errors although servers are fine</td><td>Health checks that test the right thing, never removing all servers at once</td></tr>
+<tr><th>6 Application</th><td>A bug, an exhausted thread pool, a bad deploy</td><td><code>500</code>, or slowness</td><td>Gradual rollouts with fast rollback, <x-ref to="resilience-patterns">timeouts and circuit breakers</x-ref></td></tr>
+<tr><th>7 Data</th><td>Slow query, connection pool empty, primary database down</td><td>Slowness, then <code>500</code> or <code>504</code></td><td>Indexes, replicas with failover, caching, degraded read-only modes</td></tr>
+<tr><th>9 Browser</th><td>A blocked script, a large image, a failed third-party tag</td><td>A blank or half-drawn page</td><td>Non-blocking loading, size budgets, tolerance for missing extras</td></tr>
+</tbody>
+</table>
+<div class="note production"><p><span class="label">In production.</span> The edge is a shared dependency for a large part of the web. On 18 November 2025 a database permission change at Cloudflare caused an internal configuration file to double in size. The file exceeded a fixed limit in the proxy software that reads it, the proxies failed, and sites behind Cloudflare returned 5xx errors from 11:20 UTC until traffic was largely restored at 14:30. The origin servers of those sites were healthy throughout. When you draw a box in front of your system, you also take on its failures.</p></div>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><b>Networking.</b> Each of steps 1 to 5 has its own chapter in Part II: <x-ref to="dns">DNS</x-ref>, <x-ref to="transport-protocols">TCP, UDP and QUIC</x-ref>, <x-ref to="http-and-tls">HTTP and TLS</x-ref>, <x-ref to="proxies-and-load-balancers">load balancers</x-ref> and <x-ref to="cdn-and-edge">CDNs</x-ref>.</li>
+  <li><b>Security.</b> TLS answers “is this the real server?” It does not answer “who is this user?” or “may they do this?”, which are the subjects of <x-ref to="authentication"></x-ref> and <x-ref to="authorization"></x-ref>.</li>
+  <li><b>Front-end performance.</b> Step 9 is a field of its own. The rendering path, bundling and image formats are outside this book’s scope, and the same latency reasoning from <x-ref to="latency-and-throughput"></x-ref> applies to them.</li>
+  <li><b>Operations.</b> The failure table above is the skeleton of a monitoring plan: one check per step. See <x-ref to="observability"></x-ref>.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A request passes through DNS, a transport connection, TLS, HTTP, an edge or load balancer, application code and data stores, and then the browser’s rendering.</li>
+  <li>DNS is a cached, hierarchical lookup. Caching makes it fast and also makes changes take time to spread.</li>
+  <li>TCP gives ordered, reliable delivery for one round trip of setup. TLS 1.3 adds encryption and server identity for one more. QUIC combines the two.</li>
+  <li>HTTP’s meaning is stable. Versions 1.1, 2 and 3 differ in how many requests share a connection and what a lost packet delays.</li>
+  <li>On a first visit, connection setup often takes longer than your code. Round trips and distance dominate, so remove round trips and move closer.</li>
+  <li>Every step can fail in its own way. A design should name the defense for each.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>You change a DNS record to point at a new server, and an hour later some users still reach the old one. Why?</summary><p>Resolvers and devices cached the old answer and will keep using it until its TTL expires. If the old record had a TTL of a day, some users will be sent to the old server for up to a day. Lowering the TTL well before a planned change shortens that window.</p></details>
+<details><summary>With TCP and TLS 1.3 on a 100 ms round trip, how long is it before the browser can send its first request on a new connection? And with QUIC?</summary><p>Two round trips, so about 200 ms, with TCP and TLS 1.3. One round trip, about 100 ms, with QUIC, and close to zero on a resumed connection that uses 0-RTT.</p></details>
+<details><summary>HTTP/2 removed head-of-line blocking in HTTP. Why did HTTP/3 still need to exist?</summary><p>HTTP/2 multiplexes many streams over one TCP connection, and TCP delivers bytes strictly in order. One lost packet stalls all the streams until it is retransmitted. HTTP/3 runs over QUIC, which orders each stream independently, so a loss delays only the stream it belongs to.</p></details>
+<details><summary>Your monitoring shows a jump in <code>404</code> responses and no change in <code>5xx</code>. Is your service down?</summary><p>Probably not. 4xx codes say the request was wrong, for example a client asking for pages that do not exist, perhaps a crawler or a broken link in a new release of the front end. It is worth finding the cause, and it is a different kind of problem from the servers failing.</p></details>
+<details><summary>Why is the image for photo 42 not stored in the database row with its metadata?</summary><p>Large binary files make a database bigger, slower to back up and more expensive, and a database is poor at streaming megabytes to many clients. Object storage is built for exactly that, and a CDN can serve from it directly. The row stores a reference to the object.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Root Server Technical Operations Association, <a href="https://root-servers.org/">root-servers.org</a>. Operators, locations and instance counts for the 13 root server names.</li>
+  <li>Internet Society Pulse, <a href="https://pulse.internetsociety.org/en/blog/18-years-later-ipv6-reaches-majority/">“18 Years Later, IPv6 Reaches Majority”</a>, 2026. Google’s IPv6 measurement passing 50% on 28 March 2026.</li>
+  <li>IETF, <a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446: TLS 1.3</a>, <a href="https://www.rfc-editor.org/rfc/rfc9000">RFC 9000: QUIC</a>, <a href="https://www.rfc-editor.org/rfc/rfc9113">RFC 9113: HTTP/2</a>, <a href="https://www.rfc-editor.org/rfc/rfc9114">RFC 9114: HTTP/3</a> and <a href="https://www.rfc-editor.org/rfc/rfc9460">RFC 9460: the HTTPS DNS record</a>.</li>
+  <li>DigiCert, <a href="https://www.digicert.com/blog/tls-certificate-lifetimes-will-officially-reduce-to-47-days">“TLS Certificate Lifetimes Will Officially Reduce to 47 Days”</a>, 2025. The CA/Browser Forum schedule under ballot SC-081v3.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/post-quantum-visibility/">“Is your domain using post-quantum encryption?”</a>, 29 September 2026. Share of browser traffic using hybrid ML-KEM key agreement on Cloudflare’s network.</li>
+  <li>W3Techs, <a href="https://w3techs.com/technologies/details/ce-http3">Usage statistics of HTTP/3 for websites</a>. 40.9% of surveyed websites in October 2026.</li>
+  <li>Google, <a href="https://blog.google/security/https-by-defau/">“HTTPS by default”</a>. The Chrome 154 change and HTTPS adoption figures.</li>
+  <li>Amazon Web Services, <a href="https://aws.amazon.com/message/101925/">“Summary of the Amazon DynamoDB Service Disruption in the Northern Virginia (US-EAST-1) Region”</a>, October 2025.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/18-november-2025-outage/">“Cloudflare outage on November 18, 2025”</a>.</li>
+  <li>web.dev, <a href="https://web.dev/articles/vitals">Web Vitals</a>. Definitions and thresholds for the Core Web Vitals.</li>
+  <li>Ilya Grigorik, <a href="https://hpbn.co/"><i>High Performance Browser Networking</i></a> (O’Reilly). A book-length treatment of steps 1 to 4.</li>
+</ol>
+</section>

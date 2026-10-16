@@ -1,0 +1,742 @@
+<!--meta
+{ "description": "A high-level design of a stock exchange: order books matched by price and then time on one thread, a sequencer that gives every order one place in one order, a journal that lets a backup engine and a replay reach identical state, a binary market data feed over multicast with gap repair, and a measured time budget of a few microseconds per message.",
+  "lede": "An exchange looks like a database of orders, and almost every instinct from the rest of this part leads the wrong way when designing one. Fairness is defined by order, so the core is one sequence of events, applied by one thread, the same way on every copy. This chapter builds the order book and the engine, measures what happens when copies disagree about order, repairs a lossy market data feed, and counts where the microseconds go.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a stock exchange. Brokers send orders to buy and sell shares of listed companies, and cancel them. The exchange matches buyers with sellers, tells both sides about every trade at once, and publishes every change to its order books to anyone who subscribes. It must be fair to the microsecond, never lose an order it has acknowledged, and keep running through the failure of any one machine.</p></div>
+<p>Most designs in this part spread work over many machines that each do a little, and accept some disagreement between them. An exchange cannot. Two orders that arrive a microsecond apart must be handled in that order, and every copy of the system must agree on what traded, to the share and the cent. So the heart of the design is deliberately small: one numbered stream of orders, and one thread for each book applying it. Everything around that heart exists to feed it quickly, to copy it exactly and to tell the world what it did. In the terms of <x-ref to="hld-method#shapes"></x-ref>, this is ordering at low latency.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Place limit and market orders; cancel an order</th><td>Yes</td></tr>
+<tr><th>Match by price and then by time of arrival</th><td>Yes</td></tr>
+<tr><th>Report every fill to both sides</th><td>Yes</td></tr>
+<tr><th>Market data: every change to every book, and the best prices</th><td>Yes</td></tr>
+<tr><th>Check orders against each broker’s limits before they reach a book</th><td>Yes</td></tr>
+<tr><th>Opening and closing auctions; stop and hidden orders</th><td>Follow-up questions</td></tr>
+<tr><th>Clearing and settlement of trades</th><td>No: done afterward, from the record of trades</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>5,000 symbols; 1 billion messages a day (new orders, cancels); the peak 10 times the average, around the open and the close</td></tr>
+<tr><th>Latency</th><td>An order acknowledged within tens of microseconds of reaching the exchange; matching itself around a microsecond</td></tr>
+<tr><th>Fairness</th><td>Orders handled strictly in the order they were sequenced; the same feed at the same moment for every subscriber</td></tr>
+<tr><th>Durability</th><td>No acknowledged order or trade is ever lost</td></tr>
+<tr><th>Availability</th><td>A backup takes over within seconds; when in doubt, trading halts rather than continues wrongly</td></tr>
+<tr><th>Consistency</th><td>One order of events, identical in the engine, its backups and the market data</td></tr>
+</tbody>
+</table>
+<p>A <dfn>limit order</dfn> is an order to buy or sell a quantity at a stated price or better, which waits in the book if it cannot trade at once. A <dfn>market order</dfn> trades immediately at the best prices available, and whatever cannot trade is canceled rather than left waiting.</p>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">messages: 1 billion a day ÷ 23,400 s (a 6.5-hour session) ≈ 42,700 a second; at 10 times the average, 427,000 a second<br>
+time per message at the peak, if one thread handles every symbol: 1 ÷ 427,000 ≈ 2.3 µs<br>
+journal: 1 billion × 64 bytes ≈ 64 GB a day, written in order<br>
+market data: 427,000 a second × 36.3 bytes a command (measured below) × 8 ≈ 124 Mbit/s at the peak<br>
+open orders in memory: 10 million resting × 134 bytes (measured below) ≈ 1.3 GB</div>
+<p>The numbers make three decisions (<x-ref to="estimation#method"></x-ref>). Everything fits in the memory of one ordinary server, so the books live in memory. Even one thread for all symbols has 2.3 µs per message at the peak, so there is no need to share a book between threads, and good reason not to: locks would cost more than the work. And a disk write takes longer than that budget, so no message can wait for its own write to disk; the journal is written in large sequential batches, or copied to a backup’s memory, as <x-ref to="hld-stock-exchange#sequencing"></x-ref> describes.</p>
+
+<div class="widget" data-widget="exchange96">
+<h4>The exchange’s load and its time budget</h4>
+<p>What the busiest matching engine must handle at the peak, how long it has for each message, and what the journal, the feed and the open orders take.</p>
+<div class="controls">
+  <label>Messages a day, millions<input type="number" name="msgs" value="1000" min="0" max="100000" step="100"></label>
+  <label>Trading hours<input type="number" name="hours" value="6.5" min="0.5" max="24" step="0.5"></label>
+  <label>Peak, times the average<input type="number" name="peak" value="10" min="1" max="100" step="1"></label>
+  <label>Share on the busiest engine, %<input type="number" name="share" value="100" min="1" max="100" step="1"></label>
+  <label>Orders resting at once, millions<input type="number" name="resting" value="10" min="0" max="1000" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 150" role="img" aria-label="Bars comparing the time available for each message at the peak with the measured time to match one command, and to match it and parse it from JSON."><text x="222" y="29" class="ts end">Time for each message at the peak</text><rect x="230" y="18" width="284.5" height="16" rx="2" class="bar store"></rect><circle cx="514.5" cy="26" r="5" class="dot"></circle><text x="524.5" y="30" class="ts tb">2.34 µs</text><text x="222" y="65" class="ts end">Match one command (measured)</text><rect x="230" y="54" width="72.7" height="16" rx="2" class="bar"></rect><text x="312.7" y="66" class="ts tb">598 ns</text><text x="222" y="101" class="ts end">Match, and parse it from JSON</text><rect x="230" y="90" width="294.6" height="16" rx="2" class="bar mute"></rect><text x="534.6" y="102" class="ts tb">2.42 µs</text><text x="10" y="140" class="ts">One engine thread handles one message after another: the work for each must fit in the time between them.</text></svg>
+<dl class="results">
+  <div><dt>Average</dt><dd data-out="avg">42.7 thousand a second</dd></div>
+  <div><dt>Peak</dt><dd data-out="peakrate">427 thousand a second</dd></div>
+  <div><dt>Busiest engine at the peak</dt><dd data-out="busiest">427 thousand a second</dd></div>
+  <div><dt>Time for each message there</dt><dd data-out="budget">2.34 µs</dd></div>
+  <div><dt>Journal a day</dt><dd data-out="journal">64 GB</dd></div>
+  <div><dt>Market data at the peak</dt><dd data-out="feed">124 Mbit/s</dd></div>
+  <div><dt>Open orders in memory</dt><dd data-out="memory">1.34 GB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At the peak the busiest engine receives 427 thousand messages a second, leaving 2.34 µs for each. The chapter’s engine took 598 ns on average in one run, so it keeps up with 3.9 times headroom, but parsing JSON as well would not fit.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<p>Real exchanges take orders over long-lived TCP sessions in binary protocols, such as Nasdaq’s OUCH, or in FIX, a text protocol shared across the industry. The shapes below are written as HTTP for readability; the content is the same.</p>
+<pre data-lang="http" data-title="Placing, canceling, and the stream of execution reports">
+POST /v1/orders
+{ "client_order_id": "c-881", "symbol": "ACME", "side": "buy", "type": "limit",
+  "price": "10.02", "quantity": 700, "time_in_force": "day" }
+202 Accepted   { "order_id": 7, "client_order_id": "c-881" }
+422            { "error": "risk_limit", "detail": "price more than 10% from the last trade" }
+
+DELETE /v1/orders/7
+200 OK         { "order_id": 7, "canceled": 100 }
+409 Conflict   { "error": "not_resting", "detail": "order 7 has traded or been canceled" }
+
+GET /v1/executions?after=1041          the session's own numbered stream
+{ "seq": 1042, "order_id": 7, "type": "fill", "price": "10.01", "quantity": 200, "open": 500 }
+{ "seq": 1043, "order_id": 7, "type": "fill", "price": "10.01", "quantity": 100, "open": 400 }
+</pre>
+<pre data-lang="http" data-title="Market data: a snapshot, then the numbered feed from where it ends">
+GET /v1/market-data/ACME/snapshot
+{ "sequence": 11, "bids": [["10.02", 100, 1], ["10.00", 300, 1]], "asks": [["10.03", 500, 1]] }
+</pre>
+<p>Three details matter. The client order id is unique within the broker’s session, so a broker that reconnects and sends an order again gets the original back instead of a second order (<x-ref to="idempotency-and-delivery#keys"></x-ref>). Prices travel as decimal text or whole ticks, never as floating-point numbers, because 10.01 has no exact binary form. And every stream is numbered: execution reports, so a broker can ask for what it missed after a reconnect, as FIX sessions do with a resend request; and market data, so a subscriber can tell that a snapshot taken at 11 continues with message 12. A cancel can lose a race: if the order traded a microsecond earlier, the answer is a conflict, not an error in the exchange.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Where</th></tr></thead>
+<tbody>
+<tr><th>Order books</th><td>symbol, then price</td><td>For each price, a queue of resting orders: id, owner, quantity left</td><td>The engine’s memory only; rebuilt from the journal</td></tr>
+<tr><th>Journal</th><td>sequence number</td><td>Every order and cancel as received, with the time it was sequenced</td><td>Append-only files on the sequencer and on every replica (<x-ref to="storage-engines#wal"></x-ref>)</td></tr>
+<tr><th>Snapshots</th><td>sequence number</td><td>Every resting order, in priority order</td><td>Files, taken while trading continues</td></tr>
+<tr><th>Trades</th><td>match number</td><td>Price, quantity, buying and selling orders</td><td>The engine’s output log, then a relational database for clearing and reports</td></tr>
+<tr><th>Market data</th><td>feed sequence number</td><td>Order added, executed, deleted</td><td>The publisher’s log, the re-request server, then an archive in object storage</td></tr>
+<tr><th>Reference data</th><td>symbol, broker</td><td>Tick size, trading status, each broker’s limits</td><td>A relational database, loaded into the gateways before the open</td></tr>
+</tbody>
+</table>
+<p>The <dfn>order book</dfn> is the list of resting buy and sell orders for one symbol, arranged by price. It is never written to a database. It is derived state: the journal is the truth, and the book is what applying the journal produces, which is <x-ref to="event-driven-architecture#event-sourcing"></x-ref> applied to the busiest object in the system. The highest buy price is the best bid, the lowest sell price the best ask, and the gap between them is the <dfn>spread</dfn>.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f961t f961d">
+<title id="f961t">A stock exchange: one sequenced stream through the matching engine</title>
+<desc id="f961d">Brokers connect to order gateways, which check every order against limits from reference data. Gateways pass orders and cancels to the sequencer, which gives each one the next number, writes it to the journal and sends the same numbered stream to the matching engine and to a backup engine. The engine keeps every order book in memory and matches by price and then time. It sends execution reports back through the gateways to the brokers, and publishes every change to the books as a multicast market data feed. Trades go later to clearing, surveillance and reports.</desc>
+<rect class="n" x="10" y="52" width="80" height="50" rx="6"/>
+<text class="tb mid" x="50" y="81.5">Brokers</text>
+<rect class="n sig" x="124" y="52" width="130" height="50" rx="6"/>
+<text class="tb mid" x="189" y="73">Order gateways</text>
+<text class="ts mid" x="189" y="90">sessions, risk</text>
+<rect class="n sig" x="288" y="52" width="110" height="50" rx="6"/>
+<text class="tb mid" x="343" y="73">Sequencer</text>
+<text class="ts mid" x="343" y="90">numbers all</text>
+<rect class="n sig" x="432" y="52" width="142" height="50" rx="6"/>
+<text class="tb mid" x="503" y="73">Matching engine</text>
+<text class="ts mid" x="503" y="90">books in memory</text>
+<rect class="n" x="608" y="52" width="106" height="50" rx="6"/>
+<text class="tb mid" x="661" y="73">Market data</text>
+<text class="ts mid" x="661" y="90">the feed</text>
+<rect class="n store" x="124" y="156" width="130" height="50" rx="6"/>
+<text class="tb mid" x="189" y="177">Reference data</text>
+<text class="ts mid" x="189" y="194">symbols, limits</text>
+<rect class="n store" x="288" y="156" width="110" height="50" rx="6"/>
+<text class="tb mid" x="343" y="177">Journal</text>
+<text class="ts mid" x="343" y="194">every command</text>
+<rect class="n" x="432" y="156" width="142" height="50" rx="6"/>
+<text class="tb mid" x="503" y="177">Backup engine</text>
+<text class="ts mid" x="503" y="194">same stream</text>
+<rect class="n" x="608" y="156" width="106" height="50" rx="6"/>
+<text class="tb mid" x="661" y="177">Subscribers</text>
+<text class="ts mid" x="661" y="194">firms, vendors</text>
+<rect class="n async" x="432" y="236" width="282" height="44" rx="6"/>
+<text class="tb mid" x="573" y="262.5">Clearing, surveillance, reports</text>
+<path class="e sig both" d="M90 77H124"/>
+<path class="e sig" d="M254 77H288"/>
+<path class="e sig" d="M398 77H432"/>
+<text class="ts mid" x="415" y="70">seq</text>
+<path class="e sig" d="M503 52V36H189V52"/>
+<text class="ts mid" x="346" y="31">execution reports to each broker</text>
+<path class="e" d="M574 77H608"/>
+<path class="e" d="M661 102V156"/>
+<text class="ts" x="667" y="134">multicast</text>
+<path class="e store" d="M343 102V156"/>
+<text class="ts" x="349" y="134">write</text>
+<path class="e sig" d="M398 92H415V181H432"/>
+<path class="e store" d="M189 156V102"/>
+<text class="ts" x="195" y="134">limits</text>
+<path class="e async" d="M574 92H591V236"/>
+<text class="ts end" x="585" y="228">trades</text>
+<text class="ts" x="10" y="230">Solid: the path of every order,</text>
+<text class="ts" x="10" y="246">measured in microseconds.</text>
+<text class="ts" x="10" y="268">Dashed: work done after the fact.</text>
+</svg>
+</div>
+<figcaption>Fairness and recovery both come from one numbered stream: the sequencer decides the order once, and every engine that applies the stream reaches the same books.</figcaption>
+</figure>
+
+<p>Brokers connect to <b>order gateways</b>, which hold their sessions and reject any order that breaks the broker’s limits: a price far from the market, a size too large, too much exposure in total. Checks belong here, before sequencing, so that the engine never spends its budget on orders it will refuse. Gateways forward what passes to the <b>sequencer</b>, which gives each message the next number, makes it durable and sends the numbered stream to the engine and its backups. The <dfn>matching engine</dfn> is the component that holds the order books and turns the sequenced stream of orders into trades, applying one message at a time. Its output goes three ways: execution reports back through each party’s gateway, market data to every subscriber, and trades to the systems that settle them later.</p>
+
+<figure class="fig wide" id="fig-order-path">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f962t f962d">
+<title id="f962t">The path of one order, from a broker to the market data feed</title>
+<desc id="f962d">A sequence of nine steps. A broker sends a limit order to buy 700 at 10.02 to its gateway. The gateway checks it against risk limits and forwards it to the sequencer, which numbers it 7, writes it to the journal and to the backup, and passes it to the matching engine. The engine makes three trades and leaves 100 shares resting, sends the fills back through the gateway to the broker as execution reports, and publishes three executions and one new order on the market data feed.</desc>
+<text class="tb mid" x="60" y="20">Broker</text>
+<line class="axis" x1="60" y1="28" x2="60" y2="294"/>
+<text class="tb mid" x="200" y="20">Gateway</text>
+<line class="axis" x1="200" y1="28" x2="200" y2="294"/>
+<text class="tb mid" x="350" y="20">Sequencer</text>
+<line class="axis" x1="350" y1="28" x2="350" y2="294"/>
+<text class="tb mid" x="500" y="20">Engine</text>
+<line class="axis" x1="500" y1="28" x2="500" y2="294"/>
+<text class="tb mid" x="650" y="20">Market data</text>
+<line class="axis" x1="650" y1="28" x2="650" y2="294"/>
+<g data-s="1">
+<path class="e sig" d="M61 58H199"/>
+<text class="ts mid" x="130.0" y="52">1. buy 700 at 10.02</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n sig" x="148.3" y="72" width="103.4" height="22" rx="4"/>
+<text class="ts mid" x="200" y="87">2. risk checks</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M201 114H349"/>
+<text class="ts mid" x="275.0" y="108">3. order + client id</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n store" x="264.75" y="128" width="170.5" height="22" rx="4"/>
+<text class="ts mid" x="350" y="143">4. seq 7: journal, backup</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M351 170H499"/>
+<text class="ts mid" x="425.0" y="164">5. command 7</text>
+</g>
+<g data-s="6" data-packet="none">
+<rect class="n sig" x="426.95" y="184" width="146.1" height="22" rx="4"/>
+<text class="ts mid" x="500" y="199">6. 3 trades, 100 rest</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M499 226H201"/>
+<text class="ts mid" x="350.0" y="220">7. fills 200, 100, 300</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M199 254H61"/>
+<text class="ts mid" x="130.0" y="248">8. execution reports</text>
+</g>
+<g data-s="9">
+<path class="e" d="M501 282H649"/>
+<text class="ts mid" x="575.0" y="276">9. 3 executed, 1 add</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Journal: 6 commands; Best bid and ask: 10.00 / 10.01">The broker sends a limit order: buy 700 shares at no more than 10.02, with its own client order id.</li>
+  <li data-msg="none">The gateway checks the broker’s limits: price near the market, size, total exposure. A bad order stops here.</li>
+  <li>The gateway forwards it. Its place in line is not decided yet: another gateway may be sending at the same moment.</li>
+  <li data-msg="none" data-state="Journal: 7 commands; Best bid and ask: 10.00 / 10.01">The sequencer gives it the next number, 7, and makes it durable in the journal and the backup engine.</li>
+  <li>Only now does the engine see it. The number, not any gateway’s clock, decides its place.</li>
+  <li data-msg="none" data-state="Journal: 7 commands; Best bid and ask: 10.02 / 10.03">The engine matches in memory: 300 shares at 10.01, 300 at 10.02, and the last 100 rest as the best bid.</li>
+  <li>The engine reports the fills to the gateways of the buyer and the three sellers.</li>
+  <li>The broker learns its order traded 600 shares and has 100 left open.</li>
+  <li>The same changes go to everyone on the market data feed, numbered so a receiver can tell if it missed one.</li>
+</ol>
+<figcaption>The order’s position in line is fixed by the sequencer, in one place, before any matching. Everything after that is a computation every replica can repeat exactly.</figcaption>
+</figure>
+
+<p>The path is short on purpose: three hops, all inside one building, each done by a program that holds everything it needs in memory. No step waits on a database, and no step after the sequencer makes a decision that depends on anything but the stream.</p>
+
+<h2 id="matching">Step 6a: The order book and matching</h2>
+<p>The rule that decides who trades is <dfn>price-time priority</dfn>: an incoming order trades first with the best price on the other side, and among resting orders at the same price, with the one that arrived first. The trade happens at the resting order’s price, so a buyer willing to pay 10.02 who finds a seller at 10.01 pays 10.01.</p>
+
+<figure class="fig wide" id="fig-matching">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 292" role="img" aria-labelledby="f963t f963d">
+<title id="f963t">A buy order crossing the book, by price and then by time</title>
+<desc id="f963d">Sellers rest at 10.01 (order 1 for 200, then order 2 for 100), 10.02 (order 3, 300) and 10.03 (order 4, 500); buyers at 10.00 and 9.99. Order 7, to buy 700 at up to 10.02, fills 200 from order 1 and 100 from order 2 at 10.01, then 300 from order 3 at 10.02, and its last 100 rest as the best bid. Then order 6 is canceled. These are the chapter’s code’s results.</desc>
+<text class="ts tb end" x="236" y="46">Bids: buy orders</text>
+<text class="ts tb mid" x="280" y="46">Price</text>
+<text class="ts tb" x="324" y="46">Asks: sell orders</text>
+<text class="ts tb" x="520" y="46">Trades, at the resting order’s price</text>
+<rect class="n sunk" x="252" y="62" width="56" height="28" rx="4"/>
+<text class="ts mid tb" x="280" y="80">10.03</text>
+<rect class="n sunk" x="252" y="96" width="56" height="28" rx="4"/>
+<text class="ts mid tb" x="280" y="114">10.02</text>
+<rect class="n sunk" x="252" y="130" width="56" height="28" rx="4"/>
+<text class="ts mid tb" x="280" y="148">10.01</text>
+<rect class="n sunk" x="252" y="164" width="56" height="28" rx="4"/>
+<text class="ts mid tb" x="280" y="182">10.00</text>
+<rect class="n sunk" x="252" y="198" width="56" height="28" rx="4"/>
+<text class="ts mid tb" x="280" y="216">9.99</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n " x="152" y="164" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="182">#5  300</text>
+<rect class="n " x="152" y="198" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="216">#6  200</text>
+<rect class="n " x="324" y="130" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="148">#1  200</text>
+<rect class="n " x="414" y="130" width="84" height="28" rx="4"/>
+<text class="ts mid" x="456.0" y="148">#2  100</text>
+<rect class="n " x="324" y="96" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="114">#3  300</text>
+<rect class="n " x="324" y="62" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="80">#4  500</text>
+<text class="ts" x="10" y="252">Best bid 10.00, best ask 10.01: the spread is one cent, and nothing can trade.</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n " x="152" y="164" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="182">#5  300</text>
+<rect class="n " x="152" y="198" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="216">#6  200</text>
+<rect class="n " x="324" y="130" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="148">#1  200</text>
+<rect class="n " x="414" y="130" width="84" height="28" rx="4"/>
+<text class="ts mid" x="456.0" y="148">#2  100</text>
+<rect class="n " x="324" y="96" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="114">#3  300</text>
+<rect class="n " x="324" y="62" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="80">#4  500</text>
+<rect class="n sig" x="10" y="62" width="136" height="44" rx="4"/>
+<text class="ts mid tb" x="78" y="80">#7 buy 700</text>
+<text class="ts mid" x="78" y="97">at up to 10.02</text>
+<text class="ts" x="10" y="252">It is willing to pay 10.02, and sellers ask 10.01 and 10.02: it crosses the book.</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n " x="152" y="164" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="182">#5  300</text>
+<rect class="n " x="152" y="198" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="216">#6  200</text>
+<rect class="n store" x="324" y="130" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="148">#1  200 → 0</text>
+<rect class="n " x="414" y="130" width="84" height="28" rx="4"/>
+<text class="ts mid" x="456.0" y="148">#2  100</text>
+<rect class="n " x="324" y="96" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="114">#3  300</text>
+<rect class="n " x="324" y="62" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="80">#4  500</text>
+<rect class="n sig" x="10" y="62" width="136" height="44" rx="4"/>
+<text class="ts mid tb" x="78" y="80">#7 buy 500</text>
+<text class="ts mid" x="78" y="97">left after 1 trade</text>
+<text class="ts" x="520" y="72">200 at 10.01: #7 buys from #1</text>
+<text class="ts" x="10" y="252">Best price first, 10.01, and at that price the oldest order, #1.</text>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n " x="152" y="164" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="182">#5  300</text>
+<rect class="n " x="152" y="198" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="216">#6  200</text>
+<rect class="n store" x="324" y="130" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="148">#2  100 → 0</text>
+<rect class="n " x="324" y="96" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="114">#3  300</text>
+<rect class="n " x="324" y="62" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="80">#4  500</text>
+<rect class="n sig" x="10" y="62" width="136" height="44" rx="4"/>
+<text class="ts mid tb" x="78" y="80">#7 buy 400</text>
+<text class="ts mid" x="78" y="97">left after 2 trades</text>
+<text class="ts" x="520" y="72">200 at 10.01: #7 buys from #1</text>
+<text class="ts" x="520" y="94">100 at 10.01: #7 buys from #2</text>
+<text class="ts" x="10" y="252">Then #2, the next oldest at 10.01. The level is now empty.</text>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<rect class="n " x="152" y="164" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="182">#5  300</text>
+<rect class="n " x="152" y="198" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="216">#6  200</text>
+<rect class="n store" x="324" y="96" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="114">#3  300 → 0</text>
+<rect class="n " x="324" y="62" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="80">#4  500</text>
+<rect class="n sig" x="10" y="62" width="136" height="44" rx="4"/>
+<text class="ts mid tb" x="78" y="80">#7 buy 100</text>
+<text class="ts mid" x="78" y="97">left after 3 trades</text>
+<text class="ts" x="520" y="72">200 at 10.01: #7 buys from #1</text>
+<text class="ts" x="520" y="94">100 at 10.01: #7 buys from #2</text>
+<text class="ts" x="520" y="116">300 at 10.02: #7 buys from #3</text>
+<text class="ts" x="10" y="252">The next price, 10.02, is still within its limit: #3 sells all 300.</text>
+</g>
+<g class="hide" data-s="6" data-e="6">
+<rect class="n sig" x="152" y="96" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="114">#7  100</text>
+<rect class="n " x="152" y="164" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="182">#5  300</text>
+<rect class="n " x="152" y="198" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="216">#6  200</text>
+<rect class="n " x="324" y="62" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="80">#4  500</text>
+<rect class="n sig" x="10" y="62" width="136" height="44" rx="4"/>
+<text class="ts mid tb" x="78" y="80">#7 buy 100</text>
+<text class="ts mid" x="78" y="97">rests at 10.02</text>
+<text class="ts" x="520" y="72">200 at 10.01: #7 buys from #1</text>
+<text class="ts" x="520" y="94">100 at 10.01: #7 buys from #2</text>
+<text class="ts" x="520" y="116">300 at 10.02: #7 buys from #3</text>
+<text class="ts" x="10" y="252">10.03 is above its limit. The last 100 rest as a bid: best bid 10.02, best ask 10.03.</text>
+</g>
+<g class="hide" data-s="7">
+<rect class="n sig" x="152" y="96" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="114">#7  100</text>
+<rect class="n " x="152" y="164" width="84" height="28" rx="4"/>
+<text class="ts mid" x="194.0" y="182">#5  300</text>
+<rect class="n " x="324" y="62" width="84" height="28" rx="4"/>
+<text class="ts mid" x="366.0" y="80">#4  500</text>
+<text class="ts" x="520" y="72">200 at 10.01: #7 buys from #1</text>
+<text class="ts" x="520" y="94">100 at 10.01: #7 buys from #2</text>
+<text class="ts" x="520" y="116">300 at 10.02: #7 buys from #3</text>
+<text class="ts" x="10" y="252">Order 6 is canceled: unlinked from its level in one step, and the empty level removed.</text>
+</g>
+<text class="ts" x="10" y="280">Each price level is a queue, oldest first. The book is never left crossed: best bid below best ask.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Best bid: 10.00; Best ask: 10.01; Order 7 left: not yet sent">Six orders rest in the book. Sellers queue at 10.01, 10.02 and 10.03; buyers at 10.00 and 9.99.</li>
+  <li data-msg="none" data-state="Best bid: 10.00; Best ask: 10.01; Order 7 left: 700">Order 7 arrives: buy 700 shares, paying at most 10.02. Some sellers ask less than that, so it will trade at once.</li>
+  <li data-msg="none" data-state="Best bid: 10.00; Best ask: 10.01; Order 7 left: 500">It trades with the best price first. At 10.01 there are two orders, and the one that arrived first, #1, fills first: 200 shares at 10.01.</li>
+  <li data-msg="none" data-state="Best bid: 10.00; Best ask: 10.02; Order 7 left: 400">Next in line at 10.01 is #2: 100 shares. The buyer pays 10.01, the resting order’s price, not its own limit.</li>
+  <li data-msg="none" data-state="Best bid: 10.00; Best ask: 10.03; Order 7 left: 100">The next level, 10.02, is still within the limit: 300 shares from #3. Three trades so far, 600 shares.</li>
+  <li data-msg="none" data-state="Best bid: 10.02; Best ask: 10.03; Order 7 left: 100 resting">The next ask, 10.03, is above the limit, so matching stops. The 100 shares left join the book as the new best bid.</li>
+  <li data-msg="none" data-state="Best bid: 10.02; Best ask: 10.03; Order 7 left: 100 resting">A cancel arrives for order 6. A map from order id to its place in the queue removes it without searching.</li>
+</ol>
+<figcaption>Price first, then time. The trades and the final book are the output of the chapter’s order book for these eight commands.</figcaption>
+</figure>
+
+<p>The data structure follows from the rule. Each side of the book keeps its prices sorted, best first, and each price holds a <i>level</i>: a queue of orders, oldest first, kept as a doubly linked list with a running total. A map from order id to its place in a queue makes a cancel a matter of unlinking one node. Matching only ever touches the front of the best queue.</p>
+<pre data-lang="ts" data-title="Matching: the best price first, the oldest order at that price first">
+out.push({ type: "accepted", id });
+    const opposite = cmd.side === "buy" ? this.asks : this.bids;
+    let left = cmd.qty;
+    while (left > 0) {
+      const level = opposite.best();
+      if (!level) break;
+      if (cmd.type === "limit" && (cmd.side === "buy" ? level.price > cmd.price : level.price < cmd.price)) break;
+      const maker = level.head as Resting;         // the oldest order at the best price trades first
+      const qty = Math.min(left, maker.qty);
+      left -= qty; maker.qty -= qty; level.total -= qty;
+      out.push({ type: "trade", taker: id, maker: maker.id, side: cmd.side, price: level.price, qty, makerLeft: maker.qty });
+      if (maker.qty === 0) {
+        level.unlink(maker);
+        this.byId.delete(maker.id);
+        if (level.count === 0) opposite.drop(level);
+      }
+    }
+</pre>
+<p>Adding at an existing price, canceling and each fill take constant time. Only a new price costs more: a binary search and an insert among the levels, of which there are dozens to hundreds near the market. When prices stay in a known band, an array indexed by tick removes even that.</p>
+<p>Fast code that is subtly wrong is worse than slow code here, so the test checks the book against a naive matcher that sorts every candidate again for each incoming order. Over 400,000 random commands in 200 seeded runs, mixing resting orders, crossing orders, market orders and late cancels, both produced identical events: 140,088 trades, 209,791 orders resting, 47,691 cancels and 72,377 refusals, almost all of them cancels that arrived after their order had traded. After every command the book was not crossed, meaning the best bid stayed below the best ask, and at the end every share of every order was accounted for as traded, canceled or still resting.</p>
+
+<h2 id="sequencing">Step 6b: One order for everything</h2>
+<p>Price-time priority needs a time, and in a distributed system there is no shared clock to read it from (<x-ref to="distributed-fundamentals#skew"></x-ref>). Two gateways stamping orders with their own clocks would disagree by more than the gaps between orders. The answer is a <dfn>sequencer</dfn>: the single component through which every order and cancel passes, which assigns each one the next number and so defines the order in which everything happened. “Time” in the book is that number. The engine is then a state machine whose input is the numbered stream, the technique of <x-ref to="consensus#problem"></x-ref> applied to one busy machine.</p>
+<pre data-lang="ts" data-title="Engine.apply: exactly the next number, or stop">
+apply(input: Sequenced, out: Output[] = []): Output[] {
+    // A gap or a repeat means this replica has not seen exactly the input the others saw: stop, do not guess.
+    if (input.seq !== this.lastSeq + 1) throw new Error(`expected input ${this.lastSeq + 1}, got ${input.seq}`);
+    this.lastSeq = input.seq;
+    let book = this.books.get(input.symbol);
+    if (!book) { book = new OrderBook(); this.books.set(input.symbol, book); }
+    const events: BookEvent[] = [];
+    book.submit(input.cmd, input.seq, events);
+    for (const event of events) {
+      out.push({ seq: input.seq, time: input.time, symbol: input.symbol, event });
+      this.outHash = digest(this.outHash, event);
+    }
+    return out;
+  }
+</pre>
+<p>For this to work, the engine must be deterministic: no reading of the clock, no random numbers, no iteration over anything whose order could change. The time it needs arrives inside the message, stamped by the sequencer. Then any copy that applies the same stream reaches the same state. The test sequenced 200,000 random commands for eight symbols to a primary and a backup engine, replayed the journal into a third, and restored a fourth from a snapshot taken at command 100,000 before applying the rest. All four ended with the same fingerprint of their books and the same checksum of the 388,577 events they had produced. An engine given a gap or a repeated number refuses it.</p>
+<p>What happens without one agreed order is easy to underestimate, so the chapter measured it. Two gateways each sent 300 orders for one stock, at about 100,000 a second each, to two replicas over separate paths that delayed each message by a random amount. Each replica matched in its own order of arrival.</p>
+
+<figure class="fig wide" id="fig-divergence">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f964t f964d">
+<title id="f964t">Two replicas without a sequencer: how often they disagree</title>
+<desc id="f964d">For each amount of random network delay, 200 runs in which two gateways send 300 orders each and two replicas match them in the order each received them. up to 0 µs: disagreed in 0 runs, 0.0 percent; up to 0.1 µs: disagreed in 6 runs, 3.0 percent; up to 0.25 µs: disagreed in 24 runs, 12.0 percent; up to 0.5 µs: disagreed in 43 runs, 21.5 percent; up to 1 µs: disagreed in 71 runs, 35.5 percent; up to 2 µs: disagreed in 122 runs, 61.0 percent; up to 5 µs: disagreed in 173 runs, 86.5 percent; up to 10 µs: disagreed in 195 runs, 97.5 percent; up to 20 µs: disagreed in 200 runs, 100.0 percent.</desc>
+<text class="tb" x="10" y="18">Runs in which the two replicas made different trades, of 200, by the random delay on each path</text>
+<line class="grid" x1="70" y1="220.0" x2="700" y2="220.0"/>
+<text class="ts end" x="62" y="224.0">0%</text>
+<line class="grid" x1="70" y1="175.0" x2="700" y2="175.0"/>
+<text class="ts end" x="62" y="179.0">25%</text>
+<line class="grid" x1="70" y1="130.0" x2="700" y2="130.0"/>
+<text class="ts end" x="62" y="134.0">50%</text>
+<line class="grid" x1="70" y1="85.0" x2="700" y2="85.0"/>
+<text class="ts end" x="62" y="89.0">75%</text>
+<line class="grid" x1="70" y1="40.0" x2="700" y2="40.0"/>
+<text class="ts end" x="62" y="44.0">100%</text>
+<path class="line" d="M100.0 220.0 L171.2 214.6 L242.5 198.4 L313.8 181.3 L385.0 156.1 L456.2 110.2 L527.5 64.3 L598.8 44.5 L670.0 40.0"/>
+<circle class="dot" cx="100.0" cy="220.0" r="4"/>
+<text class="ts mid" x="100.0" y="238">0</text>
+<circle class="dot" cx="171.2" cy="214.6" r="4"/>
+<text class="ts mid" x="171.2" y="238">0.1</text>
+<circle class="dot" cx="242.5" cy="198.4" r="4"/>
+<text class="ts mid" x="242.5" y="238">0.25</text>
+<circle class="dot" cx="313.8" cy="181.3" r="4"/>
+<text class="ts mid" x="313.8" y="238">0.5</text>
+<circle class="dot" cx="385.0" cy="156.1" r="4"/>
+<text class="ts mid" x="385.0" y="238">1</text>
+<circle class="dot" cx="456.2" cy="110.2" r="4"/>
+<text class="ts mid" x="456.2" y="238">2</text>
+<circle class="dot" cx="527.5" cy="64.3" r="4"/>
+<text class="ts mid" x="527.5" y="238">5</text>
+<circle class="dot" cx="598.8" cy="44.5" r="4"/>
+<text class="ts mid" x="598.8" y="238">10</text>
+<circle class="dot" cx="670.0" cy="40.0" r="4"/>
+<text class="ts mid" x="670.0" y="238">20</text>
+<text class="ts tb end" x="234.5" y="188.4">12%</text>
+<text class="ts tb end" x="377.0" y="146.1">36%</text>
+<text class="ts tb end" x="519.5" y="54.3">86%</text>
+<text class="ts tb end" x="662.0" y="30.0">100%</text>
+<text class="ts mid" x="385.0" y="258">random delay added to each message on each path, up to this many microseconds</text>
+<text class="ts" x="409.0" y="210">With a sequencer: one journal, so they agree</text>
+<rect class="hit" x="70" y="30" width="60" height="210" data-tip="Delay up to 0 µs|replicas disagreed in 0 of 200 runs (0.0%)|0 of 84,026 orders filled differently"/>
+<rect class="hit" x="141.25" y="30" width="60" height="210" data-tip="Delay up to 0.1 µs|replicas disagreed in 6 of 200 runs (3.0%)|8 of 84,026 orders filled differently"/>
+<rect class="hit" x="212.5" y="30" width="60" height="210" data-tip="Delay up to 0.25 µs|replicas disagreed in 24 of 200 runs (12.0%)|31 of 84,026 orders filled differently"/>
+<rect class="hit" x="283.75" y="30" width="60" height="210" data-tip="Delay up to 0.5 µs|replicas disagreed in 43 of 200 runs (21.5%)|53 of 84,026 orders filled differently"/>
+<rect class="hit" x="355" y="30" width="60" height="210" data-tip="Delay up to 1 µs|replicas disagreed in 71 of 200 runs (35.5%)|89 of 84,026 orders filled differently"/>
+<rect class="hit" x="426.25" y="30" width="60" height="210" data-tip="Delay up to 2 µs|replicas disagreed in 122 of 200 runs (61.0%)|150 of 84,026 orders filled differently"/>
+<rect class="hit" x="497.5" y="30" width="60" height="210" data-tip="Delay up to 5 µs|replicas disagreed in 173 of 200 runs (86.5%)|346 of 84,026 orders filled differently"/>
+<rect class="hit" x="568.75" y="30" width="60" height="210" data-tip="Delay up to 10 µs|replicas disagreed in 195 of 200 runs (97.5%)|619 of 84,026 orders filled differently"/>
+<rect class="hit" x="640" y="30" width="60" height="210" data-tip="Delay up to 20 µs|replicas disagreed in 200 of 200 runs (100.0%)|1,002 of 84,026 orders filled differently"/>
+</svg>
+</div>
+<figcaption>Measured: a fraction of a microsecond of disorder is enough for two copies of a correct engine to make different trades. Only one agreed order makes copies interchangeable.</figcaption>
+</figure>
+
+<p>With delays of up to a quarter of a microsecond, the replicas made different trades in 12% of runs. At one microsecond it was 36%, and at 20 microseconds every run. Only a small share of orders was affected, 89 of 84,026 at one microsecond, but one is enough: a backup that would have filled a different order cannot take over, and a replay cannot reproduce the day. With a sequencer, the order is decided once and every copy reads it.</p>
+<p>The sequencer is now the one component everything waits for, so it must be fast and must not lose what it has numbered. The design used by LMAX, described below, is to send each message to the backups and to the journal in parallel and let the engine process it only once both have it. The order is acknowledged after that, so a crash at any moment loses nothing that a broker was told about. Copying to a backup’s memory over a local network costs microseconds; waiting for a disk to confirm each message would cost far more. So the journal is written to disk in large batches, and until a batch is on disk, the copy in the backup’s memory is what protects each message (<x-ref to="replication#sync-async"></x-ref>). If the sequencer fails, a standby continues from the last number in the journal.</p>
+<p>Orders for different symbols never interact, so the exchange partitions by symbol: each group of symbols has its own sequencer, engine and backup (<x-ref to="partitioning#hot-keys"></x-ref>). What cannot be split is one symbol: its book must stay on one thread, and the busiest symbol sets the limit. The calculator’s “share on the busiest engine” is that limit.</p>
+
+<h2 id="market-data">Step 6c: Market data</h2>
+<p><dfn>Market data</dfn> is the stream of public information about an exchange’s books and trades. It comes in three levels of detail: the best bid and ask (level 1), the total quantity at each price (level 2), and every individual order as it is added, executed or deleted (level 3). The exchange publishes the most detailed one, and the other two are derived from it, which is what the test’s subscriber does. Every change becomes one message: in a run of 100,000 commands the engine produced 103,983, of which 41,862 were orders added to the book, 56,492 executions against resting orders and 5,629 deletions. Orders that trade on arrival never appear as added orders, only through the executions against the orders they hit.</p>
+<p>Thousands of subscribers want the same messages at the same moment, so the feed is sent by <dfn>multicast</dfn>: the network delivers one transmission to every receiver that has joined the group, and the sender does no work per receiver. It runs over UDP (<x-ref to="transport-protocols#udp"></x-ref>), so there are no acknowledgments and a packet can be lost. Sequence numbers make that safe.</p>
+
+<figure class="fig wide" id="fig-feed">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 304" role="img" aria-labelledby="f965t f965d">
+<title id="f965t">A lost packet on the market data feed, found and repaired</title>
+<desc id="f965d">A publisher sends numbered packets of market data messages. Packet 1 to 3 arrives. Packet 4 to 6 is lost. Packet 7 to 9 arrives, and the subscriber, which expected message 4, keeps it aside and asks the re-request server for 3 messages from number 4. They come back by unicast, and the subscriber applies 4 to 6 and then 7 to 9. Packet 10 to 11 arrives normally, and a heartbeat says the next message will be 12, so nothing is missing.</desc>
+<text class="tb mid" x="80" y="20">Publisher</text>
+<line class="axis" x1="80" y1="28" x2="80" y2="294"/>
+<text class="tb mid" x="380" y="20">Subscriber</text>
+<line class="axis" x1="380" y1="28" x2="380" y2="294"/>
+<text class="tb mid" x="630" y="20">Re-request server</text>
+<line class="axis" x1="630" y1="28" x2="630" y2="294"/>
+<g data-s="1">
+<path class="e" d="M81 58H379"/>
+<text class="ts mid" x="230.0" y="52">1. packet 1 to 3: three adds</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M81 86H278"/>
+<path class="x" d="M279 79l14 14M293 79l-14 14"/>
+<text class="ts mid" x="179.0" y="80">2. packet 4 to 6: three adds</text>
+</g>
+<g data-s="3">
+<path class="e" d="M81 114H379"/>
+<text class="ts mid" x="230.0" y="108">3. packet 7 to 9: 3 executed</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n fault" x="310" y="128" width="140" height="22" rx="4"/>
+<text class="ts mid" x="380" y="143">4. expected 4, got 7</text>
+</g>
+<g data-s="5">
+<path class="e" d="M381 170H629"/>
+<text class="ts mid" x="505.0" y="164">5. resend 3 from 4</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M629 198H381"/>
+<text class="ts mid" x="505.0" y="192">6. packet 4 to 6, unicast</text>
+</g>
+<g data-s="7" data-packet="none">
+<rect class="n store" x="285.6" y="212" width="188.8" height="22" rx="4"/>
+<text class="ts mid" x="380" y="227">7. apply 4 to 6, then 7 to 9</text>
+</g>
+<g data-s="8">
+<path class="e" d="M81 254H379"/>
+<text class="ts mid" x="230.0" y="248">8. packet 10 to 11: add, delete</text>
+</g>
+<g data-s="9">
+<path class="e" d="M81 282H379"/>
+<text class="ts mid" x="230.0" y="276">9. heartbeat: next is 12</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Applied: up to 3; Kept aside: none">Messages 1 to 3 arrive in one packet, as expected, and are applied.</li>
+  <li>The next packet is lost. Multicast has no acknowledgments, so nobody knows yet.</li>
+  <li data-state="Applied: up to 3; Kept aside: 7 to 9">Messages 7 to 9 arrive. They execute against orders the subscriber has not seen.</li>
+  <li data-msg="none">It expected 4, so it keeps 7 to 9 aside instead of guessing.</li>
+  <li>It asks the re-request server, which keeps every message, for the 3 it missed.</li>
+  <li>The missing messages come back to this subscriber alone.</li>
+  <li data-msg="none" data-state="Applied: up to 9; Kept aside: none">It applies 4 to 6, then the packet it kept. Its book matches the exchange again.</li>
+  <li data-state="Applied: up to 11; Kept aside: none">Normal flow resumes: order 7’s last 100 shares are added and order 6 deleted.</li>
+  <li>On a quiet feed, heartbeats carry the next number, so even a lost last packet is noticed.</li>
+</ol>
+<figcaption>Sequence numbers make a one-way multicast feed reliable enough: a receiver detects every gap, and repairs it from a server without slowing anyone else.</figcaption>
+</figure>
+
+<p>The test encoded the messages in the binary layouts of Nasdaq’s ITCH feed, packed them into packets with a header in the style of MoldUDP64, and dropped packets at random. With 1% lost, the subscriber found 23 gaps and repaired them with 23 requests; with 5% lost, 129 gaps, fewer than the 132 lost packets because neighbors lost together form one gap. Each time, the depth it rebuilt equaled the engine’s exactly. A subscriber that joins late, or falls too far behind, does not ask for the whole day: it loads a snapshot stamped with a sequence number and applies the feed from the next number on.</p>
+<p>The binary messages averaged 32.4 bytes against 80.0 for the same content as JSON, and with packet headers the feed came to 36.3 bytes for each command, the figure the estimate uses. Size matters less than what the receiver must do with each byte, which is the subject of the last deep dive.</p>
+<div class="note production"><p><span class="label">In production.</span> Exchanges sell <dfn>colocation</dfn>: space for a firm’s servers in the exchange’s own data center, connected by cables of the same length, so that the feed reaches every colocated firm at the same moment. Fairness at this scale is partly a question of cable lengths.</p></div>
+
+<h2 id="microseconds">Step 6d: Designing for microseconds</h2>
+<p>At the estimated peak one engine has about 2.3 µs for each message. The chapter’s engine, which is ordinary TypeScript running in Node, matched one million random commands at 1.67 million a second in one run, 598 ns each on average. So matching is not the problem. Everything around it can be.</p>
+
+<figure class="fig wide" id="fig-budget">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-labelledby="f966t f966d">
+<title id="f966t">Where a microsecond goes</title>
+<desc id="f966d">A bar chart on a logarithmic scale, from 100 nanoseconds to 10 milliseconds. Measured in one run of the chapter’s code: write and read a feed message, reused buffer, 166 ns; match one command, mean, 598 ns; write and read a feed message, new buffer, 961 ns; the same message as json, 1.82 µs; one command, 99.9th percentile, 17.4 µs; the slowest command in the run, 2.81 ms. For reference: light through 1 km of fiber, 5 µs; iex’s deliberate delay, 350 µs; a round trip inside a data center, 500 µs. A dashed line marks 2.34 µs, the time available for each message at the chapter’s estimated peak of 427,000 a second on one engine.</desc>
+<text class="tb" x="10" y="18">Time per item, logarithmic: each gridline is ten times the last</text>
+<rect class="bar" x="10" y="30" width="14" height="10" rx="2"/>
+<text class="ts" x="30" y="39">measured, one run, this chapter’s code in Node</text>
+<rect class="bar mute" x="350" y="30" width="14" height="10" rx="2"/>
+<text class="ts" x="370" y="39">for reference, from sources</text>
+<line class="grid" x1="262.0" y1="52" x2="262.0" y2="292"/>
+<text class="ts mid" x="262.0" y="308">100 ns</text>
+<line class="grid" x1="349.6" y1="52" x2="349.6" y2="292"/>
+<text class="ts mid" x="349.6" y="308">1 µs</text>
+<line class="grid" x1="437.2" y1="52" x2="437.2" y2="292"/>
+<text class="ts mid" x="437.2" y="308">10 µs</text>
+<line class="grid" x1="524.8" y1="52" x2="524.8" y2="292"/>
+<text class="ts mid" x="524.8" y="308">100 µs</text>
+<line class="grid" x1="612.4" y1="52" x2="612.4" y2="292"/>
+<text class="ts mid" x="612.4" y="308">1 ms</text>
+<line class="grid" x1="700.0" y1="52" x2="700.0" y2="292"/>
+<text class="ts mid" x="700.0" y="308">10 ms</text>
+<text class="ts end" x="254" y="71">Write and read a feed message, reused buffer</text>
+<rect class="bar" x="262" y="61" width="19.3" height="14" rx="2"/>
+<text class="ts tb" x="287.3" y="72">166 ns</text>
+<text class="ts end" x="254" y="97">Match one command, mean</text>
+<rect class="bar" x="262" y="87" width="68.0" height="14" rx="2"/>
+<text class="ts tb" x="336.0" y="98">598 ns</text>
+<text class="ts end" x="254" y="123">Write and read a feed message, new buffer</text>
+<rect class="bar" x="262" y="113" width="86.1" height="14" rx="2"/>
+<text class="ts tb" x="354.1" y="124">961 ns</text>
+<text class="ts end" x="254" y="149">The same message as JSON</text>
+<rect class="bar" x="262" y="139" width="110.5" height="14" rx="2"/>
+<text class="ts tb" x="378.5" y="150">1.82 µs</text>
+<text class="ts end" x="254" y="175">Light through 1 km of fiber</text>
+<rect class="bar mute" x="262" y="165" width="148.8" height="14" rx="2"/>
+<text class="ts tb" x="416.8" y="176">5 µs</text>
+<text class="ts end" x="254" y="201">One command, 99.9th percentile</text>
+<rect class="bar" x="262" y="191" width="196.2" height="14" rx="2"/>
+<text class="ts tb" x="464.2" y="202">17.4 µs</text>
+<text class="ts end" x="254" y="227">IEX’s deliberate delay</text>
+<rect class="bar mute" x="262" y="217" width="310.5" height="14" rx="2"/>
+<text class="ts tb" x="578.5" y="228">350 µs</text>
+<text class="ts end" x="254" y="253">A round trip inside a data center</text>
+<rect class="bar mute" x="262" y="243" width="324.0" height="14" rx="2"/>
+<text class="ts tb" x="592.0" y="254">500 µs</text>
+<text class="ts end" x="254" y="279">The slowest command in the run</text>
+<rect class="bar" x="262" y="269" width="389.7" height="14" rx="2"/>
+<text class="ts tb" x="657.7" y="280">2.81 ms</text>
+<path class="e none dash" d="M381.9 50V294"/>
+<text class="ts mid" x="385.9" y="326">Dashed: 2.34 µs per message at 427,000 a second</text>
+<rect class="hit" x="10" y="58" width="700" height="24" data-tip="Write and read a feed message, reused buffer|166 ns|measured once, Node v22.22.0"/>
+<rect class="hit" x="10" y="84" width="700" height="24" data-tip="Match one command, mean|598 ns|measured once, Node v22.22.0"/>
+<rect class="hit" x="10" y="110" width="700" height="24" data-tip="Write and read a feed message, new buffer|961 ns|measured once, Node v22.22.0"/>
+<rect class="hit" x="10" y="136" width="700" height="24" data-tip="The same message as JSON|1.82 µs|measured once, Node v22.22.0"/>
+<rect class="hit" x="10" y="162" width="700" height="24" data-tip="Light through 1 km of fiber|5 µs|from a source cited in the chapter"/>
+<rect class="hit" x="10" y="188" width="700" height="24" data-tip="One command, 99.9th percentile|17.4 µs|measured once, Node v22.22.0"/>
+<rect class="hit" x="10" y="214" width="700" height="24" data-tip="IEX’s deliberate delay|350 µs|from a source cited in the chapter"/>
+<rect class="hit" x="10" y="240" width="700" height="24" data-tip="A round trip inside a data center|500 µs|from a source cited in the chapter"/>
+<rect class="hit" x="10" y="266" width="700" height="24" data-tip="The slowest command in the run|2.81 ms|measured once, Node v22.22.0"/>
+</svg>
+</div>
+<figcaption>Matching itself is the cheap part. Text formats, extra network hops and pauses of the whole program are what break a budget of a few microseconds.</figcaption>
+</figure>
+
+<ul>
+  <li><b>One thread, no locks.</b> A book is touched by one thread only, so it needs no locks and never waits for another thread. Throughput comes from partitioning symbols, not from sharing a book.</li>
+  <li><b>Memory only, and no wait for the disk per message.</b> The engine holds everything it needs. Durability comes from the sequencer’s copies, done before the engine sees the message.</li>
+  <li><b>Fixed binary layouts, in buffers that are reused.</b> Encoding and parsing one message as JSON took 1,825 ns in the same run, three times the cost of matching. The binary layout took 961 ns with a new buffer for every message and 166 ns writing into one buffer that was reused: most of the cost was allocating memory, not the format.</li>
+  <li><b>No pauses.</b> The median command took 606 ns, including about 75 ns spent reading the clock twice, and the 99th percentile 1.8 µs. But the 99.9th percentile was 17.4 µs, and the slowest single command 2.8 ms. A pause of the whole program, such as the runtime collecting memory, lands on whichever order happens to be in flight. Production engines avoid creating garbage on this path, give each engine thread a processor core of its own, and read the network without going through the operating system’s usual stack.</li>
+  <li><b>Short distances.</b> Light covers 200 km in a millisecond in fiber (<x-ref to="multi-region#physics"></x-ref>): 5 µs per kilometer. A single round trip across an ordinary data center network, about half a millisecond (<x-ref to="estimation#latency-numbers"></x-ref>), is two hundred times the budget. So the parts of the critical path sit on one short network, and colocated firms sit beside them.</li>
+</ul>
+<p>The tail matters more than the average, for the reason <x-ref to="latency-and-throughput#tail-at-scale"></x-ref> gives: at 427,000 messages a second, a once-in-a-thousand pause happens hundreds of times a second, and during each one a queue builds that the next messages must wait behind.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>The matching engine</th><td>A pause; no acknowledged order lost</td><td>A backup that applied the same stream takes over. It is identical by construction, so there is nothing to reconcile</td></tr>
+<tr><th>The sequencer</th><td>Orders refused for a moment</td><td>A standby continues from the last journaled number; anything not yet journaled was never acknowledged, and brokers resend it</td></tr>
+<tr><th>A gateway</th><td>The broker’s session drops</td><td>The broker reconnects to another gateway and resends with the same client order ids; duplicates are refused</td></tr>
+<tr><th>A market data packet</th><td>A subscriber’s view is briefly incomplete</td><td>The gap is seen from the numbers and repaired by re-request, or by a snapshot</td></tr>
+<tr><th>A subscriber too slow for the feed</th><td>Its view falls behind</td><td>Multicast does not wait for anyone; the subscriber recovers from a snapshot</td></tr>
+<tr><th>A broker’s runaway program</th><td>A flood of orders</td><td>Limits per session at the gateway, a kill switch that cancels a broker’s orders, price bands, and trading pauses</td></tr>
+<tr><th>The whole data center</th><td>Trading stops</td><td>A recovery site with a copy of the journal reopens after checks (<x-ref to="disaster-recovery#objectives"></x-ref>); halting is better than trading on a state nobody can vouch for</td></tr>
+</tbody>
+</table>
+<p><b>At ten times the volume</b>, 10 billion messages a day, the peak is 4.3 million a second. Spread over 16 engines, with the busiest taking a tenth of the traffic, each message on that engine has 2.3 µs again; the feed reaches 1.2 Gbit/s and is split into several multicast groups by symbol. <b>At a hundred times</b>, the busiest symbol alone may exceed what one thread can do, and nothing in this design splits one book. That is where exchanges move the hottest paths into hardware, and where the rules of the market, such as minimum price steps and limits on message rates, become part of the capacity plan.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li>LMAX, a trading platform in London, ran its business logic on a single thread handling 6 million orders a second; input was journaled and copied to replicas before processing, and a full restart from a snapshot and a day’s journal took less than a minute (Martin Fowler, 12 July 2011).</li>
+  <li>Nasdaq’s TotalView-ITCH 5.0 specification (revision of 28 April 2023) defines the order-by-order feed used in the test: an add-order message of 36 bytes, an execution of 31 and a delete of 19, timestamps in nanoseconds since midnight and prices with four implied decimals, delivered over MoldUDP64. MoldUDP64 numbers the first message of each packet, sends heartbeats with a count of zero about once a second, and answers re-requests by unicast.</li>
+  <li>Nasdaq says its INET trading platform handles more than one million messages a second “at sub-40 microsecond speeds” (an undated page, checked in October 2026).</li>
+  <li>IEX delays incoming orders by 350 microseconds on purpose, using coiled optical fiber, 38 miles of it until it moved its primary data center in 2024 and 44 miles since, to keep the same delay (as of October 2026).</li>
+  <li>CME Globex supports nine matching algorithms (page updated 11 February 2025), among them first-in-first-out, which is price-time priority, and several pro-rata variants that share a fill among orders at a price in proportion to their size.</li>
+  <li>US markets pause all trading for 15 minutes if the S&amp;P 500 falls 7% or 13% in a day before 3:25 p.m., and stop for the day at 20%; a single stock pauses for five minutes if its price stays outside a band around its recent average for 15 seconds (SEC, checked October 2026).</li>
+  <li>On 1 August 2012, Knight Capital, a broker, sent more than 4 million orders in 45 minutes while trying to fill 212 customer orders, and lost more than $460 million; the SEC found it had violated the rule requiring brokers to check orders before they reach an exchange (SEC, 16 October 2013).</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Opening and closing auctions</th><td>A phase in which orders collect without matching, then one price is chosen that trades the most shares</td><td>The sequenced stream and the journal</td></tr>
+<tr><th>Pro-rata matching for some products</th><td>The rule inside a level: a fill divided by size instead of by arrival</td><td>Price priority between levels</td></tr>
+<tr><th>Stop orders and hidden size</th><td>The engine keeps orders that are not yet visible or active, and their rules for entering the book</td><td>Determinism: triggers depend only on the stream</td></tr>
+<tr><th>Ten times the symbols</th><td>More partitions, each with its own sequencer and engine</td><td>One thread per book</td></tr>
+<tr><th>A crypto exchange for the public</th><td>Accounts with balances checked before an order is accepted (<x-ref to="hld-digital-wallet"></x-ref>), APIs over the internet with rate limits</td><td>The engine, the sequencer and the feed</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Spend the first ten minutes on requirements and the estimate that gives the time per message; it justifies everything after. Draw the path gateway, sequencer, engine, feed, and say early that the book is in memory on one thread and the journal is the truth. Spend the deep dives on price-time priority with its data structure, on why one sequencer gives fairness and identical replicas, and on recovering a lossy feed by sequence numbers. Keep a few minutes for failover and the tail of the latency.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>A database transaction and row locks for each order</th><td>Throughput limited by locks, and an order of execution nobody chose</td><td>One thread per book, in memory, fed by a sequenced stream</td></tr>
+<tr><th>Priority by timestamps from several clocks</th><td>Clocks disagree by more than the gaps between orders</td><td>One sequencer’s numbers</td></tr>
+<tr><th>Floating-point prices</th><td>10.01 is not exact; one price splits into two levels</td><td>Whole ticks</td></tr>
+<tr><th>Replicas that each read from the network</th><td>Different trades, in 36% of runs at one microsecond of jitter</td><td>Every replica applies the same journal</td></tr>
+<tr><th>An engine that reads the clock</th><td>A replay produces a different day</td><td>Time arrives in the message</td></tr>
+<tr><th>JSON on the critical path</th><td>1.8 µs a message, more than the matching itself</td><td>Fixed binary layouts in reused buffers</td></tr>
+<tr><th>Market data as requests and responses</th><td>Work for every subscriber, and subscribers served at different moments</td><td>Multicast with sequence numbers, re-requests and snapshots</td></tr>
+<tr><th>Applying feed messages after a gap</th><td>A subscriber’s book silently wrong</td><td>Keep later messages aside until the gap is filled</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="consensus#problem"></x-ref>: state machine replication, here with one sequencer instead of a vote.</li>
+  <li><x-ref to="event-driven-architecture#event-sourcing"></x-ref>: the book as state derived from a journal.</li>
+  <li><x-ref to="distributed-fundamentals#skew"></x-ref>: why clocks cannot decide priority.</li>
+  <li><x-ref to="latency-and-throughput#tail-at-scale"></x-ref>: why the slowest one in a thousand matters.</li>
+  <li><x-ref to="hld-payments"></x-ref> and <x-ref to="hld-digital-wallet"></x-ref>: money after the trade, with ledgers.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>The estimate decides the design: at the peak an engine has a couple of microseconds per message, so books live in memory and nothing waits on a disk.</li>
+  <li>Price-time priority maps onto price levels, each a queue of orders oldest first, with an id map for constant-time cancels.</li>
+  <li>Check a fast book against a naive one over many random flows; the chapter’s matched exactly over 400,000 commands.</li>
+  <li>One sequencer defines the order; a deterministic engine then makes every replica, replay and restored snapshot identical.</li>
+  <li>Without one order, a microsecond of jitter made two correct replicas trade differently in about a third of runs.</li>
+  <li>Market data goes out once, by multicast, numbered; receivers repair gaps by re-request and catch up from snapshots.</li>
+  <li>Matching is the cheap part. Text formats, allocation, pauses and distance are what break a budget of microseconds.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A buy order for 500 at 10.05 arrives. The asks are 300 at 10.03 (order 12), 100 at 10.03 (order 15), and 400 at 10.04. What trades?</summary><p>300 at 10.03 with order 12, then 100 at 10.03 with order 15, which arrived later at the same price, then 100 at 10.04. The buyer pays each resting order’s price, never its own limit of 10.05, and the order is completely filled, so nothing rests.</p></details>
+<details><summary>Why is the order book not stored in a database that the engine updates?</summary><p>The book changes with almost every message, and the engine has a couple of microseconds for each; a database write takes far longer. The book is derived state: the journal is durable, and the book can be rebuilt by applying it, from the start or from a snapshot.</p></details>
+<details><summary>Two gateways each stamp orders with their own accurate clocks. Why is that still not enough to decide priority?</summary><p>Clocks on different machines disagree by more than the time between orders, which at hundreds of thousands a second is microseconds. Two orders could be stamped in the opposite order to their arrival, and two replicas reading them could disagree. A single sequencer’s numbers define one order that every copy shares.</p></details>
+<details><summary>The engine needs the time to expire day orders at the close. Why may it not read its own clock?</summary><p>Because a replay or a backup would read a different clock and could expire orders at a different point in the stream, producing different trades. The time must come with the stream: the sequencer stamps every message, or inserts a “close” message, and the engine acts on that.</p></details>
+<details><summary>When is an order acknowledged to the broker, and why then?</summary><p>After the sequencer has made it durable, on the journal and in the backup, and the engine has processed it. Acknowledging earlier would mean a crash could lose an order the broker believes was accepted. Making each message durable by copying it to a backup’s memory keeps that wait to microseconds.</p></details>
+<details><summary>A subscriber receives messages 1 to 3, then 7 to 9. Why must it not apply 7 to 9 at once?</summary><p>Messages 7 to 9 may execute against or delete orders added in 4 to 6, which it has not seen, so its book would be wrong or it would fail on unknown orders. It keeps 7 to 9 aside, asks for 4 to 6, and applies everything in order.</p></details>
+<details><summary>Matching takes 0.6 µs on average. Why can the engine still fall behind at a rate it could sustain on average?</summary><p>Because of the tail. A pause of tens of microseconds to milliseconds builds a queue that every following message waits behind, and at hundreds of thousands of messages a second even rare pauses happen many times a second. The design must remove pauses, not only make the average fast.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Martin Fowler, <a href="https://martinfowler.com/articles/lmax.html">The LMAX Architecture</a>, martinfowler.com, 12 July 2011. A single-threaded engine, input journaled and replicated before processing, and recovery by replay.</li>
+  <li>Nasdaq, <a href="https://nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHspecification.pdf">Nasdaq TotalView-ITCH 5.0</a>, specification, revised 28 April 2023. The order-by-order feed and its message layouts.</li>
+  <li>Nasdaq, <a href="https://m.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/moldudp64.pdf">MoldUDP64 Protocol Specification</a>, version 1.00, revised 2 August 2024. Sequenced packets, heartbeats and re-requests over UDP.</li>
+  <li>Nasdaq, <a href="https://www.nasdaqtrader.com/snippets/inet2.html">OUCH measurements of order latency, ITCH measurements of market data latency</a>, undated, checked October 2026. How round-trip latency is measured, and INET’s stated speed.</li>
+  <li>IEX, <a href="https://www.iex.io/technology">Technology</a>, checked October 2026. The 350-microsecond delay and its coil of fiber.</li>
+  <li>CME Group, <a href="https://cmegroupclientsite.atlassian.net/wiki/spaces/EPICSANDBOX/pages/457218479">Supported Matching Algorithms</a>, updated 11 February 2025. FIFO and pro-rata matching.</li>
+  <li>Cboe, <a href="https://www.cboe.com/document/tech-spec/content/technical-specifications/cboe-titanium-u.s.-equities-fix-specification/implementation-notes/common-session-level-issues/financial-information-exchange-protocol--session-protocol--message-recovery">FIX session protocol: message recovery</a>, Cboe Titanium U.S. Equities FIX specification, 2026. Sequence numbers and resend requests in FIX sessions.</li>
+  <li>U.S. Securities and Exchange Commission, <a href="https://www.investor.gov/introduction-investing/general-resources/news-alerts/alerts-bulletins/investor-bulletins/measures">Investor Bulletin: Measures to address market volatility</a>, Investor.gov, undated, checked October 2026. Market-wide circuit breakers and limit up-limit down.</li>
+  <li>U.S. Securities and Exchange Commission, <a href="https://www.sec.gov/news/press-release/2013-222">SEC Charges Knight Capital With Violations of Market Access Rule</a>, press release 2013-222, 16 October 2013.</li>
+</ol>
+</section>

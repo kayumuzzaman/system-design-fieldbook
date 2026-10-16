@@ -1,0 +1,707 @@
+<!--meta
+{ "description": "An email service designed with the method of chapter 76: requirements and estimates for 200 million mailboxes, SMTP for receiving and sending, JMAP and IMAP for reading, mailbox records, blobs and a search index per user, SPF, DKIM and DMARC computed on six messages, outgoing queues per domain measured during an outage and under greylisting, attachments stored once, spam, deliverability, failures, growth and what the standards and Gmail require.",
+  "lede": "Email is the oldest federated system most people use: millions of independent servers that agree only on a protocol. A provider must accept mail from all of them while refusing forgeries and spam, store years of mail per user and search it in a moment, and send mail that other providers trust enough to deliver.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design an email service like Gmail or Outlook.com. Users get an address, receive mail from anyone on the internet, read it on the web, phones and desktop programs, search all of it, and send mail to anyone. Spam should not reach the inbox, and mail sent from the service should not land in other people’s spam folders.</p></div>
+<p>Most systems in Part XI control both ends of every conversation. Email does not. The sender of a message to your users is a server you have never heard of, and the receiver of your users’ mail is someone else’s server with its own rules. So the design is shaped by a protocol from 1982, revised in 2008, by DNS records that say who may send for a domain, and by reputation: other providers decide from your behavior whether to trust you. Inside, the difficulty is storage. Mail is kept for years, almost never deleted, and must be searchable at once. The method of <x-ref to="hld-method"></x-ref> takes these in order.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<p>The questions that change this design are which clients must work, how much each user stores, how fast a received message must appear, and how much the service sends. With the answers written down:</p>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>Receive mail from any server on the internet; send mail to any address</th><td>In scope</td></tr>
+<tr><th>Read on the web and in the app; desktop programs through IMAP</th><td>In scope</td></tr>
+<tr><th>Folders or labels, threads, search over all mail, attachments up to 25 MB</th><td>In scope</td></tr>
+<tr><th>Spam and phishing filtering; authentication of incoming and outgoing mail</th><td>In scope</td></tr>
+<tr><th>Calendars, contacts, end-to-end encryption, marketing tools</th><td>Out of scope. Marketing and transactional sending is <x-ref to="hld-notifications"></x-ref></td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>200 million mailboxes. Each receives 40 messages a day, half of which are spam refused or filtered, and sends 5. Messages average 75 KB with attachments. The busiest hour runs at twice the average</td></tr>
+<tr><th>Latency</th><td>A received message appears in the mailbox within 10 seconds of being accepted. Mailbox lists in 200 ms; searches within a second, 99% of the time</td></tr>
+<tr><th>Durability</th><td>A message accepted with 250 is never lost: the sender has deleted its copy</td></tr>
+<tr><th>Availability</th><td>99.99% for reading. Receiving tolerates short outages, because senders retry for days</td></tr>
+<tr><th>Deliverability</th><td>Mail from the service reaches the inbox at the large providers: authenticated, from servers with a good reputation</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">received   200 million × 40 = 8 billion a day ≈ 92,600 a second         peak × 2 ≈ 185,000
+sent       200 million × 5 = 1 billion a day ≈ 11,600 a second           peak ≈ 23,000
+kept       half of the received + all the sent = 5 billion messages a day
+messages   5 billion × 75 KB = 375 TB a day
+records    5 billion × 1.5 KB = 7.5 TB a day
+a year     382.5 TB × 365 × 1.5 for redundancy ≈ 209 PB, about 1 GB per user
+inbound    185,000 × 75 KB × 8 ≈ 111 Gbit/s at peak</div>
+<p>The sizes and the 1.5 for erasure-coded redundancy (<x-ref to="object-and-file-storage#erasure-coding"></x-ref>) are assumptions. The arithmetic is that of <x-ref to="estimation#method"></x-ref>, and each line decides something.</p>
+<table>
+<thead><tr><th>The number</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><th>209 PB a year, growing</th><td>Message bodies go to a blob store with cheap, durable tiers, never to the database</td></tr>
+<tr><th>7.5 TB of records a day</th><td>The small records that every list and search reads go to a partitioned database, keyed by user</td></tr>
+<tr><th>185,000 messages a second at peak, half of them spam</th><td>Refuse as much as possible before accepting the data, when it costs least</td></tr>
+<tr><th>23,000 outgoing a second</th><td>Outbound mail needs queues, many sending addresses and per-domain limits</td></tr>
+</tbody>
+</table>
+
+<div class="widget wide" data-widget="mail84">
+<h4>Mail traffic and mailbox storage</h4>
+<p>Recomputes step 2.</p>
+<div class="controls">
+  <label>Mailboxes<input type="number" name="users" value="200000000" min="1" max="10000000000" step="1000000"></label>
+  <label>Received per user a day<input type="number" name="received" value="40" min="0" max="10000" step="1"></label>
+  <label>Share of received kept (%)<input type="number" name="kept" value="50" min="0" max="100" step="1"></label>
+  <label>Sent per user a day<input type="number" name="sent" value="5" min="0" max="10000" step="1"></label>
+  <label>Average message (KB)<input type="number" name="size" value="75" min="0.1" max="100000" step="1"></label>
+  <label>Record per message (bytes)<input type="number" name="meta" value="1500" min="0" max="1000000" step="100"></label>
+  <label>Storage overhead<input type="number" name="overhead" value="1.5" min="1" max="10" step="0.1"></label>
+  <label>Peak factor<input type="number" name="peak" value="2" min="1" max="20" step="0.5"></label>
+</div>
+<dl class="results">
+  <div><dt>Received</dt><dd data-out="inbound">92.6 thousand /s, peak 185 thousand /s</dd></div>
+  <div><dt>Sent</dt><dd data-out="outbound">11.6 thousand /s, peak 23.1 thousand /s</dd></div>
+  <div><dt>New each day</dt><dd data-out="daily">375 TB of messages, 7.5 TB of records</dd></div>
+  <div><dt>Stored per year</dt><dd data-out="yearly">209 PB</dd></div>
+  <div><dt>Inbound bandwidth</dt><dd data-out="bandwidth">111 Gbit/s at peak</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Mailboxes grow by 383 TB a day, 209 PB a year once stored with an overhead of 1.5, about 1.05 GB per user each year. Records are 2% of the bytes but are read on every list and search, so they live on fast storage and the messages in a blob store.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<p>An email service has two kinds of interface: protocols spoken with other servers and with standard programs, which the design must follow exactly, and its own API for its apps. The <dfn>Simple Mail Transfer Protocol</dfn> (SMTP) is the text protocol, defined in RFC 5321, by which one server hands a message to another: the sender names the envelope sender and recipients, sends the message, and the receiver answers with a three-digit code. A 2xx code means accepted, 4xx means try again later, 5xx means refused for good.</p>
+<pre data-lang="http" data-title="An SMTP conversation, receiving one message">
+S: 220 mx1.mail.example ESMTP
+C: EHLO mta7.shop.example
+S: 250-mx1.mail.example  250-STARTTLS  250 SIZE 26214400
+C: STARTTLS                            (the rest is encrypted)
+C: MAIL FROM:<orders@shop.example>
+S: 250 OK
+C: RCPT TO:<ben@mail.example>
+S: 250 OK
+C: DATA
+S: 354 End data with <CR><LF>.<CR><LF>
+C: From: Shop <orders@shop.example>  …headers, body, attachments…  .
+S: 250 OK queued as 7f3a91c2
+</pre>
+<pre data-lang="http" data-title="The service’s own API, for its apps (JMAP style)">
+POST /jmap  { "methodCalls": [ ["Email/query", { "filter": { "inMailbox": "inbox" }, "limit": 50 }, "a"],
+                              ["Email/get", { "#ids": { "resultOf": "a", "path": "/ids" }, "properties": ["subject", "from", "preview"] }, "b"] ] }
+POST /jmap  { "methodCalls": [ ["Email/changes", { "sinceState": "s-81723" }, "c"] ] }      → only what changed
+POST /jmap  { "methodCalls": [ ["EmailSubmission/set", { "create": { "k1": { "emailId": "m_42" } } }, "d"] ] }
+POST /upload/u_41/          → 201 { "blobId": "b_9e1…" }   then the email refers to the blob
+</pre>
+<ul>
+  <li><b>Protocols, not choices.</b> SMTP on port 25 for other servers, and for desktop programs IMAP, whose current version is RFC 9051 of 2021. The service implements them at the edge and translates to its own calls.</li>
+  <li><b>JMAP</b>, standardized in RFC 8620 and RFC 8621 in 2019, is a JSON API over HTTP for mail. A client asks for changes since a state string it holds, so an app that has been offline fetches only what changed, the same idea as the sync of <x-ref to="hld-chat"></x-ref>.</li>
+  <li><b>Attachments</b> are uploaded first as blobs and referred to by id, so a retry of a send does not upload 25 MB again (<x-ref to="object-and-file-storage#uploads"></x-ref>).</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A message record: sender, subject, preview, date, size, flags, labels, thread, blob ids</th><td>User, then message id</td><td>A partitioned database, three copies</td><td>Every list, read and sync is for one user: a partition per user, no queries across users</td></tr>
+<tr><th>Labels or folders, with counts</th><td>User, then label</td><td>The same database</td><td>Read on every screen</td></tr>
+<tr><th>Threads</th><td>User, then thread id</td><td>The same database</td><td>Built from the <code>Message-ID</code> and <code>References</code> headers as mail arrives</td></tr>
+<tr><th>The message itself: headers, body, attachments</th><td>A content hash for attachments; a message blob id</td><td>A blob store, erasure coded, with a cold tier for old mail</td><td>Large, written once, read rarely (<x-ref to="object-and-file-storage"></x-ref>)</td></tr>
+<tr><th>A search index</th><td>User</td><td>An inverted index per user, in segments (<x-ref to="search-systems#segments"></x-ref>)</td><td>Every search is in one mailbox</td></tr>
+<tr><th>The outbound queue</th><td>Receiving domain, then due time</td><td>A durable queue</td><td>Mail waits here for hours or days when a domain defers it</td></tr>
+<tr><th>Reputation and domain status</th><td>Sending IP, receiving domain</td><td>A small fast store</td><td>Read on every connection</td></tr>
+</tbody>
+</table>
+<p>The split between small records and large blobs is the main storage decision. A mailbox list of 50 messages reads 50 records of about 1.5 KB from one partition; opening a message reads one blob.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 386" role="img" aria-labelledby="f841t f841d">
+<title id="f841t">The design of the email service</title>
+<desc id="f841d">Three paths. Receiving: other mail servers connect to the inbound SMTP servers named by the domain’s MX records; checks run SPF, DKIM, DMARC and spam scoring; delivery writes the body and attachments to a blob store and the message’s record to the mailbox store, and the search index is updated later. Reading: clients call the mail API, which lists and reads from the mailbox store and searches the user’s index. Sending: the mail API puts a message on outbound queues kept per receiving domain; outbound SMTP servers sign it with DKIM and deliver it to other mail servers, consulting a domain status store that holds connection limits and the list of domains that are down.</desc>
+<text class="tb" x="10" y="20">Receiving</text>
+<rect class="n" x="10" y="30" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="51">Other servers</text>
+<text class="ts mid" x="60" y="68">on the internet</text>
+<rect class="n sig" x="134" y="30" width="120" height="50" rx="6"/>
+<text class="tb mid" x="194" y="51">Inbound SMTP</text>
+<text class="ts mid" x="194" y="68">MX, TLS, limits</text>
+<rect class="n sig" x="278" y="30" width="120" height="50" rx="6"/>
+<text class="tb mid" x="338" y="42.5">Checks</text>
+<text class="ts mid" x="338" y="59.5">SPF, DKIM, DMARC,</text>
+<text class="ts mid" x="338" y="76.5">spam score</text>
+<rect class="n sig" x="422" y="30" width="120" height="50" rx="6"/>
+<text class="tb mid" x="482" y="51">Delivery</text>
+<text class="ts mid" x="482" y="68">files the message</text>
+<rect class="n store" x="566" y="30" width="144" height="50" rx="6"/>
+<text class="tb mid" x="638" y="51">Blob store</text>
+<text class="ts mid" x="638" y="68">bodies, attachments</text>
+<path class="e sig" d="M110 55H134"/>
+<path class="e sig" d="M254 55H278"/>
+<path class="e sig" d="M398 55H422"/>
+<path class="e sig" d="M542 55H566"/>
+<rect class="n store" x="422" y="130" width="120" height="50" rx="6"/>
+<text class="tb mid" x="482" y="151">Mailbox store</text>
+<text class="ts mid" x="482" y="168">by user</text>
+<path class="e sig" d="M482 80V130"/>
+<rect class="n store" x="566" y="130" width="144" height="50" rx="6"/>
+<text class="tb mid" x="638" y="151">Search index</text>
+<text class="ts mid" x="638" y="168">one per user</text>
+<path class="e async" d="M530 80V100H630V130"/>
+<text class="ts" x="636" y="112">later</text>
+<text class="tb" x="10" y="120">Reading</text>
+<rect class="n" x="10" y="130" width="100" height="50" rx="6"/>
+<text class="tb mid" x="60" y="151">Clients</text>
+<text class="ts mid" x="60" y="168">web, apps, IMAP</text>
+<rect class="n sig" x="134" y="130" width="120" height="50" rx="6"/>
+<text class="tb mid" x="194" y="151">Mail API</text>
+<text class="ts mid" x="194" y="168">JMAP, IMAP gateway</text>
+<path class="e sig" d="M110 155H134"/>
+<path class="e sig" d="M254 155H422"/>
+<text class="ts mid" x="338" y="149">list, read</text>
+<path class="e sig" d="M194 180V204H660V180"/>
+<text class="ts mid" x="420" y="198">search</text>
+<text class="tb" x="10" y="232">Sending</text>
+<rect class="n async" x="134" y="244" width="120" height="50" rx="6"/>
+<text class="tb mid" x="194" y="265">Outbound queues</text>
+<text class="ts mid" x="194" y="282">one per domain</text>
+<path class="e async" d="M224 204V244"/>
+<rect class="n sig" x="278" y="244" width="120" height="50" rx="6"/>
+<text class="tb mid" x="338" y="265">Outbound SMTP</text>
+<text class="ts mid" x="338" y="282">signs with DKIM</text>
+<path class="e async" d="M254 269H278"/>
+<rect class="n" x="566" y="244" width="144" height="50" rx="6"/>
+<text class="tb mid" x="638" y="265">Other servers</text>
+<text class="ts mid" x="638" y="282">the recipients’ MX</text>
+<path class="e sig" d="M398 269H566"/>
+<text class="ts mid" x="482" y="263">deliver, retry later</text>
+<rect class="n store" x="278" y="324" width="120" height="50" rx="6"/>
+<text class="tb mid" x="338" y="345">Domain status</text>
+<text class="ts mid" x="338" y="362">limits, down list</text>
+<path class="e sig" d="M338 294V324"/>
+<text class="ts" x="422" y="334">Solid: the request path.</text>
+<text class="ts" x="422" y="350">Dashed: queued for later.</text>
+</svg>
+</div>
+<figcaption>Mail arrives through the top path and is stored before the sender is told it has been accepted. Outgoing mail waits in queues per receiving domain, so one slow domain holds back only its own mail.</figcaption>
+</figure>
+
+<p>The inbound path refuses early. Before any data is sent, the connecting address is checked against reputation lists and rate limits, and the recipient is checked to exist; a server that sends to thousands of made-up addresses is cut off at <code>RCPT</code>. Only then does the message arrive, get its checks, and get stored. The outbound path is the mirror image: the service is now the stranger knocking on other doors, and it must look trustworthy.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 612" role="img" aria-labelledby="f842t f842d">
+<title id="f842t">Receiving a message, and sending one that is deferred</title>
+<desc id="f842d">Two sequences. Receiving: the shop’s server looks up the MX record of mail.example, connects to the inbound SMTP server, starts TLS, names the sender and the recipient, and sends the message; the inbound server runs the checks, delivery stores the message, and only then does the inbound server answer 250, after which the message is its responsibility. Sending: Ben’s app submits a message through the mail API, which queues it for the receiving domain and tells the app it is sent; an outbound server signs it and delivers it, the receiving server answers 451 try again later, and a retry five minutes later is accepted.</desc>
+<text class="tb" x="10" y="16">Receiving</text>
+<g data-scene="receive">
+<text class="tb mid" x="54" y="40">Shop’s server</text>
+<line class="axis" x1="54" y1="48" x2="54" y2="316"/>
+<text class="tb mid" x="190" y="40">DNS</text>
+<line class="axis" x1="190" y1="48" x2="190" y2="316"/>
+<text class="tb mid" x="310" y="40">Inbound SMTP</text>
+<line class="axis" x1="310" y1="48" x2="310" y2="316"/>
+<text class="tb mid" x="424" y="40">Checks</text>
+<line class="axis" x1="424" y1="48" x2="424" y2="316"/>
+<text class="tb mid" x="534" y="40">Delivery</text>
+<line class="axis" x1="534" y1="48" x2="534" y2="316"/>
+<text class="tb mid" x="650" y="40">Mailbox store</text>
+<line class="axis" x1="650" y1="48" x2="650" y2="316"/>
+<g data-s="1">
+<path class="e sig" d="M55 72H189"/>
+<text class="ts mid" x="122.0" y="66">1. MX of mail.example?</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M189 99H55"/>
+<text class="ts mid" x="122.0" y="93">2. MX: mx1.mail.example</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M55 126H309"/>
+<text class="ts mid" x="182.0" y="120">3. EHLO, STARTTLS</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M55 153H309"/>
+<text class="ts mid" x="182.0" y="147">4. MAIL FROM, RCPT TO ben@</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M55 180H309"/>
+<text class="ts mid" x="182.0" y="174">5. DATA: the message</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M311 207H423"/>
+<text class="ts mid" x="367.0" y="201">6. SPF, DKIM, DMARC, spam</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M425 234H533"/>
+<text class="ts mid" x="479.0" y="228">7. inbox, score 0.4</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M535 261H649"/>
+<text class="ts mid" x="592.0" y="255">8. store blob and record</text>
+</g>
+<g data-s="9">
+<path class="e store" d="M309 288H55"/>
+<text class="ts mid" x="182.0" y="282">9. 250 OK</text>
+</g>
+</g>
+<path class="e none dash" d="M10 330H710"/>
+<text class="tb" x="10" y="352">Sending, with a deferral</text>
+<g data-scene="send">
+<text class="tb mid" x="54" y="376">Ben’s app</text>
+<line class="axis" x1="54" y1="384" x2="54" y2="608"/>
+<text class="tb mid" x="180" y="376">Mail API</text>
+<line class="axis" x1="180" y1="384" x2="180" y2="608"/>
+<text class="tb mid" x="310" y="376">Outbound queue</text>
+<line class="axis" x1="310" y1="384" x2="310" y2="608"/>
+<text class="tb mid" x="450" y="376">Outbound SMTP</text>
+<line class="axis" x1="450" y1="384" x2="450" y2="608"/>
+<text class="tb mid" x="620" y="376">Shop’s MX</text>
+<line class="axis" x1="620" y1="384" x2="620" y2="608"/>
+<g data-s="1">
+<path class="e sig" d="M55 404H179"/>
+<text class="ts mid" x="117.0" y="398">1. submit reply</text>
+</g>
+<g data-s="2">
+<path class="e async" d="M181 429H309"/>
+<text class="ts mid" x="245.0" y="423">2. queue for shop.example</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M179 454H55"/>
+<text class="ts mid" x="117.0" y="448">3. sent</text>
+</g>
+<g data-s="4">
+<path class="e async" d="M311 479H449"/>
+<text class="ts mid" x="380.0" y="473">4. next for shop.example</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M451 504H619"/>
+<text class="ts mid" x="535.0" y="498">5. signed with DKIM, DATA</text>
+</g>
+<g data-s="6">
+<path class="e fault" d="M619 529H451"/>
+<text class="ts mid" x="535.0" y="523">6. 451 try again later</text>
+</g>
+<g data-s="7" data-packet="none">
+<rect class="n async" x="458" y="540" width="158.3" height="22" rx="4"/>
+<text class="ts mid" x="537.15" y="555">7. wait about 5 minutes</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M451 579H619"/>
+<text class="ts mid" x="535.0" y="573">8. the same message again</text>
+</g>
+<g data-s="9">
+<path class="e store" d="M619 604H451"/>
+<text class="ts mid" x="535.0" y="598">9. 250 OK</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="receive" data-label="Receive">
+  <li data-msg="MX?" data-state="Responsible for the message: the shop; Ben’s mailbox: without it">The shop’s server looks up where mail for mail.example goes.</li>
+  <li data-msg="mx1" data-state="Responsible for the message: the shop; Ben’s mailbox: without it">DNS answers with the domain’s MX records; the server with the lowest preference number is tried first.</li>
+  <li data-msg="EHLO" data-state="Responsible for the message: the shop; Ben’s mailbox: without it">It connects on port 25, greets the server and upgrades the connection to TLS.</li>
+  <li data-msg="RCPT" data-state="Responsible for the message: the shop; Ben’s mailbox: without it">It names the envelope sender and the recipient. The server confirms that Ben’s address exists before taking any data.</li>
+  <li data-msg="DATA" data-state="Responsible for the message: the shop; Ben’s mailbox: without it">It sends the message: headers, body and attachments, ended by a line with a single dot.</li>
+  <li data-msg="check" data-state="Responsible for the message: the shop; Ben’s mailbox: without it">The inbound server runs the checks while the sender waits: authentication, then a spam score.</li>
+  <li data-msg="inbox" data-state="Responsible for the message: the shop; Ben’s mailbox: without it">The message passes and goes to the inbox. A high score would send it to the spam folder; a DMARC reject refuses it.</li>
+  <li data-msg="store" data-state="Responsible for the message: the shop; Ben’s mailbox: has it">Delivery writes the body to the blob store and the message’s record to Ben’s mailbox, in three copies.</li>
+  <li data-msg="250" data-state="Responsible for the message: mail.example; Ben’s mailbox: has it">Only now does the server say 250. From this moment the message is ours to keep, and the shop deletes its copy.</li>
+</ol>
+<ol class="steps" data-scene="send" data-label="Send">
+  <li data-msg="submit" data-state="The message is: in the app">Ben replies to the shop. His app submits the message to the mail API.</li>
+  <li data-msg="queue" data-state="The message is: queued">The API stores it in the queue for the receiving domain.</li>
+  <li data-msg="sent" data-state="The message is: queued">Ben sees it in his Sent folder. Delivery is the queue’s job now.</li>
+  <li data-msg="take" data-state="The message is: being sent">An outbound server takes it, within that domain’s connection limit.</li>
+  <li data-msg="DATA" data-state="The message is: being sent">It signs the message with mail.example’s DKIM key and delivers it to the shop’s MX.</li>
+  <li data-msg="451" data-state="The message is: queued, retry due">The shop’s server greylists unknown senders: a temporary refusal that real servers retry and many spam tools do not.</li>
+  <li data-msg="none" data-state="The message is: queued, retry due">The message goes back to its queue with a retry time, growing with each failure.</li>
+  <li data-msg="DATA" data-state="The message is: being sent">The retry presents the same sender and recipient.</li>
+  <li data-msg="250" data-state="The message is: delivered">This time it is accepted, and the queue entry is deleted.</li>
+</ol>
+<figcaption>Responsibility for a message moves with the 250 reply, so the receiver stores before it answers. A sender treats any 4xx answer as “keep it and try later”, which is what makes email survive outages.</figcaption>
+</figure>
+
+<p>The 250 in the first flow is a promise. Under RFC 5321 the receiver now owns the message, and the sender deletes its copy, so the receiver must have stored it durably before answering. The 451 in the second flow is what makes email resilient: a sender keeps mail it could not deliver and tries again, for days.</p>
+
+<h2 id="trust">Step 6a: Who sent this, and is it spam</h2>
+<p>Anyone can connect to port 25 and write any address in <code>From:</code>. Three standards, all published in DNS by the domain that claims to send, let a receiver check the claim (<x-ref to="dns#records"></x-ref>). The <dfn>Sender Policy Framework</dfn> (SPF, RFC 7208) is a list of the servers allowed to send mail whose envelope sender is in a domain; the receiver compares the connecting address with it. <dfn>DomainKeys Identified Mail</dfn> (DKIM, RFC 6376) is a signature over chosen headers and the body, made with a domain’s private key and checked with the public key the domain publishes. <dfn>DMARC</dfn> (RFC 9989, May 2026, replacing RFC 7489) ties them to what the reader sees: a message passes if SPF or DKIM passes for a domain aligned with the <code>From:</code> domain, and the domain’s policy says what to do with one that does not: nothing, quarantine or reject.</p>
+<p>The chapter’s code implements the three checks, with real Ed25519 signatures for DKIM (RFC 8463), and runs them on six messages that all show the same sender.</p>
+
+<figure class="fig wide" id="fig-auth">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 272" role="img" aria-labelledby="f843t f843d">
+<title id="f843t">Six messages from “the shop”, checked</title>
+<desc id="f843d">A table computed by the chapter’s code, with Ed25519 DKIM signatures. Sent by the shop’s own server: SPF pass, DKIM pass, DMARC pass, deliver; Forwarded unchanged: SPF fail, DKIM pass, DMARC pass, deliver; Through a mailing list: SPF pass, DKIM fail, DMARC fail, reject; Sent by an email service for the shop: SPF pass, DKIM pass, DMARC pass, deliver; Forged From: address: SPF fail, DKIM none, DMARC fail, reject; Look-alike domain: SPF pass, DKIM pass, DMARC pass, deliver.</desc>
+<text class="tb" x="10" y="18">All claim to be from orders@shop.example, whose DMARC policy is reject</text>
+<rect class="n sunk" x="10" y="30" width="290" height="28" rx="0"/>
+<text class="ts tb" x="18" y="48">Message</text>
+<rect class="n sunk" x="300" y="30" width="80" height="28" rx="0"/>
+<text class="ts tb" x="308" y="48">SPF</text>
+<rect class="n sunk" x="380" y="30" width="80" height="28" rx="0"/>
+<text class="ts tb" x="388" y="48">DKIM</text>
+<rect class="n sunk" x="460" y="30" width="80" height="28" rx="0"/>
+<text class="ts tb" x="468" y="48">DMARC</text>
+<rect class="n sunk" x="540" y="30" width="170" height="28" rx="0"/>
+<text class="ts tb" x="548" y="48">What the receiver does</text>
+<rect class="n" x="10" y="58" width="290" height="30" rx="0"/>
+<text class="ts" x="18" y="77">Sent by the shop’s own server</text>
+<rect class="n store" x="300" y="58" width="80" height="30" rx="0"/>
+<text class="ts" x="308" y="77">pass</text>
+<rect class="n store" x="380" y="58" width="80" height="30" rx="0"/>
+<text class="ts" x="388" y="77">pass</text>
+<rect class="n store" x="460" y="58" width="80" height="30" rx="0"/>
+<text class="ts" x="468" y="77">pass</text>
+<rect class="n" x="540" y="58" width="170" height="30" rx="0"/>
+<text class="ts" x="548" y="77">deliver</text>
+<rect class="n" x="10" y="88" width="290" height="30" rx="0"/>
+<text class="ts" x="18" y="107">Forwarded unchanged</text>
+<rect class="n fault" x="300" y="88" width="80" height="30" rx="0"/>
+<text class="ts" x="308" y="107">fail</text>
+<rect class="n store" x="380" y="88" width="80" height="30" rx="0"/>
+<text class="ts" x="388" y="107">pass</text>
+<rect class="n store" x="460" y="88" width="80" height="30" rx="0"/>
+<text class="ts" x="468" y="107">pass</text>
+<rect class="n" x="540" y="88" width="170" height="30" rx="0"/>
+<text class="ts" x="548" y="107">deliver</text>
+<rect class="n" x="10" y="118" width="290" height="30" rx="0"/>
+<text class="ts" x="18" y="137">Through a mailing list</text>
+<rect class="n store" x="300" y="118" width="80" height="30" rx="0"/>
+<text class="ts" x="308" y="137">pass</text>
+<rect class="n fault" x="380" y="118" width="80" height="30" rx="0"/>
+<text class="ts" x="388" y="137">fail</text>
+<rect class="n fault" x="460" y="118" width="80" height="30" rx="0"/>
+<text class="ts" x="468" y="137">fail</text>
+<rect class="n fault" x="540" y="118" width="170" height="30" rx="0"/>
+<text class="ts" x="548" y="137">reject (DMARC)</text>
+<rect class="n" x="10" y="148" width="290" height="30" rx="0"/>
+<text class="ts" x="18" y="167">Sent by an email service for the shop</text>
+<rect class="n store" x="300" y="148" width="80" height="30" rx="0"/>
+<text class="ts" x="308" y="167">pass</text>
+<rect class="n store" x="380" y="148" width="80" height="30" rx="0"/>
+<text class="ts" x="388" y="167">pass</text>
+<rect class="n store" x="460" y="148" width="80" height="30" rx="0"/>
+<text class="ts" x="468" y="167">pass</text>
+<rect class="n" x="540" y="148" width="170" height="30" rx="0"/>
+<text class="ts" x="548" y="167">deliver</text>
+<rect class="n" x="10" y="178" width="290" height="30" rx="0"/>
+<text class="ts" x="18" y="197">Forged From: address</text>
+<rect class="n fault" x="300" y="178" width="80" height="30" rx="0"/>
+<text class="ts" x="308" y="197">fail</text>
+<rect class="n" x="380" y="178" width="80" height="30" rx="0"/>
+<text class="ts" x="388" y="197">none</text>
+<rect class="n fault" x="460" y="178" width="80" height="30" rx="0"/>
+<text class="ts" x="468" y="197">fail</text>
+<rect class="n fault" x="540" y="178" width="170" height="30" rx="0"/>
+<text class="ts" x="548" y="197">reject (DMARC)</text>
+<rect class="n" x="10" y="208" width="290" height="30" rx="0"/>
+<text class="ts" x="18" y="227">Look-alike domain</text>
+<rect class="n store" x="300" y="208" width="80" height="30" rx="0"/>
+<text class="ts" x="308" y="227">pass</text>
+<rect class="n store" x="380" y="208" width="80" height="30" rx="0"/>
+<text class="ts" x="388" y="227">pass</text>
+<rect class="n store" x="460" y="208" width="80" height="30" rx="0"/>
+<text class="ts" x="468" y="227">pass</text>
+<rect class="n" x="540" y="208" width="170" height="30" rx="0"/>
+<text class="ts" x="548" y="227">deliver</text>
+<text class="ts" x="10" y="258">Passing DMARC proves the From: domain sent it, not that the sender is honest: the look-alike passes everything.</text>
+</svg>
+</div>
+<figcaption>Forwarding breaks SPF but not DKIM; a mailing list that edits the message breaks DKIM; a forger fails both. A look-alike domain passes, which is why content and reputation checks still matter.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="DMARC: pass if an aligned SPF or DKIM passes, else apply the domain’s policy">
+export function evaluate(dns: Dns, m: Message): Verdict {
+  const from = domainOf(m.headers['from'] ?? '');
+  const s = spf(dns, m), k = dkim(dns, m);
+  const record = dns.get(`_dmarc.${from}`) ?? dns.get(`_dmarc.${organizational(from)}`);
+  const aligned = (d: string) => organizational(d) === organizational(from);
+  const pass = (s === 'pass' && aligned(domainOf(m.mailFrom))) || (k === 'pass' && aligned(m.dkim?.d ?? ''));
+  if (!record?.startsWith('v=DMARC1')) return { spf: s, dkim: k, dmarc: 'none', action: 'deliver' };
+  const policy = record.match(/p=(\w+)/)?.[1] ?? 'none';
+  const action = pass || policy === 'none' ? 'deliver' : policy === 'reject' ? 'reject' : 'quarantine';
+  return { spf: s, dkim: k, dmarc: pass ? 'pass' : 'fail', action };
+}
+</pre>
+<p>Each row teaches something. Forwarding keeps the message intact but changes the server that delivers it, so SPF fails and DKIM carries the message through. A mailing list that tags the subject and adds a footer breaks the signature, and with SPF passing only for the list’s own domain, DMARC rejects the message; lists therefore rewrite <code>From:</code> or use ARC (RFC 8617, an experimental standard of 2019) to vouch for what they received. An email service sending for the shop passes because the shop published a DKIM key for it. The forger fails everything. And the look-alike domain passes everything: authentication proves which domain sent a message, not that the domain is honest.</p>
+<p>That last row is why spam filtering is layered. Cheap checks run first, while the sender is still connected: the address’s reputation, the rate at which it connects, whether the recipient exists. Then authentication, then a content classifier that scores the message, trained on what users mark as spam and as not spam. Its threshold trades two errors: wanted mail in the spam folder, which users notice and resent, against spam in the inbox. Reject only what is certain, such as a DMARC reject; put the uncertain in the spam folder, where a user can still find it.</p>
+
+<h2 id="sending">Step 6b: Sending: queues, retries and reputation</h2>
+<p>A sender must expect refusals. RFC 5321 says a sender must wait before retrying a destination, that the interval should generally be at least 30 minutes but that smarter strategies help, that it should keep trying for at least 4 to 5 days, and that it should keep a list of hosts it cannot reach rather than retrying every queued message. Two common refusals shape the queue. <dfn>Greylisting</dfn> is a receiver’s temporary refusal of the first attempt from an unfamiliar sender, on the bet that real servers retry and many spam tools do not. A <dfn>bounce</dfn> is the message a sending server returns to the envelope sender when it gives up on a delivery, after a permanent refusal or after days of temporary ones.</p>
+<p>The simulation sends 50 messages a second for two hours to 1,000 receiving domains whose sizes follow Zipf’s law, over 200 connections. A tenth of the domains greylist for 5 minutes, 2% of attempts are refused temporarily and 1% permanently. From minute 10 to minute 70 the largest domain, with 13% of the mail, stops answering, and each attempt to it holds a connection until a 30-second timeout. Three ways of running the queue were compared.</p>
+
+<figure class="fig wide" id="fig-outbound">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 320" role="img" aria-labelledby="f844t f844d">
+<title id="f844t">Mail to everyone else while one domain is down</title>
+<desc id="f844d">A line chart, log scale, of the median time to deliver mail to every other domain, by the minute it was submitted, over two hours. The largest domain is unreachable from minute 10 to 70. shared pool, retry every 30 min: before the outage 0.5 s, highest 1,001 s. shared pool, backoff: before the outage 0.5 s, highest 1,785 s. limit per domain and a down list: before the outage 0.5 s, highest 0 s.</desc>
+<text class="tb" x="10" y="18">Median delivery time of mail to the other 999 domains, by minute submitted</text>
+<line class="grid" x1="70" y1="250.0" x2="560" y2="250.0"/>
+<text class="ts end" x="62" y="254.0">0.1 s</text>
+<line class="grid" x1="70" y1="203.1" x2="560" y2="203.1"/>
+<text class="ts end" x="62" y="207.1">1 s</text>
+<line class="grid" x1="70" y1="156.2" x2="560" y2="156.2"/>
+<text class="ts end" x="62" y="160.2">10 s</text>
+<line class="grid" x1="70" y1="119.7" x2="560" y2="119.7"/>
+<text class="ts end" x="62" y="123.7">1 min</text>
+<line class="grid" x1="70" y1="72.8" x2="560" y2="72.8"/>
+<text class="ts end" x="62" y="76.8">10 min</text>
+<line class="grid" x1="70" y1="40.0" x2="560" y2="40.0"/>
+<text class="ts end" x="62" y="44.0">50 min</text>
+<line class="axis" x1="70" y1="250" x2="560" y2="250"/>
+<text class="ts mid" x="70.0" y="268">0 min</text>
+<text class="ts mid" x="151.7" y="268">20 min</text>
+<text class="ts mid" x="233.3" y="268">40 min</text>
+<text class="ts mid" x="315.0" y="268">60 min</text>
+<text class="ts mid" x="396.7" y="268">80 min</text>
+<text class="ts mid" x="478.3" y="268">100 min</text>
+<text class="ts mid" x="560.0" y="268">120 min</text>
+<rect class="n fault" x="110.8" y="40" width="245.0" height="210" style="opacity:.25"/>
+<text class="ts" x="116.8" y="239.2">largest domain down</text>
+<text class="ts" x="70" y="290">50 messages a second over 200 connections; an attempt to the dead domain holds one for 30 s. code/84-hld-email.</text>
+<path class="line" style="stroke:var(--fault)" d="M72.0 217.2 L76.1 217.2 L80.2 217.2 L84.3 217.2 L88.4 217.2 L92.5 217.2 L96.5 217.2 L100.6 217.2 L104.7 217.2 L108.8 217.2 L112.9 205.7 L117.0 161.9 L121.0 143.0 L125.1 134.9 L129.2 128.7 L133.3 125.3 L137.4 121.6 L141.5 119.1 L145.5 116.9 L149.6 116.4 L153.7 114.1 L157.8 111.7 L161.9 110.9 L166.0 109.4 L170.0 108.5 L174.1 108.4 L178.2 106.1 L182.3 105.6 L186.4 103.9 L190.5 102.6 L194.5 101.2 L198.6 100.6 L202.7 99.6 L206.8 98.4 L210.9 97.6 L215.0 96.6 L219.0 95.3 L223.1 94.4 L227.2 93.6 L231.3 92.9 L235.4 91.6 L239.5 86.9 L243.5 83.2 L247.6 80.4 L251.7 77.5 L255.8 75.0 L259.9 72.6 L264.0 70.7 L268.0 69.0 L272.1 67.5 L276.2 65.9 L280.3 64.5 L284.4 63.1 L288.5 62.4 L292.5 63.3 L296.6 64.4 L300.7 65.6 L304.8 66.8 L308.9 68.2 L313.0 69.6 L317.0 71.1 L321.1 72.8 L325.2 74.6 L329.3 76.6 L333.4 78.8 L337.5 81.3 L341.5 84.1 L345.6 87.3 L349.7 91.2 L353.8 96.0 L357.9 102.4 L362.0 111.6 L366.0 129.0 L370.1 217.2 L374.2 217.2 L378.3 217.2 L382.4 217.2 L386.5 217.2 L390.5 217.2 L394.6 217.2 L398.7 217.2 L402.8 217.2 L406.9 217.2 L411.0 217.2 L415.0 217.2 L419.1 217.2 L423.2 217.2 L427.3 217.2 L431.4 217.2 L435.5 217.2 L439.5 217.2 L443.6 217.2 L447.7 217.2 L451.8 217.2 L455.9 217.2 L460.0 217.2 L464.0 217.2 L468.1 217.2 L472.2 217.2 L476.3 217.2 L480.4 217.2 L484.5 217.2 L488.5 217.2 L492.6 217.2 L496.7 217.2 L500.8 217.2 L504.9 217.2 L509.0 217.2 L513.0 217.2 L517.1 217.2 L521.2 217.2 L525.3 217.2 L529.4 217.2 L533.5 217.2 L537.5 217.2 L541.6 217.2 L545.7 217.2 L549.8 217.2 L553.9 217.2 L558.0 217.2"/>
+<path class="line" style="stroke:var(--ink-3)" d="M72.0 217.2 L76.1 217.2 L80.2 217.2 L84.3 217.2 L88.4 217.2 L92.5 217.2 L96.5 217.2 L100.6 217.2 L104.7 217.2 L108.8 217.2 L112.9 192.3 L117.0 139.3 L121.0 111.7 L125.1 102.7 L129.2 94.4 L133.3 89.1 L137.4 84.6 L141.5 81.3 L145.5 78.6 L149.6 76.3 L153.7 73.9 L157.8 71.6 L161.9 69.7 L166.0 67.9 L170.0 66.3 L174.1 65.0 L178.2 63.3 L182.3 62.2 L186.4 60.9 L190.5 59.8 L194.5 58.7 L198.6 57.8 L202.7 56.8 L206.8 55.9 L210.9 55.0 L215.0 54.1 L219.0 53.3 L223.1 52.4 L227.2 51.7 L231.3 50.9 L235.4 50.6 L239.5 51.1 L243.5 51.7 L247.6 52.4 L251.7 53.0 L255.8 53.7 L259.9 54.4 L264.0 55.1 L268.0 55.9 L272.1 56.6 L276.2 57.4 L280.3 58.3 L284.4 59.1 L288.5 60.0 L292.5 61.0 L296.6 62.0 L300.7 63.0 L304.8 64.2 L308.9 65.3 L313.0 66.6 L317.0 67.9 L321.1 69.3 L325.2 70.8 L329.3 72.5 L333.4 74.3 L337.5 76.2 L341.5 78.4 L345.6 80.8 L349.7 83.6 L353.8 86.8 L357.9 90.6 L362.0 95.1 L366.0 100.7 L370.1 108.4 L374.2 120.7 L378.3 161.1 L382.4 217.2 L386.5 217.2 L390.5 217.2 L394.6 217.2 L398.7 217.2 L402.8 217.2 L406.9 217.2 L411.0 217.2 L415.0 217.2 L419.1 217.2 L423.2 217.2 L427.3 217.2 L431.4 217.2 L435.5 217.2 L439.5 217.2 L443.6 217.2 L447.7 217.2 L451.8 217.2 L455.9 217.2 L460.0 217.2 L464.0 217.2 L468.1 217.2 L472.2 217.2 L476.3 217.2 L480.4 217.2 L484.5 217.2 L488.5 217.2 L492.6 217.2 L496.7 217.2 L500.8 217.2 L504.9 217.2 L509.0 217.2 L513.0 217.2 L517.1 217.2 L521.2 217.2 L525.3 217.2 L529.4 217.2 L533.5 217.2 L537.5 217.2 L541.6 217.2 L545.7 217.2 L549.8 217.2 L553.9 217.2 L558.0 217.2"/>
+<path class="line" style="stroke:var(--store)" d="M72.0 217.2 L76.1 217.2 L80.2 217.2 L84.3 217.2 L88.4 217.2 L92.5 217.2 L96.5 217.2 L100.6 217.2 L104.7 217.2 L108.8 217.2 L112.9 217.2 L117.0 217.2 L121.0 217.2 L125.1 217.2 L129.2 217.2 L133.3 217.2 L137.4 217.2 L141.5 217.2 L145.5 217.2 L149.6 217.2 L153.7 217.2 L157.8 217.2 L161.9 217.2 L166.0 217.2 L170.0 217.2 L174.1 217.2 L178.2 217.2 L182.3 217.2 L186.4 217.2 L190.5 217.2 L194.5 217.2 L198.6 217.2 L202.7 217.2 L206.8 217.2 L210.9 217.2 L215.0 217.2 L219.0 217.2 L223.1 217.2 L227.2 217.2 L231.3 217.2 L235.4 217.2 L239.5 217.2 L243.5 217.2 L247.6 217.2 L251.7 217.2 L255.8 217.2 L259.9 217.2 L264.0 217.2 L268.0 217.2 L272.1 217.2 L276.2 217.2 L280.3 217.2 L284.4 217.2 L288.5 217.2 L292.5 217.2 L296.6 217.2 L300.7 217.2 L304.8 217.2 L308.9 217.2 L313.0 217.2 L317.0 217.2 L321.1 217.2 L325.2 217.2 L329.3 217.2 L333.4 217.2 L337.5 217.2 L341.5 217.2 L345.6 217.2 L349.7 217.2 L353.8 217.2 L357.9 217.2 L362.0 217.2 L366.0 217.2 L370.1 217.2 L374.2 217.2 L378.3 217.2 L382.4 217.2 L386.5 217.2 L390.5 217.2 L394.6 217.2 L398.7 217.2 L402.8 217.2 L406.9 217.2 L411.0 217.2 L415.0 217.2 L419.1 217.2 L423.2 217.2 L427.3 217.2 L431.4 217.2 L435.5 217.2 L439.5 217.2 L443.6 217.2 L447.7 217.2 L451.8 217.2 L455.9 217.2 L460.0 217.2 L464.0 217.2 L468.1 217.2 L472.2 217.2 L476.3 217.2 L480.4 217.2 L484.5 217.2 L488.5 217.2 L492.6 217.2 L496.7 217.2 L500.8 217.2 L504.9 217.2 L509.0 217.2 L513.0 217.2 L517.1 217.2 L521.2 217.2 L525.3 217.2 L529.4 217.2 L533.5 217.2 L537.5 217.2 L541.6 217.2 L545.7 217.2 L549.8 217.2 L553.9 217.2 L558.0 217.2"/>
+<text class="ts" x="306.8" y="57.3">shared pool, backoff</text>
+<text class="ts" x="217.0" y="111.3">shared pool, every 30 min</text>
+<text class="ts" x="396.7" y="209.2">limit per domain and a down list</text>
+<rect class="hit" x="70" y="40" width="4.08333" height="210" data-tip="submitted in minute 0|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="74.0833" y="40" width="4.08333" height="210" data-tip="submitted in minute 1|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="78.1667" y="40" width="4.08333" height="210" data-tip="submitted in minute 2|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="82.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 3|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="86.3333" y="40" width="4.08333" height="210" data-tip="submitted in minute 4|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="90.4167" y="40" width="4.08333" height="210" data-tip="submitted in minute 5|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="94.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 6|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="98.5833" y="40" width="4.08333" height="210" data-tip="submitted in minute 7|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="102.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 8|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="106.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 9|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="110.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 10|shared pool, retry every 30 min: 0.9 s|shared pool, backoff: 1.7 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="114.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 11|shared pool, retry every 30 min: 7.5 s|shared pool, backoff: 22.9 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="119" y="40" width="4.08333" height="210" data-tip="submitted in minute 12|shared pool, retry every 30 min: 19.1 s|shared pool, backoff: 89.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="123.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 13|shared pool, retry every 30 min: 28.4 s|shared pool, backoff: 138.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="127.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 14|shared pool, retry every 30 min: 38.6 s|shared pool, backoff: 207.3 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="131.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 15|shared pool, retry every 30 min: 45.6 s|shared pool, backoff: 270.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="135.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 16|shared pool, retry every 30 min: 54.5 s|shared pool, backoff: 336.4 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="139.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 17|shared pool, retry every 30 min: 61.6 s|shared pool, backoff: 394.1 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="143.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 18|shared pool, retry every 30 min: 68.6 s|shared pool, backoff: 450.3 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="147.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 19|shared pool, retry every 30 min: 70.6 s|shared pool, backoff: 504.1 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="151.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 20|shared pool, retry every 30 min: 79.1 s|shared pool, backoff: 568.8 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="155.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 21|shared pool, retry every 30 min: 89.0 s|shared pool, backoff: 635.9 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="159.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 22|shared pool, retry every 30 min: 92.6 s|shared pool, backoff: 698.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="163.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 23|shared pool, retry every 30 min: 99.4 s|shared pool, backoff: 761.8 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="168" y="40" width="4.08333" height="210" data-tip="submitted in minute 24|shared pool, retry every 30 min: 104.0 s|shared pool, backoff: 825.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="172.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 25|shared pool, retry every 30 min: 104.6 s|shared pool, backoff: 881.1 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="176.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 26|shared pool, retry every 30 min: 117.0 s|shared pool, backoff: 956.1 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="180.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 27|shared pool, retry every 30 min: 119.5 s|shared pool, backoff: 1,011.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="184.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 28|shared pool, retry every 30 min: 130.6 s|shared pool, backoff: 1,074.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="188.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 29|shared pool, retry every 30 min: 139.0 s|shared pool, backoff: 1,133.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="192.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 30|shared pool, retry every 30 min: 148.9 s|shared pool, backoff: 1,198.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="196.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 31|shared pool, retry every 30 min: 153.4 s|shared pool, backoff: 1,254.3 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="200.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 32|shared pool, retry every 30 min: 161.0 s|shared pool, backoff: 1,316.7 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="204.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 33|shared pool, retry every 30 min: 170.3 s|shared pool, backoff: 1,377.7 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="208.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 34|shared pool, retry every 30 min: 177.5 s|shared pool, backoff: 1,436.4 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="212.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 35|shared pool, retry every 30 min: 186.1 s|shared pool, backoff: 1,498.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="217" y="40" width="4.08333" height="210" data-tip="submitted in minute 36|shared pool, retry every 30 min: 198.5 s|shared pool, backoff: 1,564.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="221.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 37|shared pool, retry every 30 min: 207.2 s|shared pool, backoff: 1,632.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="225.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 38|shared pool, retry every 30 min: 216.2 s|shared pool, backoff: 1,690.9 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="229.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 39|shared pool, retry every 30 min: 224.1 s|shared pool, backoff: 1,756.8 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="233.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 40|shared pool, retry every 30 min: 237.8 s|shared pool, backoff: 1,785.1 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="237.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 41|shared pool, retry every 30 min: 300.3 s|shared pool, backoff: 1,736.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="241.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 42|shared pool, retry every 30 min: 359.3 s|shared pool, backoff: 1,685.6 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="245.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 43|shared pool, retry every 30 min: 413.1 s|shared pool, backoff: 1,634.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="249.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 44|shared pool, retry every 30 min: 476.4 s|shared pool, backoff: 1,583.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="253.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 45|shared pool, retry every 30 min: 537.3 s|shared pool, backoff: 1,533.3 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="257.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 46|shared pool, retry every 30 min: 607.0 s|shared pool, backoff: 1,480.3 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="261.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 47|shared pool, retry every 30 min: 663.2 s|shared pool, backoff: 1,428.7 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="266" y="40" width="4.08333" height="210" data-tip="submitted in minute 48|shared pool, retry every 30 min: 723.1 s|shared pool, backoff: 1,377.4 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="270.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 49|shared pool, retry every 30 min: 777.2 s|shared pool, backoff: 1,327.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="274.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 50|shared pool, retry every 30 min: 840.2 s|shared pool, backoff: 1,275.7 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="278.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 51|shared pool, retry every 30 min: 900.8 s|shared pool, backoff: 1,224.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="282.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 52|shared pool, retry every 30 min: 963.3 s|shared pool, backoff: 1,173.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="286.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 53|shared pool, retry every 30 min: 1,001.3 s|shared pool, backoff: 1,121.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="290.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 54|shared pool, retry every 30 min: 957.7 s|shared pool, backoff: 1,070.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="294.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 55|shared pool, retry every 30 min: 905.1 s|shared pool, backoff: 1,018.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="298.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 56|shared pool, retry every 30 min: 855.5 s|shared pool, backoff: 968.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="302.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 57|shared pool, retry every 30 min: 803.5 s|shared pool, backoff: 916.1 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="306.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 58|shared pool, retry every 30 min: 753.0 s|shared pool, backoff: 865.3 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="310.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 59|shared pool, retry every 30 min: 702.3 s|shared pool, backoff: 814.3 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="315" y="40" width="4.08333" height="210" data-tip="submitted in minute 60|shared pool, retry every 30 min: 651.1 s|shared pool, backoff: 762.8 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="319.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 61|shared pool, retry every 30 min: 599.6 s|shared pool, backoff: 710.8 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="323.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 62|shared pool, retry every 30 min: 549.4 s|shared pool, backoff: 660.6 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="327.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 63|shared pool, retry every 30 min: 497.5 s|shared pool, backoff: 608.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="331.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 64|shared pool, retry every 30 min: 446.1 s|shared pool, backoff: 557.1 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="335.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 65|shared pool, retry every 30 min: 395.5 s|shared pool, backoff: 506.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="339.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 66|shared pool, retry every 30 min: 344.7 s|shared pool, backoff: 455.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="343.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 67|shared pool, retry every 30 min: 294.2 s|shared pool, backoff: 404.4 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="347.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 68|shared pool, retry every 30 min: 243.5 s|shared pool, backoff: 353.4 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="351.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 69|shared pool, retry every 30 min: 191.6 s|shared pool, backoff: 301.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="355.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 70|shared pool, retry every 30 min: 140.4 s|shared pool, backoff: 250.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="359.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 71|shared pool, retry every 30 min: 89.3 s|shared pool, backoff: 200.4 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="364" y="40" width="4.08333" height="210" data-tip="submitted in minute 72|shared pool, retry every 30 min: 37.9 s|shared pool, backoff: 152.2 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="368.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 73|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 104.7 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="372.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 74|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 57.0 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="376.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 75|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 7.9 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="380.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 76|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="384.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 77|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="388.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 78|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="392.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 79|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="396.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 80|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="400.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 81|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="404.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 82|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="408.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 83|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="413" y="40" width="4.08333" height="210" data-tip="submitted in minute 84|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="417.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 85|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="421.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 86|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="425.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 87|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="429.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 88|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="433.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 89|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="437.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 90|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="441.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 91|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="445.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 92|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="449.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 93|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="453.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 94|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="457.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 95|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="462" y="40" width="4.08333" height="210" data-tip="submitted in minute 96|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="466.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 97|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="470.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 98|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="474.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 99|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="478.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 100|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="482.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 101|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="486.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 102|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="490.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 103|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="494.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 104|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="498.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 105|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="502.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 106|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="506.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 107|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="511" y="40" width="4.08333" height="210" data-tip="submitted in minute 108|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="515.083" y="40" width="4.08333" height="210" data-tip="submitted in minute 109|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="519.167" y="40" width="4.08333" height="210" data-tip="submitted in minute 110|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="523.25" y="40" width="4.08333" height="210" data-tip="submitted in minute 111|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="527.333" y="40" width="4.08333" height="210" data-tip="submitted in minute 112|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="531.417" y="40" width="4.08333" height="210" data-tip="submitted in minute 113|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="535.5" y="40" width="4.08333" height="210" data-tip="submitted in minute 114|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="539.583" y="40" width="4.08333" height="210" data-tip="submitted in minute 115|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="543.667" y="40" width="4.08333" height="210" data-tip="submitted in minute 116|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="547.75" y="40" width="4.08333" height="210" data-tip="submitted in minute 117|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="551.833" y="40" width="4.08333" height="210" data-tip="submitted in minute 118|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+<rect class="hit" x="555.917" y="40" width="4.08333" height="210" data-tip="submitted in minute 119|shared pool, retry every 30 min: 0.5 s|shared pool, backoff: 0.5 s|limit per domain and a down list: 0.5 s"/>
+</svg>
+</div>
+<figcaption>In a shared pool, attempts to the dead domain hold connections for 30 seconds each and everyone’s mail waits. A limit per domain and a down list keep other mail at half a second.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Policy</th><th>Other mail during the outage: median, 99th percentile</th><th>Connection time lost to timeouts</th><th>Greylisted mail, median</th><th>The dead domain after recovery: median, last</th></tr></thead>
+<tbody>
+<tr><th>Shared pool, retry every 30 min</th><td>224 s, 2,434 s</td><td>184 hours</td><td>33.8 min</td><td>2.7 min, 75.8 min</td></tr>
+<tr><th>Shared pool, backoff from 1 min</th><td>969 s, 1,797 s</td><td>188 hours</td><td>12.3 min</td><td>2.5 min, 38.7 min</td></tr>
+<tr><th>Limit of 20 connections per domain, a down list, backoff</th><td>0.5 s, 47 s</td><td>0.3 hours</td><td>6.1 min</td><td>5.6 min, 13.8 min</td></tr>
+</tbody>
+</table>
+<p>In a shared pool, mail to the dead domain keeps arriving and each attempt ties up a connection for 30 seconds, so all 200 end up waiting on it and everyone else’s mail waits too: a median of 4 minutes, and 40 minutes at the 99th percentile. Retrying sooner makes it worse, because there are more attempts to time out. A limit per domain caps the damage at 20 connections, and the down list stops the attempts altogether: after five timeouts in a row the domain is marked down, its mail is parked, and one message is tried every 5 minutes. When it gets through, everything parked is released, which drained the backlog within 14 minutes of recovery. Backoff from a minute instead of a fixed 30 minutes also delivered greylisted mail in 6 minutes instead of 34. RFC 5321 asks for at least 30 minutes in general but expects smarter strategies when the reason for a refusal is known, and a refusal that names greylisting is such a case.</p>
+<p><dfn>Deliverability</dfn> is the share of a sender’s mail that reaches the recipients’ inboxes rather than their spam folders or nowhere. It is earned. Receivers judge sending addresses and domains by their history: volume, complaints, bounces to addresses that do not exist. So the service sends from pools of addresses with a reputation to protect, keeps transactional mail apart from bulk mail, starts new addresses slowly, and limits how much a new or suddenly busy account can send, because a hijacked account sending spam damages everyone on its address (<x-ref to="hld-rate-limiter"></x-ref>). Since February 2024 Gmail has required every sender to authenticate with SPF or DKIM and to keep its reported spam rate below 0.3%, and senders of more than 5,000 messages a day to Gmail accounts to publish DMARC, align <code>From:</code> with SPF or DKIM, and offer one-click unsubscribe.</p>
+
+<h2 id="storage">Step 6c: Mailbox storage and search</h2>
+<p>Each user’s mail is a partition: records keyed by user and message id in the database, and blobs in the blob store. A mailbox with a million messages is still one user’s partition, read a page at a time in date order (<x-ref to="partitioning#shard-key"></x-ref>). Most reads are of recent mail, so blobs older than a few months move to a colder, cheaper tier and are fetched on the rare day someone opens them (<x-ref to="object-and-file-storage#tiers"></x-ref>).</p>
+<p>The same attachment often arrives many times: sent to a team, forwarded, sent again. Storing each distinct attachment once, under the hash of its content, with a reference from each message, saves those copies. On the chapter’s assumed mix of personal mail and bulk mail, attachments were 52% of the bytes and storing them once cut the total to 75.3% of a full copy per mailbox. Bodies are not shared: bulk mail is usually personalized, with the reader’s name and tracking links, so its copies differ. A shared blob is deleted only when no message refers to it any more, which needs a reference count or a periodic sweep.</p>
+<p>Every search is inside one mailbox, which decides the index layout. An index that grouped all users’ mail by term would make a search for “invoice” read the postings of every user’s invoices and throw away all but one user’s. Instead the index is partitioned by user, like the records: many users’ small indexes share a shard, every term is prefixed with the user id, and a query reads only that user’s postings (<x-ref to="search-systems#distributed"></x-ref>). New mail reaches the index through a queue, so a message can be visible in the inbox a few seconds before search finds it. Sync follows the same partition: each change to a mailbox gets the next number of that user’s change counter, and IMAP and JMAP clients ask for everything after the number they hold.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>An inbound SMTP server, or all of them for an hour</th><td>Mail arrives late</td><td>Several MX hosts share the load; if all are down, senders queue and retry for days, as RFC 5321 requires</td></tr>
+<tr><th>The blob store is slow</th><td>Lists load; opening a message is slow</td><td>Records and previews come from the database; blobs are read only when opened</td></tr>
+<tr><th>The search index falls behind</th><td>The newest mail is missing from search for a while</td><td>Indexing is queued work; lag is an alert</td></tr>
+<tr><th>A large receiving domain stops answering</th><td>Mail to it waits; other mail does not</td><td>The per-domain limit and the down list, step 6b</td></tr>
+<tr><th>A sending address is put on a blocklist</th><td>Some sent mail bounces or lands in spam</td><td>Traffic moves to another pool while the cause, often a hijacked account, is found</td></tr>
+<tr><th>A spam wave</th><td>A little more spam for a while</td><td>Connection-level limits and reputation refuse most of it before the data is sent; the classifier learns from reports</td></tr>
+</tbody>
+</table>
+<p>At ten times the mailboxes, storage is the system: two exabytes a year, which means erasure coding, cold tiers and compression matter more than any server count. The inbound edge grows with connections and the checks with messages, both stateless. At a hundred times, which no provider has, the database of records would be split by region of the user, each region running its own inbound and outbound paths behind the same MX names.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>The standards.</b> SMTP is RFC 5321 (October 2008), the message format RFC 5322. SPF is RFC 7208 (2014), DKIM RFC 6376 (2011) with Ed25519 signatures added by RFC 8463 (2018). DMARC was revised as RFC 9989 in May 2026, with reporting in RFC 9990 and 9991, replacing RFC 7489; it defines a walk up the DNS tree to find a domain’s organizational domain, where RFC 7489 relied on a public suffix list. IMAP4rev2 is RFC 9051 (2021), JMAP RFC 8620 and 8621 (2019). All checked at the RFC Editor in October 2026.</li>
+  <li><b>Retries.</b> RFC 5321 suggests, from experience, two connection attempts in the first hour a message is queued, then one every two or three hours, and notes that a client typically learns an attempt has failed only after a timeout of several minutes.</li>
+  <li><b>Gmail’s sender requirements.</b> Google’s guidelines, in force since 1 February 2024 and checked in October 2026, require all senders to Gmail accounts to use SPF or DKIM, TLS, valid forward and reverse DNS, and a spam rate below 0.3%; senders of more than 5,000 messages a day must also publish DMARC (a policy of none is allowed), align the <code>From:</code> domain with SPF or DKIM, and support one-click unsubscribe for marketing mail.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“Customers bring their own domains”</th><td>Their MX records point at the service; a DKIM key per domain; SPF includes; checks that a customer owns a domain (<x-ref to="multi-tenancy"></x-ref>)</td><td>The paths</td></tr>
+<tr><th>“Undo send for 30 seconds”</th><td>Submission puts the message in a delayed queue; undo deletes it before it is due</td><td>The outbound path after that</td></tr>
+<tr><th>“Attachments of 1 GB”</th><td>Upload to file storage and send a link</td><td>SMTP size limits</td></tr>
+<tr><th>“End-to-end encrypted mail”</th><td>The server stores what it cannot read: no server-side search, spam scoring only on metadata</td><td>Transport and storage</td></tr>
+<tr><th>“Smart categories, such as Promotions”</th><td>A classifier at delivery writes a label to the record</td><td>Storage and search</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Spend 5 minutes on requirements and say that the other ends are strangers, 3 on estimates and the storage per year, 5 on SMTP, the app API and the record-and-blob split, and 10 on the drawing and the two flows. In the deep dives, explain SPF, DKIM and DMARC with the forwarding case, then the outbound queue with per-domain limits and retries, then search partitioned by user. Keep 5 minutes for failures.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Answering 250 before the message is stored</th><td>A crash loses mail the sender has already deleted</td><td>Store durably, then answer</td></tr>
+<tr><th>Storing message bodies in the database</th><td>Hundreds of petabytes in the most expensive store</td><td>Records in the database, messages in a blob store</td></tr>
+<tr><th>Trusting <code>From:</code></th><td>Forged mail from your bank reaches the inbox</td><td>SPF, DKIM and DMARC, then reputation and content</td></tr>
+<tr><th>Treating DMARC pass as safe</th><td>Look-alike domains pass every check</td><td>Content and reputation filtering still apply</td></tr>
+<tr><th>One shared pool for outgoing connections</th><td>One dead domain delays all mail, by 40 minutes at the 99th percentile in the simulation</td><td>A limit per domain and a down list</td></tr>
+<tr><th>Retrying every 30 minutes, always</th><td>Greylisted mail waits half an hour</td><td>Retry sooner when the refusal says why, such as greylisting</td></tr>
+<tr><th>A global search index</th><td>Each search reads every user’s postings for its terms</td><td>An index partitioned by user</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="hld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="dns"></x-ref>: MX, SPF, DKIM and DMARC records.</li>
+  <li><x-ref to="object-and-file-storage"></x-ref>: blobs, erasure coding and cold tiers.</li>
+  <li><x-ref to="search-systems"></x-ref>: inverted indexes and their segments.</li>
+  <li><x-ref to="resilience-patterns"></x-ref>: per-destination limits, backoff and the down list as a circuit breaker.</li>
+  <li><x-ref to="hld-notifications"></x-ref>: sending email for other services.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>SMTP moves responsibility with the 250 reply: store before answering, and keep what you could not deliver for days.</li>
+  <li>SPF checks the sending server, DKIM signs the content, and DMARC requires one of them to pass for the domain the reader sees.</li>
+  <li>Authentication proves the domain, not the intent; layer reputation and content filtering on top.</li>
+  <li>Queue outgoing mail per receiving domain, with a connection limit and a down list, so one dead domain cannot delay the rest.</li>
+  <li>Deliverability is reputation: authenticated mail, separate pools, slow starts and limits on hijackable accounts.</li>
+  <li>Split small records from large blobs, partition both by user, and store each distinct attachment once.</li>
+  <li>Partition the search index by user, because every search is inside one mailbox.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why must the inbound server store a message before it answers 250?</summary><p>The 250 transfers responsibility: the sending server deletes its copy. If the receiver crashed after answering and before storing, the message would be gone with no one left to retry it.</p></details>
+<details><summary>A message is forwarded unchanged by an old university address. Which of SPF and DKIM survive, and does DMARC pass?</summary><p>SPF fails, because the forwarder’s server is not on the original domain’s list. DKIM passes, because the signed headers and body are unchanged. DMARC passes, since DKIM passed for the aligned domain.</p></details>
+<details><summary>Why does a look-alike domain pass all three checks?</summary><p>Its owner published correct SPF, DKIM and DMARC records for it. The checks prove which domain sent the message, not that the domain is the one the reader thinks it is.</p></details>
+<details><summary>The largest receiving domain stops answering. Why does all outgoing mail slow down in a shared pool?</summary><p>Mail to that domain keeps arriving, and each attempt holds a connection until its timeout. Soon most connections are waiting on the dead domain, and mail to everyone else queues behind them: a median of about 4 minutes in the simulation.</p></details>
+<details><summary>How does a down list help, and what happens when the domain recovers?</summary><p>After a few timeouts in a row the domain is marked down: its mail is parked without attempts, and one message is tried every few minutes. When the probe gets through, all parked mail is released; in the simulation the backlog was delivered within 14 minutes of recovery.</p></details>
+<details><summary>Why keep message bodies in a blob store and records in a database?</summary><p>Lists, counts, sync and search need the small records constantly; bodies are large, written once and read rarely. Keeping them apart puts hundreds of petabytes on cheap durable storage and keeps the hot data small.</p></details>
+<details><summary>Why partition the search index by user rather than by term?</summary><p>Every search is in one mailbox. A term-partitioned index would read every user’s postings for each term and discard almost all of them; a user-partitioned index reads only the searcher’s.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>J. Klensin, <a href="https://www.rfc-editor.org/rfc/rfc5321">RFC 5321: Simple Mail Transfer Protocol</a>, IETF, October 2008. Section 4.5.4 on retry strategies, section 5.1 on MX records.</li>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc7208">RFC 7208: Sender Policy Framework (SPF)</a>, April 2014; <a href="https://www.rfc-editor.org/rfc/rfc6376">RFC 6376: DomainKeys Identified Mail (DKIM) Signatures</a>, September 2011; <a href="https://www.rfc-editor.org/rfc/rfc8463">RFC 8463</a>, Ed25519 for DKIM, September 2018.</li>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc9989">RFC 9989: Domain-Based Message Authentication, Reporting, and Conformance (DMARC)</a>, May 2026. Replaces RFC 7489.</li>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc8617">RFC 8617: The Authenticated Received Chain (ARC) Protocol</a>, July 2019, experimental.</li>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc9051">RFC 9051: IMAP Version 4rev2</a>, August 2021; <a href="https://www.rfc-editor.org/rfc/rfc8620">RFC 8620: JMAP</a>, July 2019, and <a href="https://www.rfc-editor.org/rfc/rfc8621">RFC 8621: JMAP for Mail</a>, August 2019.</li>
+  <li>Google Workspace Admin Help, <a href="https://support.google.com/a/answer/81126">“Email sender guidelines”</a>, checked October 2026. The requirements in force since 1 February 2024.</li>
+</ol>
+</section>

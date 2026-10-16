@@ -1,0 +1,784 @@
+<!--meta
+{ "description": "A seven-step method for high-level design problems, worked through on a pastebin: what each step produces, a time plan for 45- and 60-minute rounds, how to ask for requirements, estimates with a calculator, an API, a data model, an architecture and its request flows, how to choose deep dives and two of them measured by simulation, failures and growth, the shapes of the 23 case studies that follow, and the same steps as a design document at work.",
+  "lede": "Part X had a procedure for designing classes. This chapter gives the one for designing systems: seven steps, from requirements with numbers to the failures a design must survive. Each step produces something the next one uses, and the same steps, written down, become a design document at work. A small pastebin is carried through all of them, and the 23 case studies that follow use the same headings.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="why">Why a method</h2>
+<p><x-ref to="what-is-system-design#method"></x-ref> introduced a loop of six steps for any design. This chapter turns it into the procedure every case study in Part XI follows, with the interface and the data as two steps, because the second depends on the first. A high-level design problem names a product, “design a URL shortener”, and gives you 45 to 60 minutes. What is assessed is how you get from a vague sentence to a defensible architecture. Without a method, three things go wrong: boxes are drawn before anyone knows what they are for, one part takes half the time, and the failures are never reached.</p>
+<table>
+<thead><tr><th>What is assessed</th><th>What it looks like when done well</th><th>From</th></tr></thead>
+<tbody>
+<tr><th>Scoping</th><td>A short list of features in and out, and numbers for scale, speed and availability</td><td><x-ref to="what-is-system-design#requirements"></x-ref></td></tr>
+<tr><th>Quantitative sense</th><td>Rounded estimates, said aloud, each of which changes a decision</td><td><x-ref to="estimation"></x-ref></td></tr>
+<tr><th>Interfaces and data</th><td>An API and a data model that match the requirements, with keys chosen for the main reads</td><td><x-ref to="api-styles"></x-ref>, <x-ref to="data-models"></x-ref></td></tr>
+<tr><th>Architecture</th><td>The simplest set of components that works, with one request traced through it</td><td><x-ref to="scalability#evolution"></x-ref></td></tr>
+<tr><th>Depth</th><td>Two or three hard parts designed properly, with the trade-off named</td><td>Parts III to V</td></tr>
+<tr><th>Operational sense</th><td>What fails, what users then see, and what changes at ten and a hundred times the load</td><td><x-ref to="availability-and-reliability"></x-ref></td></tr>
+<tr><th>Communication</th><td>A plan stated at the start, assumptions written down, and checks with the interviewer at each step</td><td>Practice</td></tr>
+</tbody>
+</table>
+<p>The same list describes a good design review at work. The interview compresses it into an hour.</p>
+
+<h2 id="steps">The seven steps</h2>
+<p>The order matters more than the exact minutes, because each step produces what the next one needs: numbers before estimates, estimates before boxes, an API before the data it reads.</p>
+<table>
+<thead><tr><th>Step</th><th>You produce</th><th>Interviewers listen for</th></tr></thead>
+<tbody>
+<tr><th>1. Requirements</th><td>Three to five features, a list of what is out of scope, and a number for each quality: scale, latency, availability, durability, consistency</td><td>Questions whose answers change the design. Numbers instead of adjectives</td></tr>
+<tr><th>2. Estimates</th><td>Requests a second at average and peak, storage, bandwidth and memory, rounded, each with what it decides</td><td>Quick arithmetic said aloud, followed by “so …”</td></tr>
+<tr><th>3. The API</th><td>The few operations, with requests, responses and errors</td><td>Safe retries for writes, pagination for lists, errors that match the requirements</td></tr>
+<tr><th>4. The data model</th><td>The entities, their keys, and a store for each, chosen by how it is read</td><td>A key chosen for the main read. A reason for each store, not a brand</td></tr>
+<tr><th>5. The design</th><td>An architecture drawing, with the main write and read traced through it</td><td>The simplest design first. Every box justified by a requirement or a number</td></tr>
+<tr><th>6. Deep dives</th><td>Two or three hard parts, each with options, a choice and its cost</td><td>Knowing which parts are hard. Trade-offs with numbers</td></tr>
+<tr><th>7. Failures and growth</th><td>What breaks and what users see; what changes at 10 and 100 times the load</td><td>Named failures and their recovery, not “it is highly available”</td></tr>
+</tbody>
+</table>
+<p>Every case study that follows uses these seven headings, so “Step 4” means the same thing in each. A case study opens with the problem as an interviewer would state it. After step 7 it adds what named real systems do, the follow-up questions an interviewer is likely to ask, and the common mistakes. Its code is small simulations that make the deep dives’ claims checkable.</p>
+
+<h2 id="time-plan">A time plan</h2>
+
+<figure class="fig wide" id="fig-time">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f761t f761d">
+<title id="f761t">A time plan for a 45-minute and a 60-minute round</title>
+<desc id="f761d">Two bars of minutes. In 45 minutes, after 3 of introductions: requirements 3 to 8, estimates 8 to 11, the API 11 to 14, the data model 14 to 17, the design 17 to 27, deep dives 27 to 38, failures and growth 38 to 42, then questions to 45. In 60 minutes: requirements 3 to 9, estimates 9 to 13, the API 13 to 17, the data model 17 to 21, the design 21 to 32, deep dives 32 to 48, failures and growth 48 to 55, then questions to 60.</desc>
+<text class="tb" x="10" y="18">Minute at which each step ends</text>
+<text class="tb" x="10" y="78">45 minutes</text>
+<rect class="n sunk" x="101" y="58" width="28" height="30" rx="4"/>
+<text class="ts mid" x="130" y="51">3</text>
+<rect class="n" x="131" y="58" width="48" height="30" rx="4"/>
+<text class="tb mid" x="155" y="78">1</text>
+<text class="ts mid" x="180" y="51">8</text>
+<rect class="n" x="181" y="58" width="28" height="30" rx="4"/>
+<text class="tb mid" x="195" y="78">2</text>
+<text class="ts mid" x="210" y="51">11</text>
+<rect class="n" x="211" y="58" width="28" height="30" rx="4"/>
+<text class="tb mid" x="225" y="78">3</text>
+<text class="ts mid" x="240" y="51">14</text>
+<rect class="n" x="241" y="58" width="28" height="30" rx="4"/>
+<text class="tb mid" x="255" y="78">4</text>
+<text class="ts mid" x="270" y="51">17</text>
+<rect class="n" x="271" y="58" width="98" height="30" rx="4"/>
+<text class="tb mid" x="320" y="78">5</text>
+<text class="ts mid" x="370" y="51">27</text>
+<rect class="n sig" x="371" y="58" width="108" height="30" rx="4"/>
+<text class="tb mid" x="425" y="78">6</text>
+<text class="ts mid" x="480" y="51">38</text>
+<rect class="n" x="481" y="58" width="38" height="30" rx="4"/>
+<text class="tb mid" x="500" y="78">7</text>
+<text class="ts mid" x="520" y="51">42</text>
+<rect class="n sunk" x="521" y="58" width="28" height="30" rx="4"/>
+<text class="ts mid" x="550" y="51">45</text>
+<text class="ts mid" x="100" y="51">0</text>
+<path class="e none dash" d="M370 90V108"/>
+<text class="ts" x="376" y="106">architecture drawn, one request traced, by minute 27</text>
+<text class="tb" x="10" y="168">60 minutes</text>
+<rect class="n sunk" x="101" y="148" width="28" height="30" rx="4"/>
+<text class="ts mid" x="130" y="141">3</text>
+<rect class="n" x="131" y="148" width="58" height="30" rx="4"/>
+<text class="tb mid" x="160" y="168">1</text>
+<text class="ts mid" x="190" y="141">9</text>
+<rect class="n" x="191" y="148" width="38" height="30" rx="4"/>
+<text class="tb mid" x="210" y="168">2</text>
+<text class="ts mid" x="230" y="141">13</text>
+<rect class="n" x="231" y="148" width="38" height="30" rx="4"/>
+<text class="tb mid" x="250" y="168">3</text>
+<text class="ts mid" x="270" y="141">17</text>
+<rect class="n" x="271" y="148" width="38" height="30" rx="4"/>
+<text class="tb mid" x="290" y="168">4</text>
+<text class="ts mid" x="310" y="141">21</text>
+<rect class="n" x="311" y="148" width="108" height="30" rx="4"/>
+<text class="tb mid" x="365" y="168">5</text>
+<text class="ts mid" x="420" y="141">32</text>
+<rect class="n sig" x="421" y="148" width="158" height="30" rx="4"/>
+<text class="tb mid" x="500" y="168">6</text>
+<text class="ts mid" x="580" y="141">48</text>
+<rect class="n" x="581" y="148" width="68" height="30" rx="4"/>
+<text class="tb mid" x="615" y="168">7</text>
+<text class="ts mid" x="650" y="141">55</text>
+<rect class="n sunk" x="651" y="148" width="48" height="30" rx="4"/>
+<text class="ts mid" x="700" y="141">60</text>
+<text class="ts mid" x="100" y="141">0</text>
+<path class="e none dash" d="M420 180V198"/>
+<text class="ts" x="426" y="196">architecture drawn, one request traced, by minute 32</text>
+<text class="ts" x="10" y="226">1 Requirements   2 Estimates   3 API   4 Data model   5 Design   6 Deep dives (shaded)   7 Failures and growth</text>
+<text class="ts" x="10" y="246">Gray at each end: introductions, and time for your own questions.</text>
+</svg>
+</div>
+<figcaption>Both plans give about a third of the working time to steps 1 to 4 and the largest block to the deep dives. The extra 15 minutes of a longer round go mostly to depth and failures.</figcaption>
+</figure>
+
+<p>About 40 minutes of a 45-minute round are yours once introductions and your own questions are taken out. Two checkpoints matter. If the architecture is not on the board with one request traced through it by minute 27, or 32 in the longer round, stop refining earlier steps and draw it. And leave time for step 7: a design whose failures were never discussed is judged as if it had none planned.</p>
+<p>Published frameworks agree on the shape. Hello Interview’s suggests about 5 minutes for requirements, 2 for the core entities, 5 for the API, 10 to 15 for the high-level design and about 10 for deep dives, and it treats estimates as optional: do the arithmetic only where it will change the design. Alex Xu’s <cite>System Design Interview</cite> allows a few minutes to understand the problem, 10 to 15 for the high-level design, 10 to 25 for the deep dive and a few to wrap up.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Say the plan in the first minute: “I’ll agree the requirements and rough numbers, sketch the API and data, draw a first design, then go deep on the two hardest parts and finish with failures.” Then check in at each step. A question from the interviewer is the agenda: answer it, even if it reorders the plan.</p></div>
+
+<h2 id="problem">The worked example: a pastebin</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a pastebin. A user pastes some text and gets a short link to share. Anyone with the link can read the text until it expires. Pastes cannot be edited.</p></div>
+<p>At the scale chosen here a pastebin is not hard, which is why it is the example: every step is visible without one difficult part taking over the chapter. The interesting decisions come from a latency target and from expiry, not from the load. Generating short keys is shared with <x-ref to="hld-url-shortener"></x-ref>, which treats it in depth.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<p>Step 1 produces two short lists, written where the interviewer can see them. The functional list says what the system does and, as important, what it does not. The non-functional list gives each quality a number (<x-ref to="what-is-system-design#requirements"></x-ref>). Spend about 5 minutes, 6 in a longer round. The questions worth asking are the ones whose answers change the design, and they fall into five groups.</p>
+<table>
+<thead><tr><th>Ask about</th><th>For the pastebin</th><th>What the answer changes</th></tr></thead>
+<tbody>
+<tr><th>Who uses it, for what</th><td>Who creates pastes, and who reads them? Do readers need an account?</td><td>A login, and whether anyone may cache a paste</td></tr>
+<tr><th>How many, how often</th><td>How many daily users? How many pastes does each create and open?</td><td>Every number in step 2</td></tr>
+<tr><th>The data</th><td>How large can a paste be? Can it be edited? How long is it kept?</td><td>Where the text lives, whether caches go stale, how much is stored</td></tr>
+<tr><th>How well</th><td>How fast must a read be? What may be lost? May a new paste be unreadable for a moment?</td><td>The cache, the replication, where a fresh paste is read from</td></tr>
+<tr><th>What is out</th><td>Are accounts, search and view counts part of this?</td><td>What not to draw</td></tr>
+</tbody>
+</table>
+<p>“Can a paste be edited?” is the most valuable question here: if not, a paste can be cached anywhere without going stale. When the answer is “you decide”, decide aloud and write it down.</p>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>Create a paste: text up to 512 KB, an optional language for highlighting, and an expiry chosen from 1 hour, 1 day, 1 week, 1 month or 1 year</th><td>In scope</td></tr>
+<tr><th>Read a paste by its link, rendered or as raw text</th><td>In scope</td></tr>
+<tr><th>Expire pastes, and let the creator delete one early with a token returned at creation</th><td>In scope</td></tr>
+<tr><th>Accounts, editing, search, lists of recent pastes, password-protected pastes, view counts, pastes that never expire</th><td>Out of scope. The last is a choice that keeps storage bounded</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th><th>What it will decide</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>2 million daily users. Each creates 0.25 pastes a day and opens 5. Pastes average 10 KB</td><td>Traffic, storage and bandwidth in step 2</td></tr>
+<tr><th>Expiry mix</th><td>Assumed: 10% of pastes kept 1 hour, 30% 1 day, 35% 1 week, 20% 1 month, 5% 1 year</td><td>How much is stored at once</td></tr>
+<tr><th>Read latency</th><td>99% of reads answered within 100 ms, measured at the server</td><td>Where the text is read from (step 6)</td></tr>
+<tr><th>Availability</th><td>99.9% for reads and for creates, about 43 minutes a month (<x-ref to="availability-and-reliability#nines"></x-ref>)</td><td>No single server whose loss stops either</td></tr>
+<tr><th>Durability</th><td>A paste acknowledged to its creator is not lost before it expires</td><td>How the database is replicated</td></tr>
+<tr><th>Consistency</th><td>The link works as soon as the create call returns. A paste never changes</td><td>Where a fresh paste can be read from</td></tr>
+<tr><th>Abuse</th><td>Creates limited for each address</td><td>A rate limit at the edge (<x-ref to="resilience-patterns#rate-limiting"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>The numbers are assumptions, and saying so is part of the step: an interviewer who disagrees with 0.25 pastes a day will say so now, when it is cheap.</p>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<p>Step 2 turns the requirements into the quantities of <x-ref to="estimation#method"></x-ref>: traffic, storage, bandwidth, memory and machines. Round hard, say each line aloud, and spend about 3 minutes, 4 in a longer round. Interviewers listen less for the numbers than for what follows them.</p>
+<div class="formula">creates   2,000,000 × 0.25 = 500,000 a day ÷ 86,400 ≈ 5.8 a second        peak × 3 ≈ 17
+reads     2,000,000 × 5 = 10,000,000 a day ÷ 86,400 ≈ 116 a second        peak × 3 ≈ 350
+          10,000,000 ÷ 500,000 = 20 reads for each paste
+lifetime  0.1 × 1/24 + 0.3 × 1 + 0.35 × 7 + 0.2 × 30 + 0.05 × 365 ≈ 27 days on average
+alive     500,000 a day × 27 days = 13.5 million pastes, once a year has passed
+storage   13.5 million × 10 KB = 135 GB of text        × 300 bytes = 4 GB of rows
+out       116 × 10 KB ≈ 1.2 MB/s ≈ 9.3 Mbit/s        peak ≈ 28 Mbit/s
+memory    one day of new pastes: 500,000 × 10 KB = 5 GB</div>
+<p>The line for pastes alive uses <x-ref to="latency-and-throughput#littles-law"></x-ref>: the number of things in a system is the rate at which they arrive times how long each stays. The 300 bytes for a row, with its share of the index, is an assumption to check later. Then say what the numbers decide.</p>
+<table>
+<thead><tr><th>The number</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><th>17 creates a second at peak</th><td>One database takes the writes with room to spare. No partitioning</td></tr>
+<tr><th>350 reads a second at peak</th><td>The load needs no cache. The 100 ms target may still need one</td></tr>
+<tr><th>4 GB of rows</th><td>The whole table fits in the memory of one server</td></tr>
+<tr><th>135 GB of text</th><td>Fits on one machine too, so where it lives is decided on other grounds in step 4</td></tr>
+<tr><th>28 Mbit/s out at peak</th><td>No content delivery network is needed to carry the traffic</td></tr>
+<tr><th>5 GB for a day of new pastes</th><td>A cache of that size fits easily in one ordinary server</td></tr>
+</tbody>
+</table>
+
+<div class="widget wide" data-widget="pasteplan76">
+<h4>The pastebin’s numbers, against one server</h4>
+<p>Recomputes step 2 from users and their behavior, and compares each result with one ordinary server.</p>
+<div class="controls">
+  <label>Daily users<input type="number" name="dau" value="2000000" min="1" max="10000000000" step="1000"></label>
+  <label>Pastes created per user per day<input type="number" name="create" value="0.25" min="0" max="100" step="0.05"></label>
+  <label>Pastes read per user per day<input type="number" name="reads" value="5" min="0" max="10000" step="1"></label>
+  <label>Average paste, in KB<input type="number" name="kb" value="10" min="0.1" max="512" step="0.1"></label>
+  <label>Average days a paste is kept<input type="number" name="days" value="27" min="0.1" max="3650" step="0.1"></label>
+  <label>Peak factor<input type="number" name="peak" value="3" min="1" max="20" step="0.5"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 176" role="img" aria-label="Five rows, one for each quantity: peak writes, peak reads without a cache, rows in the database, one day of new pastes, and peak traffic out. On each row a dot shows the quantity as a share of what one ordinary server handles, on a logarithmic scale, with a dashed line at one server."><text x="10" y="14" class="ts">Each dot is a share of one ordinary server, on a logarithmic scale.</text><line x1="190" y1="38" x2="190" y2="154" class="grid" style=""></line><text x="190" y="32" class="ts mid">0.1%</text><line x1="265" y1="38" x2="265" y2="154" class="grid" style=""></line><text x="265" y="32" class="ts mid">1%</text><line x1="340" y1="38" x2="340" y2="154" class="grid" style=""></line><text x="340" y="32" class="ts mid">10%</text><line x1="415" y1="38" x2="415" y2="154" class="axis" style="stroke-dasharray:4 3"></line><text x="415" y="32" class="ts mid">one server</text><line x1="490" y1="38" x2="490" y2="154" class="grid" style=""></line><text x="490" y="32" class="ts mid">10×</text><text x="10" y="58" class="ts">Peak writes</text><line x1="190" y1="54" x2="490" y2="54" class="grid"></line><circle cx="283" cy="54" r="5" class="dot"></circle><text x="502" y="58" class="ts">17.4 /s of 1,000</text><text x="10" y="82" class="ts">Peak reads, no cache</text><line x1="190" y1="78" x2="490" y2="78" class="grid"></line><circle cx="305.5" cy="78" r="5" class="dot"></circle><text x="502" y="82" class="ts">347 /s of 10,000</text><text x="10" y="106" class="ts">Rows in the database</text><line x1="190" y1="102" x2="490" y2="102" class="grid"></line><circle cx="325.1" cy="102" r="5" class="dot"></circle><text x="502" y="106" class="ts">4.05 GB of 64 GB</text><text x="10" y="130" class="ts">One day of new pastes</text><line x1="190" y1="126" x2="490" y2="126" class="grid"></line><circle cx="332" cy="126" r="5" class="dot"></circle><text x="502" y="130" class="ts">5 GB of 64 GB</text><text x="10" y="154" class="ts">Peak traffic out</text><line x1="190" y1="150" x2="490" y2="150" class="grid"></line><circle cx="223.3" cy="150" r="5" class="dot"></circle><text x="502" y="154" class="ts">27.8 Mbit/s of 10 Gbit/s</text><text x="10" y="172" class="ts">One server: 1,000 writes or 10,000 indexed reads a second, 64 GB of memory, a 10 Gbit/s link.</text></svg>
+<dl class="results">
+  <div><dt>Creates</dt><dd data-out="writes">5.79 /s, peak 17.4 /s</dd></div>
+  <div><dt>Reads</dt><dd data-out="reads">116 /s, peak 347 /s</dd></div>
+  <div><dt>Pastes alive</dt><dd data-out="live">13.5 million pastes</dd></div>
+  <div><dt>Text stored</dt><dd data-out="text">135 GB</dd></div>
+  <div><dt>Rows, at 300 bytes</dt><dd data-out="rows">4.05 GB</dd></div>
+  <div><dt>Traffic out</dt><dd data-out="egress">9.26 Mbit/s, peak 27.8 Mbit/s</dd></div>
+  <div><dt>One day of new pastes</dt><dd data-out="cache">5 GB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Every quantity is under half of one ordinary server. The first design needs no partitioning: one database with a standby, a cache of about 5 GB for the latency target, and more than one app server for failures rather than for load.</p>
+</div>
+<p>The planning figures for one server are those of <x-ref to="estimation#capacity"></x-ref>, rounded. They are crude, and enough for the question the drawing asks: is anything near the limit of one machine? At the defaults nothing is within a factor of ten. Try 200 million daily users to see which limits are crossed first.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Estimating and never using the result. Arithmetic that ends in “OK, it’s big” has decided nothing. End every estimate with a sentence that starts “so”: so one database is enough, so the cache must hold a day of pastes.</p></div>
+
+<h2 id="api">Step 3: The API</h2>
+<p>Step 3 lists the operations the outside world can call, with what each takes, returns and refuses. Spend about 3 minutes, 4 in a longer round. It exposes misunderstandings early: if you cannot say what creating a paste returns, you are not ready to draw servers. Interviewers listen for what makes an API safe to use: retried writes, paged lists, and the errors a caller must handle (<x-ref to="api-styles#contract"></x-ref>).</p>
+<pre data-lang="http" data-title="Create a paste">
+POST /api/pastes
+Content-Type: application/json
+Idempotency-Key: 5f0c2a9e-3d1b-4c7e-9a64-0e8f1b2c3d4e
+
+{ "text": "SELECT * FROM pastes …", "language": "sql", "expiresIn": "1d" }
+
+HTTP/1.1 201 Created
+Location: https://paste.example/p/Xk3b9QaZ
+
+{ "id": "Xk3b9QaZ", "url": "https://paste.example/p/Xk3b9QaZ",
+  "expiresAt": "2026-10-13T09:30:00Z", "deleteToken": "dt_8Hq2…" }
+</pre>
+<pre data-lang="http" data-title="Read, and delete">
+GET /p/Xk3b9QaZ            → 200 OK, the page with the text
+GET /raw/Xk3b9QaZ          → 200 OK, Content-Type: text/plain; charset=utf-8
+GET /p/Zz000000            → 404 Not Found
+GET /p/Ab7xQ2mP            → 410 Gone (expired or deleted)
+
+DELETE /api/pastes/Xk3b9QaZ
+Authorization: Bearer dt_8Hq2…
+                           → 204 No Content
+</pre>
+<ul>
+  <li><b>Retries.</b> A client that times out does not know whether its paste was created. The idempotency key lets it send the same request again and receive the first answer, not a second paste (<x-ref to="api-styles#idempotency-keys"></x-ref>).</li>
+  <li><b>Pagination.</b> No operation returns a list. Adding “my recent pastes” would bring cursor pagination (<x-ref to="api-styles#pagination"></x-ref>).</li>
+  <li><b>Errors.</b> 413 Content Too Large above 512 KB, 400 for an unknown expiry, 429 Too Many Requests when an address exceeds its limit, and 410 for a paste that existed and has gone (<x-ref to="api-styles#errors"></x-ref>).</li>
+  <li><b>The id.</b> Eight random characters from the 62 letters and digits give 62<sup>8</sup>, about 2.2 × 10<sup>14</sup>, possible links. They are unguessable, which matters because the link is the only thing protecting a paste (<x-ref to="unique-ids#security"></x-ref>). With 13.5 million alive, a new id collides with one in about 16 million attempts, and the database’s primary key catches it so the server can draw again.</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<p>Step 4 names the entities, their keys and a store for each, chosen by how each is read. Spend about 3 minutes, 4 in a longer round. Interviewers listen for a key that serves the main read and a reason for every store. “I’ll use Cassandra” is not a reason; “every read is by id, and nothing joins” is (<x-ref to="data-models#choosing"></x-ref>).</p>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A paste’s row: id, times, size, language, where its text is, a hash of the delete token</th><td>The id</td><td>PostgreSQL, one table</td><td>Every read is by id. An index on the expiry time serves the cleanup job, and the primary key catches id collisions. 4 GB fits in memory</td></tr>
+<tr><th>The text</th><td>Expiry class and id: <code>1d/Xk3b9QaZ</code></td><td>Object storage</td><td>Written once, never changed, up to 512 KB. Rules can delete whole prefixes by age, and the database stays small</td></tr>
+<tr><th>An idempotency key and the answer it got</th><td>The key</td><td>PostgreSQL, a second table</td><td>Kept for a day, so a retry within it gets the first answer</td></tr>
+<tr><th>A cached paste</th><td><code>paste:Xk3b9QaZ</code></td><td>An in-memory cache</td><td>Row and text together, so a hit touches neither store. It expires with the paste</td></tr>
+</tbody>
+</table>
+<pre data-lang="sql" data-title="The main table">
+CREATE TABLE pastes (
+  id          char(8)     PRIMARY KEY,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  expires_at  timestamptz NOT NULL,
+  size_bytes  integer     NOT NULL CHECK (size_bytes <= 512000),
+  language    text,
+  text_key    text        NOT NULL,   -- for example '1d/Xk3b9QaZ'
+  delete_hash bytea       NOT NULL
+);
+CREATE INDEX pastes_by_expiry ON pastes (expires_at);
+</pre>
+<p>Keeping the text in the database was the alternative. At 135 GB it would work, with one store and one network hop fewer. The text goes to object storage because it never changes, because lifecycle rules can delete it with no code of ours, and because a database of 4 GB backs up and fails over in a fraction of the time one of 140 GB takes (<x-ref to="object-and-file-storage#not-in-db"></x-ref>). The price is latency: reading from object storage is slower than reading a row, and step 6 has to pay that back. Naming the rejected option and its price is what turns a choice into a design.</p>
+
+<h2 id="design">Step 5: The design</h2>
+<p>Step 5 produces the architecture drawing and the main requests traced through it. Spend about 10 minutes, 11 in a longer round. Start with the simplest arrangement that meets the functional requirements, and add a box only when a requirement or a number from step 2 asks for it, saying which. Interviewers listen for that reason, and for a design complete from end to end before any part of it is elaborate (<x-ref to="scalability#evolution"></x-ref>).</p>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 352" role="img" aria-labelledby="f762t f762d">
+<title id="f762t">The pastebin’s first design</title>
+<desc id="f762d">A client calls a load balancer over HTTPS, which spreads requests over stateless app servers; one app server has failed and is out of rotation. The app servers use three stores: a cache holding a row and its text together, about 5 GB; object storage holding the text, 135 GB, deleted by lifecycle rules; and a PostgreSQL leader holding the pastes table, 4 GB, which copies every commit to a synchronous standby. A sweeper runs every hour and deletes expired rows.</desc>
+<rect class="n" x="10" y="146" width="100" height="52" rx="6"/>
+<text class="tb mid" x="60" y="168">Client</text>
+<text class="ts mid" x="60" y="185">browser, curl</text>
+<path class="e sig" d="M110 172H150"/>
+<text class="ts mid" x="130" y="164">HTTPS</text>
+<rect class="n" x="150" y="146" width="118" height="52" rx="6"/>
+<text class="tb mid" x="209" y="168">Load balancer</text>
+<text class="ts mid" x="209" y="185">limits per address</text>
+<rect class="n" x="318" y="84" width="118" height="52" rx="6"/>
+<text class="tb mid" x="377" y="106">App server</text>
+<text class="ts mid" x="377" y="123">stateless</text>
+<rect class="n" x="318" y="146" width="118" height="52" rx="6"/>
+<text class="tb mid" x="377" y="168">App server</text>
+<text class="ts mid" x="377" y="185">stateless</text>
+<rect class="n fault" x="318" y="208" width="118" height="52" rx="6"/>
+<text class="tb mid" x="377" y="230">App server</text>
+<text class="ts mid" x="377" y="247">failed</text>
+<path class="e sig" d="M268 166L318 116"/>
+<path class="e sig" d="M268 172H318"/>
+<path class="e fault dash" d="M268 178L300 222"/>
+<path class="x" d="M298 214l10 10M308 214l-10 10"/>
+<text class="ts" x="318" y="276">out of rotation</text>
+<rect class="n store" x="530" y="20" width="180" height="52" rx="6"/>
+<text class="tb mid" x="620" y="42">Cache</text>
+<text class="ts mid" x="620" y="59">row and text, 5 GB</text>
+<rect class="n store" x="530" y="100" width="180" height="64" rx="6"/>
+<text class="tb mid" x="620" y="119.5">Object storage</text>
+<text class="ts mid" x="620" y="136.5">text, 135 GB</text>
+<text class="ts mid" x="620" y="153.5">lifecycle rules delete it</text>
+<rect class="n store" x="530" y="196" width="180" height="52" rx="6"/>
+<text class="tb mid" x="620" y="218">PostgreSQL leader</text>
+<text class="ts mid" x="620" y="235">pastes table, 4 GB</text>
+<rect class="n store" x="530" y="290" width="180" height="40" rx="6"/>
+<text class="tb mid" x="620" y="314.5">Synchronous standby</text>
+<path class="e sig" d="M436 100L530 50"/>
+<text class="ts mid" x="470" y="62">get, set</text>
+<path class="e sig" d="M436 166L530 136"/>
+<text class="ts mid" x="476" y="140">put, get</text>
+<path class="e sig" d="M436 180L530 220"/>
+<text class="ts mid" x="486" y="182">insert, select</text>
+<path class="e sig" d="M620 248V290"/>
+<text class="ts" x="628" y="274">every commit</text>
+<rect class="n async" x="318" y="290" width="118" height="52" rx="6"/>
+<text class="tb mid" x="377" y="312">Sweeper</text>
+<text class="ts mid" x="377" y="329">every hour</text>
+<path class="e async" d="M436 316H492V234H530"/>
+<text class="ts" x="442" y="336">delete expired</text>
+<text class="ts" x="10" y="318">Blue: request path. Green: data at rest.</text>
+<text class="ts" x="10" y="334">Purple, dashed: later work. Red: failure.</text>
+</svg>
+</div>
+<figcaption>Every box answers a requirement: the cache the 100 ms target, the standby durability, the sweeper and lifecycle rules expiry. Nothing is partitioned, because the estimates said nothing needs to be.</figcaption>
+</figure>
+
+<p>The estimates said one database is enough, so the drawing has one, with a synchronous standby for durability (<x-ref to="replication#sync-async"></x-ref>). Several app servers are there for availability, not load: one would carry 350 reads a second, but its loss would stop everything. Then trace the requests that matter. Tracing is where gaps appear: a component drawn but never called, or a step that needs data nobody has.</p>
+
+<figure class="fig wide" id="fig-flow">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 456" role="img" aria-labelledby="f763t f763d">
+<title id="f763t">Creating a paste, and reading it after the cache has lost it</title>
+<desc id="f763d">Two sequences. Creating: the app server draws a random id, stores the text in object storage, inserts the row, fills the cache and answers 201. Reading after the cache lost the entry: a miss, then the row from PostgreSQL and the text from object storage, the cache refilled until expiry, and 200.</desc>
+<text class="tb" x="10" y="16">Create</text>
+<g data-scene="create">
+<text class="tb mid" x="50" y="38">Client</text>
+<line class="axis" x1="50" y1="46" x2="50" y2="232"/>
+<text class="tb mid" x="190" y="38">App server</text>
+<line class="axis" x1="190" y1="46" x2="190" y2="232"/>
+<text class="tb mid" x="330" y="38">Cache</text>
+<line class="axis" x1="330" y1="46" x2="330" y2="232"/>
+<text class="tb mid" x="480" y="38">PostgreSQL</text>
+<line class="axis" x1="480" y1="46" x2="480" y2="232"/>
+<text class="tb mid" x="640" y="38">Object storage</text>
+<line class="axis" x1="640" y1="46" x2="640" y2="232"/>
+<g data-s="1">
+<path class="e sig" d="M51 70H189"/>
+<text class="ts mid" x="120.0" y="64">1. POST /api/pastes</text>
+</g>
+<g data-s="2" data-packet="none">
+<rect class="n " x="198" y="83" width="103.4" height="22" rx="4"/>
+<text class="ts mid" x="249.7" y="98">2. id Xk3b9QaZ</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M191 124H639"/>
+<text class="ts mid" x="415.0" y="118">3. PUT 1d/Xk3b9QaZ</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M191 151H479"/>
+<text class="ts mid" x="335.0" y="145">4. INSERT row</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M191 178H329"/>
+<text class="ts mid" x="260.0" y="172">5. SET paste:Xk3b9QaZ</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M189 205H51"/>
+<text class="ts mid" x="120.0" y="199">6. 201 Created, link</text>
+</g>
+</g>
+<path class="e none dash" d="M10 246H710"/>
+<text class="tb" x="10" y="266">Read, after the cache has lost the entry</text>
+<g data-scene="read">
+<text class="tb mid" x="50" y="288">Client</text>
+<line class="axis" x1="50" y1="296" x2="50" y2="448"/>
+<text class="tb mid" x="190" y="288">App server</text>
+<line class="axis" x1="190" y1="296" x2="190" y2="448"/>
+<text class="tb mid" x="330" y="288">Cache</text>
+<line class="axis" x1="330" y1="296" x2="330" y2="448"/>
+<text class="tb mid" x="480" y="288">PostgreSQL</text>
+<line class="axis" x1="480" y1="296" x2="480" y2="448"/>
+<text class="tb mid" x="640" y="288">Object storage</text>
+<line class="axis" x1="640" y1="296" x2="640" y2="448"/>
+<g data-s="1">
+<path class="e sig" d="M51 318H189"/>
+<text class="ts mid" x="120.0" y="312">1. GET /p/Xk3b9QaZ</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M191 338H329"/>
+<text class="ts mid" x="260.0" y="332">2. GET paste:Xk3b9QaZ</text>
+</g>
+<g data-s="3">
+<path class="e" d="M329 358H191"/>
+<text class="ts mid" x="260.0" y="352">3. miss</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M191 378H479"/>
+<text class="ts mid" x="335.0" y="372">4. SELECT row</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M191 398H639"/>
+<text class="ts mid" x="415.0" y="392">5. GET 1d/Xk3b9QaZ</text>
+</g>
+<g data-s="6">
+<path class="e sig" d="M191 418H329"/>
+<text class="ts mid" x="260.0" y="412">6. SET, expires with paste</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M189 438H51"/>
+<text class="ts mid" x="120.0" y="432">7. 200 OK, the text</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="create" data-label="Create">
+  <li data-msg="POST, 1d, key k7" data-state="Rows: none; Objects: none; Cache: empty">The client sends the text, its expiry and an idempotency key.</li>
+  <li data-msg="none" data-state="Rows: none; Objects: none; Cache: empty">The app server draws a random id of 8 characters.</li>
+  <li data-msg="PUT text" data-state="Rows: none; Objects: 1d/Xk3b9QaZ; Cache: empty">The text goes to object storage first, under a key that starts with its expiry class.</li>
+  <li data-msg="INSERT" data-state="Rows: Xk3b9QaZ; Objects: 1d/Xk3b9QaZ; Cache: empty">Then the row. The paste exists once the insert commits.</li>
+  <li data-msg="SET" data-state="Rows: Xk3b9QaZ; Objects: 1d/Xk3b9QaZ; Cache: paste:Xk3b9QaZ">Row and text go into the cache now, so the first read is a hit.</li>
+  <li data-msg="201" data-state="Rows: Xk3b9QaZ; Objects: 1d/Xk3b9QaZ; Cache: paste:Xk3b9QaZ">The client gets the link and a delete token. A retry with the same key gets this answer again.</li>
+</ol>
+<ol class="steps" data-scene="read" data-label="Read">
+  <li data-msg="GET" data-state="Cache: no entry for Xk3b9QaZ">A reader opens the link, hours after the paste was created.</li>
+  <li data-msg="GET" data-state="Cache: no entry for Xk3b9QaZ">The app server asks the cache first.</li>
+  <li data-msg="miss" data-state="Cache: no entry for Xk3b9QaZ">The entry is gone, evicted or lost in a restart.</li>
+  <li data-msg="SELECT" data-state="Cache: no entry for Xk3b9QaZ">The row says where the text is and when it expires. An expired row ends the read here with 410.</li>
+  <li data-msg="GET text" data-state="Cache: no entry for Xk3b9QaZ">The text comes from object storage: the slow step, roughly 100 to 200 ms.</li>
+  <li data-msg="SET" data-state="Cache: paste:Xk3b9QaZ until expiry">The cache is filled, with a time to live that ends when the paste expires.</li>
+  <li data-msg="200" data-state="Cache: paste:Xk3b9QaZ until expiry">The reader gets the paste. The next read stops at the cache.</li>
+</ol>
+<figcaption>A create writes the text, then the row, then the cache. A read that misses pays for both stores once and refills the cache, so that the reads after it do not.</figcaption>
+</figure>
+
+<p>Two details of the create path deserve a sentence each. The text is stored before the row, so a failure between the two leaves an object nothing points to, which the lifecycle rule removes, rather than a row whose text is missing. And the cache is filled at creation, for a reason step 6 measures.</p>
+
+<h2 id="deep-dives">Step 6: Deep dives</h2>
+<p>A <dfn>deep dive</dfn> is a part of a design that is hard for the problem at hand, worked out properly: the options, a choice, and what the choice costs. Step 6 takes two or three. It gets the largest block of time, about 11 minutes, 16 in a longer round, and most of the assessment. Choosing the parts is half of it. Good candidates are, in order:</p>
+<ul>
+  <li><b>A number that breaks the simple design.</b> A write rate one database cannot take, a data set one machine cannot hold, a fan-out of thousands for each request.</li>
+  <li><b>A requirement the simple design may not meet.</b> A latency percentile, a durability promise, a rule such as “never sell the same seat twice”.</li>
+  <li><b>What makes this problem different from the last one.</b> Its shape, in the table later in this chapter.</li>
+  <li><b>Whatever the interviewer asks about.</b> A question is a request for a deep dive, and it outranks the list above.</li>
+</ul>
+<p>Avoid parts that are hard in general but not here, such as the load balancer. For the pastebin the first item yields nothing, because the load breaks nothing. The second yields the 100 ms target, and the third yields expiry.</p>
+
+<h3 id="dive-cache">Deep dive: reading within 100 ms</h3>
+<p>A read that misses the cache pays for a row and an object storage read, and AWS gives roughly 100 to 200 ms for a small object in S3. Every miss can break the target, so it holds only if fewer than one read in a hundred misses. How large must the cache be? Step 2 cannot say, because the answer depends on when pastes are read, not only how often.</p>
+<p>The chapter’s code answers it by simulation, with stated assumptions. Pastes arrive at a tenth of the real rate, with cache sizes scaled to match. Each gets a number of reads from a heavy-tailed distribution with an average of 20: the median paste is read 3 times, 20% are never read. Reads come an average of six hours after creation. Six days are replayed through a least-recently-used cache (<x-ref to="lld-lru-cache"></x-ref>), counting hits over the last four. One pass gives every size at once: a read hits exactly when its <dfn>reuse distance</dfn>, the number of different pastes touched since its own last use, is less than the number the cache holds, the stack-distance method of Mattson and colleagues (1970). A test checks this against replaying each size.</p>
+
+<figure class="fig wide" id="fig-cache">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f764t f764d">
+<title id="f764t">Share of reads answered by the cache, by cache size</title>
+<desc id="f764d">Share of reads answered by the cache against its size, 0.25 to 20 GB, measured by simulation. On a miss only, reads 6 h after creation: 1 GB 84.49%, 5 GB 95.85%, 20 GB 96.02%. On create too, reads 6 h after creation: 1 GB 84.68%, 5 GB 99.47%, 20 GB 100%. On create too, reads 2 h after: 1 GB 97.41%, 5 GB 100%, 20 GB 100%. On create too, reads 24 h after: 1 GB 58.95%, 5 GB 89.34%, 20 GB 99.72%.</desc>
+<text class="tb" x="10" y="18">Reads answered by the cache, with the cache filled …</text>
+<line class="grid" x1="70" y1="250.0" x2="560" y2="250.0"/>
+<text class="ts end" x="62" y="254.0">50%</text>
+<line class="grid" x1="70" y1="208.0" x2="560" y2="208.0"/>
+<text class="ts end" x="62" y="212.0">60%</text>
+<line class="grid" x1="70" y1="166.0" x2="560" y2="166.0"/>
+<text class="ts end" x="62" y="170.0">70%</text>
+<line class="grid" x1="70" y1="124.0" x2="560" y2="124.0"/>
+<text class="ts end" x="62" y="128.0">80%</text>
+<line class="grid" x1="70" y1="82.0" x2="560" y2="82.0"/>
+<text class="ts end" x="62" y="86.0">90%</text>
+<line class="grid" x1="70" y1="40.0" x2="560" y2="40.0"/>
+<text class="ts end" x="62" y="44.0">100%</text>
+<line class="axis" x1="70" y1="44.2" x2="560" y2="44.2" style="stroke-dasharray:4 3"/>
+<text class="ts" x="76" y="39.2">99%: a miss is rarer than 1 read in 100</text>
+<text class="ts mid" x="70.0" y="268">0.25</text>
+<text class="ts mid" x="147.5" y="268">0.5</text>
+<text class="ts mid" x="225.0" y="268">1</text>
+<text class="ts mid" x="302.5" y="268">2</text>
+<text class="ts mid" x="347.9" y="268">3</text>
+<text class="ts mid" x="405.0" y="268">5</text>
+<text class="ts mid" x="442.6" y="268">7</text>
+<text class="ts mid" x="482.5" y="268">10</text>
+<text class="ts mid" x="560.0" y="268">20</text>
+<text class="ts mid" x="315.0" y="288">Cache size in GB, at 10 KB a paste (5 GB holds one day of new pastes)</text>
+<path class="line" style="stroke:var(--sig)" d="M70.0 213.3 L147.5 155.2 L225.0 105.1 L302.5 72.0 L347.9 62.1 L405.0 57.4 L442.6 56.8 L482.5 56.7 L560.0 56.7"/>
+<circle class="dot" style="fill:var(--sig)" cx="70.0" cy="213.3" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="147.5" cy="155.2" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="225.0" cy="105.1" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="302.5" cy="72.0" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="347.9" cy="62.1" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="405.0" cy="57.4" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="442.6" cy="56.8" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="482.5" cy="56.7" r="3.5"/>
+<circle class="dot" style="fill:var(--sig)" cx="560.0" cy="56.7" r="3.5"/>
+<path class="line" style="stroke:var(--store)" d="M70.0 216.9 L147.5 157.7 L225.0 104.3 L302.5 65.2 L347.9 51.0 L405.0 42.2 L442.6 40.5 L482.5 40.0 L560.0 40.0"/>
+<circle class="dot" style="fill:var(--store)" cx="70.0" cy="216.9" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="147.5" cy="157.7" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="225.0" cy="104.3" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="302.5" cy="65.2" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="347.9" cy="51.0" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="405.0" cy="42.2" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="442.6" cy="40.5" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="482.5" cy="40.0" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="560.0" cy="40.0" r="3.5"/>
+<path class="line" style="stroke:var(--ink-3);stroke-width:1.5" d="M70.0 124.8 L147.5 79.1 L225.0 50.9 L302.5 41.0 L347.9 40.1 L405.0 40.0 L442.6 40.0 L482.5 40.0 L560.0 40.0"/>
+<path class="line" style="stroke:var(--ink-3);stroke-width:1.5" d="M225.0 212.4 L302.5 152.5 L347.9 119.8 L405.0 84.8 L442.6 66.8 L482.5 52.9 L560.0 41.2"/>
+<text class="ts tb" x="568" y="60.7">on a miss only</text>
+<text class="ts" x="568" y="75.7">first reads, 4%,</text>
+<text class="ts" x="568" y="89.7">always miss</text>
+<text class="ts tb" x="568" y="44.0">on create too</text>
+<text class="ts" x="153.5" y="73.1">reads 2 h after creation</text>
+<text class="ts" x="310.5" y="166.5">reads 24 h after creation</text>
+<rect class="hit" x="70" y="30" width="38.754" height="230" data-tip="0.25 GB of cache|filled on a miss: 58.74%|filled on create too: 57.87%|on create, reads 2 h after: 79.80%|on create, reads 24 h after: 32.75%"/>
+<rect class="hit" x="108.754" y="30" width="77.508" height="230" data-tip="0.5 GB of cache|filled on a miss: 72.58%|filled on create too: 71.98%|on create, reads 2 h after: 90.70%|on create, reads 24 h after: 45.02%"/>
+<rect class="hit" x="186.262" y="30" width="77.508" height="230" data-tip="1 GB of cache|filled on a miss: 84.49%|filled on create too: 84.68%|on create, reads 2 h after: 97.41%|on create, reads 24 h after: 58.95%"/>
+<rect class="hit" x="263.77" y="30" width="61.4236" height="230" data-tip="2 GB of cache|filled on a miss: 92.37%|filled on create too: 94.00%|on create, reads 2 h after: 99.77%|on create, reads 24 h after: 73.22%"/>
+<rect class="hit" x="325.194" y="30" width="51.23" height="230" data-tip="3 GB of cache|filled on a miss: 94.74%|filled on create too: 97.39%|on create, reads 2 h after: 99.98%|on create, reads 24 h after: 81.00%"/>
+<rect class="hit" x="376.424" y="30" width="47.3726" height="230" data-tip="5 GB of cache|filled on a miss: 95.85%|filled on create too: 99.47%|on create, reads 2 h after: 100%|on create, reads 24 h after: 89.34%"/>
+<rect class="hit" x="423.796" y="30" width="38.754" height="230" data-tip="7 GB of cache|filled on a miss: 96.00%|filled on create too: 99.89%|on create, reads 2 h after: 100%|on create, reads 24 h after: 93.62%"/>
+<rect class="hit" x="462.55" y="30" width="58.6958" height="230" data-tip="10 GB of cache|filled on a miss: 96.02%|filled on create too: 99.99%|on create, reads 2 h after: 100%|on create, reads 24 h after: 96.93%"/>
+<rect class="hit" x="521.246" y="30" width="38.754" height="230" data-tip="20 GB of cache|filled on a miss: 96.02%|filled on create too: 100%|on create, reads 2 h after: 100%|on create, reads 24 h after: 99.72%"/>
+</svg>
+</div>
+<figcaption>Measured by the chapter’s simulation. Filling only on a miss cannot pass 96%, whatever the size. Filling on create too passes 99% at one day of new pastes when reads come about six hours after creation, and needs about four times as much when they come a day after.</figcaption>
+</figure>
+
+<p>Two results decide the design. Filling the cache only on a miss can never pass 96%: 4% of reads are the first read of their paste, and a first read always misses. Filling at creation as well removes those misses, and then 5 GB, one day of new pastes, answers 99.47% of reads. At peak, the stores then see 1.8 reads a second instead of 14.4. The cost is memory spent on the 20% of pastes nobody reads. The assumption that matters most is how soon reads follow creation: if a day later on average instead of six hours, 5 GB answers 89% and passing 99% takes 20 GB. That is the number to measure first in production.</p>
+
+<h3 id="dive-expiry">Deep dive: expiry</h3>
+<p>Expiry decides how much is stored, and the estimate of 13.5 million pastes alive hides a trap: Little’s law gives the level the count settles at, not how long it takes to get there. The simulation creates pastes with the expiry mix of step 1 and counts those alive each day.</p>
+
+<figure class="fig wide" id="fig-live">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f765t f765d">
+<title id="f765t">Pastes alive on each day after launch</title>
+<desc id="f765d">A line, measured by simulation, of the number of pastes alive from day 0 to day 400 after launch, with 500,000 new pastes a day and the expiry mix of the requirements. day 5: 1.6 million, day 30: 5.1 million, day 90: 6.6 million, day 180: 8.9 million, day 365: 13.5 million, day 400: 13.5 million. The count rises quickly for a month, keeps rising slowly until day 365, then stays level at about 13.5 million.</desc>
+<line class="grid" x1="80" y1="180.0" x2="690" y2="180.0"/>
+<text class="ts end" x="72" y="184.0">0</text>
+<line class="grid" x1="80" y1="130.0" x2="690" y2="130.0"/>
+<text class="ts end" x="72" y="134.0">5 million</text>
+<line class="grid" x1="80" y1="80.0" x2="690" y2="80.0"/>
+<text class="ts end" x="72" y="84.0">10 million</text>
+<line class="grid" x1="80" y1="30.0" x2="690" y2="30.0"/>
+<text class="ts end" x="72" y="34.0">15 million</text>
+<text class="ts mid" x="80.0" y="198">0</text>
+<text class="ts mid" x="125.8" y="198">30</text>
+<text class="ts mid" x="232.5" y="198">100</text>
+<text class="ts mid" x="385.0" y="198">200</text>
+<text class="ts mid" x="537.5" y="198">300</text>
+<text class="ts mid" x="636.6" y="198">365</text>
+<text class="ts mid" x="690.0" y="198">400</text>
+<text class="ts mid" x="385.0" y="220">Days since launch</text>
+<text class="tb" x="10" y="16">Pastes alive, with 500,000 created a day</text>
+<path class="line" d="M80.0 180.0 L87.6 163.7 L95.2 153.8 L102.9 147.3 L110.5 141.5 L118.1 135.0 L125.8 128.9 L133.4 127.3 L141.0 126.2 L148.6 125.0 L156.2 123.7 L163.9 122.2 L171.5 121.2 L179.1 119.9 L186.8 118.7 L194.4 117.3 L202.0 116.2 L209.6 115.1 L217.2 113.9 L224.9 113.0 L232.5 111.5 L240.1 109.9 L247.8 108.8 L255.4 107.5 L263.0 106.1 L270.6 105.0 L278.2 103.7 L285.9 102.4 L293.5 100.7 L301.1 99.7 L308.8 98.5 L316.4 97.3 L324.0 96.1 L331.6 94.8 L339.2 93.6 L346.9 92.3 L354.5 90.6 L362.1 89.4 L369.8 88.2 L377.4 87.2 L385.0 85.8 L392.6 84.6 L400.2 83.6 L407.9 82.3 L415.5 81.2 L423.1 80.1 L430.8 78.7 L438.4 77.8 L446.0 76.4 L453.6 75.0 L461.2 73.8 L468.9 72.5 L476.5 71.2 L484.1 70.0 L491.8 68.8 L499.4 67.7 L507.0 66.3 L514.6 65.0 L522.2 63.8 L529.9 62.1 L537.5 60.8 L545.1 59.7 L552.8 58.6 L560.4 57.3 L568.0 55.7 L575.6 54.8 L583.2 53.6 L590.9 52.1 L598.5 51.2 L606.1 49.8 L613.8 48.4 L621.4 47.3 L629.0 46.1 L636.6 44.8 L644.2 44.6 L651.9 44.8 L659.5 44.9 L667.1 45.0 L674.8 45.0 L682.4 44.8 L690.0 44.9"/>
+<circle class="dot" cx="125.8" cy="128.9" r="4"/>
+<text class="ts" x="133.8" y="118.9">5.1 million after a month</text>
+<circle class="dot" cx="636.6" cy="44.8" r="4"/>
+<text class="ts end" x="628.6" y="34.8">13.5 million after a year</text>
+<rect class="hit" x="80" y="30" width="3.76543" height="150" data-tip="day 0|0 pastes alive|about 0 GB of text"/>
+<rect class="hit" x="83.8596" y="30" width="7.53086" height="150" data-tip="day 5|1,625,200 pastes alive|about 16 GB of text"/>
+<rect class="hit" x="91.4846" y="30" width="7.53086" height="150" data-tip="day 10|2,616,900 pastes alive|about 26 GB of text"/>
+<rect class="hit" x="99.1096" y="30" width="7.53086" height="150" data-tip="day 15|3,266,900 pastes alive|about 33 GB of text"/>
+<rect class="hit" x="106.735" y="30" width="7.53086" height="150" data-tip="day 20|3,854,200 pastes alive|about 39 GB of text"/>
+<rect class="hit" x="114.36" y="30" width="7.53086" height="150" data-tip="day 25|4,496,500 pastes alive|about 45 GB of text"/>
+<rect class="hit" x="121.985" y="30" width="7.53086" height="150" data-tip="day 30|5,114,300 pastes alive|about 51 GB of text"/>
+<rect class="hit" x="129.61" y="30" width="7.53086" height="150" data-tip="day 35|5,270,000 pastes alive|about 53 GB of text"/>
+<rect class="hit" x="137.235" y="30" width="7.53086" height="150" data-tip="day 40|5,382,400 pastes alive|about 54 GB of text"/>
+<rect class="hit" x="144.86" y="30" width="7.53086" height="150" data-tip="day 45|5,502,600 pastes alive|about 55 GB of text"/>
+<rect class="hit" x="152.485" y="30" width="7.53086" height="150" data-tip="day 50|5,627,600 pastes alive|about 56 GB of text"/>
+<rect class="hit" x="160.11" y="30" width="7.53086" height="150" data-tip="day 55|5,778,500 pastes alive|about 58 GB of text"/>
+<rect class="hit" x="167.735" y="30" width="7.53086" height="150" data-tip="day 60|5,881,600 pastes alive|about 59 GB of text"/>
+<rect class="hit" x="175.36" y="30" width="7.53086" height="150" data-tip="day 65|6,007,100 pastes alive|about 60 GB of text"/>
+<rect class="hit" x="182.985" y="30" width="7.53086" height="150" data-tip="day 70|6,130,700 pastes alive|about 61 GB of text"/>
+<rect class="hit" x="190.61" y="30" width="7.53086" height="150" data-tip="day 75|6,272,700 pastes alive|about 63 GB of text"/>
+<rect class="hit" x="198.235" y="30" width="7.53086" height="150" data-tip="day 80|6,376,200 pastes alive|about 64 GB of text"/>
+<rect class="hit" x="205.86" y="30" width="7.53086" height="150" data-tip="day 85|6,493,200 pastes alive|about 65 GB of text"/>
+<rect class="hit" x="213.485" y="30" width="7.53086" height="150" data-tip="day 90|6,613,600 pastes alive|about 66 GB of text"/>
+<rect class="hit" x="221.11" y="30" width="7.53086" height="150" data-tip="day 95|6,702,100 pastes alive|about 67 GB of text"/>
+<rect class="hit" x="228.735" y="30" width="7.53086" height="150" data-tip="day 100|6,853,400 pastes alive|about 69 GB of text"/>
+<rect class="hit" x="236.36" y="30" width="7.53086" height="150" data-tip="day 105|7,006,800 pastes alive|about 70 GB of text"/>
+<rect class="hit" x="243.985" y="30" width="7.53086" height="150" data-tip="day 110|7,123,000 pastes alive|about 71 GB of text"/>
+<rect class="hit" x="251.61" y="30" width="7.53086" height="150" data-tip="day 115|7,248,800 pastes alive|about 72 GB of text"/>
+<rect class="hit" x="259.235" y="30" width="7.53086" height="150" data-tip="day 120|7,392,400 pastes alive|about 74 GB of text"/>
+<rect class="hit" x="266.86" y="30" width="7.53086" height="150" data-tip="day 125|7,504,700 pastes alive|about 75 GB of text"/>
+<rect class="hit" x="274.485" y="30" width="7.53086" height="150" data-tip="day 130|7,633,300 pastes alive|about 76 GB of text"/>
+<rect class="hit" x="282.11" y="30" width="7.53086" height="150" data-tip="day 135|7,759,000 pastes alive|about 78 GB of text"/>
+<rect class="hit" x="289.735" y="30" width="7.53086" height="150" data-tip="day 140|7,931,400 pastes alive|about 79 GB of text"/>
+<rect class="hit" x="297.36" y="30" width="7.53086" height="150" data-tip="day 145|8,027,600 pastes alive|about 80 GB of text"/>
+<rect class="hit" x="304.985" y="30" width="7.53086" height="150" data-tip="day 150|8,146,000 pastes alive|about 81 GB of text"/>
+<rect class="hit" x="312.61" y="30" width="7.53086" height="150" data-tip="day 155|8,273,100 pastes alive|about 83 GB of text"/>
+<rect class="hit" x="320.235" y="30" width="7.53086" height="150" data-tip="day 160|8,387,500 pastes alive|about 84 GB of text"/>
+<rect class="hit" x="327.86" y="30" width="7.53086" height="150" data-tip="day 165|8,519,100 pastes alive|about 85 GB of text"/>
+<rect class="hit" x="335.485" y="30" width="7.53086" height="150" data-tip="day 170|8,641,000 pastes alive|about 86 GB of text"/>
+<rect class="hit" x="343.11" y="30" width="7.53086" height="150" data-tip="day 175|8,768,000 pastes alive|about 88 GB of text"/>
+<rect class="hit" x="350.735" y="30" width="7.53086" height="150" data-tip="day 180|8,941,900 pastes alive|about 89 GB of text"/>
+<rect class="hit" x="358.36" y="30" width="7.53086" height="150" data-tip="day 185|9,061,000 pastes alive|about 91 GB of text"/>
+<rect class="hit" x="365.985" y="30" width="7.53086" height="150" data-tip="day 190|9,181,300 pastes alive|about 92 GB of text"/>
+<rect class="hit" x="373.61" y="30" width="7.53086" height="150" data-tip="day 195|9,277,000 pastes alive|about 93 GB of text"/>
+<rect class="hit" x="381.235" y="30" width="7.53086" height="150" data-tip="day 200|9,418,800 pastes alive|about 94 GB of text"/>
+<rect class="hit" x="388.86" y="30" width="7.53086" height="150" data-tip="day 205|9,537,800 pastes alive|about 95 GB of text"/>
+<rect class="hit" x="396.485" y="30" width="7.53086" height="150" data-tip="day 210|9,639,900 pastes alive|about 96 GB of text"/>
+<rect class="hit" x="404.11" y="30" width="7.53086" height="150" data-tip="day 215|9,771,700 pastes alive|about 98 GB of text"/>
+<rect class="hit" x="411.735" y="30" width="7.53086" height="150" data-tip="day 220|9,880,100 pastes alive|about 99 GB of text"/>
+<rect class="hit" x="419.36" y="30" width="7.53086" height="150" data-tip="day 225|9,994,400 pastes alive|about 100 GB of text"/>
+<rect class="hit" x="426.985" y="30" width="7.53086" height="150" data-tip="day 230|10,131,800 pastes alive|about 101 GB of text"/>
+<rect class="hit" x="434.61" y="30" width="7.53086" height="150" data-tip="day 235|10,216,000 pastes alive|about 102 GB of text"/>
+<rect class="hit" x="442.235" y="30" width="7.53086" height="150" data-tip="day 240|10,364,900 pastes alive|about 104 GB of text"/>
+<rect class="hit" x="449.86" y="30" width="7.53086" height="150" data-tip="day 245|10,502,400 pastes alive|about 105 GB of text"/>
+<rect class="hit" x="457.485" y="30" width="7.53086" height="150" data-tip="day 250|10,624,800 pastes alive|about 106 GB of text"/>
+<rect class="hit" x="465.11" y="30" width="7.53086" height="150" data-tip="day 255|10,746,700 pastes alive|about 107 GB of text"/>
+<rect class="hit" x="472.735" y="30" width="7.53086" height="150" data-tip="day 260|10,878,600 pastes alive|about 109 GB of text"/>
+<rect class="hit" x="480.36" y="30" width="7.53086" height="150" data-tip="day 265|11,003,800 pastes alive|about 110 GB of text"/>
+<rect class="hit" x="487.985" y="30" width="7.53086" height="150" data-tip="day 270|11,122,500 pastes alive|about 111 GB of text"/>
+<rect class="hit" x="495.61" y="30" width="7.53086" height="150" data-tip="day 275|11,227,000 pastes alive|about 112 GB of text"/>
+<rect class="hit" x="503.235" y="30" width="7.53086" height="150" data-tip="day 280|11,371,500 pastes alive|about 114 GB of text"/>
+<rect class="hit" x="510.86" y="30" width="7.53086" height="150" data-tip="day 285|11,499,700 pastes alive|about 115 GB of text"/>
+<rect class="hit" x="518.485" y="30" width="7.53086" height="150" data-tip="day 290|11,619,100 pastes alive|about 116 GB of text"/>
+<rect class="hit" x="526.11" y="30" width="7.53086" height="150" data-tip="day 295|11,785,600 pastes alive|about 118 GB of text"/>
+<rect class="hit" x="533.735" y="30" width="7.53086" height="150" data-tip="day 300|11,922,200 pastes alive|about 119 GB of text"/>
+<rect class="hit" x="541.36" y="30" width="7.53086" height="150" data-tip="day 305|12,031,900 pastes alive|about 120 GB of text"/>
+<rect class="hit" x="548.985" y="30" width="7.53086" height="150" data-tip="day 310|12,138,700 pastes alive|about 121 GB of text"/>
+<rect class="hit" x="556.61" y="30" width="7.53086" height="150" data-tip="day 315|12,265,600 pastes alive|about 123 GB of text"/>
+<rect class="hit" x="564.235" y="30" width="7.53086" height="150" data-tip="day 320|12,433,300 pastes alive|about 124 GB of text"/>
+<rect class="hit" x="571.86" y="30" width="7.53086" height="150" data-tip="day 325|12,525,000 pastes alive|about 125 GB of text"/>
+<rect class="hit" x="579.485" y="30" width="7.53086" height="150" data-tip="day 330|12,644,300 pastes alive|about 126 GB of text"/>
+<rect class="hit" x="587.11" y="30" width="7.53086" height="150" data-tip="day 335|12,785,400 pastes alive|about 128 GB of text"/>
+<rect class="hit" x="594.735" y="30" width="7.53086" height="150" data-tip="day 340|12,880,800 pastes alive|about 129 GB of text"/>
+<rect class="hit" x="602.36" y="30" width="7.53086" height="150" data-tip="day 345|13,024,800 pastes alive|about 130 GB of text"/>
+<rect class="hit" x="609.985" y="30" width="7.53086" height="150" data-tip="day 350|13,161,100 pastes alive|about 132 GB of text"/>
+<rect class="hit" x="617.61" y="30" width="7.53086" height="150" data-tip="day 355|13,270,200 pastes alive|about 133 GB of text"/>
+<rect class="hit" x="625.235" y="30" width="7.53086" height="150" data-tip="day 360|13,391,800 pastes alive|about 134 GB of text"/>
+<rect class="hit" x="632.86" y="30" width="7.53086" height="150" data-tip="day 365|13,522,100 pastes alive|about 135 GB of text"/>
+<rect class="hit" x="640.485" y="30" width="7.53086" height="150" data-tip="day 370|13,539,800 pastes alive|about 135 GB of text"/>
+<rect class="hit" x="648.11" y="30" width="7.53086" height="150" data-tip="day 375|13,524,700 pastes alive|about 135 GB of text"/>
+<rect class="hit" x="655.735" y="30" width="7.53086" height="150" data-tip="day 380|13,512,100 pastes alive|about 135 GB of text"/>
+<rect class="hit" x="663.36" y="30" width="7.53086" height="150" data-tip="day 385|13,499,300 pastes alive|about 135 GB of text"/>
+<rect class="hit" x="670.985" y="30" width="7.53086" height="150" data-tip="day 390|13,499,900 pastes alive|about 135 GB of text"/>
+<rect class="hit" x="678.61" y="30" width="7.53086" height="150" data-tip="day 395|13,524,000 pastes alive|about 135 GB of text"/>
+<rect class="hit" x="686.235" y="30" width="7.53086" height="150" data-tip="day 400|13,514,000 pastes alive|about 135 GB of text"/>
+</svg>
+</div>
+<figcaption>Simulated, at a hundredth of the rate and scaled back. Pastes kept for a year are 5% of those created but two thirds of what is stored, and the total keeps growing until the first of them expire.</figcaption>
+</figure>
+
+<p>A month after launch 5.1 million pastes are alive, 38% of the eventual 13.5 million, and the count climbs until the first one-year pastes expire. Those are 5% of the pastes created but two thirds of what is stored. A plan drawn from the first month would be too small by a factor of 2.6. Two choices follow.</p>
+<ul>
+  <li><b>Expiry is checked on every read.</b> The row’s <code>expires_at</code> is compared with the time, and an expired paste gets 410 whether or not it has been deleted yet. Correctness then never depends on the cleanup.</li>
+  <li><b>Cleanup is batch work that must keep up.</b> Once the count is level, 500,000 pastes expire a day, about 6 a second. A sweeper deletes expired rows in batches through the index on <code>expires_at</code>, and lifecycle rules on each expiry prefix delete the text. Amazon S3’s rules count in whole days and run asynchronously, so a one-hour paste’s text lingers a day or more, unreadable because its row has expired. At a hundred times the load, a table partitioned by expiry date, with whole partitions dropped, replaces row-by-row deletes (<x-ref to="partitioning#table-partitioning"></x-ref>).</li>
+</ul>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<p>Step 7 goes through the design box by box and asks what happens when each is slow or gone, then what changes when the load grows. Spend the last 4 minutes, 7 in a longer round. “It is highly available” is not an answer; a named failure with its recovery is (<x-ref to="availability-and-reliability#design-for-failure"></x-ref>).</p>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>An app server crashes</th><td>Requests in flight fail. A retry succeeds</td><td>The load balancer’s health check takes it out of rotation. The idempotency key makes a retried create safe</td></tr>
+<tr><th>The cache restarts empty</th><td>Slower reads for hours: in the simulation 75% hit in the first hour, 90% in the second, above 99% from the tenth</td><td>The stores take about 86 reads a second at peak instead of 2, within one database’s reach. A cache replica shortens the gap</td></tr>
+<tr><th>The database leader fails</th><td>Creates fail, and so do reads that miss the cache, until the standby is promoted</td><td>Automatic failover to the synchronous standby, so no acknowledged paste is lost (<x-ref to="replication#failover"></x-ref>)</td></tr>
+<tr><th>Object storage is slow or down</th><td>Creates fail with 503. Cached pastes still load</td><td>Timeouts and a circuit breaker, so app servers do not queue behind it (<x-ref to="resilience-patterns#circuit-breaker"></x-ref>)</td></tr>
+<tr><th>The sweeper stops</th><td>Nothing at first: expired pastes still get 410</td><td>Storage grows by about 5 GB of text and 150 MB of rows a day. An alert on the age of the oldest expired row</td></tr>
+<tr><th>One paste goes viral</th><td>Nothing, while the cache holds it</td><td>One cache node serves every read of it, a hot key. A paste never changes, so a CDN can hold it until it expires (<x-ref to="cdn-and-edge"></x-ref>)</td></tr>
+<tr><th>One address creates thousands of pastes</th><td>Its requests get 429</td><td>A rate limit at the load balancer (<x-ref to="hld-rate-limiter"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>Then growth. The test recomputes step 2 with ten and a hundred times the users.</p>
+<table>
+<thead><tr><th>Quantity</th><th>Today</th><th>× 10</th><th>× 100</th></tr></thead>
+<tbody>
+<tr><th>Peak creates a second</th><td>17</td><td>174</td><td>1,736</td></tr>
+<tr><th>Peak reads a second</th><td>347</td><td>3,472</td><td>34,722</td></tr>
+<tr><th>Rows</th><td>4 GB</td><td>41 GB</td><td>405 GB</td></tr>
+<tr><th>Text</th><td>135 GB</td><td>1.35 TB</td><td>13.5 TB</td></tr>
+<tr><th>One day of new pastes, the cache</th><td>5 GB</td><td>50 GB</td><td>500 GB</td></tr>
+<tr><th>Peak traffic out</th><td>28 Mbit/s</td><td>0.28 Gbit/s</td><td>2.8 Gbit/s</td></tr>
+</tbody>
+</table>
+<p>At ten times, one thing changes: 50 GB of cache is most of one server’s memory, so the cache becomes a small cluster with keys spread by consistent hashing (<x-ref to="caching#distributed"></x-ref>). At a hundred times, peak creates pass the planning figure of about 1,000 writes a second for one database, and 405 GB of rows no longer fits in memory, so the table is partitioned by a hash of the id. That is easy because every read is by id and nothing joins (<x-ref to="partitioning#hash"></x-ref>). The text in object storage needs no change at any of these sizes. Saying what does not change is half of the answer.</p>
+
+<h2 id="shapes">Twenty-three problems, a few shapes</h2>
+<p>The case studies that follow look more varied than they are. Each has a central difficulty that its deep dives exist for, and problems with the same difficulty share a shape. Recognizing it early tells you where step 6 will go. The pastebin is a lookup by key, with expiry added.</p>
+<table>
+<thead><tr><th>Problem</th><th>Shape</th><th>The central difficulty</th></tr></thead>
+<tbody>
+<tr><th><x-ref to="hld-url-shortener"></x-ref></th><td>Lookup by key</td><td>Short keys that never collide, and fast redirects</td></tr>
+<tr><th><x-ref to="hld-rate-limiter"></x-ref></th><td>Shared counting</td><td>A counter many servers update at once, and its store failing</td></tr>
+<tr><th><x-ref to="hld-key-value-store"></x-ref></th><td>A storage system</td><td>Keys spread over machines, copies kept in agreement through failures</td></tr>
+<tr><th><x-ref to="hld-object-storage"></x-ref></th><td>A storage system</td><td>Durable bytes at low cost, and metadata for billions of objects</td></tr>
+<tr><th><x-ref to="hld-news-feed"></x-ref></th><td>Fan-out</td><td>One post delivered to millions of followers</td></tr>
+<tr><th><x-ref to="hld-chat"></x-ref></th><td>Delivery to connected users</td><td>Millions of open connections, and the order and state of every message</td></tr>
+<tr><th><x-ref to="hld-notifications"></x-ref></th><td>Fan-out</td><td>Volume across channels, retried but never sent twice</td></tr>
+<tr><th><x-ref to="hld-email"></x-ref></th><td>Delivery</td><td>Mail protocols, mailbox storage, and being trusted by other servers</td></tr>
+<tr><th><x-ref to="hld-video-streaming"></x-ref></th><td>A media pipeline</td><td>Many versions of every upload, and delivering the bytes</td></tr>
+<tr><th><x-ref to="hld-file-sync"></x-ref></th><td>Sync</td><td>Moving only what changed, and resolving edits made on two devices</td></tr>
+<tr><th><x-ref to="hld-search-autocomplete"></x-ref></th><td>Search</td><td>The best suggestions for any prefix within milliseconds, kept fresh</td></tr>
+<tr><th><x-ref to="hld-web-crawler"></x-ref></th><td>A pipeline over the web</td><td>Billions of URLs to visit, politely, with no page fetched twice</td></tr>
+<tr><th><x-ref to="hld-proximity"></x-ref></th><td>Location</td><td>What is near a point, for places and for moving people</td></tr>
+<tr><th><x-ref to="hld-ride-hailing"></x-ref></th><td>Location</td><td>A stream of driver positions, and a match within seconds</td></tr>
+<tr><th><x-ref to="hld-maps"></x-ref></th><td>Location</td><td>Routes over a continent’s roads, timed by live traffic</td></tr>
+<tr><th><x-ref to="hld-leaderboard"></x-ref></th><td>Ranking</td><td>The rank of one player among millions, updated with every score</td></tr>
+<tr><th><x-ref to="hld-ticket-booking"></x-ref></th><td>Contended inventory</td><td>Never selling a seat twice while a crowd tries at once</td></tr>
+<tr><th><x-ref to="hld-payments"></x-ref></th><td>Money</td><td>Each payment taking effect exactly once, and books that reconcile</td></tr>
+<tr><th><x-ref to="hld-digital-wallet"></x-ref></th><td>Money</td><td>Transfers across machines at volume, with reproducible balances</td></tr>
+<tr><th><x-ref to="hld-stock-exchange"></x-ref></th><td>Ordering at low latency</td><td>One deterministic order of events, processed in microseconds</td></tr>
+<tr><th><x-ref to="hld-ad-click-aggregation"></x-ref></th><td>Counting a stream</td><td>Exact counts over time windows, with late and repeated events</td></tr>
+<tr><th><x-ref to="hld-metrics-and-logging"></x-ref></th><td>Counting a stream</td><td>Millions of samples a second, stored and queried cheaply</td></tr>
+<tr><th><x-ref to="hld-collaborative-editing"></x-ref></th><td>Concurrent edits</td><td>Simultaneous edits converging to one document</td></tr>
+</tbody>
+</table>
+
+<h2 id="review">The same method in a design review</h2>
+<p>At work, the seven steps become the sections of a <dfn>design document</dfn>, a written proposal for a system that others review before the building starts, asking the interviewer’s questions at leisure. The conditions differ in the ways <x-ref to="what-is-system-design#interview-vs-work"></x-ref> lists. The order of the thinking does not.</p>
+<table>
+<thead><tr><th>Step</th><th>Section of the document</th><th>What reviewers check</th></tr></thead>
+<tbody>
+<tr><th>1. Requirements</th><td>Context, goals and non-goals</td><td>Is every quality a number? Is what is out written down?</td></tr>
+<tr><th>2. Estimates</th><td>Capacity</td><td>Are the assumptions stated, and which were measured?</td></tr>
+<tr><th>3. The API</th><td>Interfaces</td><td>Errors, retries, versions, and who calls it</td></tr>
+<tr><th>4. The data model</th><td>Data</td><td>Keys, stores, and the migration from what exists now</td></tr>
+<tr><th>5. The design</th><td>The design, with diagrams</td><td>A reason for every component. The main flows</td></tr>
+<tr><th>6. Deep dives</th><td>Alternatives considered</td><td>The options rejected, and why</td></tr>
+<tr><th>7. Failures and growth</th><td>Operations, rollout, risks</td><td>What alerts, what the on-call engineer does, how it is rolled back</td></tr>
+</tbody>
+</table>
+<p>Malte Ubl’s description of design documents at Google (2020) gives a similar outline: context and scope, goals and non-goals, the design with its diagrams, APIs and data storage, alternatives considered, and cross-cutting concerns such as security and privacy. It suggests 10 to 20 pages for a large project, and skipping the document when there is no real trade-off to decide. A single decision fits the one or two pages Michael Nygard proposed in 2011, an <dfn>architecture decision record</dfn>: title, context, decision, status and consequences.</p>
+<p>Numbers for every requirement and a reason for every box carry over from the interview. The time box does not: a review that finds a flaw in the data model sends the design back to step 4. And at work the deep dives are chosen by risk. The parts hardest to change later, the data model and any public API, deserve the most review.</p>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Drawing boxes in the second minute</th><td>A design for a problem nobody asked</td><td>Five minutes of questions, with the answers written down</td></tr>
+<tr><th>Requirements as adjectives: fast, scalable, highly available</th><td>Nothing to decide with or check against</td><td>A number for each: 99% within 100 ms, 99.9% a month</td></tr>
+<tr><th>Estimates that end without “so”</th><td>Minutes spent and no decision made</td><td>Each number followed by the choice it settles</td></tr>
+<tr><th>Products instead of reasons: “Kafka here, Cassandra there”</th><td>Boxes with no requirement behind them</td><td>The property needed, then a store that has it</td></tr>
+<tr><th>Designing for a hundred times the load on day one</th><td>A partitioned 4 GB table, and the time gone</td><td>The simplest design that meets the numbers, and the growth path in step 7</td></tr>
+<tr><th>Deep dives on the parts that are not hard</th><td>The central difficulty is never discussed</td><td>The number that breaks the design, the requirement at risk, the problem’s shape</td></tr>
+<tr><th>Running out of time before step 7</th><td>Judged as a design with no failures planned</td><td>Watch the checkpoints, and keep 4 minutes for failures</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="what-is-system-design"></x-ref>: the design loop this method expands.</li>
+  <li><x-ref to="estimation"></x-ref>: the arithmetic of step 2 and the planning figures for one server.</li>
+  <li><x-ref to="api-styles"></x-ref> and <x-ref to="data-models"></x-ref>: the material of steps 3 and 4.</li>
+  <li><x-ref to="caching"></x-ref>: the read path of the first deep dive.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: the questions of step 7.</li>
+  <li><x-ref to="lld-method"></x-ref>: the companion method for designing classes.</li>
+  <li><x-ref to="hld-url-shortener"></x-ref>: the first case study, and the pastebin’s closest relative.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Work in seven steps: requirements, estimates, the API, the data model, the design, deep dives, failures and growth. Each produces what the next needs.</li>
+  <li>In 45 minutes, have the architecture drawn with one request traced through it by about minute 27, and keep the last 4 minutes for failures.</li>
+  <li>Ask the questions whose answers change the design, and write every quality as a number.</li>
+  <li>End every estimate with “so”, and the decision it settles.</li>
+  <li>Give every store a reason based on how it is read, and name the option you rejected.</li>
+  <li>Choose deep dives where a number breaks the simple design, where a requirement is at risk, or where the problem’s shape lies.</li>
+  <li>Some answers need a model, not arithmetic: the pastebin’s cache must be filled at creation to pass 99%, and its storage grows for a whole year.</li>
+  <li>For each component, say what fails, what users see and what the design does; then say what changes, and what does not, at 10 and 100 times the load.</li>
+  <li>At work the same steps become a design document, with the deep dives written as alternatives considered.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>An interviewer says “design a photo-sharing app” and you begin by drawing a load balancer and three app servers. What have you skipped, and what does it cost?</summary><p>Steps 1 to 4. Without requirements no number justifies any box, and without an API and data model the boxes have nothing to do. The likely cost is a design for the wrong problem and no time left for the deep dives.</p></details>
+<details><summary>Your estimate gives 17 writes a second at peak. What do you say next?</summary><p>What it decides: “so one database takes the writes with plenty of room, and there is no reason to partition.”</p></details>
+<details><summary>Why can a cache that is filled only on a miss never answer more than about 96% of the pastebin’s reads, however large it is?</summary><p>Because 4% of the reads in the simulation are the first read of their paste, and a cache filled on a miss holds nothing that has not been read once. Filling it at creation removes those misses, and takes the hit ratio past 99% with 5 GB.</p></details>
+<details><summary>Little’s law says 13.5 million pastes will be alive. You measure 5 million after the first month and plan storage for 6 million. What is wrong?</summary><p>The law gives the level the count settles at, reached only after the longest lifetime, a year. In the simulation the count is 5.1 million after a month and 13.5 million after a year, because one-year pastes keep accumulating.</p></details>
+<details><summary>Twenty-eight minutes into a 45-minute round you are still refining the data model. What do you do?</summary><p>Stop, draw the architecture with what you have, and trace one request through it. A complete simple design with a deep dive scores better than a perfect data model with no system around it.</p></details>
+<details><summary>For a ticket-selling system, which of these is the better deep dive: the load balancer’s algorithm, or what happens when 50,000 people try to buy the last 100 seats?</summary><p>The second. It is the problem’s shape, contended inventory, and it puts the central requirement, never selling a seat twice, at risk. Any reasonable load balancer would work.</p></details>
+<details><summary>At a hundred times the users, what changes in the pastebin, and what does not?</summary><p>Peak creates pass about 1,000 writes a second and the rows reach 405 GB, so the table is partitioned by a hash of the id, and the cache becomes a cluster of about 500 GB. The object storage, the API and the read path’s logic do not change.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Hello Interview, <a href="https://www.hellointerview.com/learn/system-design/in-a-hurry/delivery">“Delivery Framework”</a>, Optick Labs, checked October 2026. Steps with suggested minutes.</li>
+  <li>Alex Xu, <cite>System Design Interview: An Insider’s Guide</cite>, Byte Code LLC, 2020. The four-step framework and its time allocations, summarized in Gergely Orosz’s <a href="https://blog.pragmaticengineer.com/system-design-interview-an-insiders-guide-review/">review in The Pragmatic Engineer</a>, 8 November 2020.</li>
+  <li>Malte Ubl, <a href="https://www.industrialempathy.com/posts/design-docs-at-google/">“Design Docs at Google”</a>, Industrial Empathy, 6 July 2020. What a design document contains and when not to write one.</li>
+  <li>Michael Nygard, <a href="https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions">“Documenting Architecture Decisions”</a>, Cognitect, 15 November 2011. The architecture decision record.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html">“Best practices design patterns: optimizing Amazon S3 performance”</a>, Amazon S3 User Guide, checked October 2026. The 100 to 200 ms figure.</li>
+  <li>Amazon Web Services, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html">“Expiring objects”</a> and <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_LifecycleExpiration.html">“LifecycleExpiration”</a>, checked October 2026. Expiry rules in whole days, applied asynchronously.</li>
+  <li>R. L. Mattson, J. Gecsei, D. R. Slutz and I. L. Traiger, “Evaluation Techniques for Storage Hierarchies”, <cite>IBM Systems Journal</cite> 9(2), 1970, pages 78 to 117. Hit ratios for every cache size from one pass over a trace.</li>
+</ol>
+</section>

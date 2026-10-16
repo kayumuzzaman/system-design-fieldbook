@@ -1,0 +1,698 @@
+<!--meta
+{ "description": "A complete low-level design of an elevator system in TypeScript, tested by simulation: clarifying the problem, hall calls and car calls, the three states of a car and the invariant they protect, collective control and the LOOK algorithm against first come first served, dispatching strategies for several cars compared on simulated traffic, and the usual follow-up questions about capacity, starvation and concurrency.",
+  "lede": "An elevator is a machine with modes, and the design problem has two layers that are easy to tangle. Each car has to decide the order in which it visits its stops. The system has to decide which car answers each call. Kept apart, both are small. This chapter builds a car as a state machine, shows why sweeping up and down beats answering calls in order, and then measures three ways of choosing a car on the same simulated crowd.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the control software for the elevators in an office building. There are several cars. People call a car from a landing by pressing up or down, and choose their floor on a panel inside the car.</p></div>
+<p>In the terms of <x-ref to="lld-method#shapes"></x-ref>, this is a machine with modes. A car behaves differently when it is resting, traveling and standing with its doors open, and the heart of the design is a state machine (<x-ref to="uml-diagrams#state"></x-ref>).</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>How many floors and cars?</th><td>Any number, set when the system is created. Examples use 10 or 20 floors and 1 to 3 cars</td></tr>
+<tr><th>What buttons are there?</th><td>Up and down on each landing. One for each floor inside each car</td></tr>
+<tr><th>What does “time” mean in the software?</th><td>The system is advanced by a regular tick. A moving car travels one floor in a tick, and doors stay open for two</td></tr>
+<tr><th>Is there a limit on how many people fit?</th><td>Not in the first version. A full car is a follow-up</td></tr>
+<tr><th>What matters most?</th><td>Nobody waits forever, and waits are short on average</td></tr>
+<tr><th>What is out of scope?</th><td>Motors, door sensors, fire service mode, the displays</td></tr>
+</tbody>
+</table>
+<p>The question about time is the one that makes the problem tractable. Real controllers react to sensors. For a design exercise, a tick that advances every car by one step gives the same structure and can be run and tested as ordinary code.</p>
+<p>Two kinds of request come out of the answers, and they must not be merged.</p>
+<ul>
+  <li>A <dfn>hall call</dfn> is made from a landing. It has a floor and a direction, and it is addressed to the system: any car may answer it.</li>
+  <li>A <dfn>car call</dfn> is made inside a car. It has a floor only, and it is addressed to that car: no other car can serve it.</li>
+</ul>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+<table>
+<thead><tr><th>Concept</th><th>Kind</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Car</th><td>Entity, and a state machine</td><td>It has a position, a direction, a state and a set of stops, all of which change</td></tr>
+<tr><th>Hall call</th><td>Value</td><td>A floor and a direction</td></tr>
+<tr><th>Elevator system</th><td>The coordinator</td><td>Receives hall calls, remembers which are unanswered and gives each to a car</td></tr>
+<tr><th>Dispatch</th><td>A strategy</td><td>The rule for choosing a car. This is what differs most between buildings</td></tr>
+<tr><th>Floor, button, door</th><td>Not classes</td><td>A floor is a number. A button press is a method call. The door is part of the car’s state</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th><th>How it is kept</th></tr></thead>
+<tbody>
+<tr><th>A car never moves with its doors open</th><td><code>Car</code></td><td>Only the moving state changes the floor</td></tr>
+<tr><th>A car stays within the building</th><td><code>Car</code></td><td>Requests for floors that do not exist are refused, and a car only moves toward a stop</td></tr>
+<tr><th>Every request is eventually served</th><td><code>Car</code>, by its rule for ordering stops</td><td>A car never reverses while stops remain ahead, so each sweep is finite</td></tr>
+<tr><th>One press of a hall button brings one car</th><td><code>ElevatorSystem</code></td><td>It records unanswered calls and ignores repeats</td></tr>
+</tbody>
+</table>
+<p>The third is a different kind of rule from the others. The first two say that something bad never happens. The third says that something good eventually does, and it is the one that rules out some attractive scheduling ideas, as the section on ordering stops will show.</p>
+
+<h2 id="classes">Step 4: The classes</h2>
+
+<figure class="fig wide" id="fig-classes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f681t f681d">
+<title id="f681t">The classes of the elevator system</title>
+<desc id="f681d">A class diagram. ElevatorSystem holds the hall calls not yet answered and has the operations callFrom and tick. It owns one or more Cars. A Car has a floor, a direction and a state, with private sets of floors chosen inside it and of hall calls given to it, going up and going down. Its operations are pressFloor, assignHallCall, tick and ticksToServe. ElevatorSystem also holds a Dispatch function, which takes a hall call and the cars and returns the car that should answer. Three are provided: round robin, nearest car and soonest arrival. A HallCall is a value with a floor and a direction.</desc>
+<rect class="n sig" x="10" y="24" width="210" height="96" rx="4"/>
+<text class="tb mid" x="115" y="43">ElevatorSystem</text>
+<line class="sep sig" x1="10" y1="52" x2="220" y2="52"/>
+<text class="ts" x="18" y="68">− waiting: unanswered hall calls</text>
+<line class="sep sig" x1="10" y1="78" x2="220" y2="78"/>
+<text class="ts" x="18" y="94">+ callFrom(floor, direction): Car</text>
+<text class="ts" x="18" y="110">+ tick()</text>
+<rect class="n sig" x="300" y="24" width="220" height="160" rx="4"/>
+<text class="tb mid" x="410" y="43">Car</text>
+<line class="sep sig" x1="300" y1="52" x2="520" y2="52"/>
+<text class="ts" x="308" y="68">floor, direction, state</text>
+<text class="ts" x="308" y="84">− inside: floors chosen in the car</text>
+<text class="ts" x="308" y="100">− hall: calls given, up and down</text>
+<line class="sep sig" x1="300" y1="110" x2="520" y2="110"/>
+<text class="ts" x="308" y="126">+ pressFloor(floor)</text>
+<text class="ts" x="308" y="142">+ assignHallCall(floor, direction)</text>
+<text class="ts" x="308" y="158">+ tick()</text>
+<text class="ts" x="308" y="174">+ ticksToServe(floor, direction)</text>
+<rect class="n store" x="10" y="176" width="210" height="68" rx="4"/>
+<text class="ts mid" x="115" y="192">«function»</text>
+<text class="tb mid" x="115" y="209">Dispatch</text>
+<line class="sep store" x1="10" y1="218" x2="220" y2="218"/>
+<text class="ts" x="18" y="234">(call, cars) → Car</text>
+<rect class="n" x="590" y="24" width="120" height="84" rx="4"/>
+<text class="ts mid" x="650" y="40">«value»</text>
+<text class="tb mid" x="650" y="57">HallCall</text>
+<line class="sep" x1="590" y1="66" x2="710" y2="66"/>
+<text class="ts" x="598" y="82">floor</text>
+<text class="ts" x="598" y="98">direction</text>
+<path class="e owns" d="M220 52.8 L300 56"/>
+<text class="ts mid" x="260" y="47.4">1..*</text>
+<path class="e has" d="M115 120 L115 176"/>
+<path class="e uses" d="M220 210 L300 160"/>
+<text class="ts" x="590" y="128">state is one of:</text>
+<text class="ts" x="590" y="144">idle, moving,</text>
+<text class="ts" x="590" y="160">doors open</text>
+<text class="ts" x="10" y="268">Three Dispatch functions are provided: roundRobin, nearestCar and soonestArrival.</text>
+<text class="ts" x="10" y="284">A car decides the order of its own stops. The system decides only which car gets each hall call.</text>
+</svg>
+</div>
+<figcaption>Two decisions are kept apart. Each car owns the order in which it visits its stops, and the system owns the choice of car. Either can be changed without the other.</figcaption>
+</figure>
+
+<h2 id="states">The car as a state machine</h2>
+
+<figure class="fig wide" id="fig-states">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-labelledby="f682t f682d">
+<title id="f682t">The three states of an elevator car</title>
+<desc id="f682d">A state diagram with three states: idle, moving and doors open. From idle the car goes to moving when a stop is requested on another floor, or to doors open when it is called at the floor where it stands. While moving it advances one floor each tick, and goes to doors open on arriving at a floor where it should stop. From doors open, when the dwell time ends, it goes to moving if any stops remain, or to idle if none do. The car changes floor only in the moving state.</desc>
+<path class="e" d="M171 108H308"/>
+<text class="ts mid" x="240" y="100">a stop is asked for elsewhere</text>
+<path class="e" d="M421 108H558"/>
+<text class="ts mid" x="490" y="100">arrives where it should stop</text>
+<path class="e" d="M558 130H421"/>
+<text class="ts mid" x="490" y="148">dwell over, stops remain</text>
+<path class="e" d="M615 141C615 216 115 216 115 142" style="fill:none"/>
+<text class="ts mid" x="365" y="212">dwell over, nothing left to do</text>
+<path class="e" d="M115 95C115 22 615 22 615 94" style="fill:none"/>
+<text class="ts mid" x="365" y="34">called at the floor where it stands</text>
+<path class="e" d="M340 95C340 60 390 60 390 94" style="fill:none"/>
+<text class="ts mid" x="365" y="58">one floor each tick</text>
+<rect class="n" x="60" y="96" width="110" height="44" rx="22"/>
+<text class="tb mid" x="115.0" y="123">Idle</text>
+<rect class="n" x="310" y="96" width="110" height="44" rx="22"/>
+<text class="tb mid" x="365.0" y="123">Moving</text>
+<rect class="n" x="560" y="96" width="110" height="44" rx="22"/>
+<text class="tb mid" x="615.0" y="123">Doors open</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n store" x="310" y="96" width="110" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n store" x="310" y="96" width="110" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n store" x="560" y="96" width="110" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<g class="hide" data-s="4" data-e="4">
+<rect class="n store" x="310" y="96" width="110" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<g class="hide" data-s="5" data-e="5">
+<rect class="n store" x="560" y="96" width="110" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<g class="hide" data-s="6">
+<rect class="n store" x="60" y="96" width="110" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<text class="ts" x="10" y="250">The floor number changes only on the self-loop of “moving”. With the doors open, the car cannot move.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Floor: 2, heading up; still to do: 4 up, 7, 5 down, 8 down">The car is idle at floor 2 when stops are requested above. On its next tick it chooses a direction, up, and starts moving.</li>
+  <li data-msg="none" data-state="Floor: 3, heading up; still to do: 4 up, 7, 5 down, 8 down">Each tick in the moving state takes it one floor. At floor 3 nobody has asked for anything, so it stays in this state.</li>
+  <li data-msg="none" data-state="Floor: 4, heading up; still to do: 7, 9, 5 down, 8 down">At floor 4 someone is waiting to go up. The car stops and opens its doors. The caller gets in and presses 9.</li>
+  <li data-msg="none" data-state="Floor: 4, heading up; still to do: 7, 9, 5 down, 8 down">After two ticks the doors close. Stops remain above, so the car returns to moving, still heading up.</li>
+  <li data-msg="none" data-state="Floor: 0, resting; still to do: nothing">Much later, at floor 0, it lets out its last passenger. Nothing else is waiting anywhere.</li>
+  <li data-msg="none" data-state="Floor: 0, resting; still to do: nothing">When the doors close with nothing left to do, the car goes idle and stays where it is until the next request.</li>
+</ol>
+<figcaption>Three states are enough. The rule that makes an elevator safe, never move with the doors open, is not a check in the code. It follows from which state is allowed to change the floor.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="One elevator car">
+export type Direction = "up" | "down";
+export type CarState = "idle" | "moving" | "doorsOpen";
+
+const delta = { up: 1, down: -1 } as const;
+const reverse = { up: "down", down: "up" } as const;
+
+export class ElevatorError extends Error {}
+
+// One elevator car. It is a state machine advanced by tick(): one tick moves a moving car by one floor.
+export class Car {
+  static readonly dwell = 2; // ticks the doors stay open at a stop
+
+  readonly id: string;
+  readonly topFloor: number;
+  private at: number;
+  private heading: Direction | null = null;
+  private mode: CarState = "idle";
+  private dwellLeft = 0;
+  private readonly inside = new Set<number>(); // floors chosen on the panel in the car
+  private readonly hall: Record<Direction, Set<number>> = { up: new Set(), down: new Set() }; // hall calls given to this car
+  private readonly onStop: (car: Car) => void;
+
+  constructor(id: string, topFloor: number, startFloor = 0, onStop: (car: Car) => void = () => {}) {
+    this.id = id;
+    this.topFloor = topFloor;
+    this.at = startFloor;
+    this.onStop = onStop;
+  }
+
+  get floor(): number { return this.at; }
+  get direction(): Direction | null { return this.heading; }
+  get state(): CarState { return this.mode; }
+  get pending(): number { return this.inside.size + this.hall.up.size + this.hall.down.size; }
+
+  // A passenger in the car presses a floor button.
+  pressFloor(floor: number): void {
+    this.mustExist(floor);
+    if (floor === this.at && this.mode === "doorsOpen") return; // already here, doors open
+    this.inside.add(floor);
+  }
+
+  // The dispatcher gives this car a call made from a landing.
+  assignHallCall(floor: number, direction: Direction): void {
+    this.mustExist(floor);
+    if (this.mode === "doorsOpen" && floor === this.at && (this.heading === direction || this.heading === null)) {
+      this.heading = direction; // the car is standing here with its doors open: hold them
+      this.dwellLeft = Car.dwell;
+      this.onStop(this);
+      return;
+    }
+    this.hall[direction].add(floor);
+  }
+
+  tick(): void {
+    if (this.mode === "doorsOpen") {
+      this.dwellLeft -= 1;
+      if (this.dwellLeft === 0) this.closeDoors();
+    } else if (this.mode === "idle") {
+      if (this.pending > 0) this.depart();
+    } else {
+      this.at += delta[this.heading as Direction]; // only a car in the moving state changes floor
+      if (this.shouldStop()) this.openDoors();
+    }
+  }
+
+  // The rule of collective control: stop for anyone inside, for a hall call in the direction of travel,
+  // and for a hall call the other way only when there is nothing further to go to.
+  private shouldStop(): boolean {
+    const heading = this.heading as Direction;
+    return this.inside.has(this.at) || this.hall[heading].has(this.at) || (!this.anyBeyond(heading) && this.hall[reverse[heading]].has(this.at));
+  }
+
+  private openDoors(): void {
+    this.mode = "doorsOpen";
+    this.dwellLeft = Car.dwell;
+    this.inside.delete(this.at);
+    this.heading = this.directionFromHere();
+    if (this.heading) this.hall[this.heading].delete(this.at);
+    this.onStop(this); // passengers get out, and those going this car's way get in and press buttons
+  }
+
+  private closeDoors(): void {
+    const next = this.directionFromHere();
+    if (next !== null && next !== this.heading && this.hall[next].has(this.at)) {
+      this.heading = next; // someone here is waiting to go the other way: serve them before leaving
+      this.openDoors();
+      return;
+    }
+    this.heading = next;
+    this.mode = next === null ? "idle" : "moving";
+  }
+
+  private depart(): void {
+    if (this.inside.has(this.at) || this.hall.up.has(this.at) || this.hall.down.has(this.at)) {
+      this.openDoors();
+      return;
+    }
+    const stops = [...this.inside, ...this.hall.up, ...this.hall.down];
+    const nearest = stops.reduce((best, floor) => (Math.abs(floor - this.at) < Math.abs(best - this.at) ? floor : best));
+    this.heading = nearest > this.at ? "up" : "down";
+    this.mode = "moving";
+  }
+
+  // Keep going while there is a reason to. Turn around only when there is nothing ahead. Otherwise rest.
+  private directionFromHere(): Direction | null {
+    const current = this.heading;
+    if (current && (this.anyBeyond(current) || this.hall[current].has(this.at))) return current;
+    const other: Direction = current ? reverse[current] : "up";
+    if (this.anyBeyond(other) || this.hall[other].has(this.at)) return other;
+    if (!current && (this.anyBeyond("down") || this.hall.down.has(this.at))) return "down";
+    return null;
+  }
+
+  private anyBeyond(direction: Direction): boolean {
+    const ahead = (floor: number) => (floor - this.at) * delta[direction] > 0;
+    return [...this.inside, ...this.hall.up, ...this.hall.down].some(ahead);
+  }
+
+  private mustExist(floor: number): void {
+    if (!Number.isInteger(floor) || floor < 0 || floor > this.topFloor) throw new ElevatorError(`there is no floor ${floor}`);
+  }
+}
+</pre>
+<p>The states here are labels with rules about which moves are legal, so the machine is written as a field and a <code>tick</code> method that branches on it. That is the table form of <x-ref to="behavioral-patterns#state"></x-ref>. State objects would add three classes and no clarity.</p>
+<p>Look at where the first invariant lives. No line checks “are the doors closed?” before moving. The floor changes in exactly one place, the last branch of <code>tick</code>, which is reached only in the moving state. A test stepped a car through a full journey and confirmed that the floor never changed on a tick that began in any other state.</p>
+
+<h2 id="order">Step 5, part one: The order of stops</h2>
+<p>A car with several stops to make must choose an order. The obvious choice, the order in which buttons were pressed, is poor.</p>
+<pre data-lang="ts" data-title="Two orders for the same requests">
+// Two orders in which one car could visit a list of requested floors. Each returns the floors in the order visited.
+
+// First come, first served: the order the buttons were pressed.
+export const fcfsOrder = (requests: readonly number[]): number[] => [...requests];
+
+// LOOK: keep going in one direction to the furthest request, then turn and take the rest on the way back.
+export function lookOrder(start: number, requests: readonly number[], first: "up" | "down" = "up"): number[] {
+  const above = requests.filter((f) => f > start).sort((a, b) => a - b);
+  const below = requests.filter((f) => f < start).sort((a, b) => b - a);
+  const here = requests.filter((f) => f === start);
+  return first === "up" ? [...here, ...above, ...below] : [...here, ...below, ...above];
+}
+
+export const floorsTraveled = (start: number, order: readonly number[]): number =>
+  order.reduce((sum, floor, i) => sum + Math.abs(floor - (i === 0 ? start : (order[i - 1] as number))), 0);
+</pre>
+
+<figure class="fig wide" id="fig-look">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f684t f684d">
+<title id="f684t">Floors traveled by one car serving seven requests in two different orders</title>
+<desc id="f684d">A chart of the floor a car is at against the number of floors it has traveled, for a car that starts at floor 5 with buttons pressed in the order 12, 2, 9, 1, 14, 3, 10. Serving them in the order pressed, it zigzags across the building and travels 63 floors. Serving them by the LOOK rule, it goes up through 9, 10, 12 and 14 and then down through 3, 2 and 1, and travels 22 floors.</desc>
+<line class="grid" x1="60" y1="229" x2="700" y2="229"/>
+<text class="ts end" x="50" y="233">1</text>
+<line class="grid" x1="60" y1="169" x2="700" y2="169"/>
+<text class="ts end" x="50" y="173">5</text>
+<line class="grid" x1="60" y1="94" x2="700" y2="94"/>
+<text class="ts end" x="50" y="98">10</text>
+<line class="grid" x1="60" y1="34" x2="700" y2="34"/>
+<text class="ts end" x="50" y="38">14</text>
+<text class="tb" x="10" y="16">Floor</text>
+<text class="ts mid" x="60" y="262">0</text>
+<text class="ts mid" x="160" y="262">10</text>
+<text class="ts mid" x="260" y="262">20</text>
+<text class="ts mid" x="360" y="262">30</text>
+<text class="ts mid" x="460" y="262">40</text>
+<text class="ts mid" x="560" y="262">50</text>
+<text class="ts mid" x="660" y="262">60</text>
+<text class="ts mid" x="380" y="278">floors traveled so far</text>
+<path class="line" style="stroke:var(--fault)" d="M60 169 L130 64 L230 214 L300 109 L380 229 L510 34 L620 199 L690 94"/>
+<circle class="dot fault" cx="60" cy="169" r="4"/>
+<circle class="dot fault" cx="130" cy="64" r="4"/>
+<circle class="dot fault" cx="230" cy="214" r="4"/>
+<circle class="dot fault" cx="300" cy="109" r="4"/>
+<circle class="dot fault" cx="380" cy="229" r="4"/>
+<circle class="dot fault" cx="510" cy="34" r="4"/>
+<circle class="dot fault" cx="620" cy="199" r="4"/>
+<circle class="dot fault" cx="690" cy="94" r="4"/>
+<rect class="bar fault" x="300" y="6" width="12" height="12" rx="3"/>
+<text class="ts tb" x="318" y="16">In the order pressed: 63 floors</text>
+<path class="line" style="stroke:var(--store)" d="M60 169 L100 109 L110 94 L130 64 L150 34 L260 199 L270 214 L280 229"/>
+<circle class="dot store" cx="60" cy="169" r="4"/>
+<circle class="dot store" cx="100" cy="109" r="4"/>
+<circle class="dot store" cx="110" cy="94" r="4"/>
+<circle class="dot store" cx="130" cy="64" r="4"/>
+<circle class="dot store" cx="150" cy="34" r="4"/>
+<circle class="dot store" cx="260" cy="199" r="4"/>
+<circle class="dot store" cx="270" cy="214" r="4"/>
+<circle class="dot store" cx="280" cy="229" r="4"/>
+<rect class="bar store" x="130" y="6" width="12" height="12" rx="3"/>
+<text class="ts tb" x="148" y="16">LOOK: 22 floors</text>
+<circle class="dot" cx="60" cy="169" r="4"/>
+<text class="ts" x="68" y="185">starts at 5</text>
+<rect class="hit" x="122" y="56" width="16" height="16" data-tip="In the order pressed|stop 1 of 7: floor 12|7 floors traveled so far"/>
+<rect class="hit" x="222" y="206" width="16" height="16" data-tip="In the order pressed|stop 2 of 7: floor 2|17 floors traveled so far"/>
+<rect class="hit" x="292" y="101" width="16" height="16" data-tip="In the order pressed|stop 3 of 7: floor 9|24 floors traveled so far"/>
+<rect class="hit" x="372" y="221" width="16" height="16" data-tip="In the order pressed|stop 4 of 7: floor 1|32 floors traveled so far"/>
+<rect class="hit" x="502" y="26" width="16" height="16" data-tip="In the order pressed|stop 5 of 7: floor 14|45 floors traveled so far"/>
+<rect class="hit" x="612" y="191" width="16" height="16" data-tip="In the order pressed|stop 6 of 7: floor 3|56 floors traveled so far"/>
+<rect class="hit" x="682" y="86" width="16" height="16" data-tip="In the order pressed|stop 7 of 7: floor 10|63 floors traveled so far"/>
+<rect class="hit" x="92" y="101" width="16" height="16" data-tip="LOOK|stop 1 of 7: floor 9|4 floors traveled so far"/>
+<rect class="hit" x="102" y="86" width="16" height="16" data-tip="LOOK|stop 2 of 7: floor 10|5 floors traveled so far"/>
+<rect class="hit" x="122" y="56" width="16" height="16" data-tip="LOOK|stop 3 of 7: floor 12|7 floors traveled so far"/>
+<rect class="hit" x="142" y="26" width="16" height="16" data-tip="LOOK|stop 4 of 7: floor 14|9 floors traveled so far"/>
+<rect class="hit" x="252" y="191" width="16" height="16" data-tip="LOOK|stop 5 of 7: floor 3|20 floors traveled so far"/>
+<rect class="hit" x="262" y="206" width="16" height="16" data-tip="LOOK|stop 6 of 7: floor 2|21 floors traveled so far"/>
+<rect class="hit" x="272" y="221" width="16" height="16" data-tip="LOOK|stop 7 of 7: floor 1|22 floors traveled so far"/>
+</svg>
+</div>
+<figcaption>The same seven requests, the same car. Serving them in the order they arrived takes nearly three times the travel of sweeping up and then down.</figcaption>
+</figure>
+
+<p>For a car at floor 5 with seven floors requested, serving them as pressed meant 63 floors of travel, and sweeping up and then down meant 22. The sweeping rule is called <dfn>LOOK</dfn>: travel in one direction as far as the furthest request, then reverse. Computer science knows the rule from disk drives, where the arm that reads the platter faces the same problem, and operating system textbooks call it the elevator algorithm.</p>
+<table>
+<thead><tr><th>Rule</th><th>Travel</th><th>Can a request wait forever?</th></tr></thead>
+<tbody>
+<tr><th>First come, first served</th><td>Poor. The car crosses the building repeatedly</td><td>No</td></tr>
+<tr><th>Nearest request next</th><td>Good at each step</td><td>Yes. A steady stream of requests near the car keeps it away from a distant one. This is <dfn>starvation</dfn></td></tr>
+<tr><th>LOOK</th><td>Good</td><td>No. Each sweep ends, and every request lies on the next sweep at the latest</td></tr>
+</tbody>
+</table>
+<p>Passengers add one refinement, because a hall call has a direction. A car heading up should stop for someone who wants to go up, and should pass someone who wants to go down, since stopping would take them the wrong way first. The complete rule, called <dfn>collective control</dfn>, is the <code>shouldStop</code> method in the car: stop for anyone inside, stop for a hall call in the direction of travel, and stop for a hall call in the other direction only when there is nothing further ahead.</p>
+
+<h2 id="walk">Step 7: Walk it</h2>
+
+<figure class="fig wide" id="fig-shaft">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 306" role="img" aria-labelledby="f683t f683d">
+<title id="f683t">One car answering three hall calls and its own passengers</title>
+<desc id="f683d">A chart of the position of one car over 29 ticks in a ten-floor building, produced by running the chapter’s code. The car starts idle at floor 2 with a passenger for floor 7. Hall calls are waiting: up from floor 4, down from floor 5 and down from floor 8. The car goes up, stopping at 4 and 7, passing 5 and 8 without stopping, and reaches 9. It then turns and comes down, stopping at 8, 5, 1 and 0.</desc>
+<line class="grid" x1="70" y1="262" x2="700" y2="262"/>
+<text class="ts end" x="60" y="266">0</text>
+<line class="grid" x1="70" y1="238" x2="700" y2="238"/>
+<text class="ts end" x="60" y="242">1</text>
+<line class="grid" x1="70" y1="214" x2="700" y2="214"/>
+<text class="ts end" x="60" y="218">2</text>
+<line class="grid" x1="70" y1="190" x2="700" y2="190"/>
+<text class="ts end" x="60" y="194">3</text>
+<line class="grid" x1="70" y1="166" x2="700" y2="166"/>
+<text class="ts end" x="60" y="170">4</text>
+<line class="grid" x1="70" y1="142" x2="700" y2="142"/>
+<text class="ts end" x="60" y="146">5</text>
+<line class="grid" x1="70" y1="118" x2="700" y2="118"/>
+<text class="ts end" x="60" y="122">6</text>
+<line class="grid" x1="70" y1="94" x2="700" y2="94"/>
+<text class="ts end" x="60" y="98">7</text>
+<line class="grid" x1="70" y1="70" x2="700" y2="70"/>
+<text class="ts end" x="60" y="74">8</text>
+<line class="grid" x1="70" y1="46" x2="700" y2="46"/>
+<text class="ts end" x="60" y="50">9</text>
+<text class="tb" x="10" y="18">Floor</text>
+<text class="ts mid" x="385" y="298">ticks</text>
+<text class="ts mid" x="70" y="282">0</text>
+<text class="ts mid" x="175" y="282">5</text>
+<text class="ts mid" x="280" y="282">10</text>
+<text class="ts mid" x="385" y="282">15</text>
+<text class="ts mid" x="490" y="282">20</text>
+<text class="ts mid" x="595" y="282">25</text>
+<text class="ts mid" x="700" y="282">30</text>
+<text class="ts end" x="700" y="161">▲ up from 4</text>
+<text class="ts end" x="700" y="137">▼ down from 5</text>
+<text class="ts end" x="700" y="65">▼ down from 8</text>
+<text class="ts end" x="700" y="41">waiting from the start:</text>
+<circle class="dot" cx="70" cy="214" r="4"/>
+<g class="hide" data-s="1">
+<path class="e sig" d="M70 214 L91 214 L112 190 L133 166" style="marker-end:none"/>
+<circle class="dot" cx="133" cy="166" r="5"/>
+<path class="e store" d="M133 166H175" style="marker-end:none;stroke-width:4"/>
+<text class="ts" x="139" y="183">4, boards for 9</text>
+</g>
+<g class="hide" data-s="2">
+<path class="e sig" d="M175 166 L196 142 L217 118 L238 94" style="marker-end:none"/>
+<circle class="dot" cx="238" cy="94" r="5"/>
+<path class="e store" d="M238 94H280" style="marker-end:none;stroke-width:4"/>
+<text class="ts" x="244" y="111">7</text>
+</g>
+<g class="hide" data-s="3">
+<path class="e sig" d="M280 94 L301 70 L322 46" style="marker-end:none"/>
+<circle class="dot" cx="322" cy="46" r="5"/>
+<path class="e store" d="M322 46H364" style="marker-end:none;stroke-width:4"/>
+<text class="ts" x="328" y="38">9</text>
+</g>
+<g class="hide" data-s="4">
+<path class="e sig" d="M364 46 L385 70" style="marker-end:none"/>
+<circle class="dot" cx="385" cy="70" r="5"/>
+<path class="e store" d="M385 70H427" style="marker-end:none;stroke-width:4"/>
+<text class="ts" x="391" y="62">8, boards for 1</text>
+</g>
+<g class="hide" data-s="5">
+<path class="e sig" d="M427 70 L448 94 L469 118 L490 142" style="marker-end:none"/>
+<circle class="dot" cx="490" cy="142" r="5"/>
+<path class="e store" d="M490 142H532" style="marker-end:none;stroke-width:4"/>
+<text class="ts" x="496" y="134">5, boards for 0</text>
+</g>
+<g class="hide" data-s="6">
+<path class="e sig" d="M532 142 L553 166 L574 190 L595 214 L616 238" style="marker-end:none"/>
+<circle class="dot" cx="616" cy="238" r="5"/>
+<path class="e store" d="M616 238H658" style="marker-end:none;stroke-width:4"/>
+<text class="ts" x="622" y="230">1</text>
+</g>
+<g class="hide" data-s="7">
+<path class="e sig" d="M658 238 L679 262" style="marker-end:none"/>
+<circle class="dot" cx="679" cy="262" r="5"/>
+<path class="e store" d="M679 262H679" style="marker-end:none;stroke-width:4"/>
+<text class="ts" x="685" y="254">0</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Still to do: 7, 9, down from 5, down from 8">The car leaves floor 2 heading up and stops at 4, where someone is waiting to go up. They get in and press 9.</li>
+  <li data-msg="none" data-state="Still to do: 9, down from 5, down from 8">It passes floor 5 without stopping. The person there wants to go down, and the car has stops ahead of it going up. It stops at 7 to let its first passenger out.</li>
+  <li data-msg="none" data-state="Still to do: down from 8, down from 5">It passes floor 8 for the same reason and stops at 9, the top of its run. With nothing above, it turns around.</li>
+  <li data-msg="none" data-state="Still to do: down from 5, 1">Now heading down, it stops for the caller at 8, who presses 1.</li>
+  <li data-msg="none" data-state="Still to do: 1, 0">It stops for the caller at 5, who presses 0. Both down calls were answered on one pass.</li>
+  <li data-msg="none" data-state="Still to do: 0">It lets a passenger out at floor 1.</li>
+  <li data-msg="none" data-state="Still to do: nothing">It lets the last passenger out at 0 and has nothing left to do. The whole job took 29 ticks and one change of direction.</li>
+</ol>
+<figcaption>The car keeps its direction while it has a reason to, and collects people who are going its way. This rule is called collective control, and the path it produces is the LOOK algorithm.</figcaption>
+</figure>
+
+<p>The figure is a recording of the code. The test asserts the same seven stops at the same ticks: floor 4 at tick 3, floor 7 at tick 8, the turn at floor 9 at tick 12, then 8, 5, 1 and 0, finishing at tick 29.</p>
+
+<h2 id="dispatch">Step 5, part two: Which car answers</h2>
+<p>With several cars, each hall call has to be given to one of them. This is the dispatching decision, and it is a strategy in the plainest sense: a function from a call and the cars to a car.</p>
+<pre data-lang="ts" data-title="Three dispatching strategies, and the system that uses one">
+export interface HallCall {
+  readonly floor: number;
+  readonly direction: Direction;
+}
+
+// The dispatching strategy: which car should answer this call?
+export type Dispatch = (call: HallCall, cars: readonly Car[]) => Car;
+
+const least = (cars: readonly Car[], cost: (car: Car) => number): Car =>
+  cars.reduce((best, car) => (cost(car) < cost(best) ? car : best));
+
+// Takes turns, whatever the cars are doing.
+export const roundRobin = (): Dispatch => {
+  let turn = 0;
+  return (_, cars) => cars[(turn++) % cars.length] as Car;
+};
+// The car whose position is closest right now, even if it is moving away.
+export const nearestCar: Dispatch = (call, cars) => least(cars, (car) => Math.abs(car.floor - call.floor));
+// The car that would reach the caller soonest, counting everything it has already promised to do.
+export const soonestArrival: Dispatch = (call, cars) => least(cars, (car) => car.ticksToServe(call.floor, call.direction));
+
+export class ElevatorSystem {
+  readonly cars: readonly Car[];
+  private readonly dispatch: Dispatch;
+  private readonly waiting = new Map<string, Car>(); // hall calls not yet answered, and the car each was given to
+
+  constructor(carCount: number, topFloor: number, dispatch: Dispatch, onStop: (car: Car) => void = () => {}) {
+    this.dispatch = dispatch;
+    this.cars = Array.from({ length: carCount }, (_, i) => new Car(`car ${i + 1}`, topFloor, 0, (car) => { this.answered(car); onStop(car); }));
+  }
+
+  // A button on a landing. Pressing it twice does not send two cars.
+  callFrom(floor: number, direction: Direction): Car {
+    const key = `${floor}:${direction}`;
+    const already = this.waiting.get(key);
+    if (already) return already;
+    const car = this.dispatch({ floor, direction }, this.cars);
+    this.waiting.set(key, car);
+    car.assignHallCall(floor, direction);
+    return car;
+  }
+
+  tick(): void {
+    for (const car of this.cars) car.tick();
+  }
+
+  private answered(car: Car): void {
+    for (const direction of ["up", "down"] as const) {
+      if (car.direction === direction || car.direction === null) {
+        const key = `${car.floor}:${direction}`;
+        if (this.waiting.get(key) === car) this.waiting.delete(key);
+      }
+    }
+  }
+}
+</pre>
+<p>The third strategy asks each car a question only the car can answer: given everything you have already promised, how long until you could open your doors for this caller? The car answers by running a copy of itself forward, in <code>ticksToServe</code>, which keeps the dispatcher free of any knowledge of how cars order their stops.</p>
+<p>A small test shows the difference. Car 1 is at floor 12 on its way up to 19, and car 2 is resting at floor 2. Someone at floor 9 presses down. The nearest-car rule chose car 1, three floors away and heading in the wrong direction. Soonest arrival chose car 2.</p>
+<p>To compare the strategies on something larger, the same 300 simulated passengers were sent through a 20-floor building with three cars, once for each strategy and for two patterns of traffic.</p>
+
+<figure class="fig wide" id="fig-dispatch">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f685t f685d">
+<title id="f685t">Average wait for a car under three dispatching strategies, measured by simulation</title>
+<desc id="f685d">Horizontal bars of the average wait in ticks for 300 simulated passengers in a 20-floor building with three cars, under three ways of choosing which car answers a hall call, for two patterns of traffic. With mixed traffic: round robin 21.5, nearest car 19.8, soonest arrival 14.2. With morning rush: round robin 15.9, nearest car 23.3, soonest arrival 7.9.</desc>
+<text class="tb" x="10" y="16">Average wait, in ticks, for 300 passengers, 20 floors and 3 cars</text>
+<text class="tb" x="10" y="48">Mixed traffic</text>
+<text class="ts end" x="240" y="48">round robin</text>
+<rect class="bar mute" x="250" y="34" width="326.2" height="18" rx="3"/>
+<text class="ts tb" x="584.2" y="48">21.5</text>
+<text class="ts end" x="240" y="74">nearest car</text>
+<rect class="bar async" x="250" y="60" width="301.7" height="18" rx="3"/>
+<text class="ts tb" x="559.7" y="74">19.8</text>
+<text class="ts end" x="240" y="100">soonest arrival</text>
+<rect class="bar " x="250" y="86" width="215.1" height="18" rx="3"/>
+<text class="ts tb" x="473.1" y="100">14.2</text>
+<text class="tb" x="10" y="138">Morning rush</text>
+<text class="ts end" x="240" y="138">round robin</text>
+<rect class="bar mute" x="250" y="124" width="242.0" height="18" rx="3"/>
+<text class="ts tb" x="500.0" y="138">15.9</text>
+<text class="ts end" x="240" y="164">nearest car</text>
+<rect class="bar async" x="250" y="150" width="354.0" height="18" rx="3"/>
+<text class="ts tb" x="612.0" y="164">23.3</text>
+<text class="ts end" x="240" y="190">soonest arrival</text>
+<rect class="bar " x="250" y="176" width="120.5" height="18" rx="3"/>
+<text class="ts tb" x="378.5" y="190">7.9</text>
+<line class="axis" x1="250" y1="30" x2="250" y2="200"/>
+<text class="ts" x="10" y="222">One tick is the time a car takes to travel one floor. Doors stay open for two ticks. Cars have unlimited room.</text>
+<rect class="hit" x="10" y="31" width="700" height="24" data-tip="mixed traffic, round robin|average wait 21.5 ticks|longest wait 61 ticks|average journey 33.0 ticks"/>
+<rect class="hit" x="10" y="57" width="700" height="24" data-tip="mixed traffic, nearest car|average wait 19.8 ticks|longest wait 68 ticks|average journey 32.0 ticks"/>
+<rect class="hit" x="10" y="83" width="700" height="24" data-tip="mixed traffic, soonest arrival|average wait 14.2 ticks|longest wait 54 ticks|average journey 26.2 ticks"/>
+<rect class="hit" x="10" y="121" width="700" height="24" data-tip="morning rush, round robin|average wait 15.9 ticks|longest wait 58 ticks|average journey 33.1 ticks"/>
+<rect class="hit" x="10" y="147" width="700" height="24" data-tip="morning rush, nearest car|average wait 23.3 ticks|longest wait 64 ticks|average journey 42.9 ticks"/>
+<rect class="hit" x="10" y="173" width="700" height="24" data-tip="morning rush, soonest arrival|average wait 7.9 ticks|longest wait 41 ticks|average journey 23.7 ticks"/>
+</svg>
+</div>
+<figcaption>Sending the nearest car sounds right and was the worst choice in the morning rush, when every car is near the lobby and one of them gets all the work. Estimating each car’s true arrival time cut the wait by about a third in mixed traffic and by half or more in the rush.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Average wait, in ticks</th><th>Mixed traffic</th><th>Morning rush, 85% from the lobby</th></tr></thead>
+<tbody>
+<tr><th>Round robin</th><td>21.5</td><td>15.9</td></tr>
+<tr><th>Nearest car</th><td>19.8</td><td>23.3</td></tr>
+<tr><th>Soonest arrival</th><td>14.2</td><td>7.9</td></tr>
+<tr><th>One car instead of three, nearest car</th><td>49.5</td><td></td></tr>
+</tbody>
+</table>
+<p>All 300 passengers arrived under every strategy, and none was ever let into a car going the wrong way. Two results are worth remembering. Nearest car, the answer most people give first, did worse than taking turns in the morning rush: when most calls come from the lobby, the nearest car is always the same one, and it does all the work while the others stand by. And the strategy that estimates real arrival time cut the average wait by about a third in mixed traffic and by half or more in the rush, without any change to the cars.</p>
+<p>These numbers come from a simple model: unlimited room in each car, one tick for each floor, a seeded random crowd. They show how the strategies rank on that model, and should not be read as predictions for a real building.</p>
+<div class="widget" data-widget="liftwait">
+<h4>A rough estimate of waiting time</h4>
+<p>Planning arithmetic for a group of cars: how long one car takes to go up and come back, and how often a car therefore passes a given floor.</p>
+<div class="controls">
+  <label>Floors<input type="number" name="floors" value="20" min="2" max="200" step="1"></label>
+  <label>Cars<input type="number" name="cars" value="3" min="1" max="50" step="1"></label>
+  <label>Seconds to travel one floor<input type="number" name="perFloor" value="2" min="0.2" max="30" step="0.1"></label>
+  <label>Seconds for one stop<input type="number" name="perStop" value="10" min="1" max="120" step="1"></label>
+  <label>Stops in a round trip<input type="number" name="stops" value="12" min="1" max="400" step="1"></label>
+</div>
+<dl class="results">
+  <div><dt>Round trip for one car</dt><dd data-out="trip">3.27 min</dd></div>
+  <div><dt>A car passes every</dt><dd data-out="interval">65.3 s</dd></div>
+  <div><dt>Typical wait</dt><dd data-out="wait">32.7 s</dd></div>
+  <div><dt>Cars for a wait under 30 s</dt><dd data-out="need">4</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">A car that goes from the bottom to the top and back travels 38 floors, which takes 76 s, and spends 2 min on 12 stops: 3.27 min in all. With 3 cars evenly spread, one passes a given floor every 65.3 s, so a person arriving at a random moment waits about half of that, 32.7 s. Stopping takes more of the trip than traveling does, which is usual: faster doors help more than a faster motor. Real cars bunch together, so treat this as the best case.</p>
+</div>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th></tr></thead>
+<tbody>
+<tr><th>A car can be full</th><td>The car tracks its load. A full car stops only to let people out and passes hall calls, and the system gives those calls to another car. The dispatch estimate should count a full car as unable to serve</td></tr>
+<tr><th>A car is taken out of service</th><td>A fourth state, out of service, entered from idle. The system hands its unanswered hall calls back to the dispatcher. If states now differ in several behaviors, this is the point to consider state objects</td></tr>
+<tr><th>Fire alarm: all cars to the ground floor</th><td>A mode on the system that clears hall calls, sends every car to floor 0 and holds the doors open. It overrides the normal rule for stops, which argues for the car’s stopping rule being a replaceable policy</td></tr>
+<tr><th>Passengers enter their destination at the landing</th><td>The hall call carries a destination floor, so the dispatcher can group people going to the same floors into the same car. Only the call’s data and the dispatch function change</td></tr>
+<tr><th>Some cars serve only some floors</th><td>Each car has a set of floors it serves. The dispatcher skips cars that cannot reach the caller, and a car refuses a floor outside its set</td></tr>
+<tr><th>Could a request starve?</th><td>Not with LOOK inside a car: a sweep is bounded by the height of the building. In the system, a hall call stays with its car until answered, so it is carried by that car’s next sweep</td></tr>
+<tr><th>Buttons are pressed on twenty floors at once</th><td>See the next section</td></tr>
+</tbody>
+</table>
+
+<h2 id="concurrency">Many buttons at once</h2>
+<p>Button presses arrive from many places at arbitrary moments, while the cars are being advanced. The shared state is each car’s sets of stops and the system’s map of unanswered calls. Two designs keep it consistent.</p>
+<ul>
+  <li><b>One loop owns everything.</b> Button presses are placed on a queue as small messages. A single control loop takes messages from the queue, applies them, and advances the cars, one step at a time. Nothing else touches the cars, so nothing needs a lock. This is the “one owner, send it messages” approach of <x-ref to="concurrency-in-code#design"></x-ref>, and it is how the code in this chapter behaves on a single-threaded runtime: <code>callFrom</code>, <code>pressFloor</code> and <code>tick</code> each run to completion.</li>
+  <li><b>A lock for each car.</b> In a threaded design where presses are handled on their own threads, each car guards its sets with a lock, held briefly by <code>pressFloor</code>, <code>assignHallCall</code> and <code>tick</code>. The dispatcher reads several cars to compare them, and should read each under that car’s lock in turn, never holding two at once.</li>
+</ul>
+<p>The first is simpler and is the better answer for a control system, where the order of events matters and the work for each event is tiny.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Draw the two layers before anything else, and say that you will take them one at a time: how one car orders its stops, then how a call is given to a car. Most candidates blend them into one “scheduler” class and run out of time untangling it. Then give the three states and the one-line safety rule, write <code>tick</code> and <code>shouldStop</code>, and present dispatch as a function type with the nearest-car version written and the better one described. If asked why not nearest-request-first inside a car, the word wanted is starvation.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>One kind of request for both hall calls and car calls</th><td>The direction is lost, or car calls can be given to the wrong car</td><td>Two kinds: a hall call has a direction and no car, a car call has a car and no direction</td></tr>
+<tr><th>A queue of requests served in arrival order</th><td>The car crosses the building for every request</td><td>Sets of stops, and the LOOK rule</td></tr>
+<tr><th>Always serving the nearest request next</th><td>A request at the far end of the building can wait indefinitely</td><td>Keep direction until nothing is ahead</td></tr>
+<tr><th>Stopping for a down call while going up</th><td>The caller is carried up before going down, and everyone aboard is delayed</td><td>Collective control: only calls in the direction of travel, except at the turning point</td></tr>
+<tr><th>Booleans such as <code>isMoving</code> and <code>doorsOpen</code> in place of one state</th><td>Four combinations, one of which is “moving with doors open”</td><td>One state field with three values</td></tr>
+<tr><th>The ordering of stops and the choice of car in one class</th><td>Neither can be changed or tested alone</td><td>The car orders its stops. A dispatch function chooses the car</td></tr>
+<tr><th>Dispatching to the nearest car by distance alone</th><td>Cars moving away are chosen, and one car does most of the work</td><td>Estimate the time to arrive, including direction and existing stops</td></tr>
+<tr><th>Real timers and sleeps inside the car</th><td>Tests take minutes and are not repeatable</td><td>A tick that the caller advances</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="lld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="uml-diagrams"></x-ref>: state diagrams, the notation for a car’s three states.</li>
+  <li><x-ref to="behavioral-patterns"></x-ref>: state as a table or as objects, and strategy for dispatching.</li>
+  <li><x-ref to="concurrency-in-code"></x-ref>: one owner and a queue of messages in place of locks.</li>
+  <li><x-ref to="lld-vending-machine"></x-ref>: another machine with modes, where states carry more behavior.</li>
+  <li><x-ref to="proxies-and-load-balancers"></x-ref>: choosing a server for a request is the same decision as choosing a car for a call, with the same naive and better answers.</li>
+  <li><x-ref to="hld-ride-hailing"></x-ref>: matching riders to drivers, the dispatching problem at city scale.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>An elevator system has two separate decisions: the order in which a car visits its stops, and which car is given each hall call.</li>
+  <li>Hall calls have a floor and a direction and belong to the system. Car calls have a floor and belong to one car.</li>
+  <li>A car is a state machine with three states: idle, moving and doors open. The floor changes only in the moving state, which is what keeps it from moving with open doors.</li>
+  <li>LOOK, sweeping to the furthest request and then reversing, travels far less than serving requests in order, and unlike nearest-first it cannot starve a request.</li>
+  <li>Collective control adds direction: stop for calls going your way, and for others only at the turning point.</li>
+  <li>Dispatching is a strategy. Choosing by distance alone is poor, and choosing by estimated arrival time is much better.</li>
+  <li>Drive the model with a tick, so that it can be simulated, tested and measured.</li>
+  <li>Give the cars one owner that applies button presses from a queue, and no locks are needed.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A car at floor 6 has these floors requested, in this order: 2, 9, 4, 12, 7. How many floors does it travel serving them as pressed, and how many with LOOK going up first?</summary><p>As pressed: 6 to 2 is 4, to 9 is 7, to 4 is 5, to 12 is 8, to 7 is 5, a total of 29. With LOOK going up first, the order is 7, 9, 12, then 4, 2: 6 to 12 is 6 floors and 12 down to 2 is 10, a total of 16.</p></details>
+<details><summary>Why can “always go to the nearest requested floor” leave someone waiting indefinitely, and why can LOOK not?</summary><p>If new requests keep arriving near the car, each is nearer than a distant request, so the distant one is never chosen. Nothing bounds its wait. Under LOOK the car continues in its direction only as far as the furthest request and must then reverse, so every request is reached within two sweeps of the building at most, whatever else arrives.</p></details>
+<details><summary>A car is at floor 3 going up, with a passenger for floor 8. There is a down call at floor 5 and an up call at floor 6. Where does it stop, in order?</summary><p>At 6, for the up call, since that caller is going its way. Then at 8, for its passenger, and for whatever floor the person from 6 chose above. It passes 5 on the way up, because that caller wants to go down. Once it has nothing further above, it turns and stops at 5 on the way down.</p></details>
+<details><summary>The design has no check for “doors closed” before a car moves. What prevents a car from moving with its doors open?</summary><p>The structure of the state machine. The car is in exactly one of three states, and its floor is changed by one line that runs only in the moving state. With the doors open the car is in a different state, so that line cannot run. An illegal combination was made impossible to represent, which is stronger than checking for it.</p></details>
+<details><summary>In the simulation, why did nearest-car dispatching do worse than round robin in the morning rush?</summary><p>Most calls came from the lobby. The car nearest the lobby is usually the one that most recently returned to it, so it received call after call while the other cars, a few floors away, received almost none. Distance ignores how busy a car already is and which way it is going. Taking turns at least spread the work.</p></details>
+<details><summary>How would you add a limit on the number of passengers in a car?</summary><p>Give the car a capacity and a count of people aboard, updated when people get in and out. A full car should stop only where someone inside wants to get out, and should not stop for hall calls. The system needs to learn that a hall call was passed, and give it to another car, and the dispatcher’s estimate should treat a full car as unavailable until its next stop.</p></details>
+<details><summary>Buttons can be pressed at any instant on any floor. Describe a design that needs no locks.</summary><p>Each press becomes a message on a queue. One control loop is the only code that touches the cars and the map of unanswered calls: it drains the queue, applies each press, then advances every car by one tick, and repeats. Because a single thread of control owns all the state and handles one thing at a time, no two operations can interleave.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Abraham Silberschatz, Peter Baer Galvin and Greg Gagne, <cite>Operating System Concepts</cite>, 10th edition, Wiley, 2018. The chapter on mass storage covers SCAN and LOOK scheduling for disk arms, which it calls the elevator algorithm.</li>
+  <li>Gina Barney and Lutfi Al-Sharif, <cite>Elevator Traffic Handbook: Theory and Practice</cite>, 2nd edition, Routledge, 2016. Round trip time, interval, collective control and group dispatching as lift engineers treat them.</li>
+  <li>CIBSE, <cite>Guide D: Transportation Systems in Buildings</cite>, 2020. The standard reference for sizing a group of lifts.</li>
+  <li>Donald E. Knuth, <cite>The Art of Computer Programming, Volume 1: Fundamental Algorithms</cite>, 3rd edition, Addison-Wesley, 1997. Section 2.2.5 simulates a single elevator in detail, as an example of a discrete simulation.</li>
+  <li>Fawaz Bokhari, Desmond Zhou and Alex Xu, <cite>Object Oriented Design Interview: An Insider’s Guide</cite>, ByteByteGo, 2025. A worked elevator design in interview form.</li>
+</ol>
+</section>

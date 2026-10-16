@@ -1,0 +1,652 @@
+<!--meta
+{ "description": "Creational design patterns in TypeScript: what a design pattern is, factory functions and the factory method, abstract factory, builder and the options-object alternative, singleton and its problems including the asynchronous initialization race, prototype and deep copying with structuredClone, and when dependency injection makes a creational pattern unnecessary.",
+  "lede": "Creating an object looks like the simplest thing a program does: the word new and a class name. It is also the moment at which code commits to one specific class, and a design that has carefully depended on interfaces everywhere else can give all of that away on a single line. The creational patterns are five ways of controlling that moment. This chapter builds each one, shows the lighter form that TypeScript usually allows, and is direct about the one that causes more harm than good.",
+  "updated": "2026-10-11" }
+-->
+
+<h2 id="why">Patterns, and the trouble with new</h2>
+<p>The previous three chapters gave principles and a notation. This one and the next two give vocabulary. A <dfn>design pattern</dfn> is a named, reusable arrangement of classes and objects that solves a problem which keeps recurring in software design. The names were fixed by a 1994 book whose four authors are known as the Gang of Four. It cataloged 23 patterns in three groups: five about creating objects, seven about composing them, and eleven about how they cooperate.</p>
+<p>The lasting value of the catalog is the names. “Put a decorator around the store” or “that should be a strategy” conveys in a few words a design that would otherwise take a diagram. That is worth learning even where the pattern itself turns out to be one line of TypeScript.</p>
+<p>Three cautions apply to all three chapters.</p>
+<ul>
+  <li><b>A pattern is an answer to a problem.</b> Each section here starts with the problem. If you do not have the problem, you do not want the pattern.</li>
+  <li><b>Patterns cost indirection.</b> Every one adds a class or a layer between the caller and the work. The code is harder to follow in exchange for being easier to change in one particular direction.</li>
+  <li><b>The book was written for C++ and Smalltalk in 1994.</b> Several patterns exist to work around what those languages lacked. TypeScript has functions as values, object literals and closures, and each of those makes some pattern smaller. This chapter shows both forms.</li>
+</ul>
+<p>The problem that creational patterns address is this. A class that follows the principles of <x-ref to="solid-principles#dip"></x-ref> depends on interfaces. But the expression <code>new DiskStore("/data")</code> names a concrete class, and whatever contains that expression depends on it. Somewhere, objects must be created. The question is where, and by whom.</p>
+<table>
+<thead><tr><th>Pattern</th><th>Problem</th><th>In one sentence</th><th>Often enough in TypeScript</th></tr></thead>
+<tbody>
+<tr><th>Factory</th><td>Which class to create depends on a value known only at run time</td><td>One function or object makes the choice and returns the result as an interface</td><td>A function and a <code>Map</code></td></tr>
+<tr><th>Abstract factory</th><td>Several objects must come from the same matching family</td><td>One object creates the whole family</td><td>An object literal of factory functions</td></tr>
+<tr><th>Builder</th><td>An object has many optional parts and rules between them</td><td>Collect the choices step by step, then create the object in one valid piece</td><td>An options object with defaults</td></tr>
+<tr><th>Singleton</th><td>There must be exactly one of something</td><td>The class ensures a single instance and gives global access to it</td><td>A module-level value, created once and passed in</td></tr>
+<tr><th>Prototype</th><td>A new object should start as a copy of an existing one</td><td>Objects know how to clone themselves</td><td><code>structuredClone</code>, or a <code>clone</code> method</td></tr>
+</tbody>
+</table>
+
+<h2 id="factory">Factory</h2>
+<p>The photo app accepts JPEG, PNG and HEIC files, and each needs different code to produce a thumbnail. The class to use depends on the file that arrives.</p>
+<pre data-lang="ts" data-title="Choosing a class at every call site, then in one factory function">
+// Before: every piece of code that needs a thumbnail repeats the choice of class.
+export function thumbnailBefore(type: string, bytes: Uint8Array): string {
+  let processor: ImageProcessor;
+  if (type === "image/jpeg") processor = new JpegProcessor();
+  else if (type === "image/png") processor = new PngProcessor();
+  else if (type === "image/heic") processor = new HeicProcessor();
+  else throw new Error(`cannot process ${type}`);
+  return processor.thumbnail(bytes, 200);
+}
+
+// After: one function knows which classes exist. Everyone else asks it.
+const makers = new Map<string, () => ImageProcessor>([
+  ["image/jpeg", () => new JpegProcessor()],
+  ["image/png", () => new PngProcessor()],
+  ["image/heic", () => new HeicProcessor()],
+]);
+
+export function processorFor(type: string): ImageProcessor {
+  const make = makers.get(type);
+  if (!make) throw new Error(`cannot process ${type}`);
+  return make();
+}
+
+// A new format is registered from outside. This file is not edited.
+export function registerProcessor(type: string, make: () => ImageProcessor): void {
+  makers.set(type, make);
+}
+</pre>
+<p>The first function works. The problem is that the same chain of <code>if</code> will be needed wherever a processor is wanted: in the upload handler, in the job that regenerates thumbnails, in the importer. Each copy names all three classes, and a fourth format means finding every copy.</p>
+<p>A <dfn>factory</dfn> is a function or object whose job is to create other objects, hiding from its callers which concrete class it chose. <code>processorFor</code> returns an <code>ImageProcessor</code>. What stands behind that interface is the factory’s business alone.</p>
+
+<figure class="fig wide" id="fig-factory">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 238" role="img" aria-labelledby="f591t f591d">
+<title id="f591t">A factory function between the caller and the classes</title>
+<desc id="f591d">On the left, the upload handler. In the middle, the function processorFor with its table of three file types and the class to create for each. On the right, the ImageProcessor interface and the three classes that implement it. The handler asks the function for a processor for a HEIC file. The function looks the type up, creates a HeicProcessor and returns it as an ImageProcessor. The handler then calls thumbnail on what it was given.</desc>
+<rect class="n sig" x="10" y="84" width="170" height="48" rx="6"/>
+<text class="tb mid" x="95" y="104">Upload handler</text>
+<text class="ts mid" x="95" y="121">knows no class names</text>
+<rect class="n" x="250" y="40" width="210" height="136" rx="4"/>
+<text class="tb mid" x="355" y="60">processorFor(type)</text>
+<line class="sep" x1="250" y1="70" x2="460" y2="70"/>
+<text class="ts mono" x="262" y="92">image/jpeg</text>
+<text class="ts end" x="448" y="92">new JpegProcessor</text>
+<text class="ts mono" x="262" y="118">image/png</text>
+<text class="ts end" x="448" y="118">new PngProcessor</text>
+<text class="ts mono" x="262" y="144">image/heic</text>
+<text class="ts end" x="448" y="144">new HeicProcessor</text>
+<text class="ts mid" x="355" y="168">the only code that names the classes</text>
+<rect class="n sig" x="540" y="6" width="170" height="68" rx="4"/>
+<text class="ts mid" x="625" y="22">«interface»</text>
+<text class="tb mid" x="625" y="39">ImageProcessor</text>
+<line class="sep sig" x1="540" y1="48" x2="710" y2="48"/>
+<text class="ts" x="548" y="64">+ thumbnail(bytes, width)</text>
+<rect class="n" x="560" y="96" width="150" height="28" rx="4"/>
+<text class="ts tb mid" x="635" y="114">JpegProcessor</text>
+<rect class="n" x="560" y="134" width="150" height="28" rx="4"/>
+<text class="ts tb mid" x="635" y="152">PngProcessor</text>
+<rect class="n" x="560" y="172" width="150" height="28" rx="4"/>
+<text class="ts tb mid" x="635" y="190">HeicProcessor</text>
+<path class="e implements" d="M548 186V78"/>
+<path class="e none" d="M548 110H560"/>
+<path class="e none" d="M548 148H560"/>
+<path class="e none" d="M548 186H560"/>
+<g data-s="1">
+<path class="e sig" d="M181 100H248"/>
+<text class="ts mid" x="214" y="92">ask</text>
+</g>
+<g data-s="2">
+<rect class="n sig" x="254" y="128" width="202" height="24" rx="3" style="fill-opacity:.35"/>
+<path class="e uses" d="M461 158C500 158 510 186 546 186"/>
+</g>
+<g data-s="3">
+<path class="e uses" d="M248 120H181"/>
+<text class="ts mid" x="214" y="136">returns</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M95 133C95 232 480 232 586 202"/>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="processorFor(&quot;image/heic&quot;)" data-state="The handler’s code names: ImageProcessor; Object created: none yet">The handler has a file of type image/heic and needs something that can make a thumbnail of it. It asks the factory function, passing the type.</li>
+  <li data-msg="new HeicProcessor()" data-state="The handler’s code names: ImageProcessor; Object created: a HeicProcessor">The function looks the type up in its table and creates the matching object. This is the one place where a class name follows the word new.</li>
+  <li data-msg="an ImageProcessor" data-state="The handler’s code names: ImageProcessor; Object created: a HeicProcessor">It returns the object, typed as the interface. The handler receives “an image processor” and cannot see which.</li>
+  <li data-msg="thumbnail(bytes, 200)" data-state="The handler’s code names: ImageProcessor, still; Object created: a HeicProcessor">The handler calls thumbnail on what it was given. A fourth format, added later, changes the table and nothing on the left.</li>
+</ol>
+<figcaption>A factory gathers the knowledge of “which class for which case” into one place, so that it stops leaking into every caller.</figcaption>
+</figure>
+
+<p>In a test the two versions produced identical thumbnails for all three formats, and a processor for a fourth format was added through <code>registerProcessor</code> without editing the file. That last step is the open/closed principle applied to creation: the table can grow from outside.</p>
+<p>The original catalog describes a variant called <dfn>factory method</dfn>, in which the creating function is a method that subclasses override: a base class <code>Importer</code> runs the import and calls its own <code>createReader()</code>, and <code>ZipImporter</code> and <code>FolderImporter</code> each supply a different reader. It is the same idea, reached through inheritance. In TypeScript a plain function, or a function passed in as a parameter, does the job with less machinery, and the subclass form is worth using mainly when a framework is built around it.</p>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> A factory for a class that has only one implementation and no choice to make. <code>UserFactory.create(name)</code> that does nothing but call <code>new User(name)</code> adds a layer and hides nothing. A constructor is already a perfectly good way to create an object when the caller knows which class it wants.</p></div>
+
+<h2 id="abstract-factory">Abstract factory</h2>
+<p>In production the photos service keeps files in cloud object storage and sends work to a cloud queue. On a developer’s laptop it uses a folder and an in-memory queue. These come in sets. A cloud store paired with an in-memory queue would be a bug: thumbnails requested on the laptop for files that are somewhere else.</p>
+<p>An <dfn>abstract factory</dfn> is an interface for creating a family of related objects, with one implementation of the interface for each family, so that code which is handed a factory can only ever receive objects that belong together.</p>
+<pre data-lang="ts" data-title="A platform creates a store and a queue that match">
+export interface Store {
+  put(key: string, bytes: Uint8Array): string; // returns where the file went
+}
+export interface Queue {
+  send(message: string): string; // returns what was sent where
+}
+
+// The abstract factory: one object that creates a whole matching set.
+export interface Platform {
+  createStore(): Store;
+  createQueue(): Queue;
+}
+
+// …four small classes: S3Store, SqsQueue, FolderStore and MemoryQueue…
+
+export const cloudPlatform: Platform = {
+  createStore: () => new S3Store(),
+  createQueue: () => new SqsQueue(),
+};
+export const localPlatform: Platform = {
+  createStore: () => new FolderStore(),
+  createQueue: () => new MemoryQueue(),
+};
+
+// Application code is handed a platform and never names a concrete class.
+export function startUploads(platform: Platform): (key: string, bytes: Uint8Array) => string {
+  const store = platform.createStore();
+  const queue = platform.createQueue();
+  return (key, bytes) => queue.send(`make thumbnail of ${store.put(key, bytes)}`);
+}
+</pre>
+
+<figure class="fig wide" id="fig-abstract">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f592t f592d">
+<title id="f592t">An abstract factory hands out one matching family</title>
+<desc id="f592d">Application code holds a Platform, an interface with two operations, createStore and createQueue. Two objects implement it. The cloud platform creates an S3Store and an SqsQueue. The local platform creates a FolderStore and a MemoryQueue. The application is given one platform and so receives a store and a queue from the same family.</desc>
+<rect class="n sig" x="10" y="70" width="150" height="48" rx="6"/>
+<text class="tb mid" x="85" y="90">Application code</text>
+<text class="ts mid" x="85" y="107">startUploads(platform)</text>
+<rect class="n sig" x="220" y="52" width="170" height="84" rx="4"/>
+<text class="ts mid" x="305" y="68">«interface»</text>
+<text class="tb mid" x="305" y="85">Platform</text>
+<line class="sep sig" x1="220" y1="94" x2="390" y2="94"/>
+<text class="ts" x="228" y="110">+ createStore(): Store</text>
+<text class="ts" x="228" y="126">+ createQueue(): Queue</text>
+<path class="e" d="M161 94H218"/>
+<rect class="n store" x="450" y="16" width="120" height="176" rx="6" style="fill-opacity:.4"/>
+<text class="tb mid" x="510" y="36">cloudPlatform</text>
+<rect class="n" x="460" y="56" width="100" height="44" rx="4"/>
+<text class="ts tb mid" x="510" y="74">S3Store</text>
+<text class="ts mid" x="510" y="90">a Store</text>
+<rect class="n" x="460" y="122" width="100" height="44" rx="4"/>
+<text class="ts tb mid" x="510" y="140">SqsQueue</text>
+<text class="ts mid" x="510" y="156">a Queue</text>
+<rect class="n async" x="590" y="16" width="120" height="176" rx="6" style="fill-opacity:.4"/>
+<text class="tb mid" x="650" y="36">localPlatform</text>
+<rect class="n" x="600" y="56" width="100" height="44" rx="4"/>
+<text class="ts tb mid" x="650" y="74">FolderStore</text>
+<text class="ts mid" x="650" y="90">a Store</text>
+<rect class="n" x="600" y="122" width="100" height="44" rx="4"/>
+<text class="ts tb mid" x="650" y="140">MemoryQueue</text>
+<text class="ts mid" x="650" y="156">a Queue</text>
+<path class="e implements" d="M448 80H392"/>
+<path class="e implements" d="M650 193V208H305V138"/>
+<text class="ts" x="10" y="232">The application is handed one column. It cannot end up with a store from one family and a queue from the other,</text>
+<text class="ts" x="10" y="248">because it never chooses the classes one at a time.</text>
+</svg>
+</div>
+<figcaption>Use it when several objects must agree with each other: all for the cloud, all for a laptop, all for a test.</figcaption>
+</figure>
+
+<p>Run with each platform in turn, the same <code>startUploads</code> sent “make thumbnail of s3://photos-prod/p1.jpg” to a cloud queue, and “make thumbnail of file:./data/p1.jpg” to a queue in memory. It contains no branch on the environment. The choice was made once, by whoever passed the platform in, and the type system guarantees that the pieces match.</p>
+<p>The pattern earns its place when there are at least two families and at least two kinds of product. With one product kind it is an ordinary factory. With one family it is nothing at all.</p>
+
+<h2 id="builder">Builder</h2>
+<p>A search over a user’s photos has an owner, an optional date range, any number of tags, a sort order and a page size. Some combinations are invalid: a range that ends before it starts, a page size of ten thousand. A constructor with six positional parameters, four of them optional, produces calls such as <code>new PhotoQuery("ana", undefined, undefined, ["lisbon"], false, 20)</code>, which nobody can read and anybody can get wrong.</p>
+<p>A <dfn>builder</dfn> is a separate object that gathers the parts of something complicated through a series of small calls and then creates the finished thing in a single step. It has two benefits. The calls are named, so the code reads like a sentence. And the finished object is checked as a whole and can be made immutable, because it is never seen half-made.</p>
+<pre data-lang="ts" data-title="A builder for photo queries, and the same thing as an options object">
+// The builder: collects choices one call at a time, and checks them together at the end.
+export class PhotoQueryBuilder {
+  private readonly owner: string;
+  private from: Date | null = null;
+  private to: Date | null = null;
+  private readonly tags: string[] = [];
+  private newest = true;
+  private max = 50;
+
+  constructor(owner: string) {
+    this.owner = owner; // the one thing every query must have
+  }
+  takenBetween(from: Date, to: Date): this {
+    this.from = from;
+    this.to = to;
+    return this;
+  }
+  tagged(tag: string): this {
+    this.tags.push(tag);
+    return this;
+  }
+  oldestFirst(): this {
+    this.newest = false;
+    return this;
+  }
+  limit(max: number): this {
+    this.max = max;
+    return this;
+  }
+  build(): PhotoQuery {
+    return checked({ owner: this.owner, from: this.from, to: this.to, tags: this.tags, newestFirst: this.newest, limit: this.max });
+  }
+}
+
+// The lighter alternative in TypeScript: one object of named options, with defaults.
+export function photoQuery(options: { owner: string; from?: Date; to?: Date; tags?: string[]; newestFirst?: boolean; limit?: number }): PhotoQuery {
+  return checked({
+    owner: options.owner,
+    from: options.from ?? null,
+    to: options.to ?? null,
+    tags: options.tags ?? [],
+    newestFirst: options.newestFirst ?? true,
+    limit: options.limit ?? 50,
+  });
+}
+</pre>
+
+<figure class="fig wide" id="fig-builder">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f593t f593d">
+<title id="f593t">A builder collects choices and creates the object at the end</title>
+<desc id="f593d">A sequence between calling code, a PhotoQueryBuilder and the PhotoQuery it produces. The caller creates the builder with an owner, then calls takenBetween, tagged and limit, each of which records a choice and returns the builder. Finally the caller calls build. The builder checks all the choices together, creates one frozen PhotoQuery and returns it.</desc>
+<text class="tb mid" x="120" y="20">Calling code</text>
+<line class="axis" x1="120" y1="28" x2="120" y2="234"/>
+<text class="tb mid" x="390" y="20">The builder</text>
+<line class="axis" x1="390" y1="28" x2="390" y2="234"/>
+<text class="tb mid" x="630" y="20">A PhotoQuery</text>
+<line class="axis" x1="630" y1="28" x2="630" y2="234"/>
+<g data-s="1">
+<path class="e sig" d="M121 54H389"/>
+<text class="ts mid" x="255.0" y="48">1. new PhotoQueryBuilder("ana")</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M121 82H389"/>
+<text class="ts mid" x="255.0" y="76">2. .takenBetween(1 May, 31 May)</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M121 110H389"/>
+<text class="ts mid" x="255.0" y="104">3. .tagged("lisbon")</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M121 138H389"/>
+<text class="ts mid" x="255.0" y="132">4. .limit(20)</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M121 166H389"/>
+<text class="ts mid" x="255.0" y="160">5. .build()</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M391 194H629"/>
+<text class="ts mid" x="510.0" y="188">6. create, complete and frozen</text>
+</g>
+<g data-s="7">
+<path class="e uses" d="M389 222H121"/>
+<text class="ts mid" x="255.0" y="216">7. the PhotoQuery</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="owner: ana" data-state="The builder holds: owner; Query objects made: 0">The caller creates a builder, giving it the one thing every query must have. No query exists yet.</li>
+  <li data-msg="from, to" data-state="The builder holds: owner, dates; Query objects made: 0">Each call records one choice and returns the builder, so the next call can follow on the same line.</li>
+  <li data-msg="tag" data-state="The builder holds: owner, dates, 1 tag; Query objects made: 0">Choices can come in any order, and any of them can be left out. The ones left out keep their defaults.</li>
+  <li data-msg="limit" data-state="The builder holds: owner, dates, 1 tag, limit; Query objects made: 0">Up to this point nothing has been checked. The builder is allowed to be incomplete, because it is not the query.</li>
+  <li data-msg="build" data-state="The builder holds: owner, dates, 1 tag, limit; Query objects made: 0">Now the caller asks for the result. The builder checks the choices against each other: the dates are in order, the limit is in range.</li>
+  <li data-msg="all the choices" data-state="The builder holds: owner, dates, 1 tag, limit; Query objects made: 1">It creates the query in one step, already valid, and freezes it. There was never a moment when a half-made query existed.</li>
+  <li data-msg="PhotoQuery">The caller receives an object that is complete and can no longer change.</li>
+</ol>
+<figcaption>The builder may be half-finished. The thing it builds never is.</figcaption>
+</figure>
+
+<p>The last function in the listing is the form most TypeScript code uses instead. An object literal already gives named, optional, order-free arguments, which was the main reason for builders in languages without them. A test confirmed that both forms produce equal, frozen queries from the same choices, and that both refuse a reversed date range and an oversized limit.</p>
+<table>
+<thead><tr><th>Use an options object when</th><th>Use a builder when</th></tr></thead>
+<tbody>
+<tr><td>All the choices are known at one place in the code</td><td>The choices are gathered over time or by different pieces of code: a query assembled as filters are applied</td></tr>
+<tr><td>Each option is a simple value</td><td>Steps do real work: adding to a list, building a nested part, converting units</td></tr>
+<tr><td>Readability is already good</td><td>A fluent chain reads noticeably better, as in test data or query construction</td></tr>
+</tbody>
+</table>
+<p>Whichever form is used, keep the two properties: validate once, at the point of creation, and return something that cannot be changed afterward. An object that is valid when created and never changes is valid forever.</p>
+
+<h2 id="singleton">Singleton</h2>
+<p>Some things should exist once in a running program: the pool of database connections, the loaded configuration, the object that hands out identifiers. A <dfn>singleton</dfn> is a class written so that only one instance of it can exist, with a globally reachable way to obtain that instance.</p>
+<pre data-lang="ts" data-title="The textbook singleton, and the same thing as a module value">
+// The textbook form: the class guards its own single instance.
+export class Settings {
+  private static instance: Settings | undefined;
+  readonly maxUploadBytes = 20_000_000;
+
+  private constructor() {} // nobody outside can call new
+
+  static get(): Settings {
+    Settings.instance ??= new Settings();
+    return Settings.instance;
+  }
+}
+
+// The same thing in a module: this line runs once, however many files import it.
+export const settings = { maxUploadBytes: 20_000_000 } as const;
+</pre>
+<p>The second form shows that the class machinery is rarely needed in TypeScript. A module is evaluated once, however many files import it, so a value defined at the top of a module is already a single shared instance.</p>
+<p>Singleton is probably the best-known pattern in the catalog and certainly the most criticized. The need it answers, one instance, is real. The harm comes from the second half of the definition, global access.</p>
+<table>
+<thead><tr><th>Problem</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><th>Hidden dependencies</th><td>A function that calls <code>Database.get()</code> in its body depends on the database, and its signature does not say so. Nobody can tell what a piece of code needs without reading all of it</td></tr>
+<tr><th>Tests interfere with each other</th><td>State left in the single instance by one test is seen by the next. Tests pass alone and fail together, or the reverse</td></tr>
+<tr><th>No substitutes</th><td>Code that fetches its own collaborator cannot be handed a fake one, which is the dependency inversion problem again</td></tr>
+<tr><th>“One” turns out to be wrong</th><td>A second database, a second tenant, or a second configuration for a test arrives, and the assumption is built into every caller</td></tr>
+</tbody>
+</table>
+<p>The remedy keeps the single instance and drops the global access. Create the one pool where the program starts, and pass it to whatever needs it (<x-ref to="solid-principles#dip"></x-ref>). There is still exactly one. But each class now states what it uses, and a test can supply its own.</p>
+<h3 id="async-singleton">Creating it once, when creation takes time</h3>
+<p>One real difficulty remains even with a well-placed single instance: making sure it is created only once when creation is asynchronous. Node.js runs JavaScript on one thread, so two lines of code never run at the same instant. But a function that waits gives other code a chance to run during the wait.</p>
+<pre data-lang="ts" data-title="Two ways to create a pool on first use">
+// Wrong: check, wait, then remember. A second caller arrives during the wait and also sees nothing.
+let pool: Pool | undefined;
+export async function getPoolRacy(): Promise<Pool> {
+  if (!pool) pool = await connect();
+  return pool;
+}
+
+// Right: remember the promise at once. Every caller, however early, gets the same one.
+let pending: Promise<Pool> | undefined;
+export function getPool(): Promise<Pool> {
+  pending ??= connect();
+  return pending;
+}
+</pre>
+
+<figure class="fig wide" id="fig-singleton">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 388" role="img" aria-labelledby="f594t f594d">
+<title id="f594t">Two requests asking for the one connection pool at the same moment</title>
+<desc id="f594d">Two sequences between request A, request B, the function getPool and the database. In the first version, getPool checks whether a pool exists, and if not, waits for one to be created and then remembers it. Request B arrives during the wait, also finds nothing, and starts a second connection. Two pools are created. In the second version, getPool remembers the promise of a pool immediately. Request B finds that promise and waits on it, and one pool is created.</desc>
+<text class="tb" x="10" y="16">Check, wait, then remember</text>
+<g data-scene="racy">
+<text class="tb mid" x="80" y="36">Request A</text>
+<line class="axis" x1="80" y1="44" x2="80" y2="196"/>
+<text class="tb mid" x="220" y="36">Request B</text>
+<line class="axis" x1="220" y1="44" x2="220" y2="196"/>
+<text class="tb mid" x="420" y="36">getPool()</text>
+<line class="axis" x1="420" y1="44" x2="420" y2="196"/>
+<text class="tb mid" x="640" y="36">Database</text>
+<line class="axis" x1="640" y1="44" x2="640" y2="196"/>
+<g data-s="1">
+<path class="e sig" d="M81 72H419"/>
+<text class="ts mid" x="250.0" y="66">1. getPool()</text>
+</g>
+<g data-s="1">
+<path class="e store" d="M421 99H639"/>
+<text class="ts mid" x="530.0" y="93">connect</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M221 126H419"/>
+<text class="ts mid" x="320.0" y="120">2. getPool()</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M421 153H639"/>
+<text class="ts mid" x="530.0" y="147">connect, again</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M639 180H421"/>
+<text class="ts mid" x="530.0" y="174">3. pool 1, then pool 2</text>
+</g>
+</g>
+<path class="e none dash" d="M10 212H710"/>
+<text class="tb" x="10" y="232">Remember the promise at once</text>
+<g data-scene="promise">
+<text class="tb mid" x="80" y="252">Request A</text>
+<line class="axis" x1="80" y1="260" x2="80" y2="372"/>
+<text class="tb mid" x="220" y="252">Request B</text>
+<line class="axis" x1="220" y1="260" x2="220" y2="372"/>
+<text class="tb mid" x="420" y="252">getPool()</text>
+<line class="axis" x1="420" y1="260" x2="420" y2="372"/>
+<text class="tb mid" x="640" y="252">Database</text>
+<line class="axis" x1="640" y1="260" x2="640" y2="372"/>
+<g data-s="1">
+<path class="e sig" d="M81 288H419"/>
+<text class="ts mid" x="250.0" y="282">1. getPool()</text>
+</g>
+<g data-s="1">
+<path class="e store" d="M421 315H639"/>
+<text class="ts mid" x="530.0" y="309">connect</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M221 342H419"/>
+<text class="ts mid" x="320.0" y="336">2. getPool()</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M639 369H421"/>
+<text class="ts mid" x="530.0" y="363">3. pool 1</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="racy" data-label="Check, wait, remember">
+  <li data-msg="getPool()|connect" data-state="Pools created: 0; The remembered value: empty">Request A is the first to need the database. The variable is empty, so getPool starts opening a pool and waits.</li>
+  <li data-msg="getPool()|connect" data-state="Pools created: 0; The remembered value: still empty">Request B arrives 5 ms later. Connecting takes 20 ms, so nothing has been remembered yet. The check passes again and a second connection begins.</li>
+  <li data-msg="pool 1|pool 2" data-state="Pools created: 2; The remembered value: pool 2">Both finish. A is given the first pool and B the second, and the variable ends up holding whichever arrived last.</li>
+</ol>
+<ol class="steps" data-scene="promise" data-label="Remember the promise">
+  <li data-msg="getPool()|connect" data-state="Pools created: 0; The remembered value: a promise of a pool">The variable is empty, so getPool starts connecting and, in the same instant, remembers the promise of the pool.</li>
+  <li data-state="Pools created: 0; The remembered value: the same promise">Request B arrives during the wait. The variable is not empty: it holds the promise. B is handed the same promise, and nothing new is started.</li>
+  <li data-state="Pools created: 1; The remembered value: a promise, now fulfilled">The connection completes and the promise delivers its value to everyone waiting on it. A and B hold the same pool.</li>
+</ol>
+<figcaption>“Create it once” has to hold even when the first use and the second overlap. The fix is to record that creation has started, not that it has finished.</figcaption>
+</figure>
+
+<p>In a test, two calls made together to the first function created two pools, and each caller got a different one. Two calls to the second created one pool, and a third call later received the same one. The rule generalizes to any work that must happen once: store the promise as soon as the work starts. <x-ref to="concurrency-in-code"></x-ref> returns to this kind of bug, which is a race condition without threads.</p>
+
+<h2 id="prototype">Prototype</h2>
+<p>Ana has an editing preset called Portrait, with a crop size and a list of filters, and wants a second preset that starts the same and differs in one detail. Building the new one from nothing means repeating every setting. Copying the existing one is the obvious move, and it has one trap.</p>
+<pre data-lang="ts" data-title="Three ways to copy">
+export type Preset = { name: string; crop: { width: number; height: number }; filters: string[] };
+
+// A copy made with spread shares everything below the first level.
+export function shallowCopy(preset: Preset, name: string): Preset {
+  return { ...preset, name };
+}
+
+// structuredClone copies all the way down. It is built into the language runtime.
+export function deepCopy(preset: Preset, name: string): Preset {
+  return { ...structuredClone(preset), name };
+}
+
+// For a class with methods, the object knows best how to copy itself.
+export class EditPreset {
+  readonly name: string;
+  private readonly crop: { width: number; height: number };
+  private readonly filters: string[];
+
+  constructor(name: string, crop: { width: number; height: number }, filters: string[]) {
+    this.name = name;
+    this.crop = crop;
+    this.filters = filters;
+  }
+
+  clone(name: string): EditPreset {
+    return new EditPreset(name, { ...this.crop }, [...this.filters]); // new containers, so the copies are independent
+  }
+  narrowTo(width: number): void {
+    this.crop.width = width;
+  }
+  describe(): string {
+    return `${this.name}: ${this.crop.width}x${this.crop.height}, ${this.filters.join("+")}`;
+  }
+}
+</pre>
+
+<figure class="fig wide" id="fig-copy">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-labelledby="f595t f595d">
+<title id="f595t">A shallow copy and a deep copy of the same object</title>
+<desc id="f595d">Two stories. In the first, a copy of an editing preset is made by copying its top-level fields. The copy has its own name, but its crop and filters fields point at the same two inner objects as the original. Changing the crop through the copy changes it for the original as well. In the second, the copy is made all the way down. It has its own crop and filters objects, and changing them leaves the original as it was.</desc>
+<text class="tb" x="10" y="16">A shallow copy: { ...original, name: "Story" }</text>
+<g data-scene="shallow">
+<rect class="n " x="10" y="34" width="170" height="40" rx="4"/>
+<text class="ts tb mid" x="95.0" y="51">original</text>
+<text class="ts mid" x="95.0" y="66">name: “Portrait”</text>
+<rect class="n" x="520" y="56" width="190" height="40" rx="4"/>
+<text class="ts tb mid" x="615" y="73">a filters array</text>
+<text class="ts mid" x="615" y="88">warm</text>
+<rect class="n" x="290" y="56" width="170" height="40" rx="4"/>
+<text class="ts tb mid" x="375" y="73">a crop object</text>
+<g data-s="1" data-e="1"><text class="ts mid" x="375" y="88">1080 × 1350</text></g>
+<path class="e" d="M181 48C230 48 240 68 288 70"/>
+<path class="e" d="M181 58C300 20 480 30 540 55"/>
+<g class="hide" data-s="1">
+<rect class="n sig" x="10" y="98" width="170" height="40" rx="4"/>
+<text class="ts tb mid" x="95.0" y="115">copy</text>
+<text class="ts mid" x="95.0" y="130">name: “Story”</text>
+<path class="e sig" d="M181 112C230 112 240 86 288 84"/>
+<path class="e sig" d="M181 124C320 150 500 130 560 97"/>
+</g>
+<g class="hide" data-s="2">
+<text class="ts tb mid" x="375" y="88">1080 × 1920</text>
+<rect class="n fault" x="290" y="56" width="170" height="40" rx="4" style="fill-opacity:.25"/>
+</g>
+</g>
+<path class="e none dash" d="M10 162H710"/>
+<text class="tb" x="10" y="182">A deep copy: structuredClone(original)</text>
+<g data-scene="deep">
+<rect class="n " x="10" y="196" width="170" height="40" rx="4"/>
+<text class="ts tb mid" x="95.0" y="213">original</text>
+<text class="ts mid" x="95.0" y="228">name: “Portrait”</text>
+<rect class="n " x="290" y="196" width="170" height="40" rx="4"/>
+<text class="ts tb mid" x="375.0" y="213">a crop object</text>
+<text class="ts mid" x="375.0" y="228">1080 × 1350</text>
+<rect class="n " x="520" y="196" width="190" height="40" rx="4"/>
+<text class="ts tb mid" x="615.0" y="213">a filters array</text>
+<text class="ts mid" x="615.0" y="228">warm</text>
+<path class="e" d="M181 210H288"/>
+<path class="e" d="M181 224C300 250 440 250 520 232"/>
+<g class="hide" data-s="1">
+<rect class="n sig" x="10" y="268" width="170" height="40" rx="4"/>
+<text class="ts tb mid" x="95.0" y="285">copy</text>
+<text class="ts mid" x="95.0" y="300">name: “Story”</text>
+<rect class="n sig" x="290" y="268" width="170" height="40" rx="4"/>
+<text class="ts tb mid" x="375" y="285">its own crop object</text>
+<g data-s="1" data-e="1"><text class="ts mid" x="375" y="300">1080 × 1350</text></g>
+<rect class="n sig" x="520" y="268" width="190" height="40" rx="4"/>
+<text class="ts tb mid" x="615.0" y="285">its own filters array</text>
+<text class="ts mid" x="615.0" y="300">warm</text>
+<path class="e sig" d="M181 282H288"/>
+<path class="e sig" d="M181 296C300 322 440 322 520 304"/>
+</g>
+<g class="hide" data-s="2">
+<text class="ts tb mid" x="375" y="300">1080 × 1920</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="shallow" data-label="Shallow copy">
+  <li data-msg="none" data-state="The original’s crop: 1080 × 1350">The spread syntax makes a new object and copies each top-level field into it. For crop and filters, what gets copied is the reference, so both presets point at the same inner objects.</li>
+  <li data-msg="height = 1920" data-state="The original’s crop: 1080 × 1920">Code that owns the copy sets its crop height to 1920. There is only one crop object, so the original preset has changed too, and nothing in the original’s code ran.</li>
+</ol>
+<ol class="steps" data-scene="deep" data-label="Deep copy">
+  <li data-msg="none" data-state="The original’s crop: 1080 × 1350">A deep copy duplicates the inner objects as well. The two presets now share nothing.</li>
+  <li data-msg="height = 1920" data-state="The original’s crop: 1080 × 1350">The same edit to the copy touches only the copy’s own crop object. The original is as it was.</li>
+</ol>
+<figcaption>A copy is independent only as far down as it was copied. Below that, the two objects are still one.</figcaption>
+</figure>
+
+<p>The <dfn>prototype</dfn> pattern creates new objects by copying an existing one. The catalog’s version gives each class a <code>clone</code> method, as <code>EditPreset</code> has. The reason it needs care is the difference between two kinds of copy.</p>
+<ul>
+  <li>A <dfn>shallow copy</dfn> duplicates the top level of an object and shares everything it refers to. In the test, changing the crop of a shallow copy changed the original’s crop from 1350 to 1920, and adding a filter to the copy added it to the original.</li>
+  <li>A <dfn>deep copy</dfn> duplicates the object and everything reachable from it. <code>structuredClone</code>, built into Node.js and browsers, does this for plain data. The same edits to a deep copy left the original untouched.</li>
+</ul>
+<p><code>structuredClone</code> has a limit that matters for classes: it copies data and not behavior. Applied to an <code>EditPreset</code>, it returned a plain object that had the fields, was no longer an <code>EditPreset</code>, and had no <code>describe</code> method. For objects with methods and private state, a <code>clone</code> method written by the class is the right tool, because only the class knows which of its parts need copying and which can safely be shared.</p>
+<p>The cheapest way to avoid the whole problem is not to modify things. If presets are immutable, sharing their inner objects is harmless, and “a copy with one change” is a new object that reuses everything else. That is the approach the query in the builder section takes.</p>
+
+<h2 id="wiring">Who calls new?</h2>
+<p>Step back from the five patterns and one answer covers most cases. Divide the code into two kinds.</p>
+<table>
+<thead><tr><th></th><th>Code that does the work</th><th>Code that assembles</th></tr></thead>
+<tbody>
+<tr><th>Contains</th><td>Rules, calculations, coordination</td><td>Calls to <code>new</code>, configuration, the choice of implementations</td></tr>
+<tr><th>Depends on</th><td>Interfaces</td><td>Concrete classes</td></tr>
+<tr><th>How much of it</th><td>Nearly all of the program</td><td>A few lines near the entry point: the composition root</td></tr>
+<tr><th>Tested</th><td>Thoroughly, with fakes passed in</td><td>By starting the program</td></tr>
+</tbody>
+</table>
+<p>When objects are assembled in one place and handed to the code that uses them, most creational problems do not arise. There is one pool because one was made. The store and the queue match because one function chose both. A creational pattern is then needed only where creation cannot happen at startup:</p>
+<ul>
+  <li>when the class depends on data that arrives later, such as a file’s type, which calls for a factory;</li>
+  <li>when objects are made repeatedly during the program’s life from accumulating choices, which calls for a builder;</li>
+  <li>when a new object should begin as a copy of one a user already has, which calls for a prototype.</li>
+</ul>
+<p>One more creational technique is worth knowing by name although the 1994 catalog left it out. An <dfn>object pool</dfn> keeps a set of expensive objects, creates them ahead of use, lends them out and takes them back, instead of creating and destroying one for each task. Database connections are the usual case (<x-ref to="indexes-and-queries#connections"></x-ref>), and worker threads are another.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Creational patterns rarely need to be the center of a low-level design answer. Mention a factory where the type of object depends on input, such as a vehicle type in a parking lot or a piece type in chess, and say that long-lived services are created once at startup and passed in. If you write a singleton, expect to be asked about testing and about concurrent first use. It is usually better to say “there is one instance, created at startup and injected” and avoid the pattern.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>The same chain of <code>if</code> choosing a class in many places</th><td>A new case means finding every copy</td><td>One factory function, ideally with a table that can be extended</td></tr>
+<tr><th>A factory or builder for a simple object with one implementation</th><td>Indirection that hides nothing</td><td>A constructor, or an object literal</td></tr>
+<tr><th>Constructors with many positional, optional parameters</th><td>Calls that cannot be read and silently swap arguments</td><td>An options object, or a builder when construction happens in steps</td></tr>
+<tr><th>Objects that are created empty and filled in by setters</th><td>Half-built objects escape and are used</td><td>Create complete, validate at creation, and freeze</td></tr>
+<tr><th>Global singletons reached from inside business code</th><td>Hidden dependencies and tests that interfere</td><td>One instance created at startup and passed in</td></tr>
+<tr><th>Lazy creation that checks, awaits, then stores</th><td>Two instances when two callers arrive together</td><td>Store the promise before awaiting</td></tr>
+<tr><th>Copying with spread and then changing nested parts</th><td>The original changes too</td><td>A deep copy, a <code>clone</code> method, or immutable data</td></tr>
+<tr><th>Using <code>structuredClone</code> on class instances</th><td>The copy has lost its methods</td><td>A <code>clone</code> method on the class</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="solid-principles"></x-ref>: dependency inversion and the composition root, which decide where creation belongs.</li>
+  <li><x-ref to="oop-in-typescript"></x-ref>: interfaces, which a factory returns in place of concrete classes.</li>
+  <li><x-ref to="structural-patterns"></x-ref> and <x-ref to="behavioral-patterns"></x-ref>: the other two groups of the catalog.</li>
+  <li><x-ref to="concurrency-in-code"></x-ref>: races during asynchronous initialization.</li>
+  <li><x-ref to="indexes-and-queries"></x-ref>: connection pools.</li>
+  <li><x-ref to="errors-and-testing"></x-ref>: why code that receives its collaborators is easy to test.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A design pattern is a named answer to a recurring design problem. Learn the names for communication, and apply a pattern only when you have its problem.</li>
+  <li>The word <code>new</code> ties code to a concrete class. Creational patterns control where that happens.</li>
+  <li>A factory puts the choice of class in one place and returns an interface. In TypeScript it is usually a function and a table.</li>
+  <li>An abstract factory hands out a whole family of objects that belong together.</li>
+  <li>A builder collects choices and creates a complete, valid, immutable object at the end. An options object often does the same with less code.</li>
+  <li>The need for a single instance is legitimate. Global access to it is what does the damage: create one at startup and pass it in.</li>
+  <li>For work that must happen once and takes time, remember the promise, not the result.</li>
+  <li>A shallow copy shares its inner objects with the original. Copy deeply, or do not mutate.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Notification channels are chosen from a user’s settings at run time: email, push or text message. Where should the code that says <code>new PushNotifier()</code> live, and what should it return?</summary><p>In one factory, for example a function <code>notifierFor(channel)</code> backed by a table from channel name to a function that creates the object. It should return the <code>Notifier</code> interface. Callers then hold a notifier without knowing its class, and adding a channel means adding one entry to the table.</p></details>
+<details><summary>What does an abstract factory guarantee that three separate factory functions do not?</summary><p>That the products come from the same family. With three independent functions, a caller could obtain a cloud store and a local queue. With one factory object for each family, a caller that is handed a factory can only ever get a matching set, and switching family is a change in one place.</p></details>
+<details><summary>A class has a constructor with eight parameters, five optional. Give two ways to improve it in TypeScript, and say when you would choose the heavier one.</summary><p>An options object: a single parameter with named, optional properties and defaults. Or a builder: an object with a method for each choice and a <code>build</code> method at the end. The options object is enough when the caller knows everything at once. The builder is worth its extra class when the choices are accumulated across several steps or functions, or when the steps do real work.</p></details>
+<details><summary>Why is “validate in <code>build()</code> and freeze the result” better than validating in each setter of a mutable object?</summary><p>Rules that involve several fields, such as “from must not be after to”, cannot be checked while only one of the fields has been set, so setter validation either forbids legitimate intermediate states or misses the rule. Checking once at the end sees the whole object. Freezing the result means the check never has to be repeated, because nothing can change afterward.</p></details>
+<details><summary>A service class calls <code>Config.getInstance()</code> and <code>Database.getInstance()</code> inside its methods. Name two problems and the fix.</summary><p>Its dependencies are invisible: the constructor and method signatures say nothing about configuration or a database. And it cannot be tested in isolation, because it will always fetch the real ones, and state left in them leaks between tests. The fix is to pass a configuration and a database into the constructor, create the single instances at startup, and inject them.</p></details>
+<details><summary><code>let cache; async function getCache() { if (!cache) cache = await load(); return cache; }</code> Two requests call it within a millisecond of each other, and <code>load</code> takes a second. What happens, and how is it fixed?</summary><p>Both calls see <code>cache</code> empty, because the first has not finished waiting, and both call <code>load</code>. The work is done twice, and the two callers may briefly hold different objects. Fix it by storing the promise before awaiting: <code>pending ??= load(); return pending;</code>. The second caller then receives the promise already in progress.</p></details>
+<details><summary>After <code>const b = { ...a }</code>, the line <code>b.tags.push("x")</code> also changes <code>a.tags</code>. Why, and what are three ways to prevent it?</summary><p>Spread copies the top-level properties. <code>tags</code> holds a reference to an array, and the reference is what was copied, so both objects point at one array. Prevent it by deep copying with <code>structuredClone(a)</code>, by copying the nested parts explicitly as in <code>{ ...a, tags: [...a.tags] }</code>, or by treating the data as immutable and building a new array with <code>[...a.tags, "x"]</code>.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Erich Gamma, Richard Helm, Ralph Johnson and John Vlissides, <cite>Design Patterns: Elements of Reusable Object-Oriented Software</cite>, Addison-Wesley, 1994. The catalog of 23 patterns.</li>
+  <li>Joshua Bloch, <cite>Effective Java</cite>, 3rd edition, Addison-Wesley, 2018. Items 1 to 3 on static factories, builders and singletons are the most practical treatment of creation in any language.</li>
+  <li>Joshua Bloch, <a href="https://www.informit.com/articles/article.aspx?p=1398916">Josh Bloch on the 15th Anniversary of Design Patterns</a>, InformIT, October 2009.</li>
+  <li>Eric Freeman and Elisabeth Robson, <cite>Head First Design Patterns</cite>, 2nd edition, O’Reilly, 2020. A gentler introduction to the same patterns.</li>
+  <li>MDN Web Docs, <a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone">structuredClone()</a>. What it copies and what it does not.</li>
+  <li>Refactoring.Guru, <a href="https://refactoring.guru/design-patterns/creational-patterns">Creational Design Patterns</a>. Each pattern with diagrams and TypeScript examples.</li>
+</ol>
+</section>

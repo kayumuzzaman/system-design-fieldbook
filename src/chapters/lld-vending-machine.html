@@ -1,0 +1,749 @@
+<!--meta
+{ "description": "A complete low-level design of a vending machine in TypeScript, tested: clarifying the problem, the invariants about money and stock, the state pattern with a class for each of four states, a hardware port so the machine can be driven by tests, giving change from a limited supply of coins and why the greedy method fails, keeping a customer's money apart until delivery, and the usual follow-up questions.",
+  "lede": "A vending machine is the standard exercise for the state pattern, and for a good reason: what a coin means depends entirely on what the machine is doing when it arrives. It is also a design about money, which means it has rules that must hold exactly. Nothing may be created or lost, and nobody may be charged for a product that did not drop. This chapter builds the machine as four state classes around those rules, and solves the small algorithmic problem hidden inside it: giving change from coins that can run out.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the software for a vending machine. A customer chooses a product, inserts coins, and receives the product and any change. An operator restocks the machine and collects the cash.</p></div>
+<p>Like the elevator of the previous chapter, this is a machine with modes (<x-ref to="lld-method#shapes"></x-ref>). The difference is that here each mode has substantial behavior of its own, which is the situation the state pattern was made for.</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>Does the customer choose first or pay first?</th><td>Choose first. The machine shows the price and waits for coins</td></tr>
+<tr><th>What money is accepted?</th><td>Coins of 5, 10, 25, 100 and 200 cents. Cards are a follow-up</td></tr>
+<tr><th>Does it give change?</th><td>Yes, from its own coins and those inserted for this sale. If exact change cannot be made, the sale does not happen</td></tr>
+<tr><th>Can the customer cancel?</th><td>Yes, at any time before the product is released, and gets the same coins back</td></tr>
+<tr><th>How does the software know the product came out?</th><td>A sensor in the tray reports delivered or failed</td></tr>
+<tr><th>What does the operator do?</th><td>Opens the machine with a key, refills slots and takes cash, leaving a float of coins for change</td></tr>
+<tr><th>What is out of scope?</th><td>The mechanics, the display’s graphics, remote monitoring, several products in one sale</td></tr>
+</tbody>
+</table>
+<p>The fifth question is the one most often skipped, and it changes the design. Without a delivery signal the software must assume that telling the motor to turn is the same as the product arriving. With one, there is a period of waiting between the two, and that period is a state.</p>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+<table>
+<thead><tr><th>Concept</th><th>Kind</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Slot</th><td>Entity</td><td>A position such as A1, with a product, a price and a count that goes down</td></tr>
+<tr><th>Coin</th><td>Value</td><td>One of five amounts</td></tr>
+<tr><th>Cash box</th><td>Entity</td><td>The machine’s own coins, counted by denomination</td></tr>
+<tr><th>The machine’s state</th><td>One of four objects</td><td>Idle, awaiting payment, dispensing, maintenance. Each interprets events differently</td></tr>
+<tr><th>Hardware</th><td>A port</td><td>The motor, the coin return and the display, behind an interface the software owns (<x-ref to="application-architecture#hexagon"></x-ref>)</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th></tr></thead>
+<tbody>
+<tr><th>Money is conserved: every coin inserted ends up in the cash box or back with a customer</th><td>The state classes, which are the only code that moves coins</td></tr>
+<tr><th>A customer pays exactly the price: change is the full difference, or there is no sale</th><td><code>AwaitingPayment</code>, which checks that change can be made before releasing anything</td></tr>
+<tr><th>The machine keeps a customer’s money only if the product was delivered</th><td><code>Dispensing</code>, which holds the coins until the sensor reports</td></tr>
+<tr><th>Stock is never negative, and an empty or jammed slot cannot be chosen</th><td><code>Slot</code></td></tr>
+<tr><th>Stock and cash are changed by an operator only while the machine is open for service</th><td><code>VendingMachine</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="states">The states</h2>
+
+<figure class="fig wide" id="fig-states">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f691t f691d">
+<title id="f691t">The four states of the vending machine</title>
+<desc id="f691d">A state diagram with four states. From idle, selecting a product that is in stock leads to awaiting payment. In awaiting payment, inserting a coin while still short stays in the same state. When the price has been reached and change can be made, the machine moves to dispensing. If the customer cancels, or change cannot be made, the coins are returned and the machine goes back to idle. From dispensing, a delivered signal keeps the money, gives change and returns to idle, and a failed signal returns all the money and returns to idle. An operator’s key moves the machine between idle and maintenance.</desc>
+<path class="e" d="M151 124H268"/>
+<text class="ts mid" x="210" y="116">select, in stock</text>
+<path class="e" d="M421 124H558"/>
+<text class="ts mid" x="490" y="104">paid in full, and</text>
+<text class="ts mid" x="490" y="118">change can be made</text>
+<path class="e" d="M300 109C300 74 390 74 390 108" style="fill:none"/>
+<text class="ts mid" x="345" y="72">insert, still short</text>
+<path class="e" d="M300 155C280 196 140 196 120 156" style="fill:none"/>
+<text class="ts mid" x="270" y="212">cancel, or no change possible:</text>
+<text class="ts mid" x="270" y="226">coins returned</text>
+<path class="e" d="M620 109C620 30 95 30 95 108" style="fill:none"/>
+<text class="ts mid" x="358" y="16">delivered: keep the money, give change</text>
+<text class="ts mid" x="358" y="32">failed: return all of it</text>
+<path class="e" d="M70 155V230"/>
+<path class="e" d="M120 230V157"/>
+<text class="ts" x="160" y="258">operator’s key</text>
+<rect class="n" x="40" y="110" width="110" height="44" rx="22"/>
+<text class="tb mid" x="95.0" y="137">Idle</text>
+<rect class="n" x="270" y="110" width="150" height="44" rx="22"/>
+<text class="tb mid" x="345.0" y="137">Awaiting payment</text>
+<rect class="n" x="560" y="110" width="120" height="44" rx="22"/>
+<text class="tb mid" x="620.0" y="137">Dispensing</text>
+<rect class="n" x="40" y="232" width="110" height="44" rx="22"/>
+<text class="tb mid" x="95.0" y="259">Maintenance</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n store" x="270" y="110" width="150" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n store" x="270" y="110" width="150" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n store" x="560" y="110" width="120" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<g class="hide" data-s="4">
+<rect class="n store" x="40" y="110" width="110" height="44" rx="22" style="fill-opacity:.35;stroke-width:2.5"/>
+</g>
+<text class="ts" x="300" y="262">A coin inserted in idle, dispensing or maintenance</text>
+<text class="ts" x="300" y="278">is handed straight back, and the state does not change.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Held for the customer: 0; cash box: 175">A customer presses A1, water at 125. It is in stock, so the machine shows the price and waits for money.</li>
+  <li data-msg="none" data-state="Held for the customer: 100; cash box: 175">A coin of 100 goes in. It is short by 25, so the machine stays where it is and shows how much more is needed.</li>
+  <li data-msg="none" data-state="Held for the customer: 200; cash box: 175">A second 100 makes 200. The machine finds that it can give 75 in change, tells the hardware to release the product, and waits.</li>
+  <li data-msg="none" data-state="Held for the customer: 0; cash box: 300, after 75 in change">The delivery sensor reports that the bottle has dropped. Only now is the 200 moved to the cash box and the change paid out.</li>
+</ol>
+<figcaption>Each state is a small class that knows what a coin, a button and a sensor signal mean while the machine is in it. The machine itself only passes events along.</figcaption>
+</figure>
+
+<p>Consider what inserting a coin should do. While the machine is idle, the coin is returned, because nothing has been chosen. While it awaits payment, the coin counts toward the price. While it is dispensing, or open for service, the coin is returned again. One event, three different meanings. Written without the pattern, <code>insert</code> would begin with a <code>switch</code> on the state, and so would <code>select</code>, <code>cancel</code> and every other method. The state pattern of <x-ref to="behavioral-patterns#state"></x-ref> turns that table on its side: one class for each state, holding everything that state does.</p>
+
+<h2 id="classes">Step 4: The classes</h2>
+
+<figure class="fig wide" id="fig-classes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 336" role="img" aria-labelledby="f692t f692d">
+<title id="f692t">The classes of the vending machine</title>
+<desc id="f692d">A class diagram. VendingMachine holds its slots, a cash box and a private current state, and has one method for each event: select, insert, cancel, delivered, failed, openService and closeService. It holds one MachineState, an interface with the same seven methods, each of which returns a MachineState. Four classes implement it: Idle, AwaitingPayment, Dispensing and Maintenance. VendingMachine owns one or more Slots, each with a code, a product name, a price and a private count, and one CashBox holding counts of coins. It uses a Hardware interface with the operations release, returnCoins and show.</desc>
+<rect class="n sig" x="10" y="24" width="200" height="160" rx="4"/>
+<text class="tb mid" x="110" y="43">VendingMachine</text>
+<line class="sep sig" x1="10" y1="52" x2="210" y2="52"/>
+<text class="ts" x="18" y="68">slots, cash</text>
+<text class="ts" x="18" y="84">− current: MachineState</text>
+<line class="sep sig" x1="10" y1="94" x2="210" y2="94"/>
+<text class="ts" x="18" y="110">+ select(code)</text>
+<text class="ts" x="18" y="126">+ insert(coin)</text>
+<text class="ts" x="18" y="142">+ cancel()</text>
+<text class="ts" x="18" y="158">+ delivered(), failed()</text>
+<text class="ts" x="18" y="174">+ openService(), closeService()</text>
+<rect class="n store" x="290" y="24" width="210" height="84" rx="4"/>
+<text class="ts mid" x="395" y="40">«interface»</text>
+<text class="tb mid" x="395" y="57">MachineState</text>
+<line class="sep store" x1="290" y1="66" x2="500" y2="66"/>
+<text class="ts" x="298" y="82">one method for each event,</text>
+<text class="ts" x="298" y="98">each returning the next state</text>
+<path class="e has" d="M210 64 L290 66"/>
+<text class="ts mid" x="250" y="58">current</text>
+<rect class="n" x="236" y="150" width="70" height="28" rx="4"/>
+<text class="tb mid" x="271" y="169">Idle</text>
+<path class="e implements" d="M271 150 L315.2 108"/>
+<rect class="n" x="356" y="150" width="124" height="28" rx="4"/>
+<text class="tb mid" x="418" y="169">AwaitingPayment</text>
+<path class="e implements" d="M418 150 L367.7 108"/>
+<rect class="n" x="490" y="150" width="106" height="28" rx="4"/>
+<text class="tb mid" x="543" y="169">Dispensing</text>
+<path class="e implements" d="M543 150 L420.2 108"/>
+<rect class="n" x="606" y="150" width="104" height="28" rx="4"/>
+<text class="tb mid" x="658" y="169">Maintenance</text>
+<path class="e implements" d="M658 150 L472.7 108"/>
+<rect class="n" x="10" y="222" width="130" height="96" rx="4"/>
+<text class="tb mid" x="75" y="241">Slot</text>
+<line class="sep" x1="10" y1="250" x2="140" y2="250"/>
+<text class="ts" x="18" y="266">code, name, price</text>
+<text class="ts" x="18" y="282">− count</text>
+<line class="sep" x1="10" y1="292" x2="140" y2="292"/>
+<text class="ts" x="18" y="308">+ takeOne()</text>
+<rect class="n" x="160" y="222" width="150" height="96" rx="4"/>
+<text class="tb mid" x="235" y="241">CashBox</text>
+<line class="sep" x1="160" y1="250" x2="310" y2="250"/>
+<text class="ts" x="168" y="266">− counts of each coin</text>
+<line class="sep" x1="160" y1="276" x2="310" y2="276"/>
+<text class="ts" x="168" y="292">+ add(coins)</text>
+<text class="ts" x="168" y="308">+ remove(coins)</text>
+<rect class="n" x="560" y="222" width="150" height="100" rx="4"/>
+<text class="ts mid" x="635" y="238">«interface»</text>
+<text class="tb mid" x="635" y="255">Hardware</text>
+<line class="sep" x1="560" y1="264" x2="710" y2="264"/>
+<text class="ts" x="568" y="280">+ release(slot)</text>
+<text class="ts" x="568" y="296">+ returnCoins(coins)</text>
+<text class="ts" x="568" y="312">+ show(message)</text>
+<path class="e owns" d="M70 184 L75 222"/>
+<text class="ts mid" x="88.5" y="207">1..*</text>
+<path class="e owns" d="M170 184 L220 222"/>
+<path class="e uses" d="M450 180V250H558"/>
+<text class="ts" x="456" y="244">states call it</text>
+<text class="ts" x="330" y="284">AwaitingPayment holds the coins</text>
+<text class="ts" x="330" y="300">inserted so far. Dispensing holds</text>
+<text class="ts" x="330" y="316">them, and the change it has planned.</text>
+</svg>
+</div>
+<figcaption>The state pattern in full: a context that holds one state object and forwards every event to it. The hardware is a port, so the whole machine can be driven by a test.</figcaption>
+</figure>
+
+<p>The hardware interface deserves a comment. The software never touches a motor. It calls <code>release</code>, <code>returnCoins</code> and <code>show</code> on an object it was given, and receives <code>delivered</code> or <code>failed</code> in return. In production that object drives real devices. In the tests it is a fake of a few lines that records every call (<x-ref to="errors-and-testing#doubles"></x-ref>), and that is what allows a test to drive the whole machine through twenty thousand events.</p>
+
+<h2 id="code">Step 6: The code</h2>
+<pre data-lang="ts" data-title="The hardware port, and the states">
+// The port to the physical machine. In tests it is a fake that records what it was told to do.
+export interface Hardware {
+  release(slot: string): void;        // turn the spiral; the machine reports back with delivered() or failed()
+  returnCoins(coins: Coin[]): void;   // drop coins into the tray
+  show(message: string): void;
+}
+
+// …Slot and CashBox: a count that cannot go below zero, and coins counted by denomination…
+
+export type StateName = "idle" | "awaiting payment" | "dispensing" | "maintenance";
+
+// Every state answers every event, and returns the state the machine is in afterward.
+interface MachineState {
+  readonly name: StateName;
+  select(m: VendingMachine, code: string): MachineState;
+  insert(m: VendingMachine, coin: Coin): MachineState;
+  cancel(m: VendingMachine): MachineState;
+  delivered(m: VendingMachine): MachineState;
+  failed(m: VendingMachine): MachineState;
+  openService(m: VendingMachine): MachineState;
+  closeService(m: VendingMachine): MachineState;
+}
+
+// The default answers: a coin that is not wanted is handed straight back, and everything else changes nothing.
+abstract class Base implements MachineState {
+  abstract readonly name: StateName;
+  select(m: VendingMachine, _code: string): MachineState { m.hardware.show("Please wait"); return this; }
+  insert(m: VendingMachine, coin: Coin): MachineState { m.hardware.returnCoins([coin]); return this; }
+  cancel(_m: VendingMachine): MachineState { return this; }
+  delivered(_m: VendingMachine): MachineState { return this; }
+  failed(_m: VendingMachine): MachineState { return this; }
+  openService(_m: VendingMachine): MachineState { throw new MachineError(`cannot open for service while ${this.name}`); }
+  closeService(_m: VendingMachine): MachineState { throw new MachineError("the machine is not open for service"); }
+}
+
+class Idle extends Base {
+  readonly name = "idle";
+  override select(m: VendingMachine, code: string): MachineState {
+    const slot = m.slots.get(code);
+    if (!slot) { m.hardware.show(`No slot ${code}`); return this; }
+    if (!slot.sellable) { m.hardware.show(`${slot.name} is sold out`); return this; }
+    m.hardware.show(`${slot.name}: ${slot.priceCents}`);
+    return new AwaitingPayment(slot);
+  }
+  override insert(m: VendingMachine, coin: Coin): MachineState {
+    m.hardware.show("Choose a product first");
+    return super.insert(m, coin);
+  }
+  override openService(): MachineState { return new Maintenance(); }
+}
+
+class AwaitingPayment extends Base {
+  readonly name = "awaiting payment";
+  private readonly slot: Slot;
+  private readonly inserted: Coin[] = []; // held for the customer, not yet the machine's
+
+  constructor(slot: Slot) { super(); this.slot = slot; }
+
+  override select(m: VendingMachine, code: string): MachineState {
+    if (this.inserted.length > 0) { m.hardware.show("Cancel first to choose again"); return this; }
+    return new Idle().select(m, code);
+  }
+  override insert(m: VendingMachine, coin: Coin): MachineState {
+    this.inserted.push(coin);
+    const paid = total(this.inserted);
+    if (paid < this.slot.priceCents) { m.hardware.show(`${this.slot.priceCents - paid} more`); return this; }
+    // Enough has been paid. Change may come from the cash box or from the coins just inserted.
+    const pool = new CashBox(m.cash.available); pool.add(this.inserted);
+    const change = makeChange(paid - this.slot.priceCents, pool.available);
+    if (!change) {
+      m.hardware.show("Cannot give change. Use the exact amount");
+      m.hardware.returnCoins(this.inserted);
+      return new Idle();
+    }
+    m.hardware.release(this.slot.code);
+    return new Dispensing(this.slot, this.inserted, change);
+  }
+  override cancel(m: VendingMachine): MachineState {
+    if (this.inserted.length > 0) m.hardware.returnCoins(this.inserted);
+    return new Idle();
+  }
+}
+
+class Dispensing extends Base {
+  readonly name = "dispensing";
+  private readonly slot: Slot;
+  private readonly inserted: Coin[];
+  private readonly change: Coin[];
+
+  constructor(slot: Slot, inserted: Coin[], change: Coin[]) { super(); this.slot = slot; this.inserted = inserted; this.change = change; }
+
+  // Only now, with the product in the tray, does the customer's money become the machine's.
+  override delivered(m: VendingMachine): MachineState {
+    this.slot.takeOne();
+    m.cash.add(this.inserted);
+    m.cash.remove(this.change);
+    if (this.change.length > 0) m.hardware.returnCoins(this.change);
+    m.hardware.show("Thank you");
+    return new Idle();
+  }
+  override failed(m: VendingMachine): MachineState {
+    this.slot.markJammed();
+    m.hardware.returnCoins(this.inserted);
+    m.hardware.show("Sorry, that did not work. Your money has been returned");
+    return new Idle();
+  }
+}
+</pre>
+<pre data-lang="ts" data-title="The machine: it owns the stock and the cash, and forwards every event">
+// The context: it owns the stock and the money, and passes every event to its current state.
+export class VendingMachine {
+  readonly slots = new Map<string, Slot>();
+  readonly cash: CashBox;
+  readonly hardware: Hardware;
+  private current: MachineState = new Idle();
+
+  constructor(hardware: Hardware, slots: Slot[], float: CoinCounts) {
+    this.hardware = hardware;
+    this.cash = new CashBox(float);
+    for (const slot of slots) this.slots.set(slot.code, slot);
+  }
+  get state(): StateName { return this.current.name; }
+
+  // The customer's buttons and the coin slot.
+  select(code: string): void { this.current = this.current.select(this, code); }
+  insert(coin: Coin): void { this.current = this.current.insert(this, coin); }
+  cancel(): void { this.current = this.current.cancel(this); }
+  // Signals from the delivery sensor.
+  delivered(): void { this.current = this.current.delivered(this); }
+  failed(): void { this.current = this.current.failed(this); }
+  // The operator's key.
+  openService(): void { this.current = this.current.openService(this); }
+  closeService(): void { this.current = this.current.closeService(this); }
+
+  // …restock and collectCash, which are refused unless the state is maintenance…
+}
+</pre>
+<p>Three things about this code are worth pointing out in an interview.</p>
+<ul>
+  <li><b>The machine’s methods are one line each.</b> Every event is passed to the current state, and whatever comes back becomes the current state. All the decisions are in the state classes.</li>
+  <li><b>A base class supplies the dull answers.</b> By default a coin is returned and nothing else changes. Each state overrides only the events it cares about, so <code>Dispensing</code> is two methods long.</li>
+  <li><b>States carry their own data.</b> The coins inserted so far live in the <code>AwaitingPayment</code> object, and nowhere else. When the machine returns to idle, that object is discarded and the coins with it. A field such as <code>insertedCoins</code> on the machine would exist in every state and mean something in only one.</li>
+</ul>
+<p>The scenario test followed a sale of water at 125 paid with two coins of 100. A coin inserted before choosing came straight back. After the first coin the display read “25 more”. After the second, the product was released, and at that moment the cash box still held its original 175 and the stock was unchanged. On the delivery signal, three coins of 25 were returned, the cash box rose to 300 and the stock fell by one.</p>
+
+<h2 id="walk">Step 7: Walk it</h2>
+
+<figure class="fig wide" id="fig-sale">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 420" role="img" aria-labelledby="f693t f693d">
+<title id="f693t">A sale with change, and a sale that jams</title>
+<desc id="f693d">Two sequences between a customer, the VendingMachine, the change calculation and the hardware. In the first, the customer selects A1, priced 125, and inserts 100 twice. The machine finds change of three 25s for the 75 overpaid, and tells the hardware to release A1. The hardware reports delivered. The machine moves the 200 into its cash box and returns the three 25s. In the second, the customer has selected A1 and inserted 100 and 25. The machine releases the product, but the hardware reports failed. The machine returns the 100 and the 25, and closes the slot.</desc>
+<text class="tb" x="10" y="16">Water at 125, paid with two coins of 100</text>
+<g data-scene="sale">
+<text class="tb mid" x="56" y="36">Customer</text>
+<line class="axis" x1="56" y1="44" x2="56" y2="250"/>
+<text class="tb mid" x="230" y="36">VendingMachine</text>
+<line class="axis" x1="230" y1="44" x2="230" y2="250"/>
+<text class="tb mid" x="420" y="36">makeChange</text>
+<line class="axis" x1="420" y1="44" x2="420" y2="250"/>
+<text class="tb mid" x="610" y="36">Hardware</text>
+<line class="axis" x1="610" y1="44" x2="610" y2="250"/>
+<g data-s="1">
+<path class="e sig" d="M57 70H229"/>
+<text class="ts mid" x="143.0" y="64">1. select("A1")</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M57 95H229"/>
+<text class="ts mid" x="143.0" y="89">2. insert(100)</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M57 120H229"/>
+<text class="ts mid" x="143.0" y="114">3. insert(100)</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M231 145H419"/>
+<text class="ts mid" x="325.0" y="139">4. 75, from these coins?  25, 25, 25</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M231 170H609"/>
+<text class="ts mid" x="420.0" y="164">5. release("A1")</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M609 195H231"/>
+<text class="ts mid" x="420.0" y="189">6. delivered()</text>
+</g>
+<g data-s="7">
+<path class="e store" d="M231 220H609"/>
+<text class="ts mid" x="420.0" y="214">7. returnCoins(25, 25, 25)</text>
+</g>
+</g>
+<path class="e none dash" d="M10 264H710"/>
+<text class="tb" x="10" y="284">The same product, and the spiral jams</text>
+<g data-scene="jam">
+<text class="tb mid" x="56" y="304">Customer</text>
+<line class="axis" x1="56" y1="312" x2="56" y2="432"/>
+<text class="tb mid" x="230" y="304">VendingMachine</text>
+<line class="axis" x1="230" y1="312" x2="230" y2="432"/>
+<text class="tb mid" x="420" y="304">makeChange</text>
+<line class="axis" x1="420" y1="312" x2="420" y2="432"/>
+<text class="tb mid" x="610" y="304">Hardware</text>
+<line class="axis" x1="610" y1="312" x2="610" y2="432"/>
+<g data-s="1">
+<path class="e sig" d="M57 338H229"/>
+<text class="ts mid" x="143.0" y="332">1. insert(100), insert(25)</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M231 363H609"/>
+<text class="ts mid" x="420.0" y="357">2. release("A1")</text>
+</g>
+<g data-s="3">
+<path class="e fault" d="M609 388H231"/>
+<text class="ts mid" x="420.0" y="382">3. failed()</text>
+</g>
+<g data-s="4">
+<path class="e uses" d="M231 413H609"/>
+<text class="ts mid" x="420.0" y="407">4. returnCoins(100, 25)</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="sale" data-label="A sale with change">
+  <li data-msg="select" data-state="State: awaiting payment; held: 0; cash box: 175">The customer chooses first. Idle answers by checking the slot and handing over to a new AwaitingPayment state.</li>
+  <li data-msg="100" data-state="State: awaiting payment; held: 100; cash box: 175">The coin is held for the customer, apart from the machine’s own money. The display shows “25 more”.</li>
+  <li data-msg="100" data-state="State: awaiting payment; held: 200; cash box: 175">The price is covered, with 75 to spare.</li>
+  <li data-msg="75?">Before releasing anything, the machine checks that it can give exact change from its cash box and the coins held.</li>
+  <li data-msg="release" data-state="State: dispensing; held: 200; cash box: 175">It can, so the spiral is turned. The state becomes Dispensing, which remembers the coins and the planned change.</li>
+  <li data-msg="delivered">The sensor in the tray sees the bottle fall.</li>
+  <li data-msg="change" data-state="State: idle; held: 0; cash box: 300">Now the sale is final: the stock goes down by one, the 200 joins the cash box and 75 comes out of it.</li>
+</ol>
+<ol class="steps" data-scene="jam" data-label="A jam">
+  <li data-msg="125" data-state="State: awaiting payment; held: 125; cash box: 300">Another customer has selected A1 and pays the exact price.</li>
+  <li data-msg="release" data-state="State: dispensing; held: 125; cash box: 300">No change is needed, and the product is released.</li>
+  <li data-msg="failed">Nothing reaches the tray. The hardware reports the failure.</li>
+  <li data-msg="refund" data-state="State: idle; held: 0; cash box: 300">The customer’s coins were never mixed with the machine’s, so they go straight back. The slot is closed until an operator has looked at it.</li>
+</ol>
+<figcaption>Money changes hands at one moment only: when the product is known to have been delivered. Until then the machine is holding the customer’s coins for them.</figcaption>
+</figure>
+
+<h2 id="money">Keeping the customer’s money apart</h2>
+
+<figure class="fig wide" id="fig-money">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f695t f695d">
+<title id="f695t">Where the money is at each moment of a sale</title>
+<desc id="f695d">Three places money can be: with the customer, held by the machine on the customer’s behalf, and in the machine’s cash box. Inserting a coin moves it from the customer to the held coins. Canceling, a jam, or a failure to make change moves all held coins back to the customer. A confirmed delivery moves the held coins into the cash box, and moves the change from the cash box to the customer. No other movement exists, so the three amounts always add up to the same total.</desc>
+<rect class="n " x="20" y="70" width="170" height="64" rx="8"/>
+<text class="tb mid" x="105" y="96">The customer</text>
+<text class="ts mid" x="105" y="116">coins in hand, and the tray</text>
+<rect class="n sig" x="275" y="70" width="170" height="64" rx="8"/>
+<text class="tb mid" x="360" y="96">Held for the customer</text>
+<text class="ts mid" x="360" y="116">inside the AwaitingPayment</text>
+<rect class="n store" x="530" y="70" width="170" height="64" rx="8"/>
+<text class="tb mid" x="615" y="96">The cash box</text>
+<text class="ts mid" x="615" y="116">the machine’s own money</text>
+<text class="ts mid" x="360" y="130">or Dispensing state</text>
+<path class="e sig" d="M192 86H273"/>
+<text class="ts mid" x="232" y="78">insert</text>
+<path class="e" d="M273 120H192"/>
+<text class="ts mid" x="232" y="150">cancel, jam,</text>
+<text class="ts mid" x="232" y="164">no change</text>
+<path class="e store" d="M447 102H528"/>
+<text class="ts mid" x="488" y="94">delivered</text>
+<path class="e store" d="M615 68C615 14 105 14 105 68" style="fill:none"/>
+<text class="ts mid" x="360" y="30">change, when delivered</text>
+<text class="ts" x="10" y="196">In 20,000 random events the test checked after each one that cash box + returned coins = float + inserted coins,</text>
+<text class="ts" x="10" y="212">and at the end that the cash box had grown by exactly the price of everything sold.</text>
+</svg>
+</div>
+<figcaption>Four arrows are the only ways money moves. Because the held coins are kept apart until delivery, a refund is always possible and always exact.</figcaption>
+</figure>
+
+<p>The design choice that makes refunds simple is where inserted coins are held. They are not added to the cash box as they arrive. They stay in the state object, as the customer’s money in the machine’s keeping, until the sensor confirms delivery. Canceling, a jam and a failure to make change all become the same operation: hand back what was being held.</p>
+<p>A design that adds each coin to the cash box at once has to subtract on every unhappy path, and must then find coins to refund with, which may no longer be the ones inserted. The same idea appears wherever money waits on an outcome, as an escrow account or as a payment that is authorized first and captured later (<x-ref to="hld-payments"></x-ref>).</p>
+<p>The conservation rule was tested directly. Twenty thousand random selections, coins and cancel requests were fed to a machine whose hardware failed one delivery in twenty. After every event that left the machine idle, the test confirmed that the coins in the cash box plus all coins ever returned equaled the opening float plus all coins ever inserted. At the end, 695 sales had been made, 44 jams had been refunded in full, and the cash box had grown by 98,030 cents, which was exactly the total price of what had been sold.</p>
+
+<h2 id="change">Giving change</h2>
+<p>One method in the listing hides a real problem: <code>makeChange</code>. The amount due is easy to compute. Finding coins that add up to it, from a supply in which any denomination may have run out, is not.</p>
+<p>The method everyone uses at a till is to give the largest coin that fits, and repeat. It is called a <dfn>greedy algorithm</dfn>: one that makes the best-looking choice at each step and never revisits it.</p>
+
+<figure class="fig wide" id="fig-change">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-labelledby="f694t f694d">
+<title id="f694t">Giving 30 in change from one 25 and three 10s</title>
+<desc id="f694d">Two ways of finding 30 cents from a till holding one 25-cent coin and three 10-cent coins. Taking the largest coin first, the method takes the 25, needs 5 more, finds no coin of 5 or less, and fails, although the change could have been given. The second method keeps a list of every amount that can be made. With no coins, only 0. After considering the 25: 0 and 25. After each 10 in turn, more amounts become reachable, and after the third 10 the amount 30 is reachable as 10, 10 and 10.</desc>
+<text class="tb" x="10" y="18">Largest coin first</text>
+<text class="ts" x="10" y="36">in the till:</text>
+<g data-scene="greedy">
+<g class="hide" data-s="1" data-e="1">
+<circle class="n " cx="110" cy="32" r="15"/>
+<text class="ts mid" x="110" y="36">25</text>
+<circle class="n " cx="150" cy="32" r="12"/>
+<text class="ts mid" x="150" y="36">10</text>
+<circle class="n " cx="180" cy="32" r="12"/>
+<text class="ts mid" x="180" y="36">10</text>
+<circle class="n " cx="210" cy="32" r="12"/>
+<text class="ts mid" x="210" y="36">10</text>
+</g>
+<g class="hide" data-s="2">
+<circle class="n " cx="150" cy="32" r="12"/>
+<text class="ts mid" x="150" y="36">10</text>
+<circle class="n " cx="180" cy="32" r="12"/>
+<text class="ts mid" x="180" y="36">10</text>
+<circle class="n " cx="210" cy="32" r="12"/>
+<text class="ts mid" x="210" y="36">10</text>
+</g>
+<g class="hide" data-s="1">
+<text class="ts" x="300" y="36">given so far:</text>
+<circle class="n sig" cx="400" cy="32" r="15"/>
+<text class="ts mid" x="400" y="36">25</text>
+<text class="ts" x="430" y="36">5 still to give</text>
+</g>
+<g class="hide" data-s="2">
+<text class="ts" x="10" y="76">No coin of 5 or less is left. The method gives up, and the sale is refused.</text>
+<path class="x" d="M560 20l18 18M578 20l-18 18"/>
+</g>
+</g>
+<path class="e none dash" d="M10 96H710"/>
+<text class="tb" x="10" y="120">Every amount that can be made</text>
+<g data-scene="exact">
+<rect class="n sunk" x="19.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="44.0" y="144">0</text>
+<rect class="n sunk" x="76.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="101.0" y="144">5</text>
+<rect class="n sunk" x="133.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="158.0" y="144">10</text>
+<rect class="n sunk" x="190.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="215.0" y="144">15</text>
+<rect class="n sunk" x="247.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="272.0" y="144">20</text>
+<rect class="n sunk" x="304.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="329.0" y="144">25</text>
+<rect class="n sunk" x="361.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="386.0" y="144">30</text>
+<rect class="n sunk" x="418.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="443.0" y="144">35</text>
+<rect class="n sunk" x="475.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="500.0" y="144">40</text>
+<rect class="n sunk" x="532.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="557.0" y="144">45</text>
+<rect class="n sunk" x="589.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="614.0" y="144">50</text>
+<rect class="n sunk" x="646.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="671.0" y="144">55</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="n store" x="19.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="44.0" y="171">0 coins</text>
+<rect class="n store" x="304.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="329.0" y="171">1 coin</text>
+<text class="ts" x="10" y="210">coins considered so far: 25</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="n store" x="19.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="44.0" y="171">0 coins</text>
+<rect class="n store" x="304.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="329.0" y="171">1 coin</text>
+<rect class="n store" x="133.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="158.0" y="171">1 coin</text>
+<rect class="n store" x="418.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="443.0" y="171">2 coins</text>
+<text class="ts" x="10" y="210">coins considered so far: 25, 10</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="n store" x="19.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="44.0" y="171">0 coins</text>
+<rect class="n store" x="304.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="329.0" y="171">1 coin</text>
+<rect class="n store" x="133.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="158.0" y="171">1 coin</text>
+<rect class="n store" x="418.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="443.0" y="171">2 coins</text>
+<rect class="n store" x="247.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="272.0" y="171">2 coins</text>
+<rect class="n store" x="532.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="557.0" y="171">3 coins</text>
+<text class="ts" x="10" y="210">coins considered so far: 25, 10, 10</text>
+</g>
+<g class="hide" data-s="4">
+<rect class="n store" x="19.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="44.0" y="171">0 coins</text>
+<rect class="n store" x="304.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="329.0" y="171">1 coin</text>
+<rect class="n store" x="133.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="158.0" y="171">1 coin</text>
+<rect class="n store" x="418.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="443.0" y="171">2 coins</text>
+<rect class="n store" x="247.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="272.0" y="171">2 coins</text>
+<rect class="n store" x="532.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="557.0" y="171">3 coins</text>
+<rect class="n sig" x="361.0" y="150" width="50" height="34" rx="4" style="stroke-width:2.5"/>
+<text class="ts mid" x="386.0" y="171">3 coins</text>
+<rect class="n store" x="646.0" y="150" width="50" height="34" rx="4"/>
+<text class="ts mid" x="671.0" y="171">4 coins</text>
+<text class="ts" x="10" y="210">coins considered so far: 25, 10, 10, 10</text>
+</g>
+<g class="hide" data-s="4">
+<text class="ts tb" x="10" y="236">30 can be made, from 10, 10 and 10. The sale goes ahead.</text>
+</g>
+</g>
+<text class="ts" x="10" y="300">Each box is an amount. A filled box can be paid exactly with the coins considered so far, and shows the</text>
+<text class="ts" x="10" y="316">fewest coins needed. Adding one coin can fill new boxes to the right of those already filled.</text>
+</svg>
+</div>
+<ol class="steps" data-scene="greedy" data-label="Largest first">
+  <li data-msg="none" data-state="Given: 25; still to give: 5">The change due is 30. The method takes the largest coin that fits, the 25, leaving 5 to give.</li>
+  <li data-msg="none" data-state="Given: 25; still to give: 5, and no coin fits">It needs a coin of 5 or less. The till has only 10s left. The method fails, and never reconsiders the 25 it took first.</li>
+</ol>
+<ol class="steps" data-scene="exact" data-label="Every amount">
+  <li data-msg="none" data-state="Amounts that can be made: 0, 25">Start with the 25. With that one coin, two amounts can be paid exactly: nothing, and 25.</li>
+  <li data-msg="none" data-state="Amounts that can be made: 0, 10, 25, 35">Add the first 10. Every amount already possible is still possible, and so is each of them plus 10.</li>
+  <li data-msg="none" data-state="Amounts that can be made: 0, 10, 20, 25, 35, 45">Add the second 10. Now 20 and 45 can be made as well.</li>
+  <li data-msg="none" data-state="Amounts that can be made: 0, 10, 20, 25, 30, 35, 45, 55">Add the third 10. The amount 30 becomes reachable, as three 10s, and that is the change to give.</li>
+</ol>
+<figcaption>Taking the largest coin first is right when every coin is in plentiful supply, and can fail when one runs out. Building up the set of reachable amounts, one physical coin at a time, never misses a solution.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Change from a limited supply of coins: the greedy method, and one that always finds an answer">
+export type Coin = 5 | 10 | 25 | 100 | 200; // values in cents
+export const denominations: readonly Coin[] = [200, 100, 25, 10, 5];
+export type CoinCounts = Readonly<Partial<Record<Coin, number>>>;
+
+// Largest coin first. Fast, and wrong when a coin it wants has run out.
+export function greedyChange(amount: number, available: CoinCounts): Coin[] | null {
+  const given: Coin[] = [];
+  let left = amount;
+  for (const coin of denominations) {
+    let have = available[coin] ?? 0;
+    while (left >= coin && have > 0) {
+      given.push(coin);
+      left -= coin;
+      have -= 1;
+    }
+  }
+  return left === 0 ? given : null;
+}
+
+// Finds a way to pay exactly `amount` from the coins available, using as few coins as possible, or null if there is none.
+// fewest[a] is the smallest number of coins that add up to a, using only the coins considered so far.
+export function makeChange(amount: number, available: CoinCounts): Coin[] | null {
+  if (!Number.isInteger(amount) || amount < 0) return null;
+  const fewest = new Array<number>(amount + 1).fill(Infinity);
+  const picked = new Array<Coin[]>(amount + 1);
+  fewest[0] = 0;
+  picked[0] = [];
+  for (const coin of denominations) {
+    for (let n = 0; n < (available[coin] ?? 0); n += 1) {       // each physical coin can be used once
+      for (let a = amount; a >= coin; a -= 1) {                 // downward, so this coin is not counted twice
+        if ((fewest[a - coin] as number) + 1 < (fewest[a] as number)) {
+          fewest[a] = (fewest[a - coin] as number) + 1;
+          picked[a] = [...(picked[a - coin] as Coin[]), coin];
+        }
+      }
+    }
+  }
+  return picked[amount] ?? null;
+}
+
+export const total = (coins: readonly Coin[]): number => coins.reduce((sum, coin) => sum + coin, 0);
+</pre>
+<p>The second function is a small example of <dfn>dynamic programming</dfn>: solving a problem by recording the answers to smaller versions of it. Here the record is, for each amount up to the one wanted, the fewest coins that make it. Each physical coin is considered once, and may extend any amount already reachable.</p>
+<table>
+<thead><tr><th>Checked in a test</th><th>Result</th></tr></thead>
+<tbody>
+<tr><th>30 from one 25 and three 10s, greedy</th><td>No answer</td></tr>
+<tr><th>The same, with <code>makeChange</code></th><td>10, 10, 10</td></tr>
+<tr><th>3,000 random tills and amounts, compared with trying every combination</th><td><code>makeChange</code> agreed every time on whether change was possible, and on the fewest coins</td></tr>
+<tr><th>Of the 1,272 cases where change was possible</th><td>The greedy method failed to find it in 11</td></tr>
+</tbody>
+</table>
+<p>Eleven in 1,272 is under one percent, which is the dangerous kind of bug: rare enough to pass casual testing, and each time it happens a customer is refused a sale the machine could have made. The machine in this chapter gave 10, 10 and 10 from that till in its own test.</p>
+<div class="widget" data-widget="changemaker">
+<h4>Change from the coins on hand</h4>
+<p>The two methods from the listing, side by side. Try 30 from one 25 and three 10s, then add a 5.</p>
+<div class="controls">
+  <label>Change to give, cents<input type="number" name="amount" value="30" min="0" max="500" step="5"></label>
+  <label>Coins of 100<input type="number" name="c100" value="0" min="0" max="20" step="1"></label>
+  <label>Coins of 25<input type="number" name="c25" value="1" min="0" max="20" step="1"></label>
+  <label>Coins of 10<input type="number" name="c10" value="3" min="0" max="20" step="1"></label>
+  <label>Coins of 5<input type="number" name="c5" value="0" min="0" max="20" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 110" role="img" aria-label="Two rows of coins: those given by taking the largest coin first, and those given by the method that considers every reachable amount."><text x="10" y="30" class="ts">Largest coin first</text><circle cx="190" cy="26" r="12" class="n fault"></circle><text x="190" y="30" class="ts mid">25</text><text x="221" y="30" class="ts tb">then stuck, 5 short</text><text x="10" y="70" class="ts">Every reachable amount</text><circle cx="190" cy="66" r="10" class="n store"></circle><text x="190" y="70" class="ts mid">10</text><circle cx="217" cy="66" r="10" class="n store"></circle><text x="217" y="70" class="ts mid">10</text><circle cx="244" cy="66" r="10" class="n store"></circle><text x="244" y="70" class="ts mid">10</text><text x="10" y="102" class="ts">Each circle is one coin handed over, in the order chosen.</text></svg>
+<dl class="results">
+  <div><dt>Largest coin first</dt><dd data-out="greedy">fails, 5 short</dd></div>
+  <div><dt>Every reachable amount</dt><dd data-out="exact">10, 10, 10</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Taking the largest coin first gives 25 and is then 5 short with no coin small enough. The amount can be made, as 10, 10, 10. A machine using the first method would refuse this sale for no reason.</p>
+</div>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Card and phone payments</th><td>A payment port with two operations, authorize and capture. <code>AwaitingPayment</code> authorizes, and <code>Dispensing</code> captures on delivery or releases the authorization on failure</td><td>The four states and their order. This is the same hold-then-keep rule, with a bank holding the money</td></tr>
+<tr><th>The customer walks away mid-sale</th><td>A timeout event, raised by a timer that is passed in. <code>AwaitingPayment</code> treats it as cancel. The other states ignore it</td><td>Everything else. It is one more event on the interface</td></tr>
+<tr><th>The delivery sensor never answers</th><td><code>Dispensing</code> treats a timeout as failed and refunds. A machine must not wait in one state forever</td><td>The other states</td></tr>
+<tr><th>Report sales and low stock to head office</th><td>The machine announces events such as sold, jammed and nearly empty, and a reporter subscribes (<x-ref to="behavioral-patterns#observer"></x-ref>)</td><td>The states do not know anyone is listening</td></tr>
+<tr><th>Discounts: two for a lower price, happy hour</th><td>The price becomes a function of the slot and the time, passed in: a strategy</td><td>The state classes, which ask for a price and compare</td></tr>
+<tr><th>Several items in one sale</th><td>A basket in <code>AwaitingPayment</code>, and <code>Dispensing</code> releases items one at a time, refunding the price of any that fail</td><td>Idle, maintenance, the cash box</td></tr>
+<tr><th>Is there any concurrency?</th><td>One customer at a time, but events come from several devices: buttons, the coin slot, sensors, timers. Put them on one queue and handle them one at a time, as in <x-ref to="lld-elevator#concurrency"></x-ref></td><td>No locks are needed</td></tr>
+</tbody>
+</table>
+<p>The comparison with the elevator is instructive. There, the states were labels and a single <code>tick</code> method with three branches was the clearest form. Here, four states respond differently to seven events and two of them hold data, so a class for each state is clearer. The choice between a table and state objects is made on that basis, as <x-ref to="behavioral-patterns#state"></x-ref> set out.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> Draw the state diagram first, before any class, and ask yourself aloud what each event means in each state. That exercise produces the design. Then say the two rules about money: check that change can be made before releasing the product, and keep the customer’s coins apart until delivery is confirmed. Most answers have the states and miss both rules. If time allows only one piece of code, write <code>AwaitingPayment.insert</code>, since it contains the price check, the change check and the transition.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>A state field and a <code>switch</code> in every method</th><td>Each new state or event means editing every method</td><td>A class for each state, with defaults in a base class</td></tr>
+<tr><th>Data that belongs to one state stored on the machine</th><td>Fields such as the inserted coins exist, and can be stale, in states where they mean nothing</td><td>Hold them in the state object that uses them</td></tr>
+<tr><th>Adding coins to the cash box as they are inserted</th><td>Refunds must be reconstructed, and a crash mid-sale leaves the customer’s money counted as revenue</td><td>Hold them apart until delivery</td></tr>
+<tr><th>Releasing the product, then working out change</th><td>The product is gone and the machine owes money it cannot pay</td><td>Check that change can be made first, and refuse the sale otherwise</td></tr>
+<tr><th>Largest coin first, with limited coins</th><td>Sales refused although change was possible</td><td>Search the reachable amounts</td></tr>
+<tr><th>Treating “release” as “delivered”</th><td>Customers charged when the spiral jams</td><td>A dispensing state that waits for the sensor</td></tr>
+<tr><th>Throwing an error when a customer presses the wrong button</th><td>Ordinary use is handled as failure</td><td>Each state gives a calm default response: a message, a returned coin</td></tr>
+<tr><th>Calling motors and displays directly from the logic</th><td>Nothing can be tested without a machine</td><td>A hardware interface, and a fake in tests</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="lld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="behavioral-patterns"></x-ref>: the state pattern, and when a table is enough.</li>
+  <li><x-ref to="lld-elevator"></x-ref>: the same shape of problem with states that are only labels.</li>
+  <li><x-ref to="application-architecture"></x-ref>: ports and adapters, used here for the hardware.</li>
+  <li><x-ref to="errors-and-testing"></x-ref>: fakes, and checking a property over thousands of random inputs.</li>
+  <li><x-ref to="domain-modeling"></x-ref>: money as whole cents, and invariants that must hold exactly.</li>
+  <li><x-ref to="hld-payments"></x-ref>: authorizing and capturing, the hold-then-keep rule between companies.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>A vending machine is a state machine in which the same event means different things in different states. That is the case for the state pattern.</li>
+  <li>Give each state a class, put the default responses in a base class, and let the machine forward every event to its current state.</li>
+  <li>Data that exists only in one state, such as the coins inserted so far, belongs in that state’s object.</li>
+  <li>Ask how the software knows the product was delivered. The answer adds a dispensing state.</li>
+  <li>Hold the customer’s coins apart from the cash box until delivery is confirmed, so that every unhappy path is the same refund.</li>
+  <li>Check that exact change can be made before releasing the product.</li>
+  <li>With a limited supply of coins, the largest-coin-first method can fail when change exists. A search over reachable amounts cannot.</li>
+  <li>Put the hardware behind an interface, and the whole machine can be tested, including a conservation check over thousands of random events.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>What does inserting a coin do in each of the four states, and where in the code is each behavior written?</summary><p>In idle the coin is returned with the message “Choose a product first”, in <code>Idle.insert</code>. In awaiting payment it is added to the coins held and may complete the sale, in <code>AwaitingPayment.insert</code>. In dispensing and in maintenance it is returned without comment, which is the default in the base class that neither state overrides.</p></details>
+<details><summary>A machine has two coins of 25 and four of 10 and must give 40 in change. What does largest-coin-first give, and what does the search give?</summary><p>Largest first takes 25, then cannot take another 25 since only 15 remains, takes one 10, and is left needing 5 with no coin of 5: it fails. The search finds 10, 10, 10, 10. Greedy fails here for the same reason as in the chapter’s example: its first choice ruled out the only solution.</p></details>
+<details><summary>Why are inserted coins kept in the <code>AwaitingPayment</code> object and not added to the cash box immediately?</summary><p>Until the product is delivered the money is still the customer’s. Keeping it apart means that canceling, a jam and a failure to make change are all the same simple action, returning exactly those coins, and the cash box always contains only money the machine has earned. It also keeps the conservation rule easy to state and to test.</p></details>
+<details><summary>The machine checks whether change can be made before it releases the product. What goes wrong if the order is reversed?</summary><p>The product is already out when the machine discovers it cannot pay what it owes. It must then either keep the customer’s overpayment or give back more or less than the right amount, and the product cannot be taken back. Checking first means the only consequence of a shortage of coins is a refused sale and a full refund.</p></details>
+<details><summary>Why does this design use state objects when the elevator in the previous chapter used a single field and a <code>switch</code>?</summary><p>In the elevator the states were labels: one method, <code>tick</code>, branched on three values, and no state held data of its own. Here four states each respond to seven events, mostly differently, and two of them own data such as the coins held and the planned change. A class for each state keeps each state’s behavior and data together, where a switch would repeat in every method.</p></details>
+<details><summary>How would you add a rule that a customer who has inserted coins and done nothing for 30 seconds gets them back?</summary><p>Add a timeout event to the state interface, with a default in the base class that does nothing. <code>AwaitingPayment</code> overrides it to behave like cancel. The timer itself is supplied from outside, started when a coin is inserted and reset on each event, so that tests can fire the timeout directly without waiting.</p></details>
+<details><summary>State the money conservation rule precisely, and say how you would test it.</summary><p>At any moment when no sale is in progress, the coins in the cash box plus all coins ever returned to customers equal the opening float plus all coins ever inserted. Test it by driving the machine with thousands of random events through a fake hardware object that records returned coins and sometimes reports a failed delivery, checking the equation after every event that leaves the machine idle.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Erich Gamma, Richard Helm, Ralph Johnson and John Vlissides, <cite>Design Patterns: Elements of Reusable Object-Oriented Software</cite>, Addison-Wesley, 1994. The State pattern.</li>
+  <li>Eric Freeman and Elisabeth Robson, <cite>Head First Design Patterns</cite>, 2nd edition, O’Reilly, 2020. Its chapter on the state pattern is built around a gumball machine, a close cousin of this problem.</li>
+  <li>Thomas H. Cormen, Charles E. Leiserson, Ronald L. Rivest and Clifford Stein, <cite>Introduction to Algorithms</cite>, 4th edition, MIT Press, 2022. Dynamic programming and greedy algorithms, including when greedy coin changing is and is not optimal.</li>
+  <li>Robert Nystrom, <a href="https://gameprogrammingpatterns.com/state.html">State</a>, in <cite>Game Programming Patterns</cite>, 2014. A clear account of moving from flags, to an enumerated state, to state objects.</li>
+  <li>Fawaz Bokhari, Desmond Zhou and Alex Xu, <cite>Object Oriented Design Interview: An Insider’s Guide</cite>, ByteByteGo, 2025. A worked vending machine in interview form.</li>
+</ol>
+</section>

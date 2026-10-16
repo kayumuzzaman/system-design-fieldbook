@@ -1,0 +1,790 @@
+<!--meta
+{ "description": "A low-level design of an expense-sharing app in TypeScript, tested: four kinds of split stored as plain data, dividing money by weights without losing a cent, balances that always add up to zero, an append-only history with reversals, who owes whom pair by pair or from balances, settling up greedily in at most n − 1 payments, and the fewest payments, which is NP-hard and measured against greedy.",
+  "lede": "Friends on a trip pay for things in turn, and someone has to work out who owes whom. The design problem looks like arithmetic and is mostly about rules that must hold exactly: no cent lost when a bill is divided, balances that add up to zero, a history nobody can quietly change. Then comes one real algorithmic question, settling everyone with as few payments as possible, which turns out to be hard in general and easy most of the time. This chapter builds the model, tests the rules, and measures when the simple answer is not the best one.",
+  "updated": "2026-10-12" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the core of an expense-sharing app. People in a group record expenses: one person pays, and the cost is split among some members equally, by exact amounts, by percentages, or by shares. The app shows each person’s balance and who owes whom, records repayments, and can suggest the fewest payments that settle everyone.</p></div>
+<p>The app most associated with this is Splitwise, and the interview problem is often named after it. In the terms of <x-ref to="lld-method#shapes"></x-ref>, it is a design of rules about money between people: value objects, a strategy for each kind of split, and totals that must add up. The money type comes from <x-ref to="domain-modeling#values"></x-ref>, which promised that the rule for dividing without losing a cent would be written once and used here.</p>
+
+<h2 id="clarify">Step 1: Clarify</h2>
+<table>
+<thead><tr><th>Question</th><th>Assumed answer for this design</th></tr></thead>
+<tbody>
+<tr><th>One currency or several?</th><td>One for each group. Several is a follow-up</td></tr>
+<tr><th>How many people pay for one expense?</th><td>One. Several payers is a follow-up</td></tr>
+<tr><th>Which splits?</th><td>Equal among chosen people, exact amounts, percentages to two decimal places, and whole-number shares</td></tr>
+<tr><th>When a bill does not divide evenly, who gets the extra cent?</th><td>A fixed rule, stated below. It must never depend on the order of a loop nobody chose</td></tr>
+<tr><th>Can an expense be edited or deleted?</th><td>It can be reversed, and a corrected one added. The history is never rewritten</td></tr>
+<tr><th>How large is a group?</th><td>Usually under twenty people</td></tr>
+<tr><th>Does the app move money?</th><td>No. It records repayments that people make outside it</td></tr>
+</tbody>
+</table>
+
+<h2 id="model">Steps 2 and 3: The model and its invariants</h2>
+<table>
+<thead><tr><th>Concept</th><th>Kind</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Money</th><td>Value</td><td>Whole cents and a currency, as in the domain modeling chapter, now with subtraction and division by weights</td></tr>
+<tr><th>Split</th><td>Value: plain data</td><td>One of four records describing how an expense is divided</td></tr>
+<tr><th>Expense</th><td>Entity</td><td>Who paid, how much, the split as entered, and the shares it produced</td></tr>
+<tr><th>Payment</th><td>Value</td><td>Money one person handed to another to settle up</td></tr>
+<tr><th>Group</th><td>Aggregate</td><td>Members and the history of expenses, payments and reversals. Balances are worked out from it</td></tr>
+<tr><th>Transfer</th><td>Value</td><td>One suggested payment in a plan to settle everyone</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Invariant</th><th>Owner</th></tr></thead>
+<tbody>
+<tr><th>The shares of an expense add up to exactly its amount</th><td><code>Money.allocate</code>, and a check for exact amounts</td></tr>
+<tr><th>The balances of a group add up to zero</th><td><code>Group</code>: every entry adds to one side what it takes from the other</td></tr>
+<tr><th>All money in a group is in its currency, as whole cents</th><td><code>Money</code> and <code>Group</code></td></tr>
+<tr><th>Only members pay or share</th><td><code>Group.addExpense</code></td></tr>
+<tr><th>The history is only ever added to</th><td><code>Group</code>, which has no method that edits or removes an entry</td></tr>
+<tr><th>A settlement plan brings everyone to zero without changing what anyone owes in total</th><td>The settling functions, checked by <code>apply</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="classes">Step 4: The classes</h2>
+
+<figure class="fig wide" id="fig-classes">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 356" role="img" aria-labelledby="f721t f721d">
+<title id="f721t">The classes of expense sharing</title>
+<desc id="f721d">A class diagram. Group holds a currency, private members and a private list of entries, and offers addExpense, recordPayment, reverse, expenses, balances and pairwise. It owns any number of Expenses and Payments. An Expense has an id, a description, a payer, an amount of Money, the Split as entered and the resulting shares for each person. Split is a union of four plain records: equal among a list of people, exact amounts, percentages, or whole-number shares. The function sharesOf turns a total and a Split into shares, using Money, which offers plus, minus, negate and allocate. Separately, the functions greedy, fewest and apply turn balances into transfers that settle the group.</desc>
+<rect class="n sig" x="10" y="20" width="230" height="176" rx="4"/>
+<text class="tb mid" x="125" y="39">Group</text>
+<line class="sep sig" x1="10" y1="48" x2="240" y2="48"/>
+<text class="ts" x="18" y="64">currency</text>
+<text class="ts" x="18" y="80">− members</text>
+<text class="ts" x="18" y="96">− entries: Entry[]</text>
+<line class="sep sig" x1="10" y1="106" x2="240" y2="106"/>
+<text class="ts" x="18" y="122">+ addExpense(input)</text>
+<text class="ts" x="18" y="138">+ recordPayment(from, to, cents)</text>
+<text class="ts" x="18" y="154">+ reverse(expenseId)</text>
+<text class="ts" x="18" y="170">+ expenses(), balances()</text>
+<text class="ts" x="18" y="186">+ pairwise()</text>
+<rect class="n" x="285" y="20" width="210" height="118" rx="4"/>
+<text class="tb mid" x="390" y="39">Expense</text>
+<line class="sep" x1="285" y1="48" x2="495" y2="48"/>
+<text class="ts" x="293" y="64">id, description</text>
+<text class="ts" x="293" y="80">paidBy: UserId</text>
+<text class="ts" x="293" y="96">amount: Money</text>
+<text class="ts" x="293" y="112">split: Split</text>
+<text class="ts" x="293" y="128">shares: Map&lt;UserId, Money&gt;</text>
+<path class="e owns" d="M240 51.68 L285 41.24"/>
+<text class="ts mid" x="262.5" y="39.46">*</text>
+<rect class="n" x="285" y="200" width="210" height="70" rx="4"/>
+<text class="tb mid" x="390" y="219">Payment</text>
+<line class="sep" x1="285" y1="228" x2="495" y2="228"/>
+<text class="ts" x="293" y="244">from, to: UserId</text>
+<text class="ts" x="293" y="260">amount: Money</text>
+<path class="e owns" d="M240 152 L285 228"/>
+<text class="ts mid" x="256.5" y="204">*</text>
+<rect class="n store" x="540" y="20" width="170" height="116" rx="4"/>
+<text class="ts mid" x="625" y="36">«union»</text>
+<text class="tb mid" x="625" y="53">Split</text>
+<line class="sep store" x1="540" y1="62" x2="710" y2="62"/>
+<text class="ts" x="548" y="78">equal: among</text>
+<text class="ts" x="548" y="94">exact: amounts</text>
+<text class="ts" x="548" y="110">percent: percents</text>
+<text class="ts" x="548" y="126">shares: shares</text>
+<path class="e assoc" d="M495 43.6 L540 54.8"/>
+<rect class="n" x="540" y="170" width="170" height="68" rx="4"/>
+<text class="ts mid" x="625" y="186">«function»</text>
+<text class="tb mid" x="625" y="203">sharesOf(total, split)</text>
+<line class="sep" x1="540" y1="212" x2="710" y2="212"/>
+<text class="ts" x="548" y="228">→ Map&lt;UserId, Money&gt;</text>
+<path class="e uses" d="M625 170 L625 136"/>
+<rect class="n" x="540" y="262" width="170" height="96" rx="4"/>
+<text class="tb mid" x="625" y="281">Money</text>
+<line class="sep" x1="540" y1="290" x2="710" y2="290"/>
+<text class="ts" x="548" y="306">cents, currency</text>
+<line class="sep" x1="540" y1="316" x2="710" y2="316"/>
+<text class="ts" x="548" y="332">+ plus, minus, negate</text>
+<text class="ts" x="548" y="348">+ allocate(weights)</text>
+<path class="e uses" d="M625 238 L625 262"/>
+<rect class="n" x="10" y="262" width="230" height="100" rx="4"/>
+<text class="ts mid" x="125" y="278">«functions»</text>
+<text class="tb mid" x="125" y="295">settling up</text>
+<line class="sep" x1="10" y1="304" x2="240" y2="304"/>
+<text class="ts" x="18" y="320">greedy(balances): Transfer[]</text>
+<text class="ts" x="18" y="336">fewest(balances): Transfer[]</text>
+<text class="ts" x="18" y="352">apply(balances, transfers)</text>
+<path class="e uses" d="M125 262 L125 196"/>
+<text class="ts mid" x="159" y="237">balances()</text>
+<text class="ts" x="285" y="300">Entries are only ever added.</text>
+<text class="ts" x="285" y="316">A mistake is undone by a</text>
+<text class="ts" x="285" y="332">reversal, never by an edit.</text>
+</svg>
+</div>
+<figcaption>One aggregate owns the history. Each split is a plain record that is stored as entered, and the shares it produced are stored beside it.</figcaption>
+</figure>
+
+<p>Two decisions shape the diagram.</p>
+<p><b>A split is data, not an object with behavior.</b> The classic answer to “four kinds of split” is the strategy pattern of <x-ref to="behavioral-patterns#strategy"></x-ref>: an interface with four classes. But a split must be stored with its expense and shown again a year later (“dinner, split 1:1:2”), and a class instance does not survive being saved as JSON and read back. So <code>Split</code> is a union of four plain records, told apart by <code>kind</code>, and the behavior lives in one function with a case for each. The compiler checks that every kind is handled. This is still a strategy, chosen by a value instead of by a class.</p>
+<p><b>The shares are stored, not recomputed.</b> When an expense is added, its split is turned into an amount for each person, and that result is kept beside the rule that produced it. If the rounding rule changes next year, old expenses keep the amounts everyone saw and agreed to.</p>
+
+<h2 id="varies">Step 5: What varies</h2>
+<table>
+<thead><tr><th>What varies</th><th>Where it is decided</th></tr></thead>
+<tbody>
+<tr><th>How an expense is divided</th><td>The <code>Split</code> record, and its case in <code>sharesOf</code></td></tr>
+<tr><th>Who gets leftover cents</th><td><code>Money.allocate</code>, once for all kinds of split</td></tr>
+<tr><th>How the debts are shown</th><td><code>pairwise</code> or the net balances</td></tr>
+<tr><th>How the group settles</th><td><code>greedy</code> or <code>fewest</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="code">Step 6: The code</h2>
+<h3 id="allocate">Dividing without losing a cent</h3>
+<p>The domain modeling chapter divided an amount into equal parts and gave the leftover cents to the first parts. Sharing expenses needs division in proportion to weights: shares of 1, 1 and 2, or percentages such as 33.33, 33.33 and 33.34. The method that never loses a cent is the one used to divide seats in a parliament among parties, the <dfn>largest remainder method</dfn>: give each part the whole cents of its exact share, then hand out the cents left over, one each, to the parts that lost the largest fractions.</p>
+<pre data-lang="ts" data-title="Money.allocate: in proportion to weights, adding up exactly">
+// Divides in proportion to whole-number weights. Each part gets the whole cents of its exact share, and the cents
+  // left over go one each to the parts with the largest fractions; ties go to the earlier part.
+  allocate(weights: readonly number[]): Money[] {
+    if (weights.length === 0 || weights.some((w) => !Number.isSafeInteger(w) || w < 0)) throw new Error("weights are whole numbers, at least one");
+    const total = weights.reduce((a, b) => a + b, 0);
+    if (total === 0) throw new Error("weights must not all be zero");
+    if (!Number.isSafeInteger(Math.abs(this.cents) * total)) throw new Error("amount too large to divide exactly");
+    const sign = this.cents < 0 ? -1 : 1;
+    const cents = Math.abs(this.cents);
+    const rests = weights.map((w) => (cents * w) % total);             // each fraction left over, times total
+    const parts = weights.map((w, i) => (cents * w - (rests[i] as number)) / total); // whole cents, exactly
+    const order = rests.map((rest, i) => ({ i, rest })).sort((a, b) => b.rest - a.rest || a.i - b.i);
+    let left = cents - parts.reduce((a, b) => a + b, 0);
+    for (const { i } of order) {
+      if (left === 0) break;
+      parts[i] = (parts[i] as number) + 1;
+      left -= 1;
+    }
+    return parts.map((p) => Money.of(sign * p, this.currency));
+  }
+</pre>
+
+<figure class="fig wide" id="fig-allocate">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f722t f722d">
+<title id="f722t">Dividing 85.50 in shares of 1, 1 and 2</title>
+<desc id="f722d">Three steps of dividing 85.50 euros among Ana, Ben and Chloe in shares of 1, 1 and 2. The exact shares are 21.375, 21.375 and 42.75. Keeping the whole cents of each gives 21.37, 21.37 and 42.75, which add up to 85.49, so one cent is left. It goes to the part with the largest fraction of a cent left over. Ana and Ben are tied at half a cent, and the earlier one, Ana, gets it: 21.38, 21.37 and 42.75, which add up to 85.50.</desc>
+<text class="tb" x="10" y="18">Ben paid 85.50 for dinner. Shares: Ana 1, Ben 1, Chloe 2 (with her partner).</text>
+<text class="ts mid" x="250" y="50">exact share</text>
+<text class="ts mid" x="420" y="50">whole cents</text>
+<text class="ts mid" x="590" y="50">with the leftover cent</text>
+<text class="tb" x="10" y="82">Ana, 1 share</text>
+<g data-s="1">
+<text class="ts mono mid" x="250" y="82">21.375</text>
+</g>
+<g data-s="2">
+<text class="ts mono mid" x="420" y="82">21.37</text>
+</g>
+<g data-s="3">
+<rect class="n store" x="545" y="66" width="90" height="22" rx="4"/>
+<text class="ts mono mid tb" x="590" y="82">21.38</text>
+</g>
+<text class="tb" x="10" y="116">Ben, 1 share</text>
+<g data-s="1">
+<text class="ts mono mid" x="250" y="116">21.375</text>
+</g>
+<g data-s="2">
+<text class="ts mono mid" x="420" y="116">21.37</text>
+</g>
+<g data-s="3">
+<text class="ts mono mid" x="590" y="116">21.37</text>
+</g>
+<text class="tb" x="10" y="150">Chloe, 2 shares</text>
+<g data-s="1">
+<text class="ts mono mid" x="250" y="150">42.75</text>
+</g>
+<g data-s="2">
+<text class="ts mono mid" x="420" y="150">42.75</text>
+</g>
+<g data-s="3">
+<text class="ts mono mid" x="590" y="150">42.75</text>
+</g>
+<line class="axis" x1="170" y1="168" x2="700" y2="168"/>
+<text class="tb" x="10" y="188">total</text>
+<g data-s="1">
+<text class="ts mono mid" x="250" y="188">85.50</text>
+</g>
+<g data-s="2">
+<text class="ts mono mid" x="420" y="188">85.49</text>
+<text class="ts mid" x="420" y="204">one cent short</text>
+</g>
+<g data-s="3">
+<text class="ts mono mid tb" x="590" y="188">85.50</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Exact shares: 21.375, 21.375, 42.75">Each share is the total times the person’s weight, divided by the sum of the weights. These are not whole cents.</li>
+  <li data-msg="none" data-state="Whole cents: 21.37, 21.37, 42.75; one cent left">Keep only the whole cents of each. The parts now add up to one cent less than was paid.</li>
+  <li data-msg="none" data-state="Final: Ana 21.38, Ben 21.37, Chloe 42.75; total 85.50">The leftover cent goes to the largest fraction dropped. Ana and Ben both dropped half a cent; the tie goes to the one listed first.</li>
+</ol>
+<figcaption>The largest remainder method. Each part is within one cent of its exact share, and the parts always add up to the amount paid. Equal, percentage and share splits all use it, with different weights.</figcaption>
+</figure>
+
+<p>Everything is integer arithmetic. The fraction each part lost is kept as a remainder, <code>(cents × weight) mod total</code>, so comparing fractions never involves a number that cannot be stored exactly. The test divided 10,000 random amounts by random weights: every time the parts added up to the amount, and every part was within one cent of its exact share. Rounding each part on its own, the method most code reaches for first, missed the total in 4,115 of the 10,000 cases.</p>
+<p>One property the method lacks is worth knowing. With weights 1, 3 and 3, an amount of 10 cents divides as 2, 4 and 4, and 11 cents as 1, 5 and 5: one cent more in total, one cent less for the first person. Parliaments know this as the Alabama paradox. For money it is harmless, since every part stays within a cent of its exact share, but a test that assumes parts grow with the total will fail.</p>
+
+<h3 id="splits">The four kinds of split</h3>
+<pre data-lang="ts" data-title="Split as data, and one function that interprets it">
+export type UserId = string;
+
+// How an expense is divided. It is plain data, because it is stored with the expense and shown again later.
+export type Split =
+  | { kind: "equal"; among: readonly UserId[] }
+  | { kind: "exact"; amounts: Readonly<Record<UserId, number>> }   // cents
+  | { kind: "percent"; percents: Readonly<Record<UserId, number>> } // up to two decimal places, adding up to 100
+  | { kind: "shares"; shares: Readonly<Record<UserId, number>> };   // whole numbers, such as 2 for a couple
+
+export class SplitError extends Error {}
+
+// Each kind of split, as a function from the total to each person's part. Three of the four are the same
+// calculation, allocate, with different weights; only "exact" is checked rather than computed.
+export function sharesOf(total: Money, split: Split): Map<UserId, Money> {
+  const weighted = (people: readonly UserId[], weights: readonly number[]) => {
+    if (people.length === 0) throw new SplitError("a split needs at least one person");
+    if (new Set(people).size !== people.length) throw new SplitError("a person appears twice in the split");
+    const parts = total.allocate(weights);
+    return new Map(people.map((p, i) => [p, parts[i] as Money]));
+  };
+  switch (split.kind) {
+    case "equal":
+      return weighted(split.among, split.among.map(() => 1));
+    case "shares": {
+      const people = Object.keys(split.shares);
+      const weights = people.map((p) => split.shares[p] as number);
+      if (weights.some((w) => !Number.isInteger(w) || w < 1)) throw new SplitError("shares are whole numbers of at least 1");
+      return weighted(people, weights);
+    }
+    case "percent": {
+      const people = Object.keys(split.percents);
+      const basisPoints = people.map((p) => Math.round((split.percents[p] as number) * 100));
+      if (basisPoints.some((b, i) => b < 0 || Math.abs(b - (split.percents[people[i] as UserId] as number) * 100) > 1e-6)) {
+        throw new SplitError("percentages have at most two decimal places and are not negative");
+      }
+      if (basisPoints.reduce((a, b) => a + b, 0) !== 10_000) throw new SplitError("percentages must add up to 100");
+      return weighted(people, basisPoints);
+    }
+    case "exact": {
+      const people = Object.keys(split.amounts);
+      const parts = people.map((p) => Money.of(split.amounts[p] as number, total.currency));
+      const sum = parts.reduce((a, b) => a.plus(b), Money.zero(total.currency));
+      if (!sum.equals(total)) throw new SplitError(`exact amounts add up to ${sum}, not ${total}`);
+      if (parts.some((m) => m.cents < 0)) throw new SplitError("an amount cannot be negative");
+      return new Map(people.map((p, i) => [p, parts[i] as Money]));
+    }
+  }
+}
+</pre>
+<p>Three of the four kinds are the same calculation with different weights: 1 each for equal, the shares for shares, and the percentages in hundredths, so that 33.33% becomes the whole number 3,333. Only exact amounts are checked rather than computed, and the check is that they add up to the total. The validation is strict for a reason: a percentage split that adds up to 99% would leave a percent of the bill owed by nobody, and an error now is better than a balance that cannot be explained later. The test tries eight invalid splits, from an empty list to a negative amount, and every one is refused.</p>
+
+<h3 id="group">The group and its history</h3>
+<pre data-lang="ts" data-title="Group: an append-only history, and balances worked out from it">
+// The aggregate: members, and an append-only list of what happened. Balances are worked out from the list.
+export class Group {
+  readonly currency: Currency;
+  private readonly members = new Set<UserId>();
+  private readonly entries: Entry[] = [];
+
+  constructor(currency: Currency, members: readonly UserId[]) {
+    this.currency = currency;
+    for (const m of members) this.members.add(m);
+  }
+
+  addExpense(input: { id: string; description: string; paidBy: UserId; cents: number; split: Split }): Expense {
+    if (this.findExpense(input.id)) throw new Error(`expense ${input.id} already exists`);
+    if (!Number.isInteger(input.cents) || input.cents <= 0) throw new Error("an expense is a positive amount");
+    this.requireMember(input.paidBy);
+    const amount = Money.of(input.cents, this.currency);
+    const shares = sharesOf(amount, input.split);
+    for (const person of shares.keys()) this.requireMember(person);
+    const expense: Expense = { id: input.id, description: input.description, paidBy: input.paidBy, amount, split: input.split, shares };
+    this.entries.push({ kind: "expense", expense });
+    return expense;
+  }
+
+  // …recordPayment(from, to, cents) appends a payment, after the same kind of checks…
+
+// A mistake is undone by a new entry that cancels it. Nothing is ever edited or removed.
+  reverse(expenseId: string): void {
+    if (!this.findExpense(expenseId)) throw new Error(`no expense ${expenseId}`);
+    if (this.entries.some((e) => e.kind === "reversal" && e.of === expenseId)) throw new Error(`expense ${expenseId} is already reversed`);
+    this.entries.push({ kind: "reversal", of: expenseId });
+  }
+// Each person's net position: positive if the group owes them, negative if they owe the group.
+  balances(): Map<UserId, Money> {
+    const net = new Map<UserId, Money>([...this.members].map((m) => [m, Money.zero(this.currency)]));
+    const add = (who: UserId, m: Money) => net.set(who, (net.get(who) as Money).plus(m));
+    for (const e of this.live()) {
+      if (e.kind === "expense") {
+        add(e.expense.paidBy, e.expense.amount);
+        for (const [who, share] of e.expense.shares) add(who, share.negate());
+      } else if (e.kind === "payment") {
+        add(e.payment.from, e.payment.amount);
+        add(e.payment.to, e.payment.amount.negate());
+      }
+    }
+    return net;
+  }
+</pre>
+<p>A <dfn>balance</dfn> is everything a person paid minus all their shares, plus repayments they made minus repayments they received. Each expense adds its amount to the payer and takes the same total from the people who shared it, so the balances of a group add up to zero after every entry. The test checks that after each of 20,000 random entries, a mixture of expenses, repayments and reversals, of which 1,447 were refused as invalid.</p>
+<p>Nothing is edited. A wrong expense is undone by a reversal, an entry that says “ignore expense e5”, and the corrected expense is added as a new one. The balances return to exactly where they were, which the test checks, and the history still shows what happened and when. That matters in an app where friends will ask why their balance changed. It is event sourcing (<x-ref to="event-driven-architecture#event-sourcing"></x-ref>) at the scale of one object.</p>
+
+<figure class="fig wide" id="fig-balances">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-labelledby="f723t f723d">
+<title id="f723t">Balances after each expense of a weekend away</title>
+<desc id="f723d">Net balances of four friends after each of four expenses, recorded from the chapter’s code. After the hotel, paid by Ana: Ana 270.00, Ben -90.00, Chloe -90.00, Dev -90.00. After the dinner, paid by Ben: Ana 248.62, Ben -25.87, Chloe -132.75, Dev -90.00. After the taxi, paid by Chloe: Ana 238.12, Ben -25.87, Chloe -90.75, Dev -121.50. After the groceries, paid by Dev: Ana 223.12, Ben -45.87, Chloe -90.75, Dev -86.50.</desc>
+<text class="ts end" x="392" y="22">owes the group</text>
+<text class="ts" x="408" y="22">is owed</text>
+<line class="axis" x1="400" y1="30" x2="400" y2="180"/>
+<text class="tb" x="10" y="62">Ana</text>
+<text class="tb" x="10" y="96">Ben</text>
+<text class="tb" x="10" y="130">Chloe</text>
+<text class="tb" x="10" y="164">Dev</text>
+<g class="hide" data-s="1" data-e="1">
+<rect class="bar store" x="400.0" y="48" width="260.0" height="20" rx="3"/>
+<text class="ts tb" x="668.0" y="63">+270.00</text>
+<rect class="bar fault" x="313.3" y="82" width="86.7" height="20" rx="3"/>
+<text class="ts tb end" x="305.3" y="97">−90.00</text>
+<rect class="bar fault" x="313.3" y="116" width="86.7" height="20" rx="3"/>
+<text class="ts tb end" x="305.3" y="131">−90.00</text>
+<rect class="bar fault" x="313.3" y="150" width="86.7" height="20" rx="3"/>
+<text class="ts tb end" x="305.3" y="165">−90.00</text>
+<text class="ts" x="10" y="206">1. Ana paid 360.00 for the hotel, split equally among all four.</text>
+</g>
+<g class="hide" data-s="2" data-e="2">
+<rect class="bar store" x="400.0" y="48" width="239.4" height="20" rx="3"/>
+<text class="ts tb" x="647.4" y="63">+248.62</text>
+<rect class="bar fault" x="375.1" y="82" width="24.9" height="20" rx="3"/>
+<text class="ts tb end" x="367.1" y="97">−25.87</text>
+<rect class="bar fault" x="272.2" y="116" width="127.8" height="20" rx="3"/>
+<text class="ts tb end" x="264.2" y="131">−132.75</text>
+<rect class="bar fault" x="313.3" y="150" width="86.7" height="20" rx="3"/>
+<text class="ts tb end" x="305.3" y="165">−90.00</text>
+<text class="ts" x="10" y="206">2. Ben paid 85.50 for the dinner, split in shares of 1, 1 and 2 among Ana, Ben and Chloe.</text>
+</g>
+<g class="hide" data-s="3" data-e="3">
+<rect class="bar store" x="400.0" y="48" width="229.3" height="20" rx="3"/>
+<text class="ts tb" x="637.3" y="63">+238.12</text>
+<rect class="bar fault" x="375.1" y="82" width="24.9" height="20" rx="3"/>
+<text class="ts tb end" x="367.1" y="97">−25.87</text>
+<rect class="bar fault" x="312.6" y="116" width="87.4" height="20" rx="3"/>
+<text class="ts tb end" x="304.6" y="131">−90.75</text>
+<rect class="bar fault" x="283.0" y="150" width="117.0" height="20" rx="3"/>
+<text class="ts tb end" x="275.0" y="165">−121.50</text>
+<text class="ts" x="10" y="206">3. Chloe paid 42.00 for the taxi, split 25% to Ana and 75% to Dev.</text>
+</g>
+<g class="hide" data-s="4">
+<rect class="bar store" x="400.0" y="48" width="214.9" height="20" rx="3"/>
+<text class="ts tb" x="622.9" y="63">+223.12</text>
+<rect class="bar fault" x="355.8" y="82" width="44.2" height="20" rx="3"/>
+<text class="ts tb end" x="347.8" y="97">−45.87</text>
+<rect class="bar fault" x="312.6" y="116" width="87.4" height="20" rx="3"/>
+<text class="ts tb end" x="304.6" y="131">−90.75</text>
+<rect class="bar fault" x="316.7" y="150" width="83.3" height="20" rx="3"/>
+<text class="ts tb end" x="308.7" y="165">−86.50</text>
+<text class="ts" x="10" y="206">4. Dev paid 61.37 for the groceries, split exactly: Ana 15.00, Ben 20.00, Dev 26.37.</text>
+</g>
+<text class="ts" x="10" y="228">Positive: the group owes this person. Negative: this person owes the group. The four always add up to zero.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Ana 270.00; Ben -90.00; Chloe -90.00; Dev -90.00">Ana pays for the hotel. She is owed everyone else’s quarter, 270.00 in all, and each of the others owes 90.00.</li>
+  <li data-msg="none" data-state="Ana 248.62; Ben -25.87; Chloe -132.75; Dev -90.00">Ben pays for dinner. His own share is 21.37, so he is owed the rest. Ana’s balance falls by her 21.38, Chloe’s by 42.75.</li>
+  <li data-msg="none" data-state="Ana 238.12; Ben -25.87; Chloe -90.75; Dev -121.50">Chloe pays for a taxi used by Ana and Dev. Her balance rises by the whole 42.00, since her own share is nothing.</li>
+  <li data-msg="none" data-state="Ana 223.12; Ben -45.87; Chloe -90.75; Dev -86.50">Dev pays for groceries with exact amounts. At the end Ana is owed 223.12, and the other three owe it between them.</li>
+</ol>
+<figcaption>A balance is all that a person paid minus all of their shares. Every expense adds its amount to one person and takes the same total from the people who shared it, so the balances always add up to zero.</figcaption>
+</figure>
+
+<h2 id="owes">Who owes whom</h2>
+<p>A balance says how much a person is owed or owes in total, not to whom. There are two ways to answer that, and they give different answers.</p>
+<ul>
+  <li><b>Pair by pair.</b> Every expense creates a debt from each sharer to the payer. Netting those for each pair of people gives a list that can be traced back to expenses: “Chloe owes Ben 42.75 for dinner.” With <i>n</i> people it can have up to <i>n</i>(<i>n</i> − 1) ÷ 2 entries.</li>
+  <li><b>From the balances.</b> Ignore where the debts came from, and find any set of payments that brings every balance to zero. Fewer payments, at the cost of “why am I paying Ana when I owe Ben?”</li>
+</ul>
+
+<figure class="fig wide" id="fig-debts">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f724t f724d">
+<title id="f724t">Six debts pair by pair, or three payments from the balances</title>
+<desc id="f724d">Two ways of showing who owes whom after the weekend. On the left, debts pair by pair: Ben owes Ana 68.62; Chloe owes Ana 79.50; Dev owes Ana 75.00; Chloe owes Ben 42.75; Dev owes Chloe 31.50; Ben owes Dev 20.00. Six payments. On the right, from the net balances: Chloe pays Ana 90.75; Dev pays Ana 86.50; Ben pays Ana 45.87. Three payments, and everyone ends at zero either way.</desc>
+<text class="tb" x="10" y="18">Pair by pair</text>
+<text class="ts" x="10" y="34">each expense makes debts to its payer</text>
+<path class="e sig" d="M279.0 149.7L192.6 86.5"/>
+<text class="ts tb" x="250" y="106">68.62</text>
+<path class="e sig" d="M61.0 149.7L147.4 86.5"/>
+<text class="ts tb end" x="90" y="106">79.50</text>
+<path class="e sig" d="M170.0 234.0L170.0 98.0"/>
+<text class="ts tb" x="176" y="214">75.00</text>
+<path class="e sig" d="M66.0 165.0L272.0 165.0"/>
+<text class="ts tb mid" x="120" y="158">42.75</text>
+<path class="e sig" d="M149.0 244.7L62.6 181.5"/>
+<text class="ts tb end" x="92" y="232">31.50</text>
+<path class="e sig" d="M279.0 180.3L192.6 243.5"/>
+<text class="ts tb" x="248" y="232">20.00</text>
+<circle class="n" cx="170" cy="70" r="24"/>
+<text class="ts mid tb" x="170" y="74">Ana</text>
+<circle class="n" cx="300" cy="165" r="24"/>
+<text class="ts mid tb" x="300" y="169">Ben</text>
+<circle class="n" cx="40" cy="165" r="24"/>
+<text class="ts mid tb" x="40" y="169">Chloe</text>
+<circle class="n" cx="170" cy="260" r="24"/>
+<text class="ts mid tb" x="170" y="264">Dev</text>
+<path class="e none dash" d="M360 10V290"/>
+<text class="tb" x="390" y="18">From the balances</text>
+<text class="ts" x="390" y="34">largest debt to largest credit</text>
+<path class="e sig" d="M441.0 149.7L527.4 86.5"/>
+<text class="ts tb end" x="470" y="106">90.75</text>
+<path class="e sig" d="M550.0 234.0L550.0 98.0"/>
+<text class="ts tb" x="556" y="214">86.50</text>
+<path class="e sig" d="M659.0 149.7L572.6 86.5"/>
+<text class="ts tb" x="630" y="106">45.87</text>
+<circle class="n" cx="550" cy="70" r="24"/>
+<text class="ts mid tb" x="550" y="74">Ana</text>
+<circle class="n" cx="680" cy="165" r="24"/>
+<text class="ts mid tb" x="680" y="169">Ben</text>
+<circle class="n" cx="420" cy="165" r="24"/>
+<text class="ts mid tb" x="420" y="169">Chloe</text>
+<circle class="n" cx="550" cy="260" r="24"/>
+<text class="ts mid tb" x="550" y="264">Dev</text>
+</svg>
+</div>
+<figcaption>Both settle everyone. The pair-by-pair view follows each expense; the plan from the balances never needs more than n − 1 payments for n people.</figcaption>
+</figure>
+
+<p>The test found a consequence that is easy to miss. After the four friends settled by the three payments on the right, every balance was zero, but the pair-by-pair view still listed six debts, such as Chloe owing Ben 42.75, each person’s adding up to nothing. Both views are correct, but they cannot be shown side by side once people have paid by one of them. An app has to choose for each group, and Splitwise does exactly this with a setting, “simplify debts”, which it describes as restructuring “who owes whom within a group to minimize the total number of payments”, adding that it “never changes anyone’s total balance”.</p>
+
+<h2 id="settle">Settling up</h2>
+<h3 id="greedy">Greedy, in at most n − 1 payments</h3>
+<pre data-lang="ts" data-title="Largest debt to largest credit">
+// The largest debt paid to the largest credit, again and again. Each transfer settles at least one person,
+// so there are never more than n - 1 transfers for n people who are not already settled.
+export function greedy(balances: ReadonlyMap<string, number>): Transfer[] {
+  check(balances);
+  const people = [...balances].filter(([, c]) => c !== 0).map(([who, cents]) => ({ who, cents }));
+  const transfers: Transfer[] = [];
+  for (;;) {
+    let creditor = null, debtor = null;
+    for (const p of people) {
+      if (p.cents > 0 && (!creditor || p.cents > creditor.cents)) creditor = p;
+      if (p.cents < 0 && (!debtor || p.cents < debtor.cents)) debtor = p;
+    }
+    if (!creditor || !debtor) return transfers;
+    const cents = Math.min(creditor.cents, -debtor.cents);
+    transfers.push({ from: debtor.who, to: creditor.who, cents });
+    creditor.cents -= cents;
+    debtor.cents += cents;
+  }
+}
+</pre>
+<p>Each payment is the smaller of the largest debt and the largest credit, so it brings at least one of the two people to zero, and they take no further part. With <i>n</i> people whose balances are not zero, the last payment settles two at once, so there are at most <i>n</i> − 1 payments. For the weekend away, greedy produced the three payments of the figure above.</p>
+
+<h3 id="fewest">The fewest payments</h3>
+<p>Greedy is not always the best. Here is a group of five where it needs four payments and three are enough.</p>
+
+<figure class="fig wide" id="fig-fewest">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f725t f725d">
+<title id="f725t">Five balances: settling greedily in four payments, or in three</title>
+<desc id="f725d">Balances: Ana +30, Ben +20, Chloe +20, Dev −40, Eve −30. The greedy method pays the largest debt to the largest credit each time: Dev pays Ana 30, Eve pays Ben 20, Dev pays Chloe 10 and Eve pays Chloe 10, four payments. The fewest payments come from splitting the group into parts that add up to zero: Ana and Eve, who settle with one payment of 30; and Ben, Chloe and Dev, who settle with two, Dev paying Ben 20 and Chloe 20. Three payments.</desc>
+<text class="tb" x="10" y="22">Greedy: four payments</text>
+<text class="tb" x="375" y="22">Fewest: three payments</text>
+<text class="ts" x="10" y="40">owed money on top, owing below, in euros</text>
+<text class="ts" x="375" y="40">two parts that each add up to zero</text>
+<path class="e none dash" d="M352 14V292"/>
+<g data-scene="greedy">
+<g data-s="1">
+<path class="e sig" d="M107.5 210.0L71.2 119.8"/>
+<rect class="n" x="76.4" y="155.9" width="26" height="17" rx="4"/>
+<text class="ts mid tb" x="89.4" y="168.9">30</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M222.5 210.0L186.2 119.8"/>
+<rect class="n" x="198.6" y="174.0" width="26" height="17" rx="4"/>
+<text class="ts mid tb" x="211.6" y="187.0">20</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M139.5 218.0L267.0 111.3"/>
+<rect class="n" x="218.3" y="132.2" width="26" height="17" rx="4"/>
+<text class="ts mid tb" x="231.3" y="145.2">10</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M243.3 210.0L279.0 119.9"/>
+<rect class="n" x="248.1" y="155.9" width="26" height="17" rx="4"/>
+<text class="ts mid tb" x="261.1" y="168.9">10</text>
+</g>
+</g>
+<g data-scene="fewest">
+<g data-s="1">
+<rect class="n" x="388" y="56" width="74" height="216" rx="14" style="fill:none;stroke-dasharray:5 4"/>
+<rect class="n" x="506" y="56" width="200" height="216" rx="14" style="fill:none;stroke-dasharray:5 4"/>
+<text class="ts mid" x="425" y="288">adds up to 0</text>
+<text class="ts mid" x="606" y="288">adds up to 0</text>
+</g>
+<g data-s="2">
+<path class="e store" d="M615.8 210.2L653.5 119.7"/>
+<rect class="n" x="621.6" y="155.9" width="26" height="17" rx="4"/>
+<text class="ts mid tb" x="634.6" y="168.9">20</text>
+</g>
+<g data-s="3">
+<path class="e store" d="M594.2 210.2L556.5 119.7"/>
+<rect class="n" x="562.4" y="155.9" width="26" height="17" rx="4"/>
+<text class="ts mid tb" x="575.4" y="168.9">20</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M425.0 208.0L425.0 122.0"/>
+<rect class="n" x="412.0" y="156.0" width="26" height="17" rx="4"/>
+<text class="ts mid tb" x="425.0" y="169.0">30</text>
+</g>
+</g>
+<circle class="n store" cx="60" cy="92" r="26"/>
+<text class="ts mid tb" x="60" y="90">Ana</text>
+<text class="ts mid" x="60" y="105">+30</text>
+<circle class="n store" cx="175" cy="92" r="26"/>
+<text class="ts mid tb" x="175" y="90">Ben</text>
+<text class="ts mid" x="175" y="105">+20</text>
+<circle class="n store" cx="290" cy="92" r="26"/>
+<text class="ts mid tb" x="290" y="90">Chloe</text>
+<text class="ts mid" x="290" y="105">+20</text>
+<circle class="n fault" cx="118" cy="236" r="26"/>
+<text class="ts mid tb" x="118" y="234">Dev</text>
+<text class="ts mid" x="118" y="249">−40</text>
+<circle class="n fault" cx="233" cy="236" r="26"/>
+<text class="ts mid tb" x="233" y="234">Eve</text>
+<text class="ts mid" x="233" y="249">−30</text>
+<circle class="n store" cx="425" cy="92" r="26"/>
+<text class="ts mid tb" x="425" y="90">Ana</text>
+<text class="ts mid" x="425" y="105">+30</text>
+<circle class="n fault" cx="425" cy="236" r="26"/>
+<text class="ts mid tb" x="425" y="234">Eve</text>
+<text class="ts mid" x="425" y="249">−30</text>
+<circle class="n store" cx="545" cy="92" r="26"/>
+<text class="ts mid tb" x="545" y="90">Ben</text>
+<text class="ts mid" x="545" y="105">+20</text>
+<circle class="n store" cx="665" cy="92" r="26"/>
+<text class="ts mid tb" x="665" y="90">Chloe</text>
+<text class="ts mid" x="665" y="105">+20</text>
+<circle class="n fault" cx="605" cy="236" r="26"/>
+<text class="ts mid tb" x="605" y="234">Dev</text>
+<text class="ts mid" x="605" y="249">−40</text>
+</svg>
+</div>
+<ol class="steps" data-scene="greedy" data-label="Greedy">
+  <li data-msg="none" data-state="Payments: 1; left: Ben +20, Chloe +20, Dev −10, Eve −30">The largest debt is Dev’s 40 and the largest credit Ana’s 30. Dev pays Ana 30, and Ana is settled.</li>
+  <li data-msg="none" data-state="Payments: 2; left: Chloe +20, Dev −10, Eve −10">Now the largest debt is Eve’s 30 and the largest credit Ben’s 20. Eve pays Ben 20.</li>
+  <li data-msg="none" data-state="Payments: 3; left: Chloe +10, Eve −10">Dev pays his last 10 to Chloe.</li>
+  <li data-msg="none" data-state="Payments: 4; everyone at zero">Eve pays her last 10 to Chloe. Everyone is settled, in four payments.</li>
+</ol>
+<ol class="steps" data-scene="fewest" data-label="Fewest">
+  <li data-msg="none" data-state="Groups: {Ana, Eve} and {Ben, Chloe, Dev}">Look for parts of the group that add up to zero on their own. Ana and Eve do: +30 and −30. So do Ben, Chloe and Dev: +20, +20 and −40.</li>
+  <li data-msg="none" data-state="Payments: 1">Dev pays Chloe 20, which settles her.</li>
+  <li data-msg="none" data-state="Payments: 2">Dev pays Ben 20, and the second group is settled.</li>
+  <li data-msg="none" data-state="Payments: 3; everyone at zero">Eve pays Ana 30. Two groups of two and three people take one and two payments: three in all.</li>
+</ol>
+<figcaption>Greedy never needs more than one fewer than the number of people. The fewest is the number of people minus the number of separate groups that add up to zero, and finding those groups is the hard part.</figcaption>
+</figure>
+
+<p>The reason generalizes. If some people’s balances add up to zero on their own, they can settle among themselves, and a group of <i>k</i> such people needs <i>k</i> − 1 payments. Splitting everyone into as many separate zero-sum parts as possible therefore gives the fewest payments: the number of people minus the number of parts. Finding the largest number of such parts is hard. Tom Verhoeff showed in 2004 that minimizing the number of payments is NP-hard, by reduction from a known hard partitioning problem, so no method is known that is fast for every large group.</p>
+<p>For groups of the usual size, trying every subset is fine. The code below builds, for every set of people, the most zero-sum parts it can be split into, by removing one person at a time.</p>
+<pre data-lang="ts" data-title="The fewest payments, by trying every subset">
+// The fewest transfers. A group of people whose balances add up to zero can settle among themselves in
+// (size - 1) transfers, so the fewest transfers for everyone is n minus the largest number of separate
+// zero-sum groups. Finding that number is NP-hard; this tries every subset, which is fine up to about 20 people.
+export function fewest(balances: ReadonlyMap<string, number>): Transfer[] {
+  check(balances);
+  const people = [...balances].filter(([, c]) => c !== 0);
+  const n = people.length;
+  if (n > 22) throw new Error("too many people to search every subset");
+  const size = 1 << n;
+  const sum = new Float64Array(size);
+  const best = new Int8Array(size);   // the most zero-sum groups that this set of people can be split into
+  const last = new Int8Array(size);   // the person added last on the way to that best
+  for (let mask = 1; mask < size; mask += 1) {
+    const low = 31 - Math.clz32(mask & -mask);
+    sum[mask] = (sum[mask & (mask - 1)] as number) + (people[low] as [string, number])[1];
+    let top = -1, who = -1;
+    for (let i = 0; i < n; i += 1) {
+      if (mask & (1 << i) && (best[mask ^ (1 << i)] as number) > top) { top = best[mask ^ (1 << i)] as number; who = i; }
+    }
+    best[mask] = top + (sum[mask] === 0 ? 1 : 0);
+    last[mask] = who;
+  }
+  // Walk back to recover an order of people in which every zero-sum prefix closes a group, then settle each group.
+  const order: number[] = [];
+  for (let mask = size - 1; mask; mask ^= 1 << (last[mask] as number)) order.unshift(last[mask] as number);
+  const transfers: Transfer[] = [];
+  let group = new Map<string, number>(), running = 0;
+  for (const i of order) {
+    const [who, cents] = people[i] as [string, number];
+    group.set(who, cents); running += cents;
+    if (running === 0) { transfers.push(...greedy(group)); group = new Map(); }
+  }
+  return transfers;
+}
+</pre>
+<p>It does 2<sup><i>n</i></sup> × <i>n</i> steps. In one run of the chapter’s code it took 0.1 milliseconds for 10 people, 1.6 for 14, 6.9 for 16, 29 for 18 and 145 for 20, roughly quadrupling for every two people. Somewhere in the twenties it stops being an option, and greedy is the fallback. The test checked it against a slower method still, listing every way of dividing up to seven people into groups, on 300 random cases.</p>
+
+<h3 id="how-often">How often it matters</h3>
+
+<figure class="fig wide" id="fig-gap">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 308" role="img" aria-labelledby="f726t f726d">
+<title id="f726t">How often greedy needs more payments than the fewest</title>
+<desc id="f726d">Out of 2,000 random groups for each size, the share in which the greedy plan needed more payments than the fewest possible. With round amounts: 4 people 0.0 percent, 6 people 6.0 percent, 8 people 26.9 percent, 10 people 47.9 percent, 12 people 63.3 percent. With amounts of any number of cents: 4 people 0.0 percent, 6 people 0.0 percent, 8 people 0.1 percent, 10 people 0.5 percent, 12 people 2.5 percent.</desc>
+<text class="tb" x="10" y="18">Groups in which greedy needed more payments, of 2,000 random groups of each size</text>
+<rect class="bar" x="10" y="32" width="14" height="12" rx="2"/>
+<text class="ts" x="30" y="42">every share a round number of euros</text>
+<rect class="bar mute" x="290" y="32" width="14" height="12" rx="2"/>
+<text class="ts" x="310" y="42">amounts of any number of cents</text>
+<text class="ts end" x="110" y="80">4 people</text>
+<rect class="bar " x="120" y="60" width="1.5" height="14" rx="3"/>
+<text class="ts tb" x="128.0" y="72">0.0%</text>
+<rect class="hit" x="10" y="58" width="700" height="17" data-tip="4 people, round amounts|greedy needed more in 0 of 2,000 groups (0.0%)|0 extra payments in all; fewest averaged 2.83"/>
+<rect class="bar mute" x="120" y="77" width="1.5" height="14" rx="3"/>
+<text class="ts tb" x="128.0" y="89">0.0%</text>
+<rect class="hit" x="10" y="75" width="700" height="17" data-tip="4 people, any amounts|greedy needed more in 0 of 2,000 groups (0.0%)|0 extra payments in all; fewest averaged 3"/>
+<text class="ts end" x="110" y="126">6 people</text>
+<rect class="bar " x="120" y="106" width="31.2" height="14" rx="3"/>
+<text class="ts tb" x="159.2" y="118">6.0%</text>
+<rect class="hit" x="10" y="104" width="700" height="17" data-tip="6 people, round amounts|greedy needed more in 120 of 2,000 groups (6.0%)|120 extra payments in all; fewest averaged 4.61"/>
+<rect class="bar mute" x="120" y="123" width="1.5" height="14" rx="3"/>
+<text class="ts tb" x="128.0" y="135">0.0%</text>
+<rect class="hit" x="10" y="121" width="700" height="17" data-tip="6 people, any amounts|greedy needed more in 0 of 2,000 groups (0.0%)|0 extra payments in all; fewest averaged 5"/>
+<text class="ts end" x="110" y="172">8 people</text>
+<rect class="bar " x="120" y="152" width="139.6" height="14" rx="3"/>
+<text class="ts tb" x="267.6" y="164">26.9%</text>
+<rect class="hit" x="10" y="150" width="700" height="17" data-tip="8 people, round amounts|greedy needed more in 537 of 2,000 groups (26.9%)|552 extra payments in all; fewest averaged 6.2"/>
+<rect class="bar mute" x="120" y="169" width="1.5" height="14" rx="3"/>
+<text class="ts tb" x="128.5" y="181">0.1%</text>
+<rect class="hit" x="10" y="167" width="700" height="17" data-tip="8 people, any amounts|greedy needed more in 2 of 2,000 groups (0.1%)|2 extra payments in all; fewest averaged 7"/>
+<text class="ts end" x="110" y="218">10 people</text>
+<rect class="bar " x="120" y="198" width="248.8" height="14" rx="3"/>
+<text class="ts tb" x="376.8" y="210">47.9%</text>
+<rect class="hit" x="10" y="196" width="700" height="17" data-tip="10 people, round amounts|greedy needed more in 957 of 2,000 groups (47.9%)|1,037 extra payments in all; fewest averaged 7.76"/>
+<rect class="bar mute" x="120" y="215" width="2.9" height="14" rx="3"/>
+<text class="ts tb" x="130.9" y="227">0.5%</text>
+<rect class="hit" x="10" y="213" width="700" height="17" data-tip="10 people, any amounts|greedy needed more in 11 of 2,000 groups (0.5%)|11 extra payments in all; fewest averaged 8.99"/>
+<text class="ts end" x="110" y="264">12 people</text>
+<rect class="bar " x="120" y="244" width="329.2" height="14" rx="3"/>
+<text class="ts tb" x="457.2" y="256">63.3%</text>
+<rect class="hit" x="10" y="242" width="700" height="17" data-tip="12 people, round amounts|greedy needed more in 1,266 of 2,000 groups (63.3%)|1,551 extra payments in all; fewest averaged 9.24"/>
+<rect class="bar mute" x="120" y="261" width="13.0" height="14" rx="3"/>
+<text class="ts tb" x="141.0" y="273">2.5%</text>
+<rect class="hit" x="10" y="259" width="700" height="17" data-tip="12 people, any amounts|greedy needed more in 50 of 2,000 groups (2.5%)|50 extra payments in all; fewest averaged 10.97"/>
+<line class="axis" x1="120" y1="56" x2="120" y2="280"/>
+<text class="ts" x="10" y="298">Round amounts make coincidences: two people whose balances cancel exactly. Arbitrary cents almost never do.</text>
+</svg>
+</div>
+<figcaption>Greedy is optimal when no smaller part of the group adds up to zero, which is the usual case with arbitrary amounts. Friends who split round numbers create such parts often, and then greedy pays one extra payment, occasionally two.</figcaption>
+</figure>
+
+<p>The answer depends on the amounts. When expenses are arbitrary numbers of cents, two people’s balances almost never cancel exactly, no smaller part of the group adds up to zero, and greedy is already optimal: in groups of 10 it was beaten in 11 cases out of 2,000. Friends who split round numbers, “ten euros each”, create such coincidences constantly, and in groups of 10 greedy needed an extra payment in 48% of cases. Almost always one extra, occasionally two. So an app can run the exact search for groups up to about fifteen people, where it takes milliseconds, and greedy beyond that, and the users will rarely see the difference.</p>
+
+<div class="widget" data-widget="settleup">
+<h4>Settling up six friends</h4>
+<p>Enter what five of them are owed, as positive numbers, or owe, as negative numbers. Fay’s balance is whatever makes the six add up to zero. The default is the group from the figure above.</p>
+<div class="controls">
+  <label>Ana<input type="number" name="ana" value="30" min="-10000" max="10000" step="0.01"></label>
+  <label>Ben<input type="number" name="ben" value="20" min="-10000" max="10000" step="0.01"></label>
+  <label>Chloe<input type="number" name="chloe" value="20" min="-10000" max="10000" step="0.01"></label>
+  <label>Dev<input type="number" name="dev" value="-40" min="-10000" max="10000" step="0.01"></label>
+  <label>Eve<input type="number" name="eve" value="-30" min="-10000" max="10000" step="0.01"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 258" role="img" aria-label="Six people in a ring with their balances, and arrows for the fewest payments that settle them."><path d="M341.4 183.6 L461.5 91.6" class="e store"></path><rect x="379.5" y="127.6" width="44" height="18" rx="4" class="n"></rect><text x="401.5" y="141.6" class="ts mid tb">20.00</text><path d="M346.2 193.3 L456.4 165.2" class="e store"></path><rect x="379.3" y="169.2" width="44" height="18" rx="4" class="n"></rect><text x="401.3" y="183.2" class="ts mid tb">20.00</text><path d="M176.9 141.6 L297 49.6" class="e store"></path><rect x="214.9" y="85.6" width="44" height="18" rx="4" class="n"></rect><text x="236.9" y="99.6" class="ts mid tb">30.00</text><circle cx="320" cy="32" r="24" class="n store"></circle><text x="320" y="30" class="ts mid tb">Ana</text><text x="320" y="44" class="ts mid">+30.00</text><circle cx="484.5" cy="74" r="24" class="n store"></circle><text x="484.5" y="72" class="ts mid tb">Ben</text><text x="484.5" y="86" class="ts mid">+20.00</text><circle cx="484.5" cy="158" r="24" class="n store"></circle><text x="484.5" y="156" class="ts mid tb">Chloe</text><text x="484.5" y="170" class="ts mid">+20.00</text><circle cx="320" cy="200" r="24" class="n fault"></circle><text x="320" y="198" class="ts mid tb">Dev</text><text x="320" y="212" class="ts mid">-40.00</text><circle cx="155.5" cy="158" r="24" class="n fault"></circle><text x="155.5" y="156" class="ts mid tb">Eve</text><text x="155.5" y="170" class="ts mid">-30.00</text><circle cx="155.5" cy="74" r="24" class="n "></circle><text x="155.5" y="72" class="ts mid tb">Fay</text><text x="155.5" y="86" class="ts mid">0.00</text><text x="10" y="250" class="ts">Arrows: the fewest payments, from the person who owes to the person owed.</text></svg>
+<dl class="results">
+  <div><dt>Fay’s balance</dt><dd data-out="fay">0.00</dd></div>
+  <div><dt>Payments, greedy</dt><dd data-out="greedy">4</dd></div>
+  <div><dt>Payments, fewest</dt><dd data-out="fewest">3</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Greedy needs 4 payments and 3 are enough, because the group splits into 2 parts that each add up to zero and can settle among themselves.</p>
+</div>
+
+<h2 id="walk">Step 7: Walk it</h2>
+<p>Follow Ben adding the dinner: 85.50, shares of 1 for Ana, 1 for himself and 2 for Chloe.</p>
+<ol>
+  <li><code>addExpense</code> checks that the id is new, the amount is positive and Ben is a member.</li>
+  <li><code>sharesOf</code> sees <code>kind: "shares"</code>, checks that the shares are whole numbers of at least 1, and calls <code>allocate</code> with weights 1, 1 and 2: Ana 21.38, Ben 21.37, Chloe 42.75.</li>
+  <li>The group checks that Ana and Chloe are members, then appends the expense, with the split as entered and the three shares as computed.</li>
+  <li>Later, <code>balances</code> walks the history: Ben gains 85.50 and loses his own 21.37, Ana loses 21.38 and Chloe 42.75. The four balances still add up to zero.</li>
+  <li>When the weekend is over, <code>greedy</code> or <code>fewest</code> turns the balances into payments. As each is made, <code>recordPayment</code> adds it to the history, and the balances move to zero.</li>
+</ol>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Several people paid for one expense</th><td><code>paidBy</code> becomes a list of payers and amounts that must add up to the total. Each payer gains what they paid</td><td>The split, and the rule that every entry adds as much as it takes</td></tr>
+<tr><th>Several currencies in one group</th><td>A balance for each currency, and settling up in each separately. Converting needs a rate chosen and recorded at the moment of conversion</td><td>Money never mixes currencies: <code>plus</code> refuses</td></tr>
+<tr><th>The same person always gets the extra cent</th><td>Ties go to the first in the list, so a fixed order favors one person slightly. Start the tie-breaking at a position derived from the expense id</td><td><code>allocate</code>’s guarantee that parts add up</td></tr>
+<tr><th>Two members add expenses at the same moment</th><td>Each addition appends to the history. With the group stored as one record, a version number on it turns a lost update into a retry (<x-ref to="domain-modeling#aggregates"></x-ref>)</td><td>Balances, which are derived and so cannot disagree with the history</td></tr>
+<tr><th>Groups of hundreds</th><td>Greedy only, and balances kept up to date as entries arrive instead of recomputed</td><td>The entries and the invariants</td></tr>
+<tr><th>Show each person what they owe across all groups</th><td>A view that adds balances for each pair of people over their groups, per currency</td><td>Each group’s own history</td></tr>
+</tbody>
+</table>
+
+<div class="note interview"><p><span class="label">In an interview.</span> State early that money is whole cents in a value type, and that the shares of every expense must add up to its amount. Then show the split as a small union with one function, and say why it is data. Interviewers often ask for “simplify debts” at the end: give the greedy method and its <i>n</i> − 1 bound, say that the true minimum is NP-hard and why, and offer the subset search for small groups.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Amounts as floating-point numbers</th><td>Balances that should be zero show 0.0000000001, and totals drift</td><td>Whole cents in a value type</td></tr>
+<tr><th>Rounding each share separately</th><td>Shares that miss the total, in 41% of the test’s random cases</td><td>Allocate the leftover cents explicitly</td></tr>
+<tr><th>A class for each split, saved as a type name</th><td>Saving and loading needs a factory, and old expenses depend on today’s classes</td><td>A union of plain records, with the computed shares stored beside the rule</td></tr>
+<tr><th>Recomputing old shares with today’s rules</th><td>Balances change for expenses that nobody touched</td><td>Store the shares when the expense is added</td></tr>
+<tr><th>Editing or deleting expenses in place</th><td>Balances change with no record of why</td><td>Reverse, and add a corrected expense</td></tr>
+<tr><th>Accepting percentages that add up to 99</th><td>Part of the bill is owed by nobody</td><td>Refuse any split that does not account for the whole amount</td></tr>
+<tr><th>Showing pair-by-pair debts after settling from the balances</th><td>Debts that are not owed, in a list that adds up to zero for everyone</td><td>One way of showing debts for each group</td></tr>
+<tr><th>Claiming the greedy plan is the minimum</th><td>It is not, about half the time for ten friends splitting round amounts</td><td>Say it is at most <i>n</i> − 1, and search exactly when the group is small</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="domain-modeling#values"></x-ref>: the Money value object this chapter extends.</li>
+  <li><x-ref to="behavioral-patterns#strategy"></x-ref>: a strategy chosen by a value instead of by a class.</li>
+  <li><x-ref to="event-driven-architecture#event-sourcing"></x-ref>: state derived from an append-only history.</li>
+  <li><x-ref to="errors-and-testing#property"></x-ref>: checking a rule over thousands of random inputs.</li>
+  <li><x-ref to="hld-payments"></x-ref> and <x-ref to="hld-digital-wallet"></x-ref>: money that does move, with ledgers at scale.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Money is whole cents in a value type, and every division of it must add up to what was divided.</li>
+  <li>The largest remainder method divides by any weights without losing a cent. Equal, percentage and share splits are the same method with different weights.</li>
+  <li>Store a split as plain data, and store the shares it produced beside it.</li>
+  <li>Balances add up to zero because every entry adds to one side what it takes from the other. Test that after every entry.</li>
+  <li>Never edit history. Reverse and re-add.</li>
+  <li>Pair-by-pair debts and debts from balances are both correct, and must not be mixed once people pay by one of them.</li>
+  <li>Greedy settles in at most <i>n</i> − 1 payments. The fewest is <i>n</i> minus the most zero-sum parts, NP-hard in general and quick by subset search for small groups. Round amounts make greedy’s extra payment common.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A dinner of 100.00 is split by percentages 33.33, 33.33 and 33.34. What does each person pay, and how are the percentages turned into weights?</summary><p>The percentages become whole hundredths: 3,333, 3,333 and 3,334, adding up to 10,000. The exact shares are 33.33, 33.33 and 33.34 euros, which are already whole cents, so there is nothing left over and each pays exactly that.</p></details>
+<details><summary>Why does a percentage split that adds up to 99 have to be refused rather than scaled up?</summary><p>Scaling would silently change what the person entering it asked for, and leaving it would make one percent of the bill owed by nobody, so the balances could no longer be explained from the expenses. Either way the error surfaces later and further from its cause. Refusing it at entry asks the one person who knows the intended split to fix it.</p></details>
+<details><summary>Why are the shares stored with the expense instead of being recomputed from the split when needed?</summary><p>Because the rule that turns a split into shares may change, for example to rotate who gets leftover cents. Recomputing would change old balances that nobody touched. Storing the result keeps every past expense exactly as everyone saw it.</p></details>
+<details><summary>Prove that greedy never needs more than n − 1 payments for n people with balances that are not zero.</summary><p>Each payment is the smaller of the largest credit and the largest debt, so it brings at least one of those two people to zero, and a person at zero never takes part again. After n − 2 payments at most two people remain unsettled, and since balances add up to zero, their balances are equal and opposite, so one more payment settles both.</p></details>
+<details><summary>Balances are Ana +30, Ben +20, Chloe +20, Dev −40, Eve −30. What is the fewest number of payments, and how do you know it cannot be fewer?</summary><p>Three. Ana and Eve add up to zero, as do Ben, Chloe and Dev, so they settle in 1 + 2 payments. It cannot be fewer: the payments equal the number of people minus the number of zero-sum parts, so two payments would need three parts. Each part needs at least two people, one owed and one owing, so three parts need at least six people.</p></details>
+<details><summary>After a group settles using the payments suggested from balances, a user opens the pair-by-pair view and sees that she owes someone money. Is the app wrong?</summary><p>Not in its arithmetic. The pair-by-pair view still lists debts traced to individual expenses, and those were not paid directly; her total across them is zero. The app is wrong to show that view for a group that settles from balances. It should show one view per group.</p></details>
+<details><summary>With weights 1, 3 and 3, ten cents divides as 2, 4 and 4, and eleven cents as 1, 5 and 5. Is that a bug?</summary><p>No. It is a known property of the largest remainder method, the Alabama paradox: the leftover cents are reassigned as the fractions change, so a part can fall by a cent when the total rises. Every part is still within one cent of its exact share, and the parts still add up. Only a test that assumes parts grow with the total would object.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Splitwise Help Center, <a href="https://kb.splitwise.com/balances-and-expenses/what-is-simplify-debts">What is “simplify debts”?</a> The setting, and its guarantee that no total balance changes.</li>
+  <li>Tom Verhoeff, <a href="https://infedu.vu.lt/journal/INFEDU/article/612">Settling Multiple Debts Efficiently: An Invitation to Computing Science</a>, <cite>Informatics in Education</cite> 3(1), 2004, pp. 105–126. The n − 1 bound, zero-sum groups, and NP-hardness of the fewest transfers.</li>
+  <li><a href="https://en.wikipedia.org/wiki/Quota_method">Quota method</a>, Wikipedia. The largest remainder method, as used to divide parliamentary seats, and the Alabama paradox.</li>
+  <li>Martin Fowler, <a href="https://martinfowler.com/eaaCatalog/money.html">Money</a>, from <cite>Patterns of Enterprise Application Architecture</cite>, Addison-Wesley, 2002. A class for amounts that handles currency and rounding.</li>
+</ol>
+</section>

@@ -1,0 +1,690 @@
+<!--meta
+{ "description": "A chat system designed with the method of chapter 76: requirements and estimates for 500 million daily users, a WebSocket and HTTP API, a message store partitioned by conversation, gateways and delivery workers, delivery that survives lost packets and reconnects measured by simulation, one order for every device, receipts as watermarks, group chats, presence and many devices per user, failures, growth and what Discord and Messenger have published.",
+  "lede": "A chat message must appear once, in the right place, on every device of every member, including the phone that was in a tunnel when it was sent. Connections drop all the time, so the design cannot trust them: it stores each message first, numbers it within its conversation, and lets devices notice what they missed.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design a chat service like WhatsApp or Messenger. Users send messages to one another and to groups. Each message shows whether it has been sent, delivered and read. Users have a phone and possibly a laptop, and every device shows the whole conversation, including what arrived while it was offline.</p></div>
+<p>Sending a message from one connected device to another is easy. What is hard is everything around it. Hundreds of millions of devices hold open connections, and those connections break without warning. A message must survive that: it may not be lost, may not appear twice when a send is retried, and must sit in the same place in the conversation on every device. Groups multiply each message by their size, and receipts multiply it again. <x-ref to="realtime-communication#not-a-queue"></x-ref> stated the rule this chapter builds on: a connection is not a queue. The method of <x-ref to="hld-method"></x-ref> takes these in order.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<p>The questions that change this design are the group size, whether the server keeps history, how many devices a user has, and what “delivered” must mean. With the answers written down:</p>
+<table>
+<thead><tr><th>Feature</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><th>One-to-one chats and groups of up to 1,000 members; text and images</th><td>In scope</td></tr>
+<tr><th>Sent, delivered and read status; in groups, “read by” a number of members</th><td>In scope</td></tr>
+<tr><th>Several devices per user, each showing the full conversation; history kept on the server</th><td>In scope</td></tr>
+<tr><th>Online status and “last seen”; typing indicators</th><td>In scope, best effort</td></tr>
+<tr><th>A notification on devices that are not connected</th><td>In scope, through <x-ref to="hld-notifications"></x-ref></td></tr>
+<tr><th>Voice and video calls, search in messages, end-to-end encryption</th><td>Out of scope. Calls use WebRTC (<x-ref to="realtime-communication#webrtc"></x-ref>); encryption is a follow-up question</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Quality</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>500 million daily active users, 40 messages each a day. At the busiest hour, twice the average rate, and 40% of users connected</td></tr>
+<tr><th>Latency</th><td>Between two connected devices in one region, half of messages shown within 200 ms and 99% within 2 seconds</td></tr>
+<tr><th>Delivery</th><td>Every message reaches every device of every member, and is shown once</td></tr>
+<tr><th>Order</th><td>Every device shows a conversation in the same order, and a reply never above the message it answers</td></tr>
+<tr><th>Durability</th><td>Once the sender sees “sent”, the message is never lost</td></tr>
+<tr><th>Availability</th><td>99.99% for sending and receiving</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">messages     500 million × 40 = 20 billion a day ≈ 231,000 a second       peak × 2 ≈ 463,000
+deliveries   2 devices per message on average ≈ 926,000 a second at peak
+receipts     one delivery and one read receipt each ≈ 1.9 million a second at peak
+connections  500 million × 40% = 200 million at peak ÷ 500,000 per gateway = 400 gateways
+heartbeats   200 million connections ÷ one ping every 30 s ≈ 6.7 million a second
+storage      20 billion × 200 bytes = 4 TB a day ≈ 1.5 PB a year, in three copies ≈ 4.4 PB</div>
+<p>The 200 bytes of a message, with its ids, sender, time and a short text, and the two devices it reaches on average are assumptions; images are stored separately (<x-ref to="object-and-file-storage"></x-ref>). The arithmetic is that of <x-ref to="estimation#method"></x-ref>, and each line decides something.</p>
+<table>
+<thead><tr><th>The number</th><th>What it decides</th></tr></thead>
+<tbody>
+<tr><th>200 million open connections</th><td>A tier of gateways that only hold connections, separate from the services that store and route messages (<x-ref to="realtime-communication#gateway"></x-ref>)</td></tr>
+<tr><th>6.7 million heartbeats a second</th><td>The connections’ own upkeep outweighs the messages. Pings are cheap, carry useful state, and are spaced as widely as the network allows</td></tr>
+<tr><th>1.9 million receipts a second</th><td>Receipts outnumber messages four to one. Step 6c sends far fewer</td></tr>
+<tr><th>463,000 messages a second</th><td>A store that takes writes at that rate, partitioned by conversation</td></tr>
+<tr><th>4.4 PB a year</th><td>Old messages move to cheaper storage; recent weeks stay on fast disks</td></tr>
+</tbody>
+</table>
+
+<div class="widget wide" data-widget="chat82">
+<h4>Messages, receipts, connections and storage</h4>
+<p>Recomputes step 2, and shows which load is largest.</p>
+<div class="controls">
+  <label>Daily active users<input type="number" name="users" value="500000000" min="1" max="3000000000" step="1000000"></label>
+  <label>Messages per user a day<input type="number" name="messages" value="40" min="0" max="10000" step="1"></label>
+  <label>Devices reached per message<input type="number" name="devices" value="2" min="1" max="10000" step="0.1"></label>
+  <label>Bytes per message<input type="number" name="bytes" value="200" min="1" max="1000000" step="10"></label>
+  <label>Users connected at peak (%)<input type="number" name="connected" value="40" min="0.1" max="100" step="1"></label>
+  <label>Connections per gateway<input type="number" name="gateway" value="500000" min="1" max="10000000" step="10000"></label>
+  <label>Seconds between pings<input type="number" name="ping" value="30" min="1" max="3600" step="1"></label>
+  <label>Peak factor<input type="number" name="peak" value="2" min="1" max="20" step="0.5"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 170" role="img" aria-label="Bars of events a second at peak: messages sent, deliveries, receipts sent one per message, and heartbeats."><text x="10" y="16" class="ts">Events a second at peak</text><text x="140" y="43" class="ts end">Messages sent</text><rect x="150" y="28" width="26.4" height="20" rx="2" class="bar"></rect><text x="184.4" y="43" class="ts tb">463 thousand /s</text><text x="140" y="73" class="ts end">Deliveries</text><rect x="150" y="58" width="52.8" height="20" rx="2" class="bar"></rect><text x="210.8" y="73" class="ts tb">926 thousand /s</text><text x="140" y="103" class="ts end">Receipts, one each</text><rect x="150" y="88" width="105.6" height="20" rx="2" class="bar fault"></rect><text x="263.6" y="103" class="ts tb">1.85 million /s</text><text x="140" y="133" class="ts end">Heartbeats</text><rect x="150" y="118" width="380" height="20" rx="2" class="bar async"></rect><text x="538" y="133" class="ts tb">6.67 million /s</text><text x="10" y="160" class="ts">Heartbeats depend on connections, not on messages: one per connection per interval.</text></svg>
+<dl class="results">
+  <div><dt>Messages</dt><dd data-out="messages">231 thousand /s, peak 463 thousand /s</dd></div>
+  <div><dt>Deliveries</dt><dd data-out="deliveries">926 thousand /s at peak</dd></div>
+  <div><dt>Receipts, one per delivery and kind</dt><dd data-out="receipts">1.85 million /s at peak</dd></div>
+  <div><dt>Connections at peak</dt><dd data-out="connections">200 million on 400 gateways</dd></div>
+  <div><dt>Heartbeats</dt><dd data-out="pings">6.67 million /s</dd></div>
+  <div><dt>Storage</dt><dd data-out="storage">4 TB a day, 4.38 PB a year in 3 copies</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At peak 463 thousand messages a second become 926 thousand deliveries and, with one receipt of each kind per delivery, 1.85 million receipts. 200 million connections need 400 gateways and send 6.67 million heartbeats a second, so the largest load is heartbeats, not the messages. A year of messages is 4.38 PB in three copies.</p>
+</div>
+<p>Try a ping every 5 minutes, as a phone saving battery might: heartbeats fall to 667,000 a second, below the receipts. The trade is slower detection of dead connections, which the delivery protocol of step 6a tolerates.</p>
+
+<h2 id="api">Step 3: The API</h2>
+<p>A connected device uses one WebSocket for everything live (<x-ref to="realtime-communication#websocket"></x-ref>). Each frame is a small JSON object:</p>
+<pre data-lang="http" data-title="Frames on the WebSocket">
+→ { "type": "send", "conv": "c_81", "id": "a7:1043", "text": "on my way" }
+← { "type": "ack", "id": "a7:1043", "seq": 4102, "at": "2026-10-13T08:12:31.412Z" }
+← { "type": "msg", "conv": "c_81", "seq": 4103, "from": "u_12", "text": "see you" }
+→ { "type": "received", "conv": "c_81", "upTo": 4103 }
+→ { "type": "read", "conv": "c_81", "upTo": 4103 }
+← { "type": "ping", "listVersion": 99213 }
+</pre>
+<pre data-lang="http" data-title="Catching up over HTTP">
+GET /v1/sync?since=99180            → 200 OK
+  { "version": 99213, "changed": [ { "conv": "c_81", "newest": 4110 }, { "conv": "c_9", "newest": 77 } ] }
+GET /v1/conversations/c_81/messages?after=4105&limit=100   → 200 OK, messages 4106 to 4110
+POST /v1/conversations               → 201 Created, a new group
+POST /v1/media                       → 201 Created, with a presigned upload URL
+</pre>
+<ul>
+  <li><b>Ids and retries.</b> The device chooses each message’s id, here its own device number and a counter. A retried <code>send</code> carries the same id, and the server answers it with the sequence number it gave the first time (<x-ref to="api-styles#idempotency-keys"></x-ref>).</li>
+  <li><b>Receipts are positions.</b> <code>received</code> and <code>read</code> say “everything up to 4103”, never a single message. Step 6c explains why.</li>
+  <li><b>Catching up.</b> Each user has a conversation list with a version number that rises whenever any of their conversations changes. A device that has been away asks what changed since the version it last saw, then fetches each changed conversation after the last number it holds. The <code>after</code> cursor pages through long gaps (<x-ref to="api-styles#pagination"></x-ref>).</li>
+  <li><b>Errors.</b> A send to a conversation the user has left is refused with its id, so the device can mark that message as failed; a client over its limit is slowed (<x-ref to="hld-rate-limiter"></x-ref>).</li>
+</ul>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>What</th><th>Key</th><th>Store</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>A message: sender, device id, text, media ids, time</th><td>Conversation and week, then sequence number</td><td>A wide-column store, three copies</td><td>Every read is “this conversation, after this number”, one partition in order. The week bounds a partition’s size, however old the conversation (<x-ref to="data-models#wide-column"></x-ref>)</td></tr>
+<tr><th>A conversation: members, newest sequence number</th><td>Conversation</td><td>A partitioned key-value store</td><td>Read by the chat service that owns the conversation</td></tr>
+<tr><th>A member’s receipts: received up to, read up to</th><td>Conversation, then member and device</td><td>The same store</td><td>Two numbers per member, overwritten, never one row per message</td></tr>
+<tr><th>A user’s conversation list: each conversation’s newest number, and a version</th><td>User</td><td>A partitioned key-value store</td><td>What a returning device asks first</td></tr>
+<tr><th>Where each device is connected, and presence</th><td>Device</td><td>An in-memory store, entries expiring with the connection</td><td>Written on connect, read for every delivery (<x-ref to="realtime-communication#gateway"></x-ref>)</td></tr>
+<tr><th>Devices and their push tokens</th><td>User</td><td>A relational table</td><td>Small, changes rarely (<x-ref to="realtime-communication#push"></x-ref>)</td></tr>
+</tbody>
+</table>
+<p>A group message is stored once, in the conversation. What is written per member is small: their conversation list and, later, their receipts. Copying the message into an inbox per member would multiply the 4 TB a day by the average group size.</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 372" role="img" aria-labelledby="f821t f821d">
+<title id="f821t">The design of the chat system</title>
+<desc id="f821d">Devices connect through a load balancer to gateways that hold their connections. A gateway passes a sent message to the chat service, which gives it the next sequence number of its conversation and appends it to the message store, partitioned by conversation and week. After acknowledging the sender, the chat service puts the message on a queue. Delivery workers take it, look up where each member’s devices are connected in the connection registry, update each member’s conversation list and receipts, and hand the message to the gateways of connected devices. Devices that are not connected get a notification through the push service.</desc>
+<rect class="n" x="10" y="120" width="88" height="70" rx="6"/>
+<text class="tb mid" x="54" y="142.5">Devices</text>
+<text class="ts mid" x="54" y="159.5">phones,</text>
+<text class="ts mid" x="54" y="176.5">laptops</text>
+<rect class="n" x="118" y="40" width="64" height="226" rx="6"/>
+<text class="tb mid" x="150" y="149">Load</text>
+<text class="ts mid" x="150" y="166">balancer</text>
+<rect class="n sig" x="202" y="40" width="120" height="226" rx="6"/>
+<text class="tb mid" x="262" y="149">Gateways</text>
+<text class="ts mid" x="262" y="166">hold connections</text>
+<rect class="n sig" x="350" y="40" width="150" height="46" rx="6"/>
+<text class="tb mid" x="425" y="59">Chat service</text>
+<text class="ts mid" x="425" y="76">orders each conversation</text>
+<rect class="n async" x="350" y="130" width="150" height="46" rx="6"/>
+<text class="tb mid" x="425" y="149">Queue</text>
+<text class="ts mid" x="425" y="166">stored messages</text>
+<rect class="n async" x="350" y="220" width="150" height="46" rx="6"/>
+<text class="tb mid" x="425" y="239">Delivery workers</text>
+<text class="ts mid" x="425" y="256">one job per message</text>
+<rect class="n" x="350" y="300" width="150" height="46" rx="6"/>
+<text class="tb mid" x="425" y="319">Push service</text>
+<text class="ts mid" x="425" y="336">APNs and FCM</text>
+<rect class="n store" x="540" y="40" width="170" height="46" rx="6"/>
+<text class="tb mid" x="625" y="59">Message store</text>
+<text class="ts mid" x="625" y="76">by conversation and week</text>
+<rect class="n store" x="540" y="130" width="170" height="46" rx="6"/>
+<text class="tb mid" x="625" y="149">Connection registry</text>
+<text class="ts mid" x="625" y="166">device to gateway</text>
+<rect class="n store" x="540" y="220" width="170" height="46" rx="6"/>
+<text class="tb mid" x="625" y="239">Conversation lists</text>
+<text class="ts mid" x="625" y="256">and each member’s receipts</text>
+<path class="e sig" d="M98 155H118"/>
+<path class="e sig" d="M182 155H202"/>
+<path class="e sig" d="M322 63H350"/>
+<path class="e sig" d="M500 63H540"/>
+<text class="ts mid" x="520" y="32">append</text>
+<path class="e async" d="M425 86V130"/>
+<text class="ts" x="431" y="112">after the ack</text>
+<path class="e async" d="M425 176V220"/>
+<path class="e async" d="M500 232H520V153H540"/>
+<path class="e async" d="M500 250H540"/>
+<path class="e async" d="M350 243H322"/>
+<path class="e async" d="M425 266V300"/>
+<text class="ts" x="431" y="288">not connected</text>
+<path class="e async" d="M350 323H54V190"/>
+<text class="ts mid" x="200" y="316">a notification</text>
+<text class="ts" x="540" y="300">Solid: the request path.</text>
+<text class="ts" x="540" y="316">Dashed: after the sender’s ack.</text>
+</svg>
+</div>
+<figcaption>A message is stored and acknowledged on the solid path. Everything that depends on the other members, finding their devices and delivering, happens on the dashed path afterward.</figcaption>
+</figure>
+
+<p>Gateways hold connections and nothing else, so they can be restarted and scaled without touching messages. Each conversation is owned by one chat service instance at a time, chosen by consistent hashing on its id (<x-ref to="partitioning#consistent-hashing"></x-ref>), and that owner gives out its sequence numbers. The sender is acknowledged when the message is stored; delivering it to the other members, which for a large group is a thousand lookups and pushes, is queued work.</p>
+
+<figure class="fig wide" id="fig-flows">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 584" role="img" aria-labelledby="f822t f822d">
+<title id="f822t">Sending a message, and recovering from a lost one</title>
+<desc id="f822d">Two sequences. Sending: Ana’s phone sends a message with its own id; the chat service stores it as number 4102 of the conversation and acknowledges it, so Ana sees one tick; a delivery worker passes it to the gateway holding Ben’s phone; Ben’s phone reports that it has received everything up to 4102, and Ana sees two ticks. Recovering: Ben’s phone receives 4103, misses 4104 and receives 4105; seeing the gap, it asks for everything after 4103 and gets 4104 and 4105 from the store; later its connection drops, and on reconnecting it asks for everything after 4105.</desc>
+<text class="tb" x="10" y="16">Sending</text>
+<g data-scene="send">
+<text class="tb mid" x="50" y="40">Ana’s phone</text>
+<line class="axis" x1="50" y1="48" x2="50" y2="316"/>
+<text class="tb mid" x="156" y="40">Gateway A</text>
+<line class="axis" x1="156" y1="48" x2="156" y2="316"/>
+<text class="tb mid" x="272" y="40">Chat service</text>
+<line class="axis" x1="272" y1="48" x2="272" y2="316"/>
+<text class="tb mid" x="388" y="40">Message store</text>
+<line class="axis" x1="388" y1="48" x2="388" y2="316"/>
+<text class="tb mid" x="498" y="40">Delivery worker</text>
+<line class="axis" x1="498" y1="48" x2="498" y2="316"/>
+<text class="tb mid" x="596" y="40">Gateway B</text>
+<line class="axis" x1="596" y1="48" x2="596" y2="316"/>
+<text class="tb mid" x="674" y="40">Ben’s phone</text>
+<line class="axis" x1="674" y1="48" x2="674" y2="316"/>
+<g data-s="1">
+<path class="e sig" d="M51 72H155"/>
+<text class="ts mid" x="103.0" y="66">1. send a7:1043 “on my way”</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M157 99H271"/>
+<text class="ts mid" x="214.0" y="93">2. send a7:1043</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M273 126H387"/>
+<text class="ts mid" x="330.0" y="120">3. append 4102</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M271 153H51"/>
+<text class="ts mid" x="161.0" y="147">4. ack a7:1043 = 4102</text>
+</g>
+<g data-s="5">
+<path class="e async" d="M273 180H497"/>
+<text class="ts mid" x="385.0" y="174">5. new message 4102</text>
+</g>
+<g data-s="6">
+<path class="e async" d="M499 207H595"/>
+<text class="ts mid" x="547.0" y="201">6. for Ben’s phone: 4102</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M597 234H673"/>
+<text class="ts mid" x="635.0" y="228">7. 4102</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M673 261H273"/>
+<text class="ts mid" x="473.0" y="255">8. received up to 4102</text>
+</g>
+<g data-s="9">
+<path class="e store" d="M271 288H51"/>
+<text class="ts mid" x="161.0" y="282">9. delivered: 4102</text>
+</g>
+</g>
+<path class="e none dash" d="M10 330H710"/>
+<text class="tb" x="10" y="352">A lost message, and a reconnect</text>
+<g data-scene="recover">
+<text class="tb mid" x="60" y="376">Ben’s phone</text>
+<line class="axis" x1="60" y1="384" x2="60" y2="580"/>
+<text class="tb mid" x="250" y="376">Gateway B</text>
+<line class="axis" x1="250" y1="384" x2="250" y2="580"/>
+<text class="tb mid" x="440" y="376">Chat service</text>
+<line class="axis" x1="440" y1="384" x2="440" y2="580"/>
+<text class="tb mid" x="630" y="376">Message store</text>
+<line class="axis" x1="630" y1="384" x2="630" y2="580"/>
+<g data-s="1">
+<path class="e sig" d="M249 404H61"/>
+<text class="ts mid" x="155.0" y="398">1. 4103</text>
+</g>
+<g data-s="2">
+<path class="e fault" d="M249 426H124.6"/>
+<path class="x" d="M109.6 419l14 14M123.6 419l-14 14"/>
+<text class="ts mid" x="187.3" y="420">2. 4104</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M249 448H61"/>
+<text class="ts mid" x="155.0" y="442">3. 4105</text>
+</g>
+<g data-s="4">
+<path class="e sig" d="M61 470H439"/>
+<text class="ts mid" x="250.0" y="464">4. resume after 4103</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M441 492H629"/>
+<text class="ts mid" x="535.0" y="486">5. read after 4103</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M439 514H61"/>
+<text class="ts mid" x="250.0" y="508">6. 4104, 4105</text>
+</g>
+<g data-s="7" data-packet="none">
+<rect class="n fault" x="68" y="522" width="213.2" height="22" rx="4"/>
+<text class="ts mid" x="174.6" y="537">7. connection lost for 2 minutes</text>
+</g>
+<g data-s="8">
+<path class="e sig" d="M61 558H439"/>
+<text class="ts mid" x="250.0" y="552">8. reconnect: after 4105</text>
+</g>
+<g data-s="9">
+<path class="e store" d="M439 580H61"/>
+<text class="ts mid" x="250.0" y="574">9. 4106 to 4110</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="send" data-label="Send">
+  <li data-msg="a7:1043" data-state="Store: up to 4101; Ana sees: a clock; Ben’s phone: up to 4101">Ana’s phone sends the message with an id it chose itself, a7:1043, which it will reuse on every retry.</li>
+  <li data-msg="a7:1043" data-state="Store: up to 4101; Ana sees: a clock; Ben’s phone: up to 4101">The gateway passes it to the chat service instance that owns this conversation.</li>
+  <li data-msg="4102" data-state="Store: up to 4102; Ana sees: a clock; Ben’s phone: up to 4101">The id is new, so the service gives the message the conversation’s next number, 4102, and stores it in three copies.</li>
+  <li data-msg="ack" data-state="Store: up to 4102; Ana sees: one tick; Ben’s phone: up to 4101">Only now is Ana told the message is safe: one tick. A retry of a7:1043 would get the same answer.</li>
+  <li data-msg="4102" data-state="Store: up to 4102; Ana sees: one tick; Ben’s phone: up to 4101">Delivering to the other members is queued work. The sender does not wait for it.</li>
+  <li data-msg="4102" data-state="Store: up to 4102; Ana sees: one tick; Ben’s phone: up to 4101">The worker finds in the registry that Ben’s phone is connected to gateway B, and hands it the message.</li>
+  <li data-msg="4102" data-state="Store: up to 4102; Ana sees: one tick; Ben’s phone: up to 4102">Gateway B writes it to Ben’s connection. His phone shows it after 4101.</li>
+  <li data-msg="upTo 4102" data-state="Store: up to 4102; Ana sees: one tick; Ben’s phone: up to 4102">Ben’s phone reports one number: it has everything up to 4102. That is its delivery receipt.</li>
+  <li data-msg="delivered" data-state="Store: up to 4102; Ana sees: two ticks; Ben’s phone: up to 4102">Ana’s phone learns the message reached Ben: two ticks. A read receipt works the same way when Ben opens the chat.</li>
+</ol>
+<ol class="steps" data-scene="recover" data-label="Recover">
+  <li data-msg="4103" data-state="Ben’s phone shows: up to 4103; Held back: nothing">Message 4103 arrives and is shown.</li>
+  <li data-msg="4104" data-state="Ben’s phone shows: up to 4103; Held back: nothing">Message 4104 is lost: the connection broke and came back between two packets.</li>
+  <li data-msg="4105" data-state="Ben’s phone shows: up to 4103; Held back: 4105">Message 4105 arrives. The phone sees a gap after 4103, so it holds 4105 back instead of showing it out of order.</li>
+  <li data-msg="after 4103" data-state="Ben’s phone shows: up to 4103; Held back: 4105">It asks for everything after the last message it showed.</li>
+  <li data-msg="read" data-state="Ben’s phone shows: up to 4103; Held back: 4105">The service reads the conversation from the store, not from any connection.</li>
+  <li data-msg="4104, 4105" data-state="Ben’s phone shows: up to 4105; Held back: nothing">The phone gets 4104 and 4105 and shows both, in order.</li>
+  <li data-msg="none" data-state="Ben’s phone shows: up to 4105; Held back: nothing">Ben goes into a tunnel. Messages 4106 to 4110 are stored while he is away.</li>
+  <li data-msg="after 4105" data-state="Ben’s phone shows: up to 4105; Held back: nothing">On reconnecting, the phone says how far it got.</li>
+  <li data-msg="5 messages" data-state="Ben’s phone shows: up to 4110; Held back: nothing">It gets the five it missed, from the store. Nothing depended on the connection staying up.</li>
+</ol>
+<figcaption>The sender’s tick means “stored”, not “delivered”. A device that misses a message notices the gap in the numbers and asks again, so a lost push only delays.</figcaption>
+</figure>
+
+<p>Two details in the flows carry the design. The tick Ana sees first means “stored”, not “sent to Ben”, because the store is the only place a message is safe. And Ben’s phone never trusts that it has everything: the numbers tell it what is missing, and the store has it.</p>
+
+<h2 id="delivery">Step 6a: Delivery that survives disconnects</h2>
+<p>A <dfn>sequence number</dfn> is a message’s position in its conversation, given by the server when it stores the message: 4101, 4102, 4103, with no gaps. It is what lets a device know what it is missing. To measure what each part of the protocol buys, the simulation runs a group of five members on seven devices for an hour. Each member writes a message every 6 seconds on average. Each device stays connected for 5 minutes on average and then disappears for one, 2% of transmissions on a live connection are lost, and anything in flight when a device disconnects is lost too. Three protocols ran on the same people, writing at the same moments on the same devices.</p>
+<ul>
+  <li><b>Push only.</b> The writer’s gateway relays the message to each connected device, once. Nothing is stored.</li>
+  <li><b>Stored, no message ids.</b> The server stores each message it receives and numbers it. Writers retry until acknowledged; devices fill gaps from the store.</li>
+  <li><b>Stored, ids and sequence numbers.</b> The same, but each message carries the id its device chose, and the server keeps one copy per id.</li>
+</ul>
+<table>
+<thead><tr><th>Protocol</th><th>Deliveries never shown, of 17,832</th><th>Extra copies shown</th><th>Neighbors shown in opposite order on two devices</th><th>Transmissions</th></tr></thead>
+<tbody>
+<tr><th>Push only</th><td>4,171 (23.4%)</td><td>0</td><td>287</td><td>16,916</td></tr>
+<tr><th>Stored, no message ids</th><td>0</td><td>384 (2.2%)</td><td>0</td><td>25,145</td></tr>
+<tr><th>Stored, ids and sequence numbers</th><td>0</td><td>0</td><td>0</td><td>24,880</td></tr>
+</tbody>
+</table>
+<p>Push only loses almost a quarter of deliveries: everything sent while a device was away, and everything a broken connection swallowed. Storing first and filling gaps loses nothing, but a writer whose acknowledgment was lost sends again, and without an id the server cannot tell the retry from a new message. About one delivery in 46 then shows twice. The id makes the retry harmless, which is the at-least-once delivery with deduplication of <x-ref to="idempotency-and-delivery#consumers"></x-ref>. The cost is 47% more transmissions than push only, for acknowledgments, retries and gap repairs.</p>
+<p>The server’s side is short. It answers a retry with the number it already gave, and it accepts a device’s messages only in the order they were written, for a reason step 6b explains.</p>
+<pre data-lang="ts" data-title="The server stores each message once, in each device’s order">
+case 'toServer': {
+  const d = devices[e.dev] as Device;
+  if (!d.online || d.epoch !== e.epoch) break;
+  if (!stored) { pushToAll({ seq: 0, msg: e.msg }); break; }
+  const known = ids ? byClientId.get(e.msg.clientId) : undefined;
+  if (known === undefined) {
+    // With ids, a message that overtook an earlier one from the same device waits for its retry.
+    if (ids && e.msg.deviceSeq !== nextFromDevice[d.id]) break;
+    if (ids) nextFromDevice[d.id] = e.msg.deviceSeq + 1;
+    const entry: Entry = { seq: log.length + 1, msg: e.msg };
+    log.push(entry);
+    byClientId.set(e.msg.clientId, entry);
+    pushToAll(entry);
+  }
+  transmit({ kind: 'ack', dev: d.id, epoch: d.epoch, clientId: e.msg.clientId }, down(d));
+  break;
+}
+</pre>
+<p>The device’s side is a counter and a small buffer. It shows a message only when it has every number below it; a gap, or a ping naming a newer number than it has, makes it ask the store for the rest.</p>
+<pre data-lang="ts" data-title="A device shows messages in order and asks for what it missed">
+const receive = (d: Device, entries: Entry[], newest: number) => {
+  if (!stored) { for (const e of entries) show(d, e); return; }
+  for (const e of entries) if (e.seq > d.lastSeq) d.early.set(e.seq, e);
+  while (d.early.has(d.lastSeq + 1)) {
+    const e = d.early.get(d.lastSeq + 1) as Entry;
+    d.early.delete(e.seq);
+    d.lastSeq = e.seq;
+    show(d, e);
+  }
+  // A gap, or a ping that names a newer message: something was lost. Ask for everything after the last shown.
+  if (d.early.size > 0 || newest > d.lastSeq) resume(d);
+};
+</pre>
+
+<figure class="fig wide" id="fig-latency">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-labelledby="f824t f824d">
+<title id="f824t">How long a message takes to reach each device</title>
+<desc id="f824d">A chart of the share of deliveries completed within a given time after a message was written, on a log scale from 0.05 to 600 seconds, measured with stored messages, message ids and sequence numbers. When both devices stayed connected: 0.05 s 0.0%, 0.1 s 23.9%, 0.15 s 59.8%, 0.2 s 80.3%, 0.3 s 92.9%, 0.5 s 95.5%, 1 s 96.1%, 2 s 96.8%, 5 s 99.8%, 10 s 100.0%, 30 s 100.0%, 60 s 100.0%, 120 s 100.0%, 300 s 100.0%, 600 s 100.0%. All deliveries, including devices that were offline: 0.05 s 0.0%, 0.1 s 17.1%, 0.15 s 42.7%, 0.2 s 57.4%, 0.3 s 66.3%, 0.5 s 68.3%, 1 s 68.9%, 2 s 69.8%, 5 s 73.0%, 10 s 74.5%, 30 s 81.3%, 60 s 88.0%, 120 s 94.5%, 300 s 100.0%, 600 s 100.0%.</desc>
+<text class="tb" x="10" y="18">Share of deliveries done within a time after writing</text>
+<line class="grid" x1="70" y1="240.0" x2="600" y2="240.0"/>
+<text class="ts end" x="62" y="244.0">0%</text>
+<line class="grid" x1="70" y1="200.0" x2="600" y2="200.0"/>
+<text class="ts end" x="62" y="204.0">20%</text>
+<line class="grid" x1="70" y1="160.0" x2="600" y2="160.0"/>
+<text class="ts end" x="62" y="164.0">40%</text>
+<line class="grid" x1="70" y1="120.0" x2="600" y2="120.0"/>
+<text class="ts end" x="62" y="124.0">60%</text>
+<line class="grid" x1="70" y1="80.0" x2="600" y2="80.0"/>
+<text class="ts end" x="62" y="84.0">80%</text>
+<line class="grid" x1="70" y1="40.0" x2="600" y2="40.0"/>
+<text class="ts end" x="62" y="44.0">100%</text>
+<line class="axis" x1="70" y1="240" x2="600" y2="240"/>
+<line class="axis" x1="109.1" y1="240" x2="109.1" y2="245"/>
+<text class="ts mid" x="109.1" y="258">0.1 s</text>
+<line class="axis" x1="239.0" y1="240" x2="239.0" y2="245"/>
+<text class="ts mid" x="239.0" y="258">1 s</text>
+<line class="axis" x1="369.0" y1="240" x2="369.0" y2="245"/>
+<text class="ts mid" x="369.0" y="258">10 s</text>
+<line class="axis" x1="470.1" y1="240" x2="470.1" y2="245"/>
+<text class="ts mid" x="470.1" y="258">1 min</text>
+<line class="axis" x1="600.0" y1="240" x2="600.0" y2="245"/>
+<text class="ts mid" x="600.0" y="258">10 min</text>
+<text class="ts" x="70" y="280">Time from writing to showing (log scale). 5 people on 7 devices, one hour, 2% of sends lost. code/82-hld-chat.</text>
+<path class="line" style="stroke:var(--sig)" d="M70.0 240.0 L109.1 192.1 L132.0 120.4 L148.2 79.4 L171.1 54.3 L199.9 49.1 L239.0 47.8 L278.2 46.4 L329.9 40.3 L369.0 40.0 L431.0 40.0 L470.1 40.0 L509.2 40.0 L560.9 40.0 L600.0 40.0"/>
+<circle class="dot" style="fill:var(--sig)" cx="70.0" cy="240.0" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="109.1" cy="192.1" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="132.0" cy="120.4" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="148.2" cy="79.4" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="171.1" cy="54.3" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="199.9" cy="49.1" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="239.0" cy="47.8" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="278.2" cy="46.4" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="329.9" cy="40.3" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="369.0" cy="40.0" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="431.0" cy="40.0" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="470.1" cy="40.0" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="509.2" cy="40.0" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="560.9" cy="40.0" r="3"/>
+<circle class="dot" style="fill:var(--sig)" cx="600.0" cy="40.0" r="3"/>
+<path class="line" style="stroke:var(--async)" d="M70.0 240.0 L109.1 205.8 L132.0 154.6 L148.2 125.3 L171.1 107.3 L199.9 103.5 L239.0 102.2 L278.2 100.5 L329.9 93.9 L369.0 90.9 L431.0 77.4 L470.1 64.1 L509.2 51.0 L560.9 40.0 L600.0 40.0"/>
+<circle class="dot" style="fill:var(--async)" cx="70.0" cy="240.0" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="109.1" cy="205.8" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="132.0" cy="154.6" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="148.2" cy="125.3" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="171.1" cy="107.3" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="199.9" cy="103.5" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="239.0" cy="102.2" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="278.2" cy="100.5" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="329.9" cy="93.9" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="369.0" cy="90.9" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="431.0" cy="77.4" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="470.1" cy="64.1" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="509.2" cy="51.0" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="560.9" cy="40.0" r="3"/>
+<circle class="dot" style="fill:var(--async)" cx="600.0" cy="40.0" r="3"/>
+<text class="ts" x="247.0" y="63.8">both devices connected</text>
+<text class="ts" x="377.0" y="108.9">all deliveries, offline devices included</text>
+<rect class="hit" x="70" y="40" width="19.5561" height="200" data-tip="within 0.05 s|both devices connected: 0.0%|all deliveries: 0.0%"/>
+<rect class="hit" x="89.5561" y="40" width="30.9957" height="200" data-tip="within 0.1 s|both devices connected: 23.9%|all deliveries: 17.1%"/>
+<rect class="hit" x="120.552" y="40" width="19.5561" height="200" data-tip="within 0.15 s|both devices connected: 59.8%|all deliveries: 42.7%"/>
+<rect class="hit" x="140.108" y="40" width="19.5561" height="200" data-tip="within 0.2 s|both devices connected: 80.3%|all deliveries: 57.4%"/>
+<rect class="hit" x="159.664" y="40" width="25.8518" height="200" data-tip="within 0.3 s|both devices connected: 92.9%|all deliveries: 66.3%"/>
+<rect class="hit" x="185.516" y="40" width="33.9683" height="200" data-tip="within 0.5 s|both devices connected: 95.5%|all deliveries: 68.3%"/>
+<rect class="hit" x="219.484" y="40" width="39.1122" height="200" data-tip="within 1 s|both devices connected: 96.1%|all deliveries: 68.9%"/>
+<rect class="hit" x="258.596" y="40" width="45.4079" height="200" data-tip="within 2 s|both devices connected: 96.8%|all deliveries: 69.8%"/>
+<rect class="hit" x="304.004" y="40" width="45.4079" height="200" data-tip="within 5 s|both devices connected: 99.8%|all deliveries: 73.0%"/>
+<rect class="hit" x="349.412" y="40" width="50.5518" height="200" data-tip="within 10 s|both devices connected: 100.0%|all deliveries: 74.5%"/>
+<rect class="hit" x="399.964" y="40" width="50.5518" height="200" data-tip="within 30 s|both devices connected: 100.0%|all deliveries: 81.3%"/>
+<rect class="hit" x="450.516" y="40" width="39.1122" height="200" data-tip="within 60 s|both devices connected: 100.0%|all deliveries: 88.0%"/>
+<rect class="hit" x="489.628" y="40" width="45.4079" height="200" data-tip="within 120 s|both devices connected: 100.0%|all deliveries: 94.5%"/>
+<rect class="hit" x="535.036" y="40" width="45.4079" height="200" data-tip="within 300 s|both devices connected: 100.0%|all deliveries: 100.0%"/>
+<rect class="hit" x="580.444" y="40" width="19.5561" height="200" data-tip="within 600 s|both devices connected: 100.0%|all deliveries: 100.0%"/>
+</svg>
+</div>
+<figcaption>Between connected devices most messages take about a tenth of a second; a lost one waits for the next message or a retry. Devices that were away get theirs when they reconnect.</figcaption>
+</figure>
+
+<p>Between two devices that stayed connected, half the deliveries took 134 ms and 96.1% took under a second. The rest are lost transmissions, repaired when the next message reveals the gap or the writer’s 2-second retry fires, and they put the 99th percentile at 2.23 seconds, slightly over the target. With 0.5% of transmissions lost instead of 2%, 98.9% arrived within a second and the 99th percentile was 1.60 seconds. Counting devices that were away, the 99th percentile is 201 seconds: those messages waited, safely stored, for the device to come back.</p>
+
+<h2 id="order">Step 6b: One order for every device</h2>
+<p>Sorting by the time each message was written looks natural and is wrong, because each device’s clock is its own (<x-ref to="distributed-fundamentals#clocks"></x-ref>). With clocks off by a second on average and replies written at least 2 seconds after the message they answer, sorting by the writer’s clock would have put 12 of 1,524 replies above the message they answer. Sorting by the server’s sequence number put none there: a device can only answer a message it has received, and it receives only what the server has already numbered.</p>
+<p>One case escapes that argument: a device’s own messages. If the first of two messages from a phone is lost and the second gets through, the second is numbered first, and an answer to oneself appears above its question. Without ids, that happened 3 times in the hour. The fix is the device counter in the code above: the server takes a device’s messages only in the order written, and a message that overtakes an earlier one waits for its retry. That is head-of-line blocking (<x-ref to="transport-protocols#hol"></x-ref>), and it is one reason the 99th percentile above is two seconds, not one.</p>
+<p>Numbering needs one place that decides. Each conversation’s numbers come from the chat service instance that owns it, which allows a conversation as many messages a second as one machine can number, thousands, far beyond what a group of people writes. When an owner fails, another takes over its conversations, reads the newest number from the store, and continues. The store accepts a number only if it is free, so a former owner that has not noticed it was replaced cannot write a duplicate (<x-ref to="distributed-fundamentals#pauses"></x-ref>).</p>
+
+<h2 id="receipts">Step 6c: Groups and receipts</h2>
+<p>A <dfn>delivery receipt</dfn> tells the sender that a message has reached a recipient’s device; a <dfn>read receipt</dfn> tells them the recipient has seen it. Sent once per message per member, receipts are the largest message load in step 2. But receipts have the same property as messages: they arrive in order. A device that has received 4112 has received everything before it. So a receipt can be a position, “everything up to 4112”, kept as one number per device and one per member, and the sender’s ticks are computed from those numbers.</p>
+
+<figure class="fig wide" id="fig-pointers">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 294" role="img" aria-labelledby="f823t f823d">
+<title id="f823t">One conversation log, and how far each device has got</title>
+<desc id="f823d">A row of thirteen messages of one conversation, numbered 4100 to 4112. Below it, a line for each of four devices marks the last message it has received and the last its owner has read: Ana’s phone, the writer of 4112, received and read 4112; Ben’s phone received 4112 and read 4108; Ben’s laptop received 4105; Chi’s phone received 4103 and read 4101. From these pointers the server tells Ana that 4112 has been delivered to one of two other members and read by none; 4101 has been delivered to everyone and read by both.</desc>
+<text class="tb" x="10" y="18">Conversation c_81, messages in sequence order</text>
+<rect class="n store" x="150" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="169.0" y="50">4100</text>
+<rect class="n store" x="192" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="211.0" y="50">4101</text>
+<rect class="n store" x="234" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="253.0" y="50">4102</text>
+<rect class="n store" x="276" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="295.0" y="50">4103</text>
+<rect class="n store" x="318" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="337.0" y="50">4104</text>
+<rect class="n store" x="360" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="379.0" y="50">4105</text>
+<rect class="n store" x="402" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="421.0" y="50">4106</text>
+<rect class="n store" x="444" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="463.0" y="50">4107</text>
+<rect class="n store" x="486" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="505.0" y="50">4108</text>
+<rect class="n store" x="528" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="547.0" y="50">4109</text>
+<rect class="n store" x="570" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="589.0" y="50">4110</text>
+<rect class="n store" x="612" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="631.0" y="50">4111</text>
+<rect class="n store" x="654" y="30" width="38" height="30" rx="3"/>
+<text class="ts mid" x="673.0" y="50">4112</text>
+<text class="ts end" x="140" y="50">stored</text>
+<text class="ts end" x="140" y="100">Ana’s phone</text>
+<path class="e none" d="M150 96H673" style="stroke:var(--store);stroke-width:3"/>
+<circle class="fill-store" cx="673" cy="96" r="5"/>
+<text class="ts" x="152" y="87">received 4112, read 4112</text>
+<path class="e none" d="M673 89V103" style="stroke:var(--sig);stroke-width:3"/>
+<text class="ts end" x="140" y="134">Ben’s phone</text>
+<path class="e none" d="M150 130H673" style="stroke:var(--store);stroke-width:3"/>
+<circle class="fill-store" cx="673" cy="130" r="5"/>
+<text class="ts" x="152" y="121">received 4112, read 4108</text>
+<path class="e none" d="M505 123V137" style="stroke:var(--sig);stroke-width:3"/>
+<text class="ts end" x="140" y="168">Ben’s laptop</text>
+<path class="e none" d="M150 164H379" style="stroke:var(--store);stroke-width:3"/>
+<circle class="fill-store" cx="379" cy="164" r="5"/>
+<text class="ts" x="152" y="155">received 4105</text>
+<text class="ts end" x="140" y="202">Chi’s phone</text>
+<path class="e none" d="M150 198H295" style="stroke:var(--store);stroke-width:3"/>
+<circle class="fill-store" cx="295" cy="198" r="5"/>
+<text class="ts" x="152" y="189">received 4103, read 4101</text>
+<path class="e none" d="M211 191V205" style="stroke:var(--sig);stroke-width:3"/>
+<text class="ts" x="10" y="238">Green line: received up to here, one number per device. Blue mark: read up to here, one number per member.</text>
+<text class="ts tb" x="10" y="262">Ana’s view of 4112: delivered to 1 of 2 other members, read by none.</text>
+<text class="ts" x="10" y="280">Ana’s view of 4101: delivered to both, read by both. Every receipt is a comparison with these pointers.</text>
+</svg>
+</div>
+<figcaption>Receipts are pointers into the log, not flags on messages. One number per device says “received up to here”, one per member “read up to here”, and the ticks are computed from them.</figcaption>
+</figure>
+
+<p>A position also covers many messages at once. A phone that reconnects after an hour reports one number for the whole backlog, and an open chat in a busy group reports at most one number every few seconds. The simulation compared the two in a group of 100 whose phones connect about once an hour for 5 minutes, with the chat opened in half of those connections.</p>
+
+<figure class="fig wide" id="fig-receipts">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f825t f825d">
+<title id="f825t">Receipts per message, one each or a watermark</title>
+<desc id="f825d">A chart of receipts sent per message for each member of a group of 100, against the number of messages the group writes a day, on a log scale from 20 to 20,000. One receipt per message: 20 a day 1.90, 50 a day 1.90, 100 a day 1.88, 200 a day 1.92, 500 a day 1.88, 1,000 a day 1.88, 2,000 a day 1.89, 5,000 a day 1.87, 10,000 a day 1.89, 20,000 a day 1.86. Watermarks sent at most every 5 seconds: 20 a day 0.82, 50 a day 0.50, 100 a day 0.39, 200 a day 0.27, 500 a day 0.17, 1,000 a day 0.14, 2,000 a day 0.13, 5,000 a day 0.11, 10,000 a day 0.10, 20,000 a day 0.08.</desc>
+<text class="tb" x="10" y="18">Receipts sent per message, for each member who receives it</text>
+<line class="grid" x1="70" y1="230.0" x2="560" y2="230.0"/>
+<text class="ts end" x="62" y="234.0">0</text>
+<line class="grid" x1="70" y1="182.5" x2="560" y2="182.5"/>
+<text class="ts end" x="62" y="186.5">0.5</text>
+<line class="grid" x1="70" y1="135.0" x2="560" y2="135.0"/>
+<text class="ts end" x="62" y="139.0">1</text>
+<line class="grid" x1="70" y1="87.5" x2="560" y2="87.5"/>
+<text class="ts end" x="62" y="91.5">1.5</text>
+<line class="grid" x1="70" y1="40.0" x2="560" y2="40.0"/>
+<text class="ts end" x="62" y="44.0">2</text>
+<line class="axis" x1="70" y1="230" x2="560" y2="230"/>
+<line class="axis" x1="70.0" y1="230" x2="70.0" y2="235"/>
+<text class="ts mid" x="70.0" y="248">20</text>
+<line class="axis" x1="184.2" y1="230" x2="184.2" y2="235"/>
+<text class="ts mid" x="184.2" y="248">100</text>
+<line class="axis" x1="347.5" y1="230" x2="347.5" y2="235"/>
+<text class="ts mid" x="347.5" y="248">1,000</text>
+<line class="axis" x1="510.8" y1="230" x2="510.8" y2="235"/>
+<text class="ts mid" x="510.8" y="248">10,000</text>
+<text class="ts" x="70" y="270">Messages the group writes a day (log scale). Phones connect hourly for 5 minutes on average. code/82-hld-chat.</text>
+<path class="line" style="stroke:var(--fault)" d="M70.0 49.4 L135.0 49.7 L184.2 51.8 L233.3 48.0 L298.3 51.5 L347.5 51.4 L396.7 50.4 L461.7 51.9 L510.8 50.6 L560.0 53.1"/>
+<circle class="dot" style="fill:var(--fault)" cx="70.0" cy="49.4" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="135.0" cy="49.7" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="184.2" cy="51.8" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="233.3" cy="48.0" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="298.3" cy="51.5" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="347.5" cy="51.4" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="396.7" cy="50.4" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="461.7" cy="51.9" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="510.8" cy="50.6" r="3.5"/>
+<circle class="dot" style="fill:var(--fault)" cx="560.0" cy="53.1" r="3.5"/>
+<path class="line" style="stroke:var(--store)" d="M70.0 151.9 L135.0 182.2 L184.2 192.8 L233.3 203.9 L298.3 213.5 L347.5 216.4 L396.7 217.5 L461.7 219.2 L510.8 220.5 L560.0 222.6"/>
+<circle class="dot" style="fill:var(--store)" cx="70.0" cy="151.9" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="135.0" cy="182.2" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="184.2" cy="192.8" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="233.3" cy="203.9" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="298.3" cy="213.5" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="347.5" cy="216.4" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="396.7" cy="217.5" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="461.7" cy="219.2" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="510.8" cy="220.5" r="3.5"/>
+<circle class="dot" style="fill:var(--store)" cx="560.0" cy="222.6" r="3.5"/>
+<text class="ts" x="233.3" y="36.0">one delivery and one read receipt per message</text>
+<text class="ts" x="245.3" y="193.9">watermarks, at most one every 5 s</text>
+<rect class="hit" x="70" y="40" width="32.4984" height="190" data-tip="20 messages a day|one per message: 1.90 per member|watermarks: 0.82 per member|2.3 times fewer"/>
+<rect class="hit" x="102.498" y="40" width="57.0826" height="190" data-tip="50 messages a day|one per message: 1.90 per member|watermarks: 0.50 per member|3.8 times fewer"/>
+<rect class="hit" x="159.581" y="40" width="49.1682" height="190" data-tip="100 messages a day|one per message: 1.88 per member|watermarks: 0.39 per member|4.8 times fewer"/>
+<rect class="hit" x="208.749" y="40" width="57.0826" height="190" data-tip="200 messages a day|one per message: 1.92 per member|watermarks: 0.27 per member|7.0 times fewer"/>
+<rect class="hit" x="265.832" y="40" width="57.0826" height="190" data-tip="500 messages a day|one per message: 1.88 per member|watermarks: 0.17 per member|10.8 times fewer"/>
+<rect class="hit" x="322.914" y="40" width="49.1682" height="190" data-tip="1,000 messages a day|one per message: 1.88 per member|watermarks: 0.14 per member|13.1 times fewer"/>
+<rect class="hit" x="372.083" y="40" width="57.0826" height="190" data-tip="2,000 messages a day|one per message: 1.89 per member|watermarks: 0.13 per member|14.4 times fewer"/>
+<rect class="hit" x="429.165" y="40" width="57.0826" height="190" data-tip="5,000 messages a day|one per message: 1.87 per member|watermarks: 0.11 per member|16.4 times fewer"/>
+<rect class="hit" x="486.248" y="40" width="49.1682" height="190" data-tip="10,000 messages a day|one per message: 1.89 per member|watermarks: 0.10 per member|18.9 times fewer"/>
+<rect class="hit" x="535.416" y="40" width="24.5841" height="190" data-tip="20,000 messages a day|one per message: 1.86 per member|watermarks: 0.08 per member|23.9 times fewer"/>
+</svg>
+</div>
+<figcaption>One receipt per message costs about two per member whatever the group does. A watermark covers everything before it, so the busier the group, the more it saves.</figcaption>
+</figure>
+
+<p>One receipt of each kind per message costs about 1.9 per member per message, whatever the group does. Positions cost 0.27 at 200 messages a day, 7 times fewer, and 0.14 at 1,000 a day, 13 times fewer. In a group of 1,000 at that rate, each message brings about 1,880 receipts sent one by one, or about 143 as positions. For the sender, the server keeps the pointers and sends updated counts at most every few seconds, and in large groups only when the sender opens the message’s details.</p>
+<p>The message itself is stored once per group and delivered by the queued workers: for each member, look up the connected devices, push to them, and update the member’s conversation list. For a member with no connected device, the worker asks the notification service to wake the phone (<x-ref to="hld-notifications"></x-ref>). A 1,000-member group with 1.5 devices per member is about 1,500 pushes per message, which is why delivery is queued work rather than part of sending.</p>
+
+<h2 id="presence">Step 6d: Presence and many devices</h2>
+<p><dfn>Presence</dfn> is whether a user is connected now, or when they were last seen. It changes every time a phone connects or disconnects, which on mobile networks is often, and each change interests everyone who might look. Sending every change to every contact would cost more than the messages. So presence is kept in the connection registry, with an expiry renewed by heartbeats, and a device asks for the presence of the people in the conversation on screen, subscribing to changes only while it is open (<x-ref to="realtime-communication#operations"></x-ref>). Typing indicators are presence for one conversation: never stored, and dropped if they arrive late.</p>
+<p>Each device keeps its own “received up to” number, because each must receive every message. “Read up to” belongs to the member: reading on the laptop is sent to the phone as a position, and the phone clears its unread count without receiving anything new. A new device starts from the conversation list and fetches recent messages of each conversation as it is opened, rather than downloading years of history.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>A gateway crashes</th><td>A few seconds of “connecting”</td><td>Its devices reconnect elsewhere with random delays (<x-ref to="realtime-communication#reconnect"></x-ref>) and resume after their last number. Nothing is lost</td></tr>
+<tr><th>A conversation’s owner crashes</th><td>A send takes a second longer</td><td>Another instance takes the conversation, reads the newest number and continues; devices retry with the same ids</td></tr>
+<tr><th>The delivery queue falls behind</th><td>Messages arrive late; sending still works</td><td>Messages are stored and acknowledged before the queue. Devices that ping see newer numbers and fetch them</td></tr>
+<tr><th>The registry names a dead gateway</th><td>A notification instead of a live message</td><td>The push fails, the device is treated as away, and it catches up when it reconnects</td></tr>
+<tr><th>A notification is lost</th><td>The message appears when the app is opened</td><td>Notifications only wake the app; the app always syncs from the store</td></tr>
+<tr><th>A store partition loses a copy</th><td>Nothing</td><td>The other two copies serve it (<x-ref to="replication#leaderless"></x-ref>)</td></tr>
+<tr><th>One group is extremely busy</th><td>Nothing, unless its partition is overloaded</td><td>Time-bucketed partitions spread it over weeks, and reads of the newest messages are served from a cache</td></tr>
+</tbody>
+</table>
+<p>At ten times the users, the connection tier is the largest fleet: 4,000 gateways and 67 million heartbeats a second at a 30-second interval, which pushes the interval up and the connections per gateway toward what each can safely lose at once. Users connect to the nearest region; a conversation is owned in one region, and members elsewhere pay a cross-region round trip for each send (<x-ref to="multi-region"></x-ref>). At a hundred times the messages, storage dominates, 440 PB a year in three copies, and history older than a few months moves to object storage in compressed weekly blocks. The numbering, the receipts and the gateway split do not change.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li><b>Discord, 2017.</b> Discord stored messages in Cassandra with the key <code>((channel_id, bucket), message_id)</code>, where a bucket is a static time window of about 10 days, chosen to keep partitions under 100 MB, and the message id is a time-ordered Snowflake id. It was storing well over 120 million messages a day.</li>
+  <li><b>Discord, 2023.</b> Discord moved its trillions of messages from 177 Cassandra nodes to 72 ScyllaDB nodes. The 99th percentile for fetching history fell from 40 to 125 ms to 15 ms, and for inserts from 5 to 70 ms to a steady 5 ms. Hot partitions, a busy channel’s bucket, were a recurring problem; services in front of the database now merge identical concurrent requests, routed by channel id with consistent hashing.</li>
+  <li><b>Facebook Messenger, 2014.</b> Messenger’s Iris system keeps a totally ordered queue of messaging updates for each user, with pointers to the last update sent to each app, and pushes new updates over MQTT. Facebook reported that the change cut Messenger’s non-media data use by about 40% and the number of people who saw errors when sending by about 20%.</li>
+  <li><b>Slack.</b> Its gateway and channel-server design is described in <x-ref to="realtime-communication#gateway"></x-ref>.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>“End-to-end encryption”</th><td>The server stores and forwards ciphertext it cannot read, encrypted for each device, so server-side search and previews go (<x-ref to="cryptography-in-practice#rest"></x-ref>)</td><td>Ids, sequence numbers, receipts, sync</td></tr>
+<tr><th>“Edit and delete messages”</th><td>An edit is a new entry in the log that names the number it changes; devices apply it when they reach it</td><td>The order, and catching up</td></tr>
+<tr><th>“Channels with a million readers”</th><td>No per-member pushes or receipts: readers fetch the newest messages from a cache, and the counts are approximate</td><td>The log and its numbers</td></tr>
+<tr><th>“Disappearing messages”</th><td>An expiry per conversation; storage deletes whole expired buckets</td><td>Delivery</td></tr>
+<tr><th>“Members on every continent”</th><td>Regional gateways and stores; each conversation owned in one region, with failover</td><td>The protocol</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Spend 5 minutes on requirements and ask about group size and history, 3 on estimates and say the connection count aloud, 5 on the API and data model, and 10 on the drawing and the send flow. In the deep dives, start with “store first, then push” and the sequence number with a resume, then ids for retries, then receipts as positions. Keep the last 5 minutes for failures: a gateway crash and a lost push.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Pushing to the connection and calling it delivered</th><td>23.4% of deliveries lost in the simulation</td><td>Store first; the push is an optimization</td></tr>
+<tr><th>Retries without message ids</th><td>2.2% of deliveries shown twice</td><td>An id chosen by the device, kept on every retry</td></tr>
+<tr><th>Ordering by the sender’s timestamp</th><td>Replies above the messages they answer</td><td>A sequence number from the conversation’s owner</td></tr>
+<tr><th>A “delivered” and a “read” flag per message per member</th><td>Two writes per member per message, two receipts each</td><td>Two positions per member, overwritten</td></tr>
+<tr><th>Copying each group message into every member’s inbox</th><td>Storage multiplied by the group size</td><td>Store once per conversation; update small per-member lists</td></tr>
+<tr><th>Broadcasting every presence change to all contacts</th><td>More traffic than the messages</td><td>Presence on request for the conversation on screen</td></tr>
+<tr><th>Gateways that also run the chat logic</th><td>Every deployment drops millions of connections and messages in flight</td><td>Thin gateways; logic in stateless services behind them</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="hld-method"></x-ref>: the seven steps this chapter follows.</li>
+  <li><x-ref to="realtime-communication"></x-ref>: WebSockets, heartbeats, reconnecting and gateways.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: at-least-once delivery made harmless by ids.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: why clocks cannot order messages.</li>
+  <li><x-ref to="partitioning"></x-ref>: conversations spread over owners and partitions.</li>
+  <li><x-ref to="hld-notifications"></x-ref>: reaching devices that are not connected.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Store the message first, number it within its conversation, then push. A connection is never the only copy.</li>
+  <li>A device shows messages only in number order, notices gaps, and asks the store for what it missed.</li>
+  <li>Retries are unavoidable; an id chosen by the device makes them harmless.</li>
+  <li>One owner per conversation gives out numbers, so every device shows the same order and replies stay below their questions.</li>
+  <li>Receipts are positions, “everything up to 4112”, which cost 7 to 24 times fewer messages than one receipt per message in the simulation.</li>
+  <li>Store a group message once; deliver it to members as queued work after the sender’s acknowledgment.</li>
+  <li>Gateways only hold connections. Their heartbeats and presence can outweigh the messages, so both are kept cheap.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Ana’s phone shows one tick. What exactly does it know?</summary><p>That the server has stored the message in three copies and given it a sequence number. It does not know that any recipient has it; that is the second tick, from a delivery receipt.</p></details>
+<details><summary>Ben’s phone has shown up to 4103 and receives 4105. What does it do?</summary><p>It holds 4105 back, because 4104 is missing, and asks the server for everything after 4103. When 4104 and 4105 arrive it shows both, in order.</p></details>
+<details><summary>A send times out and the phone sends it again. How does the design avoid a duplicate?</summary><p>The retry carries the same id the phone chose the first time. The server finds that id already stored and answers with the same sequence number instead of storing a second copy. Without ids, the simulation showed 2.2% of deliveries twice.</p></details>
+<details><summary>Why not order messages by the time on the sender’s phone?</summary><p>Phone clocks disagree. With clocks off by about a second, sorting by them put 12 of 1,524 replies above the messages they answered. A server-given sequence number cannot, because a device only answers what the server has already numbered.</p></details>
+<details><summary>Why are receipts sent as “everything up to N”?</summary><p>Messages arrive in order, so one number says everything a device has received or a member has read. It covers a whole backlog in one message and needs one stored number per device or member, not a flag per message.</p></details>
+<details><summary>A gateway holding 500,000 connections crashes. What happens to messages sent to those devices meanwhile?</summary><p>They are already stored. The devices reconnect to other gateways after random delays and ask for everything after their last number, so the messages arrive late but none is lost.</p></details>
+<details><summary>Why are group messages delivered by queued workers rather than during the send?</summary><p>A message to a 1,000-member group is about 1,500 pushes and as many registry lookups. Doing them before acknowledging the sender would make sending slow and fragile; once the message is stored, delivery can safely happen afterward.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Stanislav Vishnevskiy, <a href="https://discord.com/blog/how-discord-stores-billions-of-messages">“How Discord Stores Billions of Messages”</a>, Discord blog, January 2017. Partitioning messages by channel and time bucket.</li>
+  <li>Bo Ingram, <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages">“How Discord Stores Trillions of Messages”</a>, Discord blog, March 2023. The move to ScyllaDB, hot partitions and request coalescing.</li>
+  <li>Jeremy Fein, <a href="https://engineering.fb.com/2014/10/09/production-engineering/building-mobile-first-infrastructure-for-messenger/">“Building Mobile-First Infrastructure for Messenger”</a>, Engineering at Meta, October 2014. Iris, an ordered queue of updates per user with pointers per app.</li>
+</ol>
+</section>

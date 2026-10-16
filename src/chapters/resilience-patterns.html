@@ -1,0 +1,1033 @@
+<!--meta
+{ "description": "Resilience patterns for system design: cascading failure, timeouts and deadline propagation, retries and retry budgets, circuit breakers, bulkheads, the five rate limiting algorithms (token bucket, leaky bucket, fixed window, sliding log, sliding window counter), load shedding, graceful degradation and metastable failures, with working TypeScript.",
+  "lede": "In a system of many parts, something is always failing or slow. Resilience is the set of habits that stop one part’s trouble from becoming everyone’s. Most of them come down to refusing work: giving up on a call, declining to retry, rejecting a request before starting it. This chapter covers those patterns, why each exists, and how they fit together, including the rate limiting algorithms that interviews ask about by name.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="cascade">How one slow service takes down the rest</h2>
+<p>The photo app’s web service calls the feed service, which calls a small tags service to decorate each photo with its tags. Tags are a minor feature. One afternoon the tags service becomes slow: its responses take five seconds instead of fifty milliseconds.</p>
+
+<figure class="fig wide" id="fig-cascade">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-labelledby="f421t f421d">
+<title id="f421t">A slow dependency exhausting the threads of the services that call it</title>
+<desc id="f421d">Three services in a chain: web calls feed, which calls tags. Step one, the tags service slows from 50 milliseconds to 5 seconds. Step two, all 20 of the feed service’s threads are waiting on tags, so it has no free thread for any request. Step three, all 20 of the web service’s threads are waiting on feed, so every page fails, even pages with no tags. Nothing crashed.</desc>
+<rect class="n" x="10" y="30" width="200" height="84" rx="6"/>
+<text class="tb mid" x="110" y="50">Web</text>
+<rect x="56" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="67" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="78" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="89" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="100" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="111" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="122" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="133" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="144" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="155" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="56" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="67" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="78" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="89" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="100" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="111" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="122" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="133" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="144" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="155" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<g class="hide" data-s="2" data-packet="none">
+<rect x="56" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="67" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="78" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="89" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="100" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="111" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+</g>
+<g class="hide" data-s="3">
+<rect x="122" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="133" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="144" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="155" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="56" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="67" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="78" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="89" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="100" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="111" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="122" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="133" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="144" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="155" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+</g>
+<text class="ts mid" x="110" y="132" data-s="1" data-e="1">20 threads, all free</text>
+<text class="ts mid" x="110" y="132" data-s="2" data-e="2">6 of 20 threads waiting on Feed</text>
+<g class="hide" data-s="3">
+<text class="ts mid" x="110" y="132">20 of 20 threads waiting on Feed</text>
+</g>
+<path class="e" d="M210 72H250" data-s="1" data-e="1" data-packet="none"/>
+<g data-s="2">
+<path class="e fault" d="M210 72H250"/>
+</g>
+<rect class="n" x="250" y="30" width="200" height="84" rx="6"/>
+<text class="tb mid" x="350" y="50">Feed</text>
+<rect x="296" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="307" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="318" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="329" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="340" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="351" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="362" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="373" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="384" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="395" y="60" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="296" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="307" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="318" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="329" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="340" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="351" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="362" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="373" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="384" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<rect x="395" y="71" width="9" height="9" rx="1" fill="var(--rule-2)"/>
+<g class="hide" data-s="2">
+<rect x="296" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="307" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="318" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="329" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="340" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="351" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="362" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="373" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="384" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="395" y="60" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="296" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="307" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="318" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="329" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="340" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="351" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="362" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="373" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="384" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="395" y="71" width="9" height="9" rx="1" fill="var(--fault)"/>
+</g>
+<text class="ts mid" x="350" y="132" data-s="1" data-e="1">20 threads, all free</text>
+<g class="hide" data-s="2">
+<text class="ts mid" x="350" y="132">20 of 20 threads waiting on Tags</text>
+</g>
+<g data-s="1">
+<path class="e fault" d="M450 72H490"/>
+</g>
+<rect class="n fault" x="490" y="30" width="200" height="84" rx="6"/>
+<text class="tb mid" x="590" y="50">Tags</text>
+<text class="ts mid" x="590" y="82">a dependency</text>
+<g data-s="1">
+<text class="ts mid" x="590" y="132">slow: 5 s instead of 50 ms</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="18">Every page fails, even pages with no tags</text>
+</g>
+<g data-s="2">
+<text class="ts" x="250" y="18">Feed has no free thread for any request</text>
+</g>
+<g data-s="1">
+<text class="ts" x="490" y="18">One optional dependency slows down</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="166">Nothing crashed. Each service is waiting for the one below, and while it waits it holds a thread that other requests need.</text>
+<text class="ts" x="10" y="182">A slow dependency does more damage than a dead one, because a dead one fails fast.</text>
+</g>
+
+</svg>
+</div>
+<ol class="steps">
+  <li>The tags service slows down. It now answers in 5 seconds instead of 50 milliseconds. Nothing has failed, and every caller still has free threads.</li>
+  <li>Each feed thread that calls tags now waits five seconds. Within a moment all 20 are waiting, so feed has none left for any request. Web threads that call feed begin to wait behind them.</li>
+  <li>Web runs out of threads in the same way. Every page fails, including pages that never show a tag. Nothing crashed: each service is only waiting for the one below it.</li>
+</ol>
+<figcaption>A cascading failure. The fault moved upward through waiting, not through errors.</figcaption>
+</figure>
+
+<p>Each request to the feed service now holds one of its threads, or connections, for five seconds instead of a twentieth of one. By Little’s law (<x-ref to="latency-and-throughput#saturation"></x-ref>), the same arrival rate needs a hundred times as many threads, and the pool has twenty. Within seconds every thread is waiting on tags. Requests that do not need tags at all queue behind them. The web service, waiting on the feed service, fills up the same way. The whole product is down because of a feature most users would not have missed.</p>
+<p>Three observations from this shape everything that follows.</p>
+<ul>
+  <li><b>Slow is worse than down.</b> A dead service refuses connections instantly, and callers move on. A slow one ties up its callers’ resources.</li>
+  <li><b>Failure travels through shared, limited resources.</b> Threads, connections, memory, queue slots. Protecting those is the heart of resilience.</li>
+  <li><b>The right outcome was available.</b> Photos without tags is a perfectly good page. The system failed because nothing told it to give up on the optional part.</li>
+</ul>
+<p>The patterns below are introduced one at a time. The last section shows how they stack.</p>
+
+<h2 id="timeouts">Timeouts and deadlines</h2>
+<p>The first defense is the simplest: never wait forever. Every network call needs a <dfn>timeout</dfn>, after which the caller stops waiting and treats the call as failed. Many client libraries ship with no timeout or with one measured in minutes, so this has to be set deliberately, for every dependency.</p>
+<p>There are two to set. The <b>connection timeout</b> bounds how long to wait for a connection to be established, and can be short, since a healthy server accepts within milliseconds. The <b>request timeout</b> bounds the wait for a response.</p>
+<p>Choosing the request timeout is the compromise of <x-ref to="distributed-fundamentals#timeouts"></x-ref>. Too long, and a slow dependency still ties up threads. Too short, and healthy but slightly slow responses are thrown away and retried, adding load. Start from measurement: a little above the dependency’s 99.9th percentile in normal operation. If that percentile is 300 ms, a timeout of 30 seconds protects nothing.</p>
+
+<h3 id="deadlines">One deadline for the whole request</h3>
+<p>Separate timeouts at each layer have a flaw that only shows under stress.</p>
+
+<figure class="fig wide" id="fig-deadline">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 326" role="img" aria-labelledby="f422t f422d">
+<title id="f422t">Independent one-second timeouts at each layer compared with one deadline passed down</title>
+<desc id="f422d">In the first arrangement, the user’s browser gives up at 1,000 milliseconds. The web service started 20 milliseconds in and has its own one-second timeout, expiring at 1,020. The feed service times out at 1,070. The database query, which nobody cancels, runs until 2,120 milliseconds for nobody. In the second arrangement, one deadline of 1,000 milliseconds is passed down. The web service is told it has 980 milliseconds left, the feed service 930, and the database query is canceled at 1,000.</desc>
+<g data-scene="separate">
+<text class="tb" x="10" y="18">Separate timeouts: each layer waits a full second on its own clock</text>
+<g data-s="1">
+<text class="ts" x="10" y="47">User’s browser</text>
+<rect class="n sig" x="140.0" y="30" width="170.0" height="24" rx="3"/>
+<text class="ts" x="318.0" y="47">gives up at 1,000 ms</text>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="77">Web</text>
+<rect class="n " x="143.4" y="60" width="170.0" height="24" rx="3"/>
+<text class="ts" x="321.4" y="77">times out at 1,020</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="107">Feed</text>
+<rect class="n " x="151.9" y="90" width="170.0" height="24" rx="3"/>
+<text class="ts" x="329.9" y="107">times out at 1,070</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="137">Database query</text>
+<rect class="n fault" x="160.4" y="120" width="340.0" height="24" rx="3"/>
+<text class="ts" x="508.40000000000003" y="137">runs to 2,120 ms, for nobody</text>
+<path class="e none dash fault" d="M310.0 24V150"/>
+</g>
+</g>
+<g data-scene="deadline">
+<text class="tb" x="10" y="184">One deadline, passed down: each layer gets what is left</text>
+<g data-s="1">
+<text class="ts" x="10" y="213">User’s browser</text>
+<rect class="n sig" x="140.0" y="196" width="170.0" height="24" rx="3"/>
+<text class="ts" x="318.0" y="213">deadline: 1,000 ms</text>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="243">Web</text>
+<rect class="n " x="143.4" y="226" width="166.6" height="24" rx="3"/>
+<text class="ts" x="318.0" y="243">told: 980 ms left</text>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="273">Feed</text>
+<rect class="n " x="151.9" y="256" width="158.1" height="24" rx="3"/>
+<text class="ts" x="318.0" y="273">told: 930 ms left</text>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="303">Database query</text>
+<rect class="n store" x="160.4" y="286" width="149.6" height="24" rx="3"/>
+<text class="ts" x="318.0" y="303">canceled at 1,000 ms</text>
+<path class="e none dash" d="M310.0 190V316"/>
+</g>
+</g>
+
+</svg>
+</div>
+<ol class="steps" data-scene="separate" data-label="Separate timeouts">
+  <li>The browser sends a request and will wait one second at most.</li>
+  <li>The web tier starts 20 ms later with a one-second timeout of its own, so it would give up at 1,020 ms.</li>
+  <li>Feed starts later still, with another full second: 1,070 ms.</li>
+  <li>The database query is slow and runs to 2,120 ms. The user gave up at 1,000 ms, so everything to the right of the dashed line is work done for nobody.</li>
+</ol>
+<ol class="steps" data-scene="deadline" data-label="One deadline">
+  <li>The browser sends the same request, and this time the deadline travels with it: 1,000 ms from now.</li>
+  <li>Web is told how much time is left: 980 ms.</li>
+  <li>Feed is told 930 ms.</li>
+  <li>At 1,000 ms the deadline passes. The query is canceled, and every layer stops at the same moment.</li>
+</ol>
+<figcaption>With independent timeouts, lower layers keep working after the user has gone. With a propagated deadline, everyone stops together.</figcaption>
+</figure>
+
+<p>Work done after the caller has given up is pure waste, and it is done exactly when the system is slowest and can least afford it. The fix is <dfn>deadline propagation</dfn>. The first service to receive the request decides when it must be finished, and passes that moment, or the time remaining, with every call it makes. Each service does the same for its own calls, and checks the deadline before starting anything expensive. gRPC does this as part of the protocol. Over plain HTTP it is a header that every service must read and forward.</p>
+<p>A related rule: a caller’s timeout should be longer than the timeout of whatever it calls, so that the inner call can fail and be handled before the outer one expires.</p>
+
+<h2 id="retries">Retries, and how they multiply</h2>
+<p>Many failures are brief: a dropped packet, an instance being replaced. Trying again usually works. <x-ref to="idempotency-and-delivery#retries"></x-ref> gave the basic rules: retry only what might succeed, only operations that are safe to repeat, with a growing and randomized delay, and a limit.</p>
+<p>The danger of retries is what they do under real failure. If a service is struggling because it is overloaded, each retry is additional load on it. And retries at several layers multiply.</p>
+
+<div class="widget" data-widget="retries">
+<h4>Retry amplification</h4>
+<p>How many calls reach a failing service at the bottom of a chain, when every layer above it retries.</p>
+<div class="controls">
+  <label>Layers that retry<input type="number" name="layers" value="3" min="1" max="10" step="1"></label>
+  <label>Attempts per layer, including the first<input type="number" name="attempts" value="3" min="1" max="10" step="1"></label>
+  <label>Retry budget, in percent<input type="number" name="budget" value="10" min="0" max="100" step="5"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 154" role="img" aria-label="For each layer, two bars: the calls it receives for one user request when every layer retries, and when every layer keeps to a retry budget."><rect x="150" y="8" width="12" height="12" rx="3" class="bar fault"></rect><text x="168" y="19" class="ts">every layer retries</text><rect x="300" y="8" width="12" height="12" rx="3" class="bar store"></rect><text x="318" y="19" class="ts">every layer keeps to its retry budget</text><text x="10" y="48" class="ts">Layer 2 gets</text><rect x="150" y="32" width="38.9" height="11" rx="2" class="bar fault"></rect><text x="194.9" y="42" class="ts">3 calls</text><rect x="150" y="46" width="14.3" height="11" rx="2" class="bar store"></rect><text x="170.3" y="56" class="ts">1.1 calls</text><text x="10" y="82" class="ts">Layer 3 gets</text><rect x="150" y="66" width="116.7" height="11" rx="2" class="bar fault"></rect><text x="272.7" y="76" class="ts">9 calls</text><rect x="150" y="80" width="15.7" height="11" rx="2" class="bar store"></rect><text x="171.7" y="90" class="ts">1.21 calls</text><text x="10" y="116" class="ts">The failing service gets</text><rect x="150" y="100" width="350" height="11" rx="2" class="bar fault"></rect><text x="506" y="110" class="ts">27 calls</text><rect x="150" y="114" width="17.3" height="11" rx="2" class="bar store"></rect><text x="173.3" y="124" class="ts">1.33 calls</text><text x="150" y="146" class="ts">Calls caused by one user request.</text></svg>
+<dl class="results">
+  <div><dt>Worst-case multiplier</dt><dd data-out="worst">27×</dd></div>
+  <div><dt>Calls per 1,000 user requests</dt><dd data-out="worstcalls">27 thousand</dd></div>
+  <div><dt>Multiplier with a retry budget</dt><dd data-out="budgeted">1.33×</dd></div>
+  <div><dt>Calls per 1,000, with the budget</dt><dd data-out="budgetcalls">1,331</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">If the service at the bottom starts failing, each user request turns into up to 27 calls to it: 3 layers, each trying 3 times. For every 1,000 user requests it receives 27 thousand calls, at the moment it is least able to cope. If every layer instead limits retries to 10% of its traffic, the same 1,000 requests become at most 1,331 calls.</p>
+</div>
+
+<p>Three measures keep retries from turning a small failure into a large one.</p>
+<ul>
+  <li><b>Retry at one layer.</b> Usually the one closest to the failure, which knows most about whether a retry makes sense. Layers above pass the error up.</li>
+  <li><b>A retry budget.</b> Limit retries to a fraction of normal traffic. Google’s SRE book describes a budget of 10%: a client may retry only while its retries are below a tenth of its requests. In normal conditions almost nothing needs retrying, so the budget is never reached. During an outage it caps the extra load at 10% instead of 200%.</li>
+  <li><b>Say “do not retry”.</b> A service that is rejecting requests because it is overloaded should say so distinctly, with a <code>503</code> or <code>429</code> and a <code>Retry-After</code> header, and callers should respect it.</li>
+</ul>
+<p>One special kind of retry is the <dfn>hedged request</dfn> from <x-ref to="latency-and-throughput#tail-at-scale"></x-ref>: send a second copy of a slow request before the first has failed. It cuts tail latency and must be limited in the same way, to a few percent of traffic.</p>
+
+<h2 id="circuit-breaker">Circuit breakers</h2>
+<p>Timeouts bound how long each call waits. If a dependency is down for ten minutes, every call during those ten minutes still waits for the full timeout before failing. A <dfn>circuit breaker</dfn> notices that a dependency is failing and stops calling it for a while.</p>
+
+<figure class="fig wide" id="fig-breaker">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-labelledby="f423t f423d">
+<title id="f423t">The three states of a circuit breaker</title>
+<desc id="f423d">In the closed state, calls pass through and failures are counted. After too many failures the breaker opens: calls fail at once and the dependency rests. When a cool-down period is over, the breaker becomes half-open and lets one trial call through. If the trial succeeds the breaker closes. If it fails the breaker opens again.</desc>
+<rect class="n store" x="10" y="56" width="150" height="64" rx="6"/>
+<text class="tb mid" x="85" y="75.5">Closed</text>
+<text class="ts mid" x="85" y="92.5">calls pass through</text>
+<text class="ts mid" x="85" y="109.5">failures are counted</text>
+<rect class="n fault" x="285" y="56" width="150" height="64" rx="6"/>
+<text class="tb mid" x="360" y="75.5">Open</text>
+<text class="ts mid" x="360" y="92.5">calls fail at once</text>
+<text class="ts mid" x="360" y="109.5">the dependency rests</text>
+<rect class="n async" x="560" y="56" width="150" height="64" rx="6"/>
+<text class="tb mid" x="635" y="75.5">Half-open</text>
+<text class="ts mid" x="635" y="92.5">one trial call</text>
+<text class="ts mid" x="635" y="109.5">is let through</text>
+<g data-s="1">
+<path class="e fault" d="M160 78H285"/>
+<text class="ts mid" x="222" y="70">too many failures</text>
+</g>
+<g data-s="3">
+<path class="e async" d="M435 78H560"/>
+<text class="ts mid" x="497" y="70">cool-down over</text>
+</g>
+<g data-s="4">
+<path class="e fault" d="M560 104H435"/>
+<text class="ts mid" x="497" y="122">trial fails</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M635 56C635 10 85 10 85 56"/>
+<text class="ts mid" x="360" y="16">trial succeeds</text>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="156">While open, the caller gets an immediate error or a fallback instead of waiting for a timeout,</text>
+<text class="ts" x="10" y="172">and the struggling dependency receives no traffic from this caller, which gives it room to recover.</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li>A breaker starts closed. Calls pass through and failures are counted. When too many fail, it opens.</li>
+  <li>While it is open, every call fails at once, with an error or a fallback. The caller stops waiting, and the struggling dependency gets no traffic from it and has room to recover.</li>
+  <li>After a cool-down period the breaker becomes half-open and lets one trial call through.</li>
+  <li>If the trial fails, the breaker opens again and waits out another cool-down.</li>
+  <li>If the trial succeeds, it closes, and traffic flows as before.</li>
+</ol>
+<figcaption>The name comes from electrical circuit breakers. Closed means current flows, which is the opposite of what the word suggests at first.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="A circuit breaker">
+type State = "closed" | "open" | "half-open";
+
+class CircuitBreaker {
+  private state: State = "closed";
+  private failures = 0;
+  private openedAt = 0;
+
+  constructor(
+    private threshold = 5,                       // consecutive failures before opening
+    private coolDownMs = 10_000,                 // how long to stay open before testing again
+    private now: () => number = Date.now,
+  ) {}
+
+  async call<T>(action: () => Promise<T>): Promise<T> {
+    if (this.state === "open") {
+      if (this.now() - this.openedAt < this.coolDownMs) {
+        throw new Error("circuit open");         // fail at once, without touching the dependency
+      }
+      this.state = "half-open";                  // cool-down over: let a trial request through
+    }
+    try {
+      const result = await action();
+      this.state = "closed";
+      this.failures = 0;
+      return result;
+    } catch (error) {
+      this.failures += 1;
+      if (this.state === "half-open" || this.failures >= this.threshold) {
+        this.state = "open";
+        this.openedAt = this.now();
+      }
+      throw error;
+    }
+  }
+}
+</pre>
+<p>In a test against a dependency that was down, twenty calls through this breaker produced five real attempts and fifteen immediate failures. After the cool-down, one trial call went through, failed, and the breaker reopened. When the dependency recovered, the next trial succeeded and traffic resumed.</p>
+<p>Production breakers refine this in ways worth knowing.</p>
+<ul>
+  <li>They open on a <b>failure rate</b> over a recent window, such as more than half of the last 20 calls, instead of consecutive failures. Slow calls count as failures.</li>
+  <li>They allow a <b>limited number</b> of trial calls when half-open, not unlimited traffic.</li>
+  <li>They are scoped carefully. One breaker for a whole service hides a single bad instance behind the good ones. A breaker for each instance is the outlier detection of <x-ref to="service-communication#client-server"></x-ref>.</li>
+  <li>They are <b>visible</b>. A breaker opening is an event to log and alert on.</li>
+</ul>
+<p>A breaker is only as useful as what happens when it is open. Failing fast gives the caller its thread back. What the user sees depends on the fallback, covered under graceful degradation below.</p>
+
+<h2 id="bulkheads">Bulkheads</h2>
+<p>A ship’s hull is divided into watertight compartments so that one breach does not flood the vessel. A <dfn>bulkhead</dfn> in software divides a shared resource so that one misbehaving dependency cannot consume all of it.</p>
+
+<figure class="fig wide" id="fig-bulkhead">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-labelledby="f424t f424d">
+<title id="f424t">One shared pool of threads compared with a separate limit for each dependency</title>
+<desc id="f424d">On the left, a single pool of 100 threads is entirely occupied by calls to a slow tags service, so requests that only need the healthy profile service cannot get a thread and everything is down. On the right, the capacity is divided: tags may use 30 and is full, while profile with 30 and other work with 40 are healthy. Calls to tags beyond its limit are rejected at once, and everything else keeps working.</desc>
+<text class="tb" x="10" y="18">One shared pool of 100</text>
+<rect class="n" x="10" y="30" width="330" height="92" rx="6"/>
+<rect x="22" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="33" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="44" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="55" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="66" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="77" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="88" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="99" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="110" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="121" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="132" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="143" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="154" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="165" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="176" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="187" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="198" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="209" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="220" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="231" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="242" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="253" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="264" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="275" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="286" y="42" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="22" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="33" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="44" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="55" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="66" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="77" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="88" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="99" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="110" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="121" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="132" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="143" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="154" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="165" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="176" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="187" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="198" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="209" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="220" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="231" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="242" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="253" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="264" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="275" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="286" y="53" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="22" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="33" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="44" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="55" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="66" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="77" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="88" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="99" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="110" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="121" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="132" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="143" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="154" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="165" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="176" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="187" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="198" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="209" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="220" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="231" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="242" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="253" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="264" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="275" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="286" y="64" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="22" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="33" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="44" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="55" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="66" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="77" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="88" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="99" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="110" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="121" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="132" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="143" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="154" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="165" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="176" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="187" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="198" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="209" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="220" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="231" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="242" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="253" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="264" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="275" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<rect x="286" y="75" width="9" height="9" rx="1" fill="var(--fault)"/>
+<text class="ts" x="22" y="104">all 100 threads are stuck calling the slow Tags service</text>
+<text class="ts" x="10" y="146">Requests that only need the healthy Profile</text>
+<text class="ts" x="10" y="162">service cannot get a thread. Everything is down.</text>
+<path class="e none dash" d="M360 8V190"/>
+<text class="tb" x="380" y="18">Separate limits for each dependency</text>
+<rect class="n" x="380" y="30" width="102" height="92" rx="6"/>
+<text class="ts tb mid" x="431" y="48">Tags: 30</text>
+<rect x="387" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="396" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="405" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="414" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="423" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="432" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="441" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="450" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="459" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="468" y="58" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="387" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="396" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="405" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="414" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="423" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="432" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="441" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="450" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="459" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="468" y="68" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="387" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="396" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="405" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="414" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="423" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="432" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="441" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="450" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="459" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<rect x="468" y="78" width="7" height="8" rx="1" fill="var(--fault)"/>
+<text class="ts mid" x="431" y="114">full</text>
+<rect class="n" x="494" y="30" width="102" height="92" rx="6"/>
+<text class="ts tb mid" x="545" y="48">Profile: 30</text>
+<rect x="501" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="510" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="519" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="528" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="537" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="546" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="555" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="564" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="573" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="582" y="58" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="501" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="510" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="519" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="528" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="537" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="546" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="555" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="564" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="573" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="582" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="501" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="510" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="519" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="528" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="537" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="546" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="555" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="564" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="573" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="582" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<text class="ts mid" x="545" y="114">9 in use</text>
+<rect class="n" x="608" y="30" width="102" height="92" rx="6"/>
+<text class="ts tb mid" x="659" y="48">Other: 40</text>
+<rect x="615" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="624" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="633" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="642" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="651" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="660" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="669" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="678" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="687" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="696" y="58" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="615" y="68" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="624" y="68" width="7" height="8" rx="1" fill="var(--store)"/>
+<rect x="633" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="642" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="651" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="660" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="669" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="678" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="687" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="696" y="68" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="615" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="624" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="633" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="642" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="651" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="660" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="669" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="678" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="687" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="696" y="78" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="615" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="624" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="633" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="642" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="651" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="660" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="669" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="678" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="687" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<rect x="696" y="88" width="7" height="8" rx="1" fill="var(--rule-2)"/>
+<text class="ts mid" x="659" y="114">12 in use</text>
+<text class="ts" x="380" y="146">Calls to Tags beyond its limit are rejected at once.</text>
+<text class="ts" x="380" y="162">Profile and everything else keep working.</text>
+</svg>
+</div>
+<figcaption>The same capacity, divided. The tags outage now costs tags, and nothing else.</figcaption>
+</figure>
+
+<p>The simplest form is a limit on calls in progress for each dependency.</p>
+<pre data-lang="ts" data-title="A bulkhead: a cap on concurrent calls to one dependency">
+class Bulkhead {
+  private inUse = 0;
+  constructor(private limit: number) {}
+
+  async run<T>(action: () => Promise<T>): Promise<T> {
+    if (this.inUse >= this.limit) throw new Error("bulkhead full");    // reject, do not queue
+    this.inUse += 1;
+    try { return await action(); } finally { this.inUse -= 1; }
+  }
+}
+
+const tagsCalls = new Bulkhead(30);       // at most 30 calls to the tags service at once
+</pre>
+<p>Had the feed service in the opening example allowed at most a few of its twenty threads to wait on tags, the rest would have stayed free. The same idea applies at other scales: separate connection pools for separate databases, separate worker pools for cheap and expensive requests, separate queues for each tenant (<x-ref to="multi-tenancy#noisy-neighbors"></x-ref>), and at the largest scale, separate copies of the whole system (<x-ref to="multi-tenancy#cells"></x-ref>).</p>
+<p>The limit rejects when full, on purpose. Queuing the excess would bring back the waiting that the bulkhead exists to prevent.</p>
+
+<h2 id="rate-limiting">Rate limiting</h2>
+<p>The patterns so far protect a caller from its dependencies. <dfn>Rate limiting</dfn> protects a service from its callers: it caps how many requests each client may make in a period. It serves several purposes at once.</p>
+<ul>
+  <li><b>Fairness.</b> One client’s runaway script should not use the capacity that everyone shares.</li>
+  <li><b>Abuse.</b> Password guessing, scraping and spam all depend on making many requests.</li>
+  <li><b>Cost.</b> Some operations cost real money each time they run.</li>
+  <li><b>A commercial boundary.</b> Plans are often defined by request quotas.</li>
+</ul>
+<p>Three decisions define a limiter: what is counted (requests, or a weighted cost), who it is counted for (an API key, a user, an IP address, a tenant), and the algorithm. There are five standard algorithms, and the differences between them are a favorite interview topic.</p>
+
+<h3 id="token-bucket">Token bucket</h3>
+<p>Each client has a bucket that holds up to <i>N</i> tokens. Tokens are added at a steady rate. A request takes one token. If the bucket is empty, the request is rejected.</p>
+
+<figure class="fig wide" id="fig-bucket">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f425t f425d">
+<title id="f425t">The token bucket and the leaky bucket</title>
+<desc id="f425d">On the left, a token bucket. Tokens are added at a fixed rate into a bucket that holds at most N. A request takes one token and passes, and is rejected if there is none. A full bucket lets a burst of N through at once, and over time throughput cannot exceed the refill rate. On the right, a leaky bucket. Requests arrive in bursts into a queue that holds at most N, with any beyond that rejected, and leave at a fixed rate. Whatever arrives, what comes out is even.</desc>
+<text class="tb" x="10" y="18">Token bucket: allows bursts, limits the average</text>
+<path class="e none" d="M70 60V140H170V60"/>
+<circle class="dot" cx="86" cy="128" r="7"/>
+<circle class="dot" cx="108" cy="128" r="7"/>
+<circle class="dot" cx="130" cy="128" r="7"/>
+<circle class="dot" cx="152" cy="128" r="7"/>
+<circle class="dot" cx="86" cy="108" r="7"/>
+<circle class="dot" cx="108" cy="108" r="7"/>
+<circle class="dot" cx="130" cy="108" r="7"/>
+<path class="e sig" d="M120 30V58"/>
+<text class="ts" x="130" y="44">tokens added at a fixed rate</text>
+<text class="ts" x="180" y="84">bucket holds at most N</text>
+<rect class="n" x="70" y="164" width="100" height="34" rx="6"/>
+<text class="ts tb mid" x="120" y="185.5">Request</text>
+<path class="e sig" d="M120 164V142"/>
+<text class="ts" x="184" y="170">takes one token and passes.</text>
+<text class="ts" x="184" y="185">No token: rejected.</text>
+<text class="ts" x="10" y="224">A full bucket lets a burst of N through at once.</text>
+<text class="ts" x="10" y="239">Over time, throughput cannot exceed the refill rate.</text>
+<path class="e none dash" d="M360 8V256"/>
+<text class="tb" x="380" y="18">Leaky bucket: smooths bursts into a steady flow</text>
+<path class="e none" d="M440 60V140H540V60"/>
+<rect class="n sig" x="452" y="120" width="76" height="11" rx="2"/>
+<rect class="n sig" x="452" y="106" width="76" height="11" rx="2"/>
+<rect class="n sig" x="452" y="92" width="76" height="11" rx="2"/>
+<rect class="n sig" x="452" y="78" width="76" height="11" rx="2"/>
+<rect class="n sig" x="452" y="64" width="76" height="11" rx="2"/>
+<path class="e sig" d="M490 30V58"/>
+<text class="ts" x="500" y="44">requests arrive in bursts</text>
+<text class="ts" x="550" y="84">queue holds at most N;</text>
+<text class="ts" x="550" y="100">beyond that, rejected</text>
+<path class="e store" d="M490 140V176"/>
+<text class="ts" x="500" y="164">leave at a fixed rate</text>
+<text class="ts" x="380" y="224">Whatever arrives, what comes out is even. Bursts wait</text>
+<text class="ts" x="380" y="239">in the queue, so requests are delayed, not just counted.</text>
+
+</svg>
+</div>
+<figcaption>Two buckets with opposite attitudes to bursts. One permits them up to a size. The other flattens them.</figcaption>
+</figure>
+
+<p>Two numbers describe it: the refill rate, which is the long-run average allowed, and the bucket size, which is the largest burst. This matches how real clients behave. A page load fires eight requests at once and then nothing for a minute, which a token bucket allows while still capping sustained use. It needs two stored values for each client, the token count and the time of the last update, and it is the most widely used algorithm. Stripe and AWS API limits work this way.</p>
+
+<div class="widget" data-widget="tokenbucket">
+<h4>A token bucket under a burst</h4>
+<p>The bucket starts full. See how long a burst is absorbed and what is rejected after that.</p>
+<div class="controls">
+  <label>Refill rate, tokens per second<input type="number" name="rate" value="10" min="0.1" step="1"></label>
+  <label>Bucket size<input type="number" name="capacity" value="50" min="1" step="5"></label>
+  <label>Requests arriving per second<input type="number" name="incoming" value="30" min="0" step="5"></label>
+  <label>For how many seconds<input type="number" name="seconds" value="10" min="1" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 210" role="img" aria-label="Tokens left in the bucket during the burst. The line falls from full while requests arrive faster than tokens are added, and stays at zero once the bucket is empty."><line x1="56" x2="622" y1="26" y2="26" class="grid"></line><path class="fill-sig" style="opacity:.14" d="M56.0 26.0 L197.5 170.0 L622.0 170.0 L622.0 170 L56 170 Z"></path><path class="line" d="M56.0 26.0 L197.5 170.0 L622.0 170.0"></path><line class="x" style="stroke-width:1.5;stroke-dasharray:4 4" y1="16" y2="170" x1="197.5" x2="197.5"></line><text class="ts" y="13" x="203.5">empty after 2.5 s</text><text x="48" y="30" class="ts end">50</text><text x="339" y="187" class="ts mid">5 s</text><text x="622" y="187" class="ts end">10 s</text><line x1="56" x2="622" y1="170" y2="170" class="axis"></line><text x="48" y="174" class="ts end">0</text><text x="56" y="187" class="ts">0 s</text><text x="339" y="204" class="ts mid">Tokens left in the bucket, second by second</text></svg>
+<dl class="results">
+  <div><dt>Bucket runs dry after</dt><dd data-out="burst">2.5 s</dd></div>
+  <div><dt>Requests allowed</dt><dd data-out="allowed">150</dd></div>
+  <div><dt>Requests rejected</dt><dd data-out="rejected">150</dd></div>
+  <div><dt>Share rejected</dt><dd data-out="share">50%</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">The bucket starts full with 50 tokens and refills at 10 a second. Requests arrive at 30 a second, so the bucket runs dry after 2.5 s, having let 75 requests through at full speed. From then on only 10 a second pass. Over 10 s, 150 of 300 requests are allowed and 150 are rejected.</p>
+</div>
+
+<pre data-lang="ts" data-title="A token bucket. Tokens are computed on demand, with no background timer">
+class TokenBucket {
+  private tokens: number;
+  private last: number;
+
+  constructor(private ratePerSecond: number, private capacity: number, now = Date.now()) {
+    this.tokens = capacity;                      // start full: a new client may burst
+    this.last = now;
+  }
+
+  allow(now = Date.now(), cost = 1): boolean {
+    const refill = ((now - this.last) / 1000) * this.ratePerSecond;
+    this.tokens = Math.min(this.capacity, this.tokens + refill);
+    this.last = now;
+    if (this.tokens < cost) return false;
+    this.tokens -= cost;
+    return true;
+  }
+}
+</pre>
+<p>The <code>cost</code> parameter lets expensive operations take more tokens than cheap ones, which is fairer than counting every request as one.</p>
+
+<h3 id="leaky-bucket">Leaky bucket</h3>
+<p>Requests enter a queue of fixed size and are processed at a constant rate, like water leaving a bucket through a small hole. If the queue is full, new requests are rejected. The output is perfectly smooth whatever the input looks like, which suits a downstream system that needs an even flow. The price is delay: a burst is not rejected, it waits, and a request at the back of a long queue may be stale by the time it is served. The term is also used for a meter that counts the same way without queuing anything, which behaves much like a token bucket.</p>
+
+<h3 id="fixed-window">Fixed window counter</h3>
+<p>Divide time into windows, such as each clock minute, and keep one counter for each client for the current window. Increment it on each request and reject when it exceeds the limit. This is the simplest algorithm and the cheapest: one counter, which in Redis is one <code>INCR</code> on a key that expires. Its weakness is at the edges.</p>
+
+<figure class="fig wide" id="fig-window">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 258" role="img" aria-labelledby="f426t f426d">
+<title id="f426t">A burst across the boundary between two fixed windows</title>
+<desc id="f426d">A limit of 100 requests a minute is counted in fixed windows. A client sends 100 requests in the last three seconds of the window ending at 12:01:00, and 100 more in the first three seconds of the next window, where the counter has restarted at zero. That is 200 requests in six seconds, and every one was within its window’s limit. A sliding window that looks at the last 60 seconds, wherever they fall, contains all of the first burst and would have rejected the second.</desc>
+<text class="tb" x="10" y="18">A limit of 100 a minute, counted in fixed windows</text>
+<line class="axis" x1="60" y1="96" x2="690" y2="96"/>
+<line class="axis" x1="60" y1="40" x2="60" y2="104"/>
+<text class="ts mid" x="60.0" y="120">12:00:00</text>
+<line class="axis" x1="375" y1="40" x2="375" y2="104"/>
+<text class="ts mid" x="375.0" y="120">12:01:00</text>
+<line class="axis" x1="690" y1="40" x2="690" y2="104"/>
+<text class="ts mid" x="690.0" y="120">12:02:00</text>
+<text class="ts mid" x="217.5" y="56">window 1: counter reaches 100</text>
+<text class="ts mid" x="532.5" y="56">window 2: counter restarts at 0</text>
+<rect class="bar fault" x="359.2" y="66" width="14.8" height="30" rx="2"/>
+<rect class="bar fault" x="376.0" y="66" width="14.8" height="30" rx="2"/>
+<text class="ts end" x="348.75" y="86">100 requests</text>
+<text class="ts" x="401.25" y="86">100 more</text>
+<path class="e none fault" d="M359.2 132v8H390.8v-8"/>
+<text class="ts mid" x="375.0" y="158">200 requests in six seconds, and every one was within its window’s limit</text>
+<rect class="n store" x="75.8" y="176" width="315.0" height="26" rx="4"/>
+<text class="ts mid" x="233.25" y="194">a sliding window covers the last 60 seconds</text>
+<text class="ts" x="10" y="228">A sliding window ending at 12:01:03 contains all of the first burst, so it would have rejected the second.</text>
+<text class="ts" x="10" y="244">The sliding window counter estimates this from the two fixed counters, weighting the earlier one by how much of it still overlaps.</text>
+</svg>
+</div>
+<figcaption>The boundary problem. A fixed window can let through twice the limit in a short span that straddles two windows.</figcaption>
+</figure>
+
+<h3 id="sliding-log">Sliding window log</h3>
+<p>To be exact, store the timestamp of every request for each client. On a new request, discard timestamps older than the window, count what remains, and allow the request if the count is under the limit. There is no boundary problem, because the window is always the last sixty seconds from now. The cost is memory: a limit of 1,000 an hour means up to 1,000 timestamps for each active client, about 8 KB, which for a million clients is 8 GB. It is used where precision matters and limits are small.</p>
+
+<h3 id="sliding-counter">Sliding window counter</h3>
+<p>The practical compromise keeps the fixed window’s two cheap counters and removes most of its error. Keep the count for the current window and for the previous one. Estimate the rate over the last full window by weighting the previous count by how much of that window still overlaps.</p>
+<div class="formula">estimate = previous count × (share of the previous window still in view) + current count
+
+limit 50 a minute, previous minute 42, this minute 18 so far, 15 seconds in:
+estimate = 42 × (45 ÷ 60) + 18 = 49.5        under 50, so the request is allowed</div>
+<pre data-lang="ts" data-title="A sliding window counter">
+class SlidingWindowCounter {
+  private windowStart = 0;
+  private current = 0;
+  private previous = 0;
+
+  constructor(private limit: number, private windowMs: number) {}
+
+  allow(now = Date.now()): boolean {
+    const start = Math.floor(now / this.windowMs) * this.windowMs;
+    if (start !== this.windowStart) {
+      // Move on. A gap of more than one window means the previous one was empty.
+      this.previous = start - this.windowStart === this.windowMs ? this.current : 0;
+      this.current = 0;
+      this.windowStart = start;
+    }
+    const elapsed = (now - start) / this.windowMs;                     // 0 to 1 through this window
+    const estimate = this.previous * (1 - elapsed) + this.current;     // weight the previous window
+    if (estimate >= this.limit) return false;
+    this.current += 1;
+    return true;
+  }
+}
+</pre>
+<p>The estimate assumes requests in the previous window were evenly spread, which is not exactly true, and the error is small in practice. Cloudflare, which uses this approach, reported that across 400 million requests from 270,000 sources, only 0.003% were wrongly allowed or wrongly limited. In a test of the code above against the boundary burst in <x-fig to="fig-window"></x-fig>, a fixed window allowed all 200 requests and this counter allowed 101.</p>
+
+<h3 id="rl-compare">The five compared</h3>
+<table>
+<thead><tr><th>Algorithm</th><th>Stored for each client</th><th>Bursts</th><th>Accuracy</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><th>Token bucket</th><td>Two numbers</td><td>Allowed, up to the bucket size</td><td>Exact</td><td>The general default for APIs</td></tr>
+<tr><th>Leaky bucket</th><td>A queue, or two numbers as a meter</td><td>Smoothed into a steady flow</td><td>Exact</td><td>Downstream needs an even rate</td></tr>
+<tr><th>Fixed window</th><td>One counter</td><td>Up to twice the limit at a boundary</td><td>Poor at boundaries</td><td>Simplicity matters more than precision</td></tr>
+<tr><th>Sliding log</th><td>A timestamp for every request</td><td>None beyond the limit</td><td>Exact</td><td>Small limits that must be precise</td></tr>
+<tr><th>Sliding counter</th><td>Two counters</td><td>Close to none</td><td>Very good approximation</td><td>Large scale with window-style limits</td></tr>
+</tbody>
+</table>
+
+<h3 id="rl-practice">Limiting in practice</h3>
+<p><b>Tell the client.</b> A rejected request gets status <code>429 Too Many Requests</code> with a <code>Retry-After</code> header saying when to try again. Good APIs also report the limit on successful responses, so that clients can pace themselves before being rejected. An IETF draft standardizes two header fields for this, still an Internet-Draft as of October 2026.</p>
+<pre data-lang="http" data-title="A response that reports the client’s limit, and a rejection">
+HTTP/1.1 200 OK
+RateLimit-Policy: "default";q=100;w=60
+RateLimit: "default";r=37;t=22
+
+HTTP/1.1 429 Too Many Requests
+Retry-After: 22
+</pre>
+<p>The first response says the policy is 100 requests per 60-second window, with 37 remaining and 22 seconds until the window resets.</p>
+<p><b>Limit at more than one level.</b> A limit for each user does nothing against a thousand users arriving at once. Stripe has described running four limiters together: a request rate limiter for each user, a limit on each user’s concurrent requests, which catches slow, expensive calls that a rate limit misses, and two load shedders that protect the fleet as a whole, covered below.</p>
+<p><b>Counting across many servers.</b> With twenty API servers, a limit kept in each server’s memory lets a client have twenty times the intended rate. The counters must be shared, usually in Redis, and the update must be atomic. A limiter that reads the count, checks it, and writes it back in separate steps will let two simultaneous requests both pass on the last token. Use a single atomic operation, or a short server-side script. <x-ref to="hld-rate-limiter"></x-ref> designs this in full, including what to do when the counter store is unavailable.</p>
+<p><b>Decide the failure mode.</b> If the limiter itself breaks, requests can be let through, which risks overload, or rejected, which is an outage. For most APIs letting them through is right, with the load shedding below as the backstop.</p>
+
+<h2 id="load-shedding">Load shedding</h2>
+<p>Rate limiting caps each client. <dfn>Load shedding</dfn> is the server protecting itself regardless of who is asking: when it has more work than it can do, it rejects some of it immediately.</p>
+<p>This sounds like giving up, and it is the opposite. A server that accepts everything when overloaded becomes slow for everyone. Requests queue, wait longer than their callers will wait, and are finished after the callers have gone. The server is working at full effort and producing nothing useful.</p>
+
+<figure class="fig wide" id="fig-goodput">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 262" role="img" aria-labelledby="f427t f427d">
+<title id="f427t">Useful responses against arriving requests, with and without load shedding</title>
+<desc id="f427d">A chart from an illustrative model of a server with a capacity of 1,000 requests a second. Below capacity, useful output equals arriving requests in both cases. Past capacity, a server that accepts everything spends its effort on requests that time out before they finish, and its useful output falls as demand rises. A server that rejects the excess early keeps serving at about its capacity.</desc>
+<line class="axis" x1="64" y1="214" x2="470" y2="214"/>
+<text class="ts end" x="56" y="218.0">0</text>
+<line class="grid" x1="64" y1="134.833" x2="470" y2="134.833"/>
+<text class="ts end" x="56" y="138.83333333333331">500</text>
+<line class="grid" x1="64" y1="55.6667" x2="470" y2="55.6667"/>
+<text class="ts end" x="56" y="59.66666666666666">1,000</text>
+<text class="ts mid" x="64.0" y="232">0</text>
+<text class="ts mid" x="199.33333333333331" y="232">1,000</text>
+<text class="ts mid" x="334.66666666666663" y="232">2,000</text>
+<text class="ts mid" x="470.0" y="232">3,000</text>
+<text class="ts mid" x="267.0" y="252">requests arriving per second</text>
+<text class="ts mid" transform="translate(14 119) rotate(-90)">useful responses per second</text>
+<path class="line" style="stroke:var(--fault)" d="M64.0 214.0 L67.4 210.0 L70.8 206.1 L74.2 202.1 L77.5 198.2 L80.9 194.2 L84.3 190.2 L87.7 186.3 L91.1 182.3 L94.5 178.4 L97.8 174.4 L101.2 170.5 L104.6 166.5 L108.0 162.5 L111.4 158.6 L114.8 154.6 L118.1 150.7 L121.5 146.7 L124.9 142.8 L128.3 138.8 L131.7 134.8 L135.1 130.9 L138.4 126.9 L141.8 123.0 L145.2 119.0 L148.6 115.0 L152.0 111.1 L155.4 107.1 L158.7 103.2 L162.1 99.2 L165.5 95.2 L168.9 91.3 L172.3 87.3 L175.7 83.4 L179.0 79.4 L182.4 75.5 L185.8 71.5 L189.2 67.5 L192.6 63.6 L196.0 59.6 L199.3 55.7 L202.7 61.8 L206.1 67.6 L209.5 73.0 L212.9 78.1 L216.2 82.9 L219.6 87.4 L223.0 91.7 L226.4 95.7 L229.8 99.6 L233.2 103.2 L236.5 106.7 L239.9 109.9 L243.3 113.1 L246.7 116.0 L250.1 118.9 L253.5 121.6 L256.9 124.2 L260.2 126.6 L263.6 129.0 L267.0 131.2 L270.4 133.4 L273.8 135.5 L277.1 137.5 L280.5 139.4 L283.9 141.2 L287.3 142.9 L290.7 144.6 L294.1 146.3 L297.4 147.8 L300.8 149.3 L304.2 150.8 L307.6 152.2 L311.0 153.5 L314.4 154.8 L317.8 156.1 L321.1 157.3 L324.5 158.5 L327.9 159.6 L331.3 160.7 L334.7 161.8 L338.1 162.8 L341.4 163.8 L344.8 164.8 L348.2 165.7 L351.6 166.6 L355.0 167.5 L358.3 168.3 L361.7 169.2 L365.1 170.0 L368.5 170.7 L371.9 171.5 L375.3 172.2 L378.7 173.0 L382.0 173.6 L385.4 174.3 L388.8 175.0 L392.2 175.6 L395.6 176.3 L398.9 176.9 L402.3 177.5 L405.7 178.0 L409.1 178.6 L412.5 179.1 L415.9 179.7 L419.2 180.2 L422.6 180.7 L426.0 181.2 L429.4 181.7 L432.8 182.2 L436.2 182.6 L439.6 183.1 L442.9 183.5 L446.3 183.9 L449.7 184.4 L453.1 184.8 L456.5 185.2 L459.8 185.6 L463.2 186.0 L466.6 186.3 L470.0 186.7"/>
+<path class="line" style="stroke:var(--store)" d="M64.0 214.0 L67.4 210.0 L70.8 206.1 L74.2 202.1 L77.5 198.2 L80.9 194.2 L84.3 190.2 L87.7 186.3 L91.1 182.3 L94.5 178.4 L97.8 174.4 L101.2 170.5 L104.6 166.5 L108.0 162.5 L111.4 158.6 L114.8 154.6 L118.1 150.7 L121.5 146.7 L124.9 142.8 L128.3 138.8 L131.7 134.8 L135.1 130.9 L138.4 126.9 L141.8 123.0 L145.2 119.0 L148.6 115.0 L152.0 111.1 L155.4 107.1 L158.7 103.2 L162.1 99.2 L165.5 95.2 L168.9 91.3 L172.3 87.3 L175.7 83.4 L179.0 79.4 L182.4 75.5 L185.8 71.5 L189.2 67.5 L192.6 63.6 L196.0 63.6 L199.3 63.6 L202.7 63.6 L206.1 63.6 L209.5 63.6 L212.9 63.6 L216.2 63.6 L219.6 63.6 L223.0 63.6 L226.4 63.6 L229.8 63.6 L233.2 63.6 L236.5 63.6 L239.9 63.6 L243.3 63.6 L246.7 63.6 L250.1 63.6 L253.5 63.6 L256.9 63.6 L260.2 63.6 L263.6 63.6 L267.0 63.6 L270.4 63.6 L273.8 63.6 L277.1 63.6 L280.5 63.6 L283.9 63.6 L287.3 63.6 L290.7 63.6 L294.1 63.6 L297.4 63.6 L300.8 63.6 L304.2 63.6 L307.6 63.6 L311.0 63.6 L314.4 63.6 L317.8 63.6 L321.1 63.6 L324.5 63.6 L327.9 63.6 L331.3 63.6 L334.7 63.6 L338.1 63.6 L341.4 63.6 L344.8 63.6 L348.2 63.6 L351.6 63.6 L355.0 63.6 L358.3 63.6 L361.7 63.6 L365.1 63.6 L368.5 63.6 L371.9 63.6 L375.3 63.6 L378.7 63.6 L382.0 63.6 L385.4 63.6 L388.8 63.6 L392.2 63.6 L395.6 63.6 L398.9 63.6 L402.3 63.6 L405.7 63.6 L409.1 63.6 L412.5 63.6 L415.9 63.6 L419.2 63.6 L422.6 63.6 L426.0 63.6 L429.4 63.6 L432.8 63.6 L436.2 63.6 L439.6 63.6 L442.9 63.6 L446.3 63.6 L449.7 63.6 L453.1 63.6 L456.5 63.6 L459.8 63.6 L463.2 63.6 L466.6 63.6 L470.0 63.6"/>
+<path class="e none dash" d="M199.3 24V214"/>
+<text class="ts" x="205.33333333333331" y="34">capacity</text>
+<text class="ts mid" x="361.7333333333333" y="80.58333333333334">with load shedding</text>
+<text class="ts mid" x="379.32666666666665" y="153.75">without</text>
+<text class="ts" x="492" y="40">Below capacity the two behave</text>
+<text class="ts" x="492" y="56">the same.</text>
+<text class="ts" x="492" y="92">Past it, a server that accepts</text>
+<text class="ts" x="492" y="108">everything spends its effort on</text>
+<text class="ts" x="492" y="124">requests that time out before they</text>
+<text class="ts" x="492" y="140">finish. Useful output falls as</text>
+<text class="ts" x="492" y="156">demand rises.</text>
+<text class="ts" x="492" y="192">A server that rejects the excess</text>
+<text class="ts" x="492" y="208">early keeps serving at capacity.</text>
+<text class="ts" x="492" y="224">An illustrative model, not a</text>
+<text class="ts" x="492" y="240">measurement.</text>
+<rect class="hit" x="64" y="24" width="6.8" height="190" data-tip="0 arriving per second|with load shedding: 0 useful|without: 0 useful"/>
+<rect class="hit" x="70.7" y="24" width="13.5" height="190" data-tip="100 arriving per second|with load shedding: 100 useful|without: 100 useful"/>
+<rect class="hit" x="84.3" y="24" width="13.5" height="190" data-tip="200 arriving per second|with load shedding: 200 useful|without: 200 useful"/>
+<rect class="hit" x="97.8" y="24" width="13.5" height="190" data-tip="300 arriving per second|with load shedding: 300 useful|without: 300 useful"/>
+<rect class="hit" x="111.3" y="24" width="13.5" height="190" data-tip="400 arriving per second|with load shedding: 400 useful|without: 400 useful"/>
+<rect class="hit" x="124.9" y="24" width="13.5" height="190" data-tip="500 arriving per second|with load shedding: 500 useful|without: 500 useful"/>
+<rect class="hit" x="138.4" y="24" width="13.5" height="190" data-tip="600 arriving per second|with load shedding: 600 useful|without: 600 useful"/>
+<rect class="hit" x="151.9" y="24" width="13.5" height="190" data-tip="700 arriving per second|with load shedding: 700 useful|without: 700 useful"/>
+<rect class="hit" x="165.5" y="24" width="13.5" height="190" data-tip="800 arriving per second|with load shedding: 800 useful|without: 800 useful"/>
+<rect class="hit" x="179.0" y="24" width="13.5" height="190" data-tip="900 arriving per second|with load shedding: 900 useful|without: 900 useful"/>
+<rect class="hit" x="192.5" y="24" width="13.5" height="190" data-tip="1,000 arriving per second|with load shedding: 950 useful|without: 1,000 useful"/>
+<rect class="hit" x="206.1" y="24" width="13.5" height="190" data-tip="1,100 arriving per second|with load shedding: 950 useful|without: 860 useful"/>
+<rect class="hit" x="219.6" y="24" width="13.5" height="190" data-tip="1,200 arriving per second|with load shedding: 950 useful|without: 750 useful"/>
+<rect class="hit" x="233.1" y="24" width="13.5" height="190" data-tip="1,300 arriving per second|with load shedding: 950 useful|without: 660 useful"/>
+<rect class="hit" x="246.7" y="24" width="13.5" height="190" data-tip="1,400 arriving per second|with load shedding: 950 useful|without: 580 useful"/>
+<rect class="hit" x="260.2" y="24" width="13.5" height="190" data-tip="1,500 arriving per second|with load shedding: 950 useful|without: 520 useful"/>
+<rect class="hit" x="273.7" y="24" width="13.5" height="190" data-tip="1,600 arriving per second|with load shedding: 950 useful|without: 470 useful"/>
+<rect class="hit" x="287.3" y="24" width="13.5" height="190" data-tip="1,700 arriving per second|with load shedding: 950 useful|without: 430 useful"/>
+<rect class="hit" x="300.8" y="24" width="13.5" height="190" data-tip="1,800 arriving per second|with load shedding: 950 useful|without: 390 useful"/>
+<rect class="hit" x="314.3" y="24" width="13.5" height="190" data-tip="1,900 arriving per second|with load shedding: 950 useful|without: 360 useful"/>
+<rect class="hit" x="327.9" y="24" width="13.5" height="190" data-tip="2,000 arriving per second|with load shedding: 950 useful|without: 330 useful"/>
+<rect class="hit" x="341.4" y="24" width="13.5" height="190" data-tip="2,100 arriving per second|with load shedding: 950 useful|without: 310 useful"/>
+<rect class="hit" x="354.9" y="24" width="13.5" height="190" data-tip="2,200 arriving per second|with load shedding: 950 useful|without: 280 useful"/>
+<rect class="hit" x="368.5" y="24" width="13.5" height="190" data-tip="2,300 arriving per second|with load shedding: 950 useful|without: 260 useful"/>
+<rect class="hit" x="382.0" y="24" width="13.5" height="190" data-tip="2,400 arriving per second|with load shedding: 950 useful|without: 250 useful"/>
+<rect class="hit" x="395.5" y="24" width="13.5" height="190" data-tip="2,500 arriving per second|with load shedding: 950 useful|without: 230 useful"/>
+<rect class="hit" x="409.1" y="24" width="13.5" height="190" data-tip="2,600 arriving per second|with load shedding: 950 useful|without: 220 useful"/>
+<rect class="hit" x="422.6" y="24" width="13.5" height="190" data-tip="2,700 arriving per second|with load shedding: 950 useful|without: 200 useful"/>
+<rect class="hit" x="436.1" y="24" width="13.5" height="190" data-tip="2,800 arriving per second|with load shedding: 950 useful|without: 190 useful"/>
+<rect class="hit" x="449.7" y="24" width="13.5" height="190" data-tip="2,900 arriving per second|with load shedding: 950 useful|without: 180 useful"/>
+<rect class="hit" x="463.2" y="24" width="6.8" height="190" data-tip="3,000 arriving per second|with load shedding: 950 useful|without: 170 useful"/>
+</svg>
+</div>
+<figcaption>Throughput that counts only responses someone was still waiting for is sometimes called goodput. Without shedding it collapses under overload.</figcaption>
+</figure>
+
+<p>Ways to shed, from simple to refined:</p>
+<ul>
+  <li><b>A cap on requests in progress.</b> Beyond it, respond <code>503</code> at once. This is a bulkhead at the front door, and alone it prevents the collapse in the figure.</li>
+  <li><b>Bounded queues with deadlines.</b> Never queue without limit, and discard queued requests whose deadline has passed before working on them.</li>
+  <li><b>Priorities.</b> Not all requests are equal. Shed health-check noise and background refreshes before checkout. Google’s SRE book describes tagging every request with one of four levels of criticality and shedding the lowest first. Stripe’s load shedders reserve a share of capacity for critical API methods and drop test-mode traffic before live traffic.</li>
+  <li><b>Adaptive limits.</b> A fixed concurrency cap is a guess. Adaptive limiters watch latency and adjust the cap continuously, raising it while latency holds and cutting it sharply when latency climbs, as TCP does with its congestion window (<x-ref to="transport-protocols"></x-ref>).</li>
+</ul>
+<p>Clients can take part too. In <dfn>adaptive throttling</dfn>, as described in the SRE book, each client tracks how many of its recent requests the server accepted. When it sees rejections, it starts dropping a share of its own requests locally, before sending them, so that an overloaded server is spared even the cost of saying no.</p>
+<div class="formula">probability that the client rejects a request itself
+  = max(0, (requests − K × accepts) ÷ (requests + 1))        with K usually 2</div>
+
+<h2 id="degradation">Graceful degradation</h2>
+<p>Every pattern above ends with some call not being made or not succeeding. <dfn>Graceful degradation</dfn> is deciding in advance what the user gets in that case, so that a partial failure produces a reduced page instead of an error page.</p>
+<table>
+<thead><tr><th>When this is unavailable</th><th>Serve this instead</th></tr></thead>
+<tbody>
+<tr><th>Tags, recommendations, counters</th><td>The page without them</td></tr>
+<tr><th>Personalized feed ranking</th><td>A simple chronological feed</td></tr>
+<tr><th>Fresh data</th><td>The last cached copy, marked as possibly stale</td></tr>
+<tr><th>Search</th><td>Browsing, with search shown as temporarily off</td></tr>
+<tr><th>Writes</th><td>Read-only mode, or accept the write into a queue to apply later</td></tr>
+</tbody>
+</table>
+<p>This requires knowing which dependencies are essential and which are optional, and it is a product decision as much as a technical one. A useful exercise is to list every dependency of a page and write beside each what the page should do without it.</p>
+<p>Fallbacks carry a risk of their own. A fallback path that runs only during failures is code that is rarely exercised and never under load. If it is heavier than the normal path, such as falling back from a cache to the database, it will make an overload worse at the worst moment. The Cloudflare incident in <x-ref to="message-queues#cloudflare-2024"></x-ref> was a fallback that did more work than the path it replaced. Prefer fallbacks that do less, and test them regularly.</p>
+
+<h2 id="metastable">Failures that sustain themselves</h2>
+<p>The most troublesome outages have a peculiar shape. Something triggers an overload: a deployment, a traffic spike, a brief dependency failure. The trigger is fixed within minutes. The system stays down for hours.</p>
+<p>Researchers named these <dfn>metastable failures</dfn> in 2021. The system has two stable states, healthy and overloaded, and a feedback loop holds it in the bad one after the original cause is gone. The loops are usually built from the well-intentioned mechanisms in this chapter.</p>
+<ul>
+  <li><b>Retries.</b> Overload causes failures, failures cause retries, retries are more load.</li>
+  <li><b>Cold caches.</b> A restart empties the cache, so every request hits the database, which is too slow to refill the cache (<x-ref to="caching#stampede"></x-ref>).</li>
+  <li><b>Slow failure paths.</b> Handling an error costs more than handling a success.</li>
+  <li><b>Restart storms.</b> Every instance restarts at once and all of them load their state from the same place.</li>
+</ul>
+
+<h3 id="google-2025">Google Cloud, 12 June 2025</h3>
+<p>A change to a quota-checking component used by most Google Cloud APIs contained a code path with no error handling for a missing field, and it had been released without a feature flag. When a policy record with blank fields was written, it replicated to every region within seconds, and the component began crashing in a loop everywhere at once. Engineers identified the cause and disabled the faulty code path in about forty minutes.</p>
+<p>The outage did not end there. In the largest regions, the restarting tasks all fetched their data from the same database together, which overloaded it. Google’s report states that the component lacked randomized exponential backoff for this case. Recovery in one region took up to two hours and forty minutes, most of it after the original fault had been removed.</p>
+<p>Both halves are instructive. The trigger was a change that reached every region at once, which <x-ref to="multi-region#failover"></x-ref> returns to. The duration was a recovery that created its own overload.</p>
+<p>Getting out of a metastable state means breaking the loop, which usually means reducing load well below normal: shed most traffic, turn off retries, bring instances back a few at a time, warm caches before admitting users. Preventing one means having, in advance, the limits this chapter describes: retry budgets, backoff with jitter everywhere including at startup, and load shedding that is configured and tested.</p>
+
+<h2 id="testing">Testing that it works</h2>
+<p>Resilience code runs only when things go wrong, so in normal operation it is untested. A breaker with a mistaken threshold or a fallback that throws will be discovered during an incident unless it is exercised deliberately.</p>
+<ul>
+  <li><b>Inject faults.</b> Add delay or errors to a dependency in a test environment, then in production for a small share of traffic, and confirm that callers time out, break and fall back as designed. A service mesh can inject these without code changes (<x-ref to="service-communication#traffic"></x-ref>).</li>
+  <li><b>Test overload, not only failure.</b> Push a service past its capacity and check that useful throughput stays flat instead of collapsing, and that it recovers when the load drops.</li>
+  <li><b>Rehearse.</b> Scheduled exercises in which a dependency is taken away on purpose (<x-ref to="availability-and-reliability#practice"></x-ref>).</li>
+</ul>
+
+<h2 id="together">Putting the patterns together</h2>
+<p>For one outgoing call, the patterns nest. From the outside in:</p>
+<table>
+<thead><tr><th>Layer</th><th>Question it answers</th><th>If the answer is no</th></tr></thead>
+<tbody>
+<tr><th>Deadline check</th><td>Is there still time for this request?</td><td>Stop now</td></tr>
+<tr><th>Bulkhead</th><td>Is there room for another call to this dependency?</td><td>Reject at once</td></tr>
+<tr><th>Circuit breaker</th><td>Has this dependency been failing?</td><td>Fail at once</td></tr>
+<tr><th>Retry, within a budget</th><td>Did the attempt fail in a way worth repeating?</td><td>Return the error</td></tr>
+<tr><th>Timeout, on each attempt</th><td>Has this attempt taken too long?</td><td>Abandon the attempt</td></tr>
+<tr><th>Fallback, around all of it</th><td>What does the user get instead?</td><td>A reduced result, or an honest error</td></tr>
+</tbody>
+</table>
+<p>For incoming requests: rate limits for each client at the edge, a concurrency cap and priority-based shedding at each service.</p>
+<p>You will rarely write these from scratch. Libraries provide them for every major language, and a service mesh can apply timeouts, retries, breakers and outlier detection without touching application code. What cannot be delegated is the judgment: which dependencies are optional, what each timeout should be, what the fallback is, and at which single layer retries happen.</p>
+<div class="note interview"><p><span class="label">In an interview.</span> When the interviewer asks “what if this service is slow?”, walk the stack briefly: “the caller has a timeout based on the dependency’s p99.9, a circuit breaker so that we fail fast during an outage, and a fallback, which here is the feed without recommendations. Retries happen at one layer only, with backoff, jitter and a budget, and the endpoint is idempotent.” For rate limiting, name an algorithm and say why: “token bucket for each API key, because it allows short bursts and caps the average, with counters in Redis updated atomically”. Be ready to explain the fixed-window boundary problem.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>No timeout, or a library default of a minute</th><td>One slow dependency exhausts every thread</td><td>A timeout for each dependency, set from its measured latency</td></tr>
+<tr><th>Independent timeouts at every layer</th><td>Lower layers work on requests nobody is waiting for</td><td>Propagate one deadline</td></tr>
+<tr><th>Retrying at every layer</th><td>Load multiplies by the product of the attempts</td><td>Retry at one layer, with a budget</td></tr>
+<tr><th>Retrying immediately and in step</th><td>Synchronized waves of load on a recovering service</td><td>Exponential backoff with jitter</td></tr>
+<tr><th>Retrying operations that are not idempotent</th><td>Duplicate orders and charges</td><td>Idempotency keys first (<x-ref to="idempotency-and-delivery#keys"></x-ref>)</td></tr>
+<tr><th>One shared pool for all dependencies</th><td>A failure in an optional feature takes down essential ones</td><td>Bulkheads</td></tr>
+<tr><th>Queuing excess requests without limit</th><td>Latency grows until everything times out</td><td>Bounded queues, and reject early</td></tr>
+<tr><th>Fixed window limits where precision matters</th><td>Twice the limit at window boundaries</td><td>Token bucket or sliding window counter</td></tr>
+<tr><th>Rate limit counters held in each server’s memory</th><td>The real limit is multiplied by the number of servers</td><td>Shared counters with atomic updates</td></tr>
+<tr><th>A fallback that is heavier than the normal path</th><td>Failure causes more load, which causes more failure</td><td>Fallbacks that do less work, tested regularly</td></tr>
+<tr><th>Resilience settings never exercised</th><td>They fail, or misfire, during the first real incident</td><td>Fault injection and overload tests</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="latency-and-throughput"></x-ref>: queues, utilization and why slowness consumes capacity.</li>
+  <li><x-ref to="availability-and-reliability"></x-ref>: the availability arithmetic these patterns defend.</li>
+  <li><x-ref to="distributed-fundamentals"></x-ref>: why a timeout cannot tell slow from dead.</li>
+  <li><x-ref to="idempotency-and-delivery"></x-ref>: what makes retrying safe.</li>
+  <li><x-ref to="message-queues"></x-ref>: backpressure, the same idea for asynchronous work.</li>
+  <li><x-ref to="service-communication"></x-ref>: where these patterns are applied by a mesh.</li>
+  <li><x-ref to="lld-rate-limiter"></x-ref> and <x-ref to="hld-rate-limiter"></x-ref>: a rate limiter as an object design and as a distributed system.</li>
+  <li><x-ref to="capacity-and-cost"></x-ref>: load testing and knowing where the limits are.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Failures cascade through shared, limited resources held by waiting callers. A slow dependency does more harm than a dead one.</li>
+  <li>Every call needs a timeout based on measured latency. Propagate one deadline so that all layers stop together.</li>
+  <li>Retries multiply across layers. Retry at one layer, with backoff, jitter and a budget, and only what is idempotent.</li>
+  <li>A circuit breaker stops calling a failing dependency and tests it periodically. A bulkhead caps how much any one dependency can consume.</li>
+  <li>Rate limiting caps each client. Token bucket allows bursts, leaky bucket smooths them, fixed windows are simple and leak at boundaries, sliding logs are exact and costly, sliding counters approximate well with two numbers.</li>
+  <li>Load shedding rejects excess work early so that useful throughput holds at capacity instead of collapsing.</li>
+  <li>Decide in advance what users get when each dependency is missing, and keep fallbacks lighter than the normal path.</li>
+  <li>Outages often outlast their trigger because retries, cold caches and mass restarts sustain the overload. Recovery needs limits too.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A service has 50 worker threads and normally handles 400 requests a second at 100 ms each. A dependency used by a quarter of requests slows to 10 seconds, with no timeout set. What happens, and how quickly?</summary><p>About 100 requests a second need the slow dependency, and each now holds a thread for 10 seconds. The 50 threads are all occupied within half a second, and after that every request, including the three-quarters that never touch the dependency, waits for a thread. The service is effectively down in under a second. A timeout and a bulkhead on calls to that dependency would have confined the damage.</p></details>
+<details><summary>Why can a propagated deadline save more work than a separate timeout at each layer?</summary><p>With separate timeouts, each layer measures from when it started, so lower layers keep working after the original caller has given up, and nobody cancels them. With one deadline passed down, every layer knows the moment after which the result is useless and stops, or declines to start. Under overload this removes exactly the work that was going to be wasted.</p></details>
+<details><summary>Four layers each make up to three attempts. A service at the bottom is failing. How many calls can one user request cause, and what are two ways to prevent it?</summary><p>Three to the fourth power, 81. Retry at a single layer and let the others pass the error upward. And apply a retry budget, such as allowing retries only up to 10% of a client’s request volume, which caps the added load at about 10% for each layer however bad the failure is.</p></details>
+<details><summary>Describe the three states of a circuit breaker and what moves it between them.</summary><p>Closed: calls pass through and failures are counted. When failures exceed a threshold it becomes open: calls fail immediately without reaching the dependency. After a cool-down it becomes half-open: a trial call is allowed. If the trial succeeds it closes, and if it fails it opens again for another cool-down.</p></details>
+<details><summary>A limit of 100 requests a minute uses a fixed window counter. How can a client send 200 requests in a few seconds without being limited, and which algorithms avoid this?</summary><p>By sending 100 at the very end of one window and 100 at the start of the next, where the counter has reset. Each window sees only 100. A sliding window log avoids it exactly, a sliding window counter avoids it approximately with two counters, and a token bucket avoids it because the bucket, once emptied, refills only at the steady rate.</p></details>
+<details><summary>A token bucket holds 20 tokens and refills at 5 a second. A client that has been idle sends 40 requests at once. How many pass, and when can it next send one?</summary><p>The bucket is full, so 20 pass and 20 are rejected. Tokens return at 5 a second, so the next request can pass 200 ms later. The size sets the largest burst, 20, and the refill rate sets the sustained maximum, 5 a second.</p></details>
+<details><summary>Why does an overloaded server that accepts every request deliver fewer useful responses than one that rejects some?</summary><p>Accepted requests queue. As the queue grows, waiting time exceeds what callers will tolerate, so they time out and often retry, while the server goes on to process the abandoned requests. Its capacity is spent on work whose results are discarded. Rejecting the excess immediately keeps the queue short, so the requests it does accept finish while their callers are still waiting.</p></details>
+<details><summary>In the Google Cloud outage of June 2025 the faulty code path was disabled in about forty minutes. Why did recovery in the largest region take much longer?</summary><p>When the crashed tasks restarted, they all loaded their data from the same database at once, and in the largest region that surge overloaded the database. The restarts had no randomized exponential backoff. The recovery itself created a new overload, which had to be managed by throttling task creation. It is an example of a failure that sustains itself after its trigger is gone.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Michael Nygard, <cite>Release It!</cite>, 2nd edition, Pragmatic Bookshelf, 2018. The book that named circuit breakers and bulkheads for software.</li>
+  <li>Alejandro Forero Cuervo, <a href="https://sre.google/sre-book/handling-overload/">Handling Overload</a>, chapter 21 of <cite>Site Reliability Engineering</cite>, Google, 2016. Criticality, client-side adaptive throttling and retry budgets.</li>
+  <li>Mike Ulrich, <a href="https://sre.google/sre-book/addressing-cascading-failures/">Addressing Cascading Failures</a>, chapter 22 of the same book.</li>
+  <li>Marc Brooker, <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, retries, and backoff with jitter</a>, Amazon Builders’ Library.</li>
+  <li>Paul Tarjan, <a href="https://stripe.com/blog/rate-limiters">Scaling your API with rate limiters</a>, Stripe, March 2017. Four limiters used together, built on token buckets.</li>
+  <li>Julien Desgats, <a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/">How we built rate limiting capable of scaling to millions of domains</a>, Cloudflare, June 2017. The sliding window counter and its measured accuracy.</li>
+  <li>IETF HTTPAPI Working Group, <a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/">RateLimit header fields for HTTP</a>, Internet-Draft, version 11, May 2026.</li>
+  <li>Nathan Bronson and others, “Metastable Failures in Distributed Systems”, HotOS 2021, and Lexiang Huang and others, <a href="https://www.usenix.org/conference/osdi22/presentation/huang-lexiang">Metastable Failures in the Wild</a>, OSDI 2022.</li>
+  <li>Google Cloud, <a href="https://status.cloud.google.com/incidents/ow5i3PPK96RduMcb1SsW">Incident report for 12 June 2025</a>.</li>
+  <li>David Yanacek, <a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/">Using load shedding to avoid overload</a>, Amazon Builders’ Library.</li>
+</ol>
+</section>

@@ -1,0 +1,590 @@
+<!--meta
+{ "description": "Backups and disaster recovery explained for system design: why replication is not a backup, recovery point and recovery time objectives in practice, full, incremental and differential backups, point-in-time recovery, the 3-2-1 rule and immutability, restore drills, standby strategies, recovery plans, and lessons from real data-loss incidents.",
+  "lede": "Redundancy keeps a system running when a part fails. It does nothing when the data itself is destroyed: deleted by a mistaken command, corrupted by a bug, encrypted by an attacker, or lost with an entire site. Disaster recovery is the plan for those days. This chapter covers what to back up and how, how to know the backups work, how to bring a system back elsewhere, and what real incidents have taught.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">What redundancy does not cover</h2>
+<p>Earlier chapters made the photo app hard to stop. The database has replicas in three zones. Objects are stored with eleven nines of durability. A failed server is replaced within a minute. Then an engineer, meaning to clean up a test table, runs a <code>DELETE</code> on the production table.</p>
+<p>Every protection listed works exactly as designed. The delete is written durably, replicated to all three zones in milliseconds, and survives any hardware failure. The data is gone from every copy at once. This is the sense in which <dfn>replication is not a backup</dfn>: replication keeps copies identical, so it copies mistakes as faithfully as it copies everything else.</p>
+<p>A <dfn>backup</dfn> is a copy that differs from the live data in three ways, and it needs all three.</p>
+<ul>
+  <li><b>Separate in time.</b> It holds the data as it was, so a change made now does not alter it.</li>
+  <li><b>Separate in place.</b> It survives the loss of the site, region or provider that holds the original.</li>
+  <li><b>Separate in authority.</b> The credentials, people and software that can damage the original cannot damage it.</li>
+</ul>
+<p><dfn>Disaster recovery</dfn>, shortened to DR, is the wider discipline: the plans, copies and standby systems that bring a service back after an event that ordinary redundancy cannot absorb.</p>
+
+<h2 id="threats">What can go wrong</h2>
+<table>
+<thead><tr><th>Event</th><th>Example</th><th>Do replicas help?</th><th>What does</th></tr></thead>
+<tbody>
+<tr><th>Hardware failure</th><td>A disk or server dies</td><td>Yes</td><td>Replication and automatic failover</td></tr>
+<tr><th>Loss of a site</th><td>Fire, flood, a regional outage</td><td>Only replicas elsewhere</td><td>Copies in another region</td></tr>
+<tr><th>Human error</th><td>A wrong command, a bad migration</td><td>No. The error replicates</td><td>Point-in-time recovery, soft deletion</td></tr>
+<tr><th>Software bug</th><td>A release that silently corrupts rows for days</td><td>No</td><td>Backups kept long enough to predate the bug</td></tr>
+<tr><th>Malice</th><td>Ransomware, a stolen credential, an insider</td><td>No</td><td>Copies the attacker’s access cannot reach</td></tr>
+<tr><th>Loss of the account or provider</th><td>An account deleted or suspended</td><td>No</td><td>A copy under separate control</td></tr>
+</tbody>
+</table>
+<p>The rows are ordered roughly by how well systems are usually protected, and the order is the reverse of how often the events cause real data loss. Hardware failure is handled almost everywhere. The rows below it account for most of the incidents later in this chapter.</p>
+
+<h2 id="objectives">Two objectives</h2>
+<p><x-ref to="availability-and-reliability#rto-rpo"></x-ref> defined the two numbers that every recovery design is built to.</p>
+<ul>
+  <li>The <dfn>recovery point objective</dfn>, RPO, is how much recent data you can afford to lose, measured as time. An RPO of one hour means that after recovery, at most the last hour of changes is missing.</li>
+  <li>The <dfn>recovery time objective</dfn>, RTO, is how long the service may be down while you recover.</li>
+</ul>
+<p>Both are business decisions with engineering prices. Each step toward zero costs more, steeply at the end. They also differ by data. In the photo app, losing an hour of uploaded photos is serious and visible. Losing an hour of “recently viewed” history is nothing. Classify the data and set objectives for each class, because protecting everything to the standard of the most precious part is expensive, and protecting everything to the standard of the least is negligent.</p>
+<table>
+<thead><tr><th>Data</th><th>RPO</th><th>RTO</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Photos and their metadata</th><td>Minutes</td><td>An hour</td><td>Users’ own irreplaceable content</td></tr>
+<tr><th>Accounts and payments</th><td>Near zero</td><td>An hour</td><td>Money and identity</td></tr>
+<tr><th>Feeds, counters, search index</th><td>Not applicable</td><td>Hours</td><td>Derived: can be rebuilt from the data above</td></tr>
+<tr><th>Caches, sessions</th><td>Not applicable</td><td>Minutes</td><td>Disposable</td></tr>
+</tbody>
+</table>
+<p>The third row is a design opportunity. Data that can be recomputed from other data does not need backing up, only a tested way to rebuild it, as <x-ref to="change-data-capture#derived"></x-ref> discussed.</p>
+
+<h2 id="backups">Kinds of backup</h2>
+<p>A <dfn>full backup</dfn> copies everything. It is simple and self-contained, and for a large database it is slow and expensive to take every day. Two schemes reduce the cost by copying only changes between full backups.</p>
+
+<figure class="fig wide" id="fig-types">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 234" role="img" aria-labelledby="f501t f501d">
+<title id="f501t">Incremental and differential backups over one week</title>
+<desc id="f501d">Two rows of seven days, each starting with a full backup on Sunday. In the incremental row, each later day’s backup is small and the same size, holding what changed since the previous backup. To restore Thursday you need the full backup and all four since. In the differential row, each later day’s backup is larger than the one before, holding what changed since the full backup. To restore Thursday you need the full backup and Thursday’s only. An incremental is small to take and every link in the chain is needed. A differential grows through the week and any one will do.</desc>
+<text class="ts tb" x="10" y="44">Incremental</text>
+<rect class="n store" x="150" y="26" width="52" height="40" rx="3"/>
+<text class="ts mid" x="176" y="82">Sun</text>
+<rect class="n sig" x="214" y="58" width="52" height="8" rx="3"/>
+<text class="ts mid" x="240" y="82">Mon</text>
+<rect class="n sig" x="278" y="58" width="52" height="8" rx="3"/>
+<text class="ts mid" x="304" y="82">Tue</text>
+<rect class="n sig" x="342" y="58" width="52" height="8" rx="3"/>
+<text class="ts mid" x="368" y="82">Wed</text>
+<rect class="n sig" x="406" y="58" width="52" height="8" rx="3"/>
+<text class="ts mid" x="432" y="82">Thu</text>
+<rect class="n sig ghost" x="470" y="58" width="52" height="8" rx="3"/>
+<text class="ts mid" x="496" y="82">Fri</text>
+<rect class="n sig ghost" x="534" y="58" width="52" height="8" rx="3"/>
+<text class="ts mid" x="560" y="82">Sat</text>
+<text class="ts" x="606" y="40">To restore Thursday:</text>
+<text class="ts" x="606" y="56">the full backup and</text>
+<text class="ts" x="606" y="71">all four since</text>
+<text class="ts tb" x="10" y="134">Differential</text>
+<rect class="n store" x="150" y="116" width="52" height="40" rx="3"/>
+<text class="ts mid" x="176" y="172">Sun</text>
+<rect class="n async ghost" x="214" y="148" width="52" height="8" rx="3"/>
+<text class="ts mid" x="240" y="172">Mon</text>
+<rect class="n async ghost" x="278" y="144" width="52" height="12" rx="3"/>
+<text class="ts mid" x="304" y="172">Tue</text>
+<rect class="n async ghost" x="342" y="138" width="52" height="18" rx="3"/>
+<text class="ts mid" x="368" y="172">Wed</text>
+<rect class="n async" x="406" y="132" width="52" height="24" rx="3"/>
+<text class="ts mid" x="432" y="172">Thu</text>
+<rect class="n async ghost" x="470" y="126" width="52" height="30" rx="3"/>
+<text class="ts mid" x="496" y="172">Fri</text>
+<rect class="n async ghost" x="534" y="120" width="52" height="36" rx="3"/>
+<text class="ts mid" x="560" y="172">Sat</text>
+<text class="ts" x="606" y="130">To restore Thursday:</text>
+<text class="ts" x="606" y="146">the full backup and</text>
+<text class="ts" x="606" y="161">Thursday’s only</text>
+<text class="ts" x="10" y="206">Sunday is a full copy. An incremental holds what changed since the previous backup: small to take, and every link in the</text>
+<text class="ts" x="10" y="222">chain is needed. A differential holds what changed since the full backup: it grows through the week, and any one will do.</text>
+
+</svg>
+</div>
+<figcaption>Solid boxes are the backups needed to restore Thursday. Incrementals save space and make the restore depend on more pieces.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="restore-set.ts">type Backup = { day: number; kind: "full" | "incremental" | "differential"; sizeGb: number };
+
+/** The backups needed to restore the state as of the end of `day`. */
+export function restoreSet(backups: Backup[], day: number): Backup[] {
+  const upTo = backups.filter((b) => b.day <= day).sort((a, b) => a.day - b.day);
+  const lastFull = upTo.findLastIndex((b) => b.kind === "full");
+  if (lastFull < 0) throw new Error("no full backup to start from");
+  const after = upTo.slice(lastFull + 1);
+  const lastDiff = after.findLastIndex((b) => b.kind === "differential");
+  // a differential replaces everything between the full backup and itself
+  const tail = lastDiff >= 0 ? after.slice(lastDiff) : after;
+  return [upTo[lastFull], ...tail];
+}</pre>
+
+<p>For a 500 GB database that changes by 10 GB a day, a week of incrementals stores 560 GB and a week of differentials stores 710 GB. Restoring Thursday reads 540 GB either way, from five backups in one case and two in the other. The count matters more than it looks: one unreadable incremental breaks every restore that comes after it in the chain.</p>
+<p>Backups also differ in what they contain.</p>
+<table>
+<thead><tr><th></th><th>Logical</th><th>Physical</th><th>Volume snapshot</th></tr></thead>
+<tbody>
+<tr><th>What it is</th><td>The data exported as statements or rows, such as <code>pg_dump</code></td><td>A copy of the database’s own files</td><td>The storage system’s frozen image of a whole disk</td></tr>
+<tr><th>Restore speed</th><td>Slow: everything is re-inserted and every index rebuilt</td><td>Fast: files are copied back</td><td>Fastest, within the same provider</td></tr>
+<tr><th>Portable across versions and systems</th><td>Yes</td><td>No: same major version</td><td>No: same platform</td></tr>
+<tr><th>Can restore one table</th><td>Yes</td><td>Not directly</td><td>No</td></tr>
+<tr><th>Typical use</th><td>Small databases, migrations, an extra copy in a different form</td><td>The main backup of a large database</td><td>Frequent, cheap restore points</td></tr>
+</tbody>
+</table>
+<p>Whatever the method, a backup must be <em>consistent</em>: it must represent the data at one moment, not half of one transaction and half of the next. Database backup tools arrange this. Copying a running database’s files with an ordinary file copy does not, and produces something that may or may not start.</p>
+
+<h2 id="pitr">Point-in-time recovery</h2>
+<p>A nightly backup has an RPO of up to a day: whatever happened since the last one is lost. Closing that gap uses something the database already produces. <x-ref to="storage-engines#wal"></x-ref> explained that every change is first written to a log. If that log is copied somewhere safe as it is written, then a backup plus the log can reproduce the database at any moment after the backup, by replaying changes up to that moment and stopping. This is <dfn>point-in-time recovery</dfn>, PITR.</p>
+<p>It was tested for this chapter on a real PostgreSQL 16 server. The setup is three settings and one command.</p>
+
+<pre data-lang="text" data-title="postgresql.conf, on the live server">wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /backup/archive/%f && cp %p /backup/archive/%f'</pre>
+
+<pre data-lang="sh" data-title="a base backup">pg_basebackup -D /backup/base -c fast</pre>
+
+<p>The test then followed the scenario from the start of the chapter. A table had 1,000 rows when the base backup was taken. Another 500 were added. A few seconds later a <code>DELETE</code> with no <code>WHERE</code> removed all 1,500, and one new row was inserted after that. To recover, the base backup was copied to a new directory and given a target time two seconds before the delete.</p>
+
+<pre data-lang="text" data-title="postgresql.auto.conf, on the restored copy, plus an empty file named recovery.signal">restore_command = 'cp /backup/archive/%f %p'
+recovery_target_time = '2026-10-10 16:52:46.469874+00'
+recovery_target_action = 'promote'</pre>
+
+<pre data-lang="text" data-title="the server's log during recovery">LOG:  starting point-in-time recovery to 2026-10-10 16:52:46.469874+00
+LOG:  restored log file "000000010000000000000002" from archive
+LOG:  restored log file "000000010000000000000003" from archive
+LOG:  recovery stopping before commit of transaction 733, time 2026-10-10 16:52:48.492862+00</pre>
+
+<p>The recovered database had 1,500 rows, the largest ID was 1,500, and the row inserted after the mistake was absent. The last log line shows the server reaching the delete’s commit and declining to apply it.</p>
+
+<figure class="fig wide" id="fig-pitr">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 228" role="img" aria-labelledby="f502t f502d">
+<title id="f502t">Point-in-time recovery to just before a mistaken delete</title>
+<desc id="f502d">A timeline. A base backup is taken when the table has 1,000 rows. From then on every change is archived as it happens. Later the table has 1,500 rows, and this moment is chosen as the recovery target. Then a DELETE with no WHERE clause leaves 0 rows, one new row is added, and the mistake is noticed. Recovery restores the base backup, then replays the log up to the target and stops. Any moment between the base backup and the end of the archived log can be recovered. The result is the database as it was two seconds before the mistake, with 1,500 rows. The delete, and the row added after it, are not replayed.</desc>
+<line class="axis" x1="40" y1="96" x2="700" y2="96"/>
+<g data-s="1" data-packet="none">
+<rect class="n store" x="61" y="30" width="90" height="34" rx="5"/>
+<text class="ts tb mid" x="106.0" y="51">Base backup</text>
+<path class="e none store" d="M106 64V96"/>
+<text class="ts mid" x="106.0" y="114">1,000 rows</text>
+</g>
+<g data-s="2">
+<rect class="n sig" x="106" y="84" width="528" height="12" rx="2"/>
+<text class="ts mid" x="251.2" y="78">every change, archived as it happens</text>
+</g>
+<g data-s="6" data-packet="none">
+<path class="e none store" d="M410 40V96"/>
+<text class="ts tb mid" x="409.59999999999997" y="34">recovery target</text>
+</g>
+<g data-s="3">
+<text class="ts mid" x="409.59999999999997" y="114">1,500 rows</text>
+</g>
+<g data-s="4" data-packet="none">
+<path class="e none fault" d="M476 56V96"/>
+<text class="ts" x="481.6" y="62">DELETE with no WHERE</text>
+<text class="ts mid" x="475.6" y="114">0 rows</text>
+</g>
+<g data-s="5" data-packet="none">
+<path class="e none" d="M542 76V96"/>
+<text class="ts mid" x="559.6" y="130">1 new row</text>
+<path class="e none fault" d="M634 40V96"/>
+<text class="ts mid" x="634.0" y="34">noticed</text>
+</g>
+<g data-s="6">
+<path class="e store" d="M106 150H410"/>
+<text class="ts mid" x="257.79999999999995" y="168">restore the base backup, then replay the log up to the target and stop</text>
+</g>
+<text class="ts" x="10" y="200">Any moment between the base backup and the end of the archived log can be recovered. The result here is the database</text>
+<text class="ts" x="10" y="216">as it was two seconds before the mistake: 1,500 rows. The delete, and the row added after it, are not replayed.</text>
+
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Rows in the table: 1,000">A base backup is taken while the table holds 1,000 rows.</li>
+  <li>From then on every change is archived as it happens, so the log is a complete record of what followed.</li>
+  <li data-state="Rows in the table: 1,500">Normal work continues and the table grows to 1,500 rows.</li>
+  <li data-state="Rows in the table: 0">Someone runs a DELETE with no WHERE clause. The table is empty, and every replica faithfully copies the mistake.</li>
+  <li data-state="Rows in the table: 1">One more row is written, and then the mistake is noticed.</li>
+  <li data-msg="replay" data-state="Rows in the table: 1,500, restored">Recovery restores the base backup and replays the log up to a chosen moment just before the delete, then stops. The table has 1,500 rows again; the delete and the row after it are not replayed.</li>
+</ol>
+<figcaption>The scenario that was run. With the log archived continuously, the recovery point is a choice made afterward, not a schedule set in advance.</figcaption>
+</figure>
+
+<p>Three practical points come with it.</p>
+<ul>
+  <li><b>Recovering loses what came after.</b> The row inserted after the delete is gone from the recovered copy. For that reason the usual practice is to recover into a <em>new</em> database, copy the lost rows back into the live one, and leave later legitimate changes in place. That requires knowing when the mistake happened, which is one more job for the deployment markers and audit logs of <x-ref to="observability#dashboards"></x-ref>.</li>
+  <li><b>Replay takes time.</b> Recovery replays every change since the base backup. A base backup taken weekly means up to a week of log to replay. Frequent base backups keep recovery short.</li>
+  <li><b>The archive is part of the backup.</b> A gap in the archived log ends recovery at the gap. Monitor that archiving is succeeding, and store the archive with the same care as the backups.</li>
+</ul>
+<p>Managed database services provide this as a setting, usually with a retention period of days to weeks. Turn it on, and find out what the retention is before you need it.</p>
+
+<h2 id="321">Where backups live</h2>
+<p>A long-standing rule of thumb, attributed to the photographer Peter Krogh, is called <dfn>3-2-1</dfn>: keep three copies of anything important, on two different kinds of storage, with one of them off-site. Two extensions are now common: one copy that cannot be altered or deleted, and zero errors when a restore is tested.</p>
+
+<figure class="fig wide" id="fig-rule321">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 226" role="img" aria-labelledby="f503t f503d">
+<title id="f503t">Backup copies separated by place and by authority</title>
+<desc id="f503d">On the left, region A and the production account hold the live database, a replica that receives the same mistakes instantly, and snapshots for fast local restore. On the right, region B and a separate backup account hold backups and the archived log in versioned object storage, locked so that they cannot be deleted for 30 days. Data is copied out from production with write-only access. There are three copies: live, local snapshots and remote backups, on two kinds of storage, with one copy away from the site and out of reach of production credentials, held so that nobody, including an attacker with full access to the first account, can remove it early.</desc>
+<rect class="n ghost" x="10" y="24" width="330" height="150" rx="8"/>
+<text class="ts tb" x="22" y="42">Region A, production account</text>
+<rect class="n sig" x="22" y="56" width="140" height="50" rx="6"/>
+<text class="ts tb mid" x="92" y="77">Database</text>
+<text class="ts mid" x="92" y="94">the live copy</text>
+<rect class="n" x="186" y="56" width="140" height="50" rx="6"/>
+<text class="ts tb mid" x="256" y="77">Replica</text>
+<text class="ts mid" x="256" y="94">same mistakes, instantly</text>
+<path class="e" d="M162 81H186"/>
+<rect class="n store" x="22" y="118" width="140" height="44" rx="6"/>
+<text class="ts tb mid" x="92" y="136">Snapshots</text>
+<text class="ts mid" x="92" y="153">fast local restore</text>
+<path class="e store" d="M92 106V118"/>
+<rect class="n ghost" x="390" y="24" width="320" height="150" rx="8"/>
+<text class="ts tb" x="402" y="42">Region B, separate backup account</text>
+<rect class="n store" x="402" y="56" width="296" height="50" rx="6"/>
+<text class="ts tb mid" x="550" y="77">Backups and archived log</text>
+<text class="ts mid" x="550" y="94">object storage, versioned</text>
+<rect class="n async" x="402" y="118" width="296" height="44" rx="6"/>
+<text class="ts tb mid" x="550" y="144.5">Locked: cannot be deleted for 30 days</text>
+<path class="e store" d="M162 148H350C385 148 370 81 402 81"/>
+<text class="ts mid" x="256" y="166">copied out, write-only</text>
+<path class="e async" d="M550 106V118"/>
+<text class="ts" x="10" y="198">Three copies: live, local snapshots, remote backups. Two kinds of storage. One copy away from the site and out of reach of</text>
+<text class="ts" x="10" y="214">production credentials, held so that nobody, including an attacker with full access to the first account, can remove it early.</text>
+</svg>
+</div>
+<figcaption>The replica is not counted among the three copies. It is the same data, in the same instant, under the same control.</figcaption>
+</figure>
+
+<p>Each element of the figure answers a threat from the table above.</p>
+<ul>
+  <li><b>Another region</b> survives the loss of a site.</li>
+  <li><b>Another account</b>, with its own administrators, survives a compromised or deleted production account. Production should be able to write new backups there and unable to read, change or delete old ones.</li>
+  <li><b>Immutability.</b> Object stores can lock an object so that it cannot be overwritten or deleted until a date passes, even by the account’s owner. Combined with the versioning described in <x-ref to="object-and-file-storage#durability"></x-ref>, it is the main defense against ransomware, which looks for backups and destroys them first.</li>
+  <li><b>Encryption</b>, with the keys backed up separately. An encrypted backup whose only key was on the machine that burned is noise.</li>
+</ul>
+<p>Not everything worth backing up is in a database. A recovery also needs the definitions of the infrastructure, the configuration, the secrets, the container images and the DNS records. If those exist only in the environment that was lost, the data has nowhere to be restored to. Keeping infrastructure as code in version control, as <x-ref to="deployment-strategies#gitops"></x-ref> advised, is a large part of disaster recovery for everything that is not data.</p>
+
+<h3 id="retention">How long to keep them</h3>
+<p>Backups must reach back further than the time it takes to notice a problem. A bug that corrupts a little data each day may go unseen for weeks. Keeping every daily backup forever is costly, so retention is usually thinned with age: every day for a week, one a week for a month, one a month for a year.</p>
+
+<pre data-lang="ts" data-title="retention.ts">type Keep = { daily: number; weekly: number; monthly: number };
+
+/** Given the dates of existing backups (newest first), returns the ones to keep. Dates are YYYY-MM-DD. */
+export function retain(dates: string[], keep: Keep): Set<string> {
+  const sorted = [...dates].sort().reverse();
+  const kept = new Set<string>(sorted.slice(0, keep.daily));
+  const pick = (bucketOf: (d: string) => string, n: number) => {
+    const seen = new Set<string>();
+    for (const d of sorted) {
+      const b = bucketOf(d);
+      if (seen.has(b)) continue;          // only the newest backup in each week or month
+      seen.add(b);
+      if (seen.size > n) break;
+      kept.add(d);
+    }
+  };
+  const weekOf = (d: string) => { const t = new Date(d + "T00:00:00Z"); const day = (t.getUTCDay() + 6) % 7; t.setUTCDate(t.getUTCDate() - day); return t.toISOString().slice(0, 10); };
+  pick(weekOf, keep.weekly);
+  pick((d) => d.slice(0, 7), keep.monthly);
+  return kept;
+}</pre>
+
+<p>Applied to 400 daily backups with a policy of 7 daily, 4 weekly and 12 monthly, it keeps 20 and reaches back more than ten months. Retention has a legal side too. Some records must be kept for years, and personal data that a user asks you to delete must eventually leave the backups as well, which argues for a stated maximum age.</p>
+
+<h2 id="restore">A backup is not proven until it is restored</h2>
+<p>Backup jobs fail quietly. The job reports success and wrote an empty file. The tool’s version no longer matches the database. The credentials expired in March. The disk filled and the last good backup is from the spring. None of these is visible until someone tries to restore, and the worst time to find out is during the disaster.</p>
+<p>The only evidence that a backup works is a restore. Make it routine and automatic:</p>
+<ol>
+  <li>On a schedule, restore the latest backup into a fresh, isolated environment.</li>
+  <li>Start the database and run checks: it starts, the row counts are plausible, the newest record is recent, a few known queries return the expected answers.</li>
+  <li>Record how long it took. That figure, and not the one in a planning document, is the copy-and-replay part of your RTO.</li>
+  <li>Alert if any step fails, and alert if no backup has succeeded within the expected interval. The absence of a backup is the condition to watch for, since a job that never ran reports no error.</li>
+</ol>
+
+<h3 id="restore-time">How long a restore takes</h3>
+<p>Restore time grows with the data, and it is easy to hold an RTO that was true two years ago. The arithmetic is short.</p>
+
+<div class="widget" data-widget="restore">
+<h4>Restore time</h4>
+<p>How long recovery from a backup takes, and how much recent data is at risk.</p>
+<div class="controls">
+  <label>Data to restore, in GB<input type="number" name="size" value="500" min="1" step="100"></label>
+  <label>Restore speed, in MB per second<input type="number" name="speed" value="100" min="1" step="10"></label>
+  <label>Hours between backups<input type="number" name="interval" value="24" min="0.1" step="1"></label>
+  <label>Everything else, in minutes<input type="number" name="other" value="45" min="0" step="5"></label>
+</div>
+<dl class="results">
+  <div><dt>Copying the data back</dt><dd data-out="copy">85.3 min</dd></div>
+  <div><dt>Until service returns</dt><dd data-out="total">2.17 hours</dd></div>
+  <div><dt>Data at risk without log archiving</dt><dd data-out="rpo">24 hours</dd></div>
+  <div><dt>The same restore at ten times the size</dt><dd data-out="tenx">15 hours</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">Copying 500 GB back at 100 MB a second takes 85.3 min. Add 45 min to notice, decide, provision and verify, and the service returns after about 2.17 hours. With a backup every 24 hours and no log archiving, up to 24 hours of changes are gone. When the data has grown ten times, the same restore takes 15 hours unless the speed grows with it.</p>
+</div>
+
+<figure class="fig wide" id="fig-rto">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 178" role="img" aria-labelledby="f504t f504d">
+<title id="f504t">The parts of a recovery that takes 2 hours 22 minutes</title>
+<desc id="f504d">A bar divided into seven steps, in minutes: notice 10, decide 15, provision 10, copy data back 85, replay log 7, verify 10, and redirect 5, for a total of 142 minutes. The copy is the largest part and the only one a faster disk helps. Half an hour passes before anything is restored at all, and the last steps are skipped at your peril: a restore that was not checked may be the wrong data, served confidently.</desc>
+<text class="tb" x="10" y="18">Where 2 hours 22 minutes of recovery go, in minutes</text>
+<rect class="n " x="10.0" y="32" width="46.3" height="36" rx="4"/>
+<text class="ts tb mid" x="33.147887323943664" y="54">10</text>
+<text class="ts mid" x="33.147887323943664" y="88">Notice</text>
+<rect class="n async" x="59.3" y="32" width="70.9" height="36" rx="4"/>
+<text class="ts tb mid" x="94.76760563380282" y="54">15</text>
+<path class="e none" d="M94.8 70V93"/>
+<text class="ts mid" x="94.76760563380282" y="106">Decide</text>
+<rect class="n " x="133.2" y="32" width="46.3" height="36" rx="4"/>
+<text class="ts tb mid" x="156.38732394366195" y="54">10</text>
+<text class="ts mid" x="156.38732394366195" y="88">Provision</text>
+<rect class="n store" x="182.5" y="32" width="416.0" height="36" rx="4"/>
+<text class="ts tb mid" x="390.5422535211268" y="54">85</text>
+<text class="ts mid" x="390.5422535211268" y="88">Copy data back</text>
+<rect class="n sig" x="601.5" y="32" width="31.5" height="36" rx="4"/>
+<text class="ts tb mid" x="617.3028169014084" y="54">7</text>
+<text class="ts mid" x="617.3028169014084" y="88">Replay log</text>
+<rect class="n " x="636.1" y="32" width="46.3" height="36" rx="4"/>
+<text class="ts tb mid" x="659.2042253521126" y="54">10</text>
+<path class="e none" d="M659.2 70V93"/>
+<text class="ts mid" x="659.2042253521126" y="106">Verify</text>
+<rect class="n " x="685.4" y="32" width="21.6" height="36" rx="4"/>
+<text class="ts tb mid" x="696.1760563380282" y="54">5</text>
+<path class="e none" d="M696.2 70V111"/>
+<text class="ts end" x="696.1760563380282" y="124">Redirect</text>
+<text class="ts" x="10" y="150">The copy is the largest part and the only one a faster disk helps. Half an hour passes before anything is restored at all,</text>
+<text class="ts" x="10" y="166">and the last steps are skipped at your peril: a restore that was not checked may be the wrong data, served confidently.</text>
+<rect class="hit" x="10.0" y="32" width="46.3" height="36" rx="4" data-tip="Notice|10 minutes|minute 0 to minute 10|7% of the recovery"/>
+<rect class="hit" x="59.3" y="32" width="70.9" height="36" rx="4" data-tip="Decide|15 minutes|minute 10 to minute 25|11% of the recovery"/>
+<rect class="hit" x="133.2" y="32" width="46.3" height="36" rx="4" data-tip="Provision|10 minutes|minute 25 to minute 35|7% of the recovery"/>
+<rect class="hit" x="182.5" y="32" width="416.0" height="36" rx="4" data-tip="Copy data back|85 minutes|minute 35 to minute 120|60% of the recovery"/>
+<rect class="hit" x="601.5" y="32" width="31.5" height="36" rx="4" data-tip="Replay log|7 minutes|minute 120 to minute 127|5% of the recovery"/>
+<rect class="hit" x="636.1" y="32" width="46.3" height="36" rx="4" data-tip="Verify|10 minutes|minute 127 to minute 137|7% of the recovery"/>
+<rect class="hit" x="685.4" y="32" width="21.6" height="36" rx="4" data-tip="Redirect|5 minutes|minute 137 to minute 142|4% of the recovery"/>
+</svg>
+</div>
+<figcaption>An illustrative breakdown. Recovery time is measured from the failure, not from the moment someone starts typing.</figcaption>
+</figure>
+
+<p>Two parts of the bar are often forgotten. The first half hour is people: noticing, understanding, and deciding to declare a disaster, which nobody does lightly. And the restore speed in the widget is whatever the slowest link allows, be it the backup storage, the network or the new disks. Measure it. When the answer no longer fits the objective, the options are a faster path, smaller units to restore through partitioning, or a standby that is already running.</p>
+
+<h2 id="strategies">Standby strategies</h2>
+<p>Restoring from backups into nothing is the cheapest plan and the slowest. Shorter objectives need part of the system to exist in the recovery location beforehand. AWS’s guidance names four strategies in order of cost, and the terms are widely used.</p>
+
+<figure class="fig wide" id="fig-strategies">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 222" role="img" aria-labelledby="f505t f505d">
+<title id="f505t">Four disaster recovery strategies with their recovery objectives</title>
+<desc id="f505d">Four strategies from cheaper and slower to faster and more costly every day. Backup and restore: only backups exist in the second region, data lost is measured in hours and time to recover is 24 hours or less. Pilot light: data is replicated and servers are defined but not running, data lost in minutes and recovery in tens of minutes. Warm standby: a small working copy runs all the time, data lost in seconds and recovery in minutes. Active-active: both regions serve users all the time, data lost near zero and time to recover potentially zero.</desc>
+<rect class="n store" x="10" y="22" width="165" height="36" rx="6"/>
+<text class="ts tb mid" x="92.5" y="44.5">Backup and restore</text>
+<text class="ts" x="10" y="80">Data lost</text>
+<text class="ts tb end" x="175" y="80">hours</text>
+<text class="ts" x="10" y="100">Recovery</text>
+<text class="ts tb end" x="175" y="100">24 hours or less</text>
+<line class="grid" x1="10" y1="110" x2="175" y2="110"/>
+<text class="ts" x="10" y="128">Only backups exist</text>
+<text class="ts" x="10" y="143">in the second region.</text>
+<rect class="n sig" x="187" y="22" width="165" height="36" rx="6"/>
+<text class="ts tb mid" x="269.5" y="44.5">Pilot light</text>
+<text class="ts" x="187" y="80">Data lost</text>
+<text class="ts tb end" x="352" y="80">minutes</text>
+<text class="ts" x="187" y="100">Recovery</text>
+<text class="ts tb end" x="352" y="100">tens of minutes</text>
+<line class="grid" x1="187" y1="110" x2="352" y2="110"/>
+<text class="ts" x="187" y="128">Data is replicated.</text>
+<text class="ts" x="187" y="143">Servers are defined,</text>
+<text class="ts" x="187" y="158">not running.</text>
+<rect class="n async" x="364" y="22" width="165" height="36" rx="6"/>
+<text class="ts tb mid" x="446.5" y="44.5">Warm standby</text>
+<text class="ts" x="364" y="80">Data lost</text>
+<text class="ts tb end" x="529" y="80">seconds</text>
+<text class="ts" x="364" y="100">Recovery</text>
+<text class="ts tb end" x="529" y="100">minutes</text>
+<line class="grid" x1="364" y1="110" x2="529" y2="110"/>
+<text class="ts" x="364" y="128">A small working copy</text>
+<text class="ts" x="364" y="143">runs all the time.</text>
+<rect class="n fault" x="541" y="22" width="165" height="36" rx="6"/>
+<text class="ts tb mid" x="623.5" y="44.5">Active-active</text>
+<text class="ts" x="541" y="80">Data lost</text>
+<text class="ts tb end" x="706" y="80">near zero</text>
+<text class="ts" x="541" y="100">Recovery</text>
+<text class="ts tb end" x="706" y="100">potentially zero</text>
+<line class="grid" x1="541" y1="110" x2="706" y2="110"/>
+<text class="ts" x="541" y="128">Both regions serve</text>
+<text class="ts" x="541" y="143">users all the time.</text>
+<path class="e none" d="M10 192H710"/>
+<text class="ts" x="10" y="210">cheaper, slower</text>
+<text class="ts end" x="710" y="210">faster, costs more every day</text>
+</svg>
+</div>
+<figcaption>Objectives as given in the AWS Well-Architected Framework. They are what each strategy can achieve when practiced, not what it guarantees.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Strategy</th><th>In the recovery region, always</th><th>To recover</th></tr></thead>
+<tbody>
+<tr><th>Backup and restore</th><td>Backups</td><td>Create infrastructure, deploy, restore data</td></tr>
+<tr><th>Pilot light</th><td>A replicated database and the definitions of everything else</td><td>Start the application servers, promote the database, redirect traffic</td></tr>
+<tr><th>Warm standby</th><td>A complete, small, running copy</td><td>Scale it up, promote the database, redirect traffic</td></tr>
+<tr><th>Active-active</th><td>A full copy already serving users</td><td>Stop sending traffic to the failed region</td></tr>
+</tbody>
+</table>
+<p>The last two are the multi-region designs of <x-ref to="multi-region#topologies"></x-ref>, and everything said there about failover applies: spare capacity must already exist, the procedure should need as little as possible from control planes during the incident, and a standby that never takes traffic is a standby nobody has tested.</p>
+<p>These strategies protect against losing a site. None of them replaces backups. A warm standby with a replicated database receives the mistaken delete as quickly as any other replica. Recovery from bad data and recovery from a lost site are separate problems, and a complete plan has an answer to each.</p>
+
+<h2 id="plan">The recovery plan</h2>
+<p>The technical pieces are worth little without a plan people can follow under stress, at night, possibly without the colleague who knows the system best.</p>
+<ul>
+  <li><b>A written runbook</b> for each scenario: commands, in order, with expected results and what to do when a step fails. Stored where it can be read when the main systems are down. A runbook kept only in the wiki that the outage took down is a known and repeated mistake.</li>
+  <li><b>An order of recovery.</b> Services depend on each other. Identity, DNS, the secrets store and the network usually have to come back before anything else can start. Work out the order beforehand, and watch for circular dependencies, such as a deployment system that needs the service it is trying to restore.</li>
+  <li><b>Authority.</b> Who may declare a disaster and start a failover that may lose data? Hesitation over this decision is often the largest part of an outage.</li>
+  <li><b>Emergency access.</b> If single sign-on is down, how do engineers reach the cloud console? Sealed emergency credentials, tested and monitored, answer this.</li>
+  <li><b>Communication.</b> Who tells customers, through what channel, hosted where? A status page should not share fate with the product.</li>
+</ul>
+<p>Then practice. A <dfn>tabletop exercise</dfn> walks through a scenario on paper and finds gaps in the plan cheaply. A <dfn>game day</dfn> does it for real: restore the database from backup, fail over to the other region, on a planned date with everyone watching. Each exercise finds something, usually something small and fatal: an expired credential, a missing permission, a step that only one person knew.</p>
+
+<h2 id="cases">Three incidents</h2>
+
+<h3 id="gitlab-2017">GitLab, January 2017: five mechanisms, one accident</h3>
+<p>GitLab’s own published account is one of the most instructive documents on this subject, because nothing in it is exotic. On 31 January 2017 the secondary database of GitLab.com fell too far behind the primary to catch up, and an engineer set about rebuilding it, which begins with emptying its data directory. Late in the evening, after hours of trouble, the command to empty the directory was run on the primary by mistake. It was stopped within seconds. About 300 GB was already gone.</p>
+
+<figure class="fig wide" id="fig-gitlab">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 234" role="img" aria-labelledby="f506t f506d">
+<title id="f506t">The five recovery mechanisms at GitLab.com on 31 January 2017 and what became of each</title>
+<desc id="f506d">Five ways to get the data back. The second database server: replication had broken, it was being rebuilt, and its data had just been wiped. Nightly SQL dumps: failing for some time because of a wrong tool version, with the error emails being rejected. Cloud disk snapshots: never enabled for the database servers. Log archiving: not set up, so no point-in-time recovery. A volume snapshot for staging: taken by hand six hours earlier for another purpose, and this is what was restored. About 300 gigabytes was deleted from the primary by a command meant for the secondary. Six hours of changes were lost, and copying the snapshot back took about 18 hours because the disks holding it were slow.</desc>
+<text class="tb" x="10" y="18">GitLab.com, 31 January 2017: five ways to get the data back</text>
+<rect class="n fault" x="10" y="30" width="200" height="26" rx="6"/>
+<text class="ts tb mid" x="110" y="47.5">Second database server</text>
+<text class="ts" x="222" y="47">Replication had broken. It was being rebuilt, and its data had just been wiped.</text>
+<rect class="n fault" x="10" y="62" width="200" height="26" rx="6"/>
+<text class="ts tb mid" x="110" y="79.5">Nightly SQL dumps</text>
+<text class="ts" x="222" y="79">Failing for some time: wrong tool version. The error emails were being rejected.</text>
+<rect class="n fault" x="10" y="94" width="200" height="26" rx="6"/>
+<text class="ts tb mid" x="110" y="111.5">Cloud disk snapshots</text>
+<text class="ts" x="222" y="111">Never enabled for the database servers.</text>
+<rect class="n fault" x="10" y="126" width="200" height="26" rx="6"/>
+<text class="ts tb mid" x="110" y="143.5">Log archiving</text>
+<text class="ts" x="222" y="143">Not set up, so no point-in-time recovery.</text>
+<rect class="n store" x="10" y="158" width="200" height="26" rx="6"/>
+<text class="ts tb mid" x="110" y="175.5">Volume snapshot for staging</text>
+<text class="ts" x="222" y="175">Taken by hand six hours earlier, for another purpose. This is what was restored.</text>
+<text class="ts" x="10" y="206">About 300 GB was deleted from the primary by a command meant for the secondary. Six hours of changes were lost,</text>
+<text class="ts" x="10" y="222">and copying the snapshot back took about 18 hours because the disks holding it were slow.</text>
+
+</svg>
+</div>
+<figcaption>Four of the five were unavailable when they were needed. The one that worked was not meant to be a backup at all.</figcaption>
+</figure>
+
+<p>The lessons are the content of this chapter.</p>
+<ul>
+  <li><b>Backups that are not tested are not backups.</b> The nightly dumps had been failing silently because the job used an older version of the tool than the database it was dumping.</li>
+  <li><b>Failures must be visible.</b> The job’s error emails existed and were being rejected before anyone saw them. Nothing alerted on the absence of a recent backup.</li>
+  <li><b>Replication is not a backup,</b> and here it was the thing being repaired when the accident happened.</li>
+  <li><b>Restore time is part of the design.</b> Copying 300 GB at the roughly 60 megabits a second those disks allowed takes over eleven hours on arithmetic alone.</li>
+  <li><b>People make mistakes under pressure,</b> late at night, on the wrong one of two similar servers. The company said afterward that its focus would shift from preventing such commands toward making recovery fast and making it obvious which machine a session is on.</li>
+</ul>
+<p>Among the changes GitLab committed to were continuous log archiving for point-in-time recovery, automated testing of restores, and monitoring of the backups themselves.</p>
+
+<h3 id="ovh-2021">OVHcloud, March 2021: the backup in the same building</h3>
+<p>On 10 March 2021 a fire destroyed one of OVHcloud’s data centers in Strasbourg and damaged a second on the same campus. Many customers lost their servers, and some then found that their backups were gone too, because the backups had been stored in the same building or the one beside it. In 2023 French courts awarded damages to two customers. In one case the contract had described the backup as physically isolated from the server, and the court found that it had not been.</p>
+<p>The lesson is the “1” in 3-2-1, with a sharper edge: know <em>where</em> your backups physically are. A backup service bought from the same provider, in the same region, at the default settings, may be closer to the original than its name suggests.</p>
+
+<h3 id="unisuper-2024">UniSuper, May 2024: the provider deletes the account</h3>
+<p>UniSuper is an Australian pension fund with more than 600,000 members. In May 2024 its services went offline for over a week. A joint statement with Google Cloud explained that a misconfiguration during the provisioning of UniSuper’s private cloud had led to the deletion of its subscription. UniSuper had duplicated its environment across two geographies as protection against outages, and the deletion removed both.</p>
+<p>What made recovery possible, according to the statement, was that UniSuper also held backups with a different service provider.</p>
+<p>The event is rare. Its lesson is about what “separate” means. Two regions under one account are separate places and one authority. Whatever can delete the account, whether a provider’s error, a billing dispute, an attacker or your own automation, deletes both. For data whose loss would end the organization, one copy belongs under different control entirely.</p>
+
+<h2 id="ransomware">Ransomware changes the assumptions</h2>
+<p>Most of this chapter assumes accidents. An attacker who has taken over administrative access behaves differently: they look for the backups first, delete or encrypt them, and only then encrypt the live data and ask for payment. Backups reachable with production credentials do not survive this.</p>
+<p>The defenses are the separations already described, taken seriously: backups in a different account with different administrators, locked against deletion for a fixed period, with deletion of anything backup-related raising an alarm. Recovery speed matters as much here as anywhere, because the pressure to pay grows with every hour offline, and a restore that takes two weeks is a weak bargaining position.</p>
+
+<h2 id="soft-delete">The cheapest recovery: not really deleting</h2>
+<p>The commonest “disaster” is small: a user deletes something by accident, or a support agent removes the wrong account. Restoring a database to recover one album is slow and heavy. Three inexpensive habits handle most such cases without touching a backup.</p>
+<ul>
+  <li><b>Soft deletion.</b> Mark rows as deleted and hide them, and remove them for good after a waiting period. <x-ref to="schema-design#soft-delete"></x-ref> covered the pattern and its costs.</li>
+  <li><b>Versioned object storage.</b> Deleting or overwriting an object keeps the earlier version, which can be brought back.</li>
+  <li><b>Delayed destruction.</b> For large, irreversible operations such as deleting a tenant, a table or a storage bucket, schedule the destruction for days later and make canceling it easy.</li>
+</ul>
+<p>These turn most recoveries into an “undo”. They are not a substitute for backups: they do not survive a bug that ignores the deleted flag, an attacker, or the loss of the store itself.</p>
+
+<div class="note interview"><p><span class="label">In an interview.</span> When asked about durability or “what if the database is lost”, separate the two problems. Replicas and multiple zones handle hardware and site failures. Backups with point-in-time recovery, stored in another region and account, handle mistakes and corruption. State an RPO and an RTO for the main data, say that restores are tested on a schedule, and point out which data is derived and can be rebuilt instead of backed up.</p></div>
+
+<h2 id="choosing">Choosing</h2>
+<table>
+<thead><tr><th>Need</th><th>Reasonable choice</th></tr></thead>
+<tbody>
+<tr><th>Protect against accidental deletion by users</th><td>Soft deletion and object versioning</td></tr>
+<tr><th>Protect a database against mistakes and bugs</th><td>Regular base backups with continuous log archiving, kept for weeks</td></tr>
+<tr><th>Protect against losing a site</th><td>Backup copies in another region, plus a standby matched to the RTO</td></tr>
+<tr><th>Protect against attackers and account loss</th><td>A separate account or provider, with immutable copies</td></tr>
+<tr><th>RTO of a day</th><td>Backup and restore, with infrastructure as code</td></tr>
+<tr><th>RTO of an hour</th><td>Pilot light or warm standby</td></tr>
+<tr><th>RTO of minutes, RPO near zero</th><td>Active-active across regions, with consensus-replicated data, and backups still</td></tr>
+<tr><th>Derived data: indexes, feeds, caches</th><td>No backup. A tested rebuild</td></tr>
+</tbody>
+</table>
+
+<h2 id="mistakes">Common mistakes</h2>
+<ul>
+  <li><b>Calling replicas backups.</b> They share every mistake, instantly.</li>
+  <li><b>Never restoring.</b> The backups are discovered to be empty, corrupt or unreadable on the day they are needed.</li>
+  <li><b>No alert on a missing backup.</b> The job stopped in March and nothing noticed.</li>
+  <li><b>Backups beside the original.</b> The same disk, building, region or account.</li>
+  <li><b>Backups deletable with production credentials.</b> One compromise removes both.</li>
+  <li><b>Retention shorter than detection.</b> The corruption is three weeks old and the oldest backup is two.</li>
+  <li><b>Losing the key.</b> Encrypted backups, and the key lived only on what was lost.</li>
+  <li><b>An RTO from a document.</b> Nobody has timed a restore since the data was a tenth of its size.</li>
+  <li><b>Backing up data and nothing else.</b> No infrastructure definitions, configuration or secrets to restore into.</li>
+  <li><b>A plan only one person knows,</b> or a runbook stored inside the system it describes.</li>
+  <li><b>A standby that replaces backups.</b> It protects against losing a site and not against bad data.</li>
+</ul>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="availability-and-reliability"></x-ref>: recovery objectives, and the difference between staying up and getting back.</li>
+  <li><x-ref to="replication"></x-ref>: what copies protect against, and what they faithfully reproduce.</li>
+  <li><x-ref to="storage-engines"></x-ref>: the write-ahead log that point-in-time recovery replays.</li>
+  <li><x-ref to="object-and-file-storage"></x-ref>: versioning, replication and locking, where most backups are kept.</li>
+  <li><x-ref to="multi-region"></x-ref>: standby regions and failover in detail.</li>
+  <li><x-ref to="deployment-strategies"></x-ref>: infrastructure as code, which is the backup of everything that is not data.</li>
+  <li><x-ref to="threats-and-defenses"></x-ref>: the attacker’s view of backups.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Replication protects against hardware failure and copies mistakes, bugs and attacks to every replica. A backup is separate in time, in place and in authority.</li>
+  <li>Set a recovery point objective and a recovery time objective for each class of data. Derived data needs a rebuild procedure, not a backup.</li>
+  <li>Continuous log archiving turns periodic backups into point-in-time recovery: any moment since the last base backup can be restored.</li>
+  <li>Keep three copies on two kinds of storage with one off-site, at least one immutable, in an account that production credentials cannot damage.</li>
+  <li>A backup is proven only by restoring it. Automate restores, check the result, time it, and alert when a backup is missing.</li>
+  <li>Restore time grows with data. When it exceeds the objective, a standby must already exist: pilot light, warm standby or active-active.</li>
+  <li>Standbys protect against losing a site, and backups against bad data. A complete plan has both, written down and rehearsed.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A database has synchronous replicas in three zones. An engineer runs a destructive update without a WHERE clause. Why do the replicas not help, and what would?</summary><p>Replication applies every committed change to every replica, including this one, within milliseconds. All copies now hold the damaged data. Point-in-time recovery from a base backup and archived log, to a moment just before the statement, would recover it. Soft deletion or a delayed replica might also, for some kinds of mistake.</p></details>
+<details><summary>Name the three ways a backup must be separate from the data it protects, and one threat each addresses.</summary><p>Separate in time, so that a mistake or bug made now does not change it. Separate in place, so that a fire or regional outage does not take it. Separate in authority, so that a compromised credential, a ransomware attack or a deleted account cannot remove it.</p></details>
+<details><summary>A full backup is taken on Sunday and incrementals on each day after. Wednesday’s incremental turns out to be unreadable. Which days can still be restored?</summary><p>Sunday, Monday and Tuesday. Each incremental depends on every one before it back to the full backup, so Wednesday and all later days in that chain are lost. With differentials, only Wednesday itself would be lost, because each differential depends on the full backup alone.</p></details>
+<details><summary>With continuous log archiving, a base backup every Sunday, and a mistake at 15:00 on Thursday, what is restored and what work does recovery involve?</summary><p>The database can be recovered to any moment up to just before 15:00 on Thursday. Recovery restores Sunday’s base backup and replays four days of archived log up to the target time. That replay may be long, which is the argument for more frequent base backups.</p></details>
+<details><summary>A 2 TB database restores at 80 MB a second. The team’s RTO is two hours. Does a restore from backup meet it?</summary><p>2 TB is 2,048 GB, about 2.1 million MB, which takes about 26,200 seconds, or 7.3 hours, for the copy alone, before detection, provisioning, log replay and verification. It misses by a wide margin. They need a faster restore path, a smaller unit to restore, or a standby that is already running.</p></details>
+<details><summary>What is the difference between a pilot light and a warm standby, and what does each cost?</summary><p>A pilot light keeps the data replicated in the recovery region and everything else defined and switched off, so recovery means starting servers: tens of minutes, at low standing cost. A warm standby keeps a small complete copy running, so recovery means scaling it up and redirecting traffic: minutes, at the cost of running that copy all the time.</p></details>
+<details><summary>A company runs active-active in two regions with a consensus-replicated database. Why does it still need backups?</summary><p>The design protects against the loss of a region. It does not protect against bad data: a mistaken delete, a corrupting bug or an attacker’s changes are committed and replicated to both regions like any other write. It also does not protect against the loss of the account that owns both regions.</p></details>
+<details><summary>What did the working recovery mechanism at GitLab in 2017 have in common with the one at UniSuper in 2024?</summary><p>In both, the copy that saved the data was outside the system that failed. At GitLab it was a snapshot taken for a different purpose and held on a different machine, when the intended backups had silently stopped. At UniSuper it was a backup with a different provider, when the account covering both regions was deleted. Separation, more than the number of copies, is what counted.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>GitLab, <a href="https://about.gitlab.com/blog/postmortem-of-database-outage-of-january-31/">Postmortem of database outage of January 31</a>, February 2017.</li>
+  <li>PostgreSQL Global Development Group, <a href="https://www.postgresql.org/docs/current/continuous-archiving.html">Continuous Archiving and Point-in-Time Recovery</a>, PostgreSQL documentation.</li>
+  <li>AWS Well-Architected Framework, <a href="https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_planning_for_recovery_disaster_recovery.html">Use defined recovery strategies to meet the recovery objectives</a>. The four strategies and their objectives.</li>
+  <li>UniSuper and Google Cloud, <a href="https://www.unisuper.com.au/about-us/media-centre/2024/a-joint-statement-from-unisuper-and-google-cloud">A joint statement from UniSuper CEO Peter Chun and Google Cloud CEO Thomas Kurian</a>, May 2024.</li>
+  <li>Blocks and Files, <a href="https://blocksandfiles.com/2023/03/23/ovh-cloud-must-pay-damages-for-lost-backup-data/">OVHcloud must pay damages for lost backup data</a>, March 2023. The court findings after the Strasbourg fire.</li>
+  <li>Raymond Blum and Rhandeev Singh, <a href="https://sre.google/sre-book/data-integrity/">Data Integrity: What You Read Is What You Wrote</a>, chapter 26 of <cite>Site Reliability Engineering</cite>, Google, 2016. Soft deletion, backups and restores as layers of defense.</li>
+  <li>AWS, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html">Locking objects with Object Lock</a>, Amazon S3 documentation. Write-once storage for backups.</li>
+  <li>Peter Krogh, <cite>The DAM Book: Digital Asset Management for Photographers</cite>, O’Reilly, 2005. The source usually given for the 3-2-1 rule.</li>
+</ol>
+</section>

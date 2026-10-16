@@ -1,0 +1,744 @@
+<!--meta
+{ "description": "A high-level design of a metrics, monitoring and logging platform: collection by scraping and by push with scrapes spread by a hash, samples sharded to ingesters and compressed in the style of Gorilla (measured by kind of series), two-hour blocks in object storage, rollups that keep histograms because percentiles do not average, four alert rules measured on a noisy day, and logs stored with a label index against an index of every word.",
+  "lede": "A monitoring system writes far more than it reads: every service reports every few seconds, and most of what is stored is never looked at. Yet when something breaks, the one query that matters must answer in seconds, and the alert must fire even if half the company is down. This chapter designs the system behind the dashboards and pages, and measures the three things that decide its cost and its usefulness: how small a sample can be, what survives downsampling, and which alert rules page for the right reasons.",
+  "updated": "2026-10-13" }
+-->
+
+<h2 id="problem">The problem</h2>
+<div class="note brief"><p><span class="label">The problem.</span> Design the monitoring platform for a company running thousands of services. It collects metrics from every service and host, keeps them for two years, draws dashboards in a second or two, evaluates alert rules and pages the engineer on call, and stores and searches the services’ logs. Many teams share it, and none of them may be able to break it for the others.</p></div>
+<p><x-ref to="observability"></x-ref> covered what to measure and how to read it: counters, gauges and histograms, structured logs, and alerts on symptoms by burn rate. This chapter designs the system that receives all of it. Its workload is the time-series shape of <x-ref to="specialized-databases#time-series"></x-ref> at the scale of a whole company: a steady flood of small appends, read rarely and mostly as summaries. Two things make it more than a database. It must stay up when the systems it watches are down, since that is when it is needed. And its cost grows with every label a developer adds, so it has to defend itself. In the terms of <x-ref to="hld-method#shapes"></x-ref>, this is counting a stream: millions of samples a second, stored and queried cheaply.</p>
+
+<h2 id="requirements">Step 1: Requirements</h2>
+<table>
+<thead><tr><th>Functional requirement</th><th>In scope</th></tr></thead>
+<tbody>
+<tr><th>Collect metrics by scraping services, and accept metrics that are pushed</th><td>Yes</td></tr>
+<tr><th>Query any series over any range, with aggregation, for dashboards</th><td>Yes</td></tr>
+<tr><th>Evaluate alert rules and notify the right people, once</th><td>Yes</td></tr>
+<tr><th>Store logs and search them by service, time and text</th><td>Yes</td></tr>
+<tr><th>Limits per team, so one team cannot overload the platform</th><td>Yes</td></tr>
+<tr><th>Traces</th><td>The same shape as logs, keyed by trace id: a follow-up</td></tr>
+<tr><th>Drawing dashboards</th><td>No: an existing tool reads the query API</td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>Non-functional requirement</th><th>Target</th></tr></thead>
+<tbody>
+<tr><th>Scale</th><td>10,000 targets with 1,000 series each, scraped every 15 seconds; 2 TB of logs a day</td></tr>
+<tr><th>Retention</th><td>Every sample for 15 days, 5-minute rollups for 90 days, hourly ones for 2 years; logs for 30 days</td></tr>
+<tr><th>Latency</th><td>A dashboard query over a day in under 2 seconds; a sample queryable within 30 seconds of being scraped</td></tr>
+<tr><th>Alerting</th><td>Rules evaluated every 15 seconds; a sustained problem paged within a few minutes, a brief spike not at all</td></tr>
+<tr><th>Availability</th><td>Higher than any service it watches; ingestion never slows a service down</td></tr>
+<tr><th>Durability</th><td>A sample acknowledged is not lost; losing a few seconds during a failure is tolerable</td></tr>
+</tbody>
+</table>
+
+<h2 id="estimates">Step 2: Estimates</h2>
+<div class="formula">series: 10,000 targets × 1,000 series = 10 million active series<br>
+samples: 10 million ÷ 15 s ≈ 667,000 a second<br>
+storage: 667,000 × 2.13 bytes a sample (measured below) × 86,400 s ≈ 123 GB a day; 15 days ≈ 1.84 TB<br>
+rollups, four values of 2.13 bytes each: 10 million × (288 a day × 90 days + 24 a day × 730 days) × 8.5 bytes ≈ 3.7 TB<br>
+logs: 2 TB a day ÷ 6.3 (compression, measured below) × 30 days ≈ 9.5 TB; an index of every word would add about 27 TB</div>
+<p>Three conclusions follow (<x-ref to="estimation#method"></x-ref>). The samples are cheap once compressed: two years of metrics fit in a few terabytes of object storage. The rate is not: 667,000 appends a second must be spread across machines by series. And the logs dwarf the metrics, so the decision about how to index them is the largest cost decision in the system.</p>
+
+<div class="widget" data-widget="monitoring98">
+<h4>Series, samples and storage</h4>
+<p>The ingestion rate and the storage for metrics and logs, using the bytes per sample and the compression of logs measured in this chapter.</p>
+<div class="controls">
+  <label>Targets<input type="number" name="targets" value="10000" min="0" max="10000000" step="1000"></label>
+  <label>Series per target<input type="number" name="per" value="1000" min="0" max="100000" step="100"></label>
+  <label>Scrape every, seconds<input type="number" name="every" value="15" min="1" max="600" step="5"></label>
+  <label>Keep every sample, days<input type="number" name="days" value="15" min="0" max="3650" step="1"></label>
+  <label>Logs a day, TB<input type="number" name="logs" value="2" min="0" max="10000" step="0.5"></label>
+  <label>Keep logs, days<input type="number" name="logdays" value="30" min="0" max="3650" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 160" role="img" aria-label="Bars comparing storage for every metric sample, for rollups, for compressed logs, and for a word index of the logs."><text x="242" y="24" class="ts end">Metrics, every sample, 15 days</text><rect x="250" y="12" width="19.1" height="16" rx="2" class="bar"></rect><circle cx="269.1" cy="20" r="5" class="dot"></circle><text x="279.1" y="24" class="ts tb">1.84 TB</text><text x="242" y="56" class="ts end">Metrics, rollups, 90 days and 2 years</text><rect x="250" y="44" width="38.4" height="16" rx="2" class="bar"></rect><text x="298.4" y="56" class="ts tb">3.7 TB</text><text x="242" y="88" class="ts end">Logs, compressed, 30 days</text><rect x="250" y="76" width="98.8" height="16" rx="2" class="bar store"></rect><text x="358.8" y="88" class="ts tb">9.52 TB</text><text x="242" y="120" class="ts end">A word index for those logs</text><rect x="250" y="108" width="280" height="16" rx="2" class="bar mute"></rect><text x="540" y="120" class="ts tb">27 TB</text><text x="10" y="150" class="ts">Bars share one scale. Rollups keep 5-minute rows for 90 days and hourly rows for 2 years.</text></svg>
+<dl class="results">
+  <div><dt>Active series</dt><dd data-out="series">10 million</dd></div>
+  <div><dt>Samples</dt><dd data-out="rate">667 thousand a second</dd></div>
+  <div><dt>Metrics a day</dt><dd data-out="perday">123 GB</dd></div>
+  <div><dt>Every sample, kept</dt><dd data-out="raw">1.84 TB</dd></div>
+  <div><dt>Rollups</dt><dd data-out="rollups">3.7 TB</dd></div>
+  <div><dt>Logs, compressed</dt><dd data-out="logstore">9.52 TB</dd></div>
+  <div><dt>A word index for them</dt><dd data-out="index">27 TB</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">10 million series scraped every 15 s make 667 thousand samples a second, 123 GB a day at 2.13 bytes a sample. The logs, compressed, still take more than all the metrics together, and indexing every word of the logs would add 27 TB.</p>
+</div>
+
+<h2 id="api">Step 3: The API</h2>
+<pre data-lang="http" data-title="Collection: a page to scrape, or a batch pushed">
+GET /metrics                                  served by every service, read by a collector
+# TYPE http_requests_total counter
+http_requests_total{route="/v1/feed",status="200"} 1027
+http_request_duration_seconds_bucket{route="/v1/feed",le="0.1"} 980
+
+POST /v1/push                                 from a collector or a short-lived job
+X-Tenant: payments
+(a compressed batch of series, each with its labels and samples)
+204 No Content    |    429 Too Many Requests  { "error": "series_limit", "limit": 2000000 }
+</pre>
+<pre data-lang="http" data-title="Queries, alert rules and logs">
+GET /v1/query_range?query=sum(rate(http_requests_total{service="feed"}[5m]))&amp;start=…&amp;end=…&amp;step=60
+200 OK   { "series": [ { "labels": {}, "values": [[1791892800, "412.7"], …] } ] }
+
+PUT /v1/rules/payments/latency
+{ "expr": "avg_over_time(api_p99_seconds[5m]) > 0.3", "labels": { "severity": "page" } }
+
+GET /v1/logs?selector={service="api",level="error"}&amp;contains=4bf92f35&amp;start=…&amp;end=…
+</pre>
+<p>Every request carries the tenant, the team, and every limit is enforced per tenant: series, samples a second, and the series and samples a single query may touch (<x-ref to="multi-tenancy#noisy-neighbors"></x-ref>). A push that exceeds a limit is refused with an error the sender can act on, so a team that adds a user id as a label finds out at once, not when the platform falls over.</p>
+
+<h2 id="data">Step 4: The data model</h2>
+<table>
+<thead><tr><th>Data</th><th>Key</th><th>Holds</th><th>Where</th></tr></thead>
+<tbody>
+<tr><th>Series</th><td>metric name and labels, hashed to an id</td><td>One stream of samples</td><td>The index of each block</td></tr>
+<tr><th>Samples</th><td>series, time</td><td>A value, in compressed chunks of two hours</td><td>Ingesters’ memory and write-ahead log, then blocks in object storage</td></tr>
+<tr><th>Label index</th><td>label name and value</td><td>The ids of the series that have it, sorted</td><td>In each block, beside the chunks (<x-ref to="search-systems#inverted-index"></x-ref>)</td></tr>
+<tr><th>Rollups</th><td>series, 5 minutes or 1 hour</td><td>Minimum, maximum, sum and count; histogram buckets added</td><td>Downsampled blocks in object storage</td></tr>
+<tr><th>Rules and silences</th><td>tenant, rule</td><td>The query, the threshold, who is paged</td><td>A small relational database</td></tr>
+<tr><th>Log chunks</th><td>stream (labels), time range</td><td>Compressed lines</td><td>Object storage, with a small label index</td></tr>
+</tbody>
+</table>
+<p>A series is identified by its name and all its labels, so each new combination of label values is a new series, with its own index entries and its own chunk in memory. The number of series, not the number of samples, is what exhausts an ingester, which is why limits count series (<x-ref to="specialized-databases#cardinality"></x-ref>).</p>
+
+<h2 id="design">Step 5: The design</h2>
+
+<figure class="fig wide" id="fig-architecture">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 324" role="img" aria-labelledby="f981t f981d">
+<title id="f981t">A metrics platform: collectors, ingesters, object storage, queriers and alerts</title>
+<desc id="f981d">Collectors scrape services and hosts, or receive what they push, and send batches of samples to distributors. Distributors check limits and send each series to three ingesters, which keep the last two hours in memory and write finished blocks to object storage. A compactor merges blocks and writes downsampled ones. Queriers answer dashboards by reading recent data from ingesters and older data from object storage. A rule evaluator runs queries every 15 seconds and sends firing alerts to an alert manager, which groups them and pages the person on call.</desc>
+<rect class="n" x="10" y="44" width="90" height="50" rx="6"/>
+<text class="tb mid" x="55" y="65">Services</text>
+<text class="ts mid" x="55" y="82">and hosts</text>
+<rect class="n sig" x="130" y="44" width="120" height="50" rx="6"/>
+<text class="tb mid" x="190" y="65">Collectors</text>
+<text class="ts mid" x="190" y="82">scrape, receive</text>
+<rect class="n sig" x="290" y="44" width="120" height="50" rx="6"/>
+<text class="tb mid" x="350" y="65">Distributors</text>
+<text class="ts mid" x="350" y="82">check, shard</text>
+<rect class="n sig" x="450" y="44" width="120" height="50" rx="6"/>
+<text class="tb mid" x="510" y="65">Ingesters</text>
+<text class="ts mid" x="510" y="82">last 2 hours</text>
+<rect class="n store" x="610" y="44" width="104" height="150" rx="6"/>
+<text class="tb mid" x="662" y="106.5">Object storage</text>
+<text class="ts mid" x="662" y="123.5">blocks,</text>
+<text class="ts mid" x="662" y="140.5">rollups</text>
+<rect class="n" x="10" y="144" width="90" height="50" rx="6"/>
+<text class="tb mid" x="55" y="173.5">Dashboards</text>
+<rect class="n sig" x="130" y="144" width="120" height="50" rx="6"/>
+<text class="tb mid" x="190" y="165">Rule evaluator</text>
+<text class="ts mid" x="190" y="182">every 15 s</text>
+<rect class="n sig" x="450" y="144" width="120" height="50" rx="6"/>
+<text class="tb mid" x="510" y="165">Queriers</text>
+<text class="ts mid" x="510" y="182">fan out, merge</text>
+<rect class="n" x="10" y="244" width="90" height="50" rx="6"/>
+<text class="tb mid" x="55" y="273.5">On call</text>
+<rect class="n async" x="130" y="244" width="120" height="50" rx="6"/>
+<text class="tb mid" x="190" y="265">Alert manager</text>
+<text class="ts mid" x="190" y="282">group, route</text>
+<rect class="n async" x="450" y="244" width="120" height="50" rx="6"/>
+<text class="tb mid" x="510" y="265">Compactor</text>
+<text class="ts mid" x="510" y="282">merge, downsample</text>
+<path class="e sig" d="M130 69H100"/>
+<text class="ts mid" x="115" y="62">pull</text>
+<path class="e sig" d="M250 69H290"/>
+<path class="e sig" d="M410 69H450"/>
+<text class="ts mid" x="430" y="62">×3</text>
+<path class="e async" d="M570 69H610"/>
+<path class="e sig both" d="M55 144V122H480V144"/>
+<text class="ts mid" x="270" y="116">queries</text>
+<path class="e sig" d="M250 169H450"/>
+<text class="ts mid" x="350" y="162">rule queries</text>
+<path class="e sig" d="M540 144V94"/>
+<text class="ts" x="546" y="124">recent</text>
+<path class="e sig" d="M570 169H610"/>
+<path class="e async" d="M190 194V244"/>
+<text class="ts" x="196" y="224">firing</text>
+<path class="e async" d="M130 269H100"/>
+<text class="ts mid" x="115" y="262">page</text>
+<path class="e async both" d="M570 269H662V194"/>
+<text class="ts" x="290" y="314">Solid: in the path of a scrape or a query. Dashed: work done later.</text>
+</svg>
+</div>
+<figcaption>The write path is spread by series and copied three times; recent data stays in memory and older data lives in object storage, so queries read from both.</figcaption>
+</figure>
+
+<p>Collection is by pull or by push. To <dfn>scrape</dfn> is to fetch a target’s current values over HTTP on a fixed schedule, the pull model: the platform holds the list of targets, and a target that does not answer is itself a signal. Push suits short-lived jobs and devices that cannot be reached, and it is how collectors forward what they gathered. Scraping has one trap that the simulation measured: if 10,000 targets are all scraped at the start of each 15-second interval, the busiest second receives 15 times the average. Prometheus gives each target a fixed offset within the interval, derived from a hash of the target, and with offsets chosen that way the busiest second received 1.06 times the average.</p>
+<p>Distributors check limits and send each series to three ingesters, picked by a hash of its labels on a ring (<x-ref to="partitioning#consistent-hashing"></x-ref>), so that one ingester holds all of a series and losing one loses nothing.</p>
+
+<figure class="fig wide" id="fig-write-path">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-labelledby="f982t f982d">
+<title id="f982t">One scrape, from a service to a block in object storage</title>
+<desc id="f982d">A collector requests a service’s metrics page and receives about a thousand samples. It sends them in a batch to a distributor, which checks the tenant’s limits and sends each series to three ingesters chosen by a hash of its labels. Each ingester appends the samples to its write-ahead log and to the series’ current compressed chunk, and answers. The distributor acknowledges once two of three have. Every two hours, ingesters write the finished block to object storage.</desc>
+<text class="tb mid" x="50" y="20">Service</text>
+<line class="axis" x1="50" y1="28" x2="50" y2="266"/>
+<text class="tb mid" x="180" y="20">Collector</text>
+<line class="axis" x1="180" y1="28" x2="180" y2="266"/>
+<text class="tb mid" x="330" y="20">Distributor</text>
+<line class="axis" x1="330" y1="28" x2="330" y2="266"/>
+<text class="tb mid" x="480" y="20">Ingester</text>
+<line class="axis" x1="480" y1="28" x2="480" y2="266"/>
+<text class="tb mid" x="640" y="20">Object storage</text>
+<line class="axis" x1="640" y1="28" x2="640" y2="266"/>
+<g data-s="1">
+<path class="e sig" d="M179 58H51"/>
+<text class="ts mid" x="115.0" y="52">1. GET /metrics</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M51 86H179"/>
+<text class="ts mid" x="115.0" y="80">2. 1,000 samples</text>
+</g>
+<g data-s="3">
+<path class="e sig" d="M181 114H329"/>
+<text class="ts mid" x="255.0" y="108">3. batch, compressed</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n sig" x="260" y="128" width="140" height="22" rx="4"/>
+<text class="ts mid" x="330" y="143">4. limits, then hash</text>
+</g>
+<g data-s="5">
+<path class="e sig" d="M331 170H479"/>
+<text class="ts mid" x="405.0" y="164">5. series to 3 copies</text>
+</g>
+<g data-s="6" data-packet="none">
+<rect class="n store" x="416.1" y="184" width="127.8" height="22" rx="4"/>
+<text class="ts mid" x="480" y="199">6. WAL, then chunk</text>
+</g>
+<g data-s="7">
+<path class="e sig" d="M479 226H331"/>
+<text class="ts mid" x="405.0" y="220">7. stored</text>
+</g>
+<g data-s="8">
+<path class="e async" d="M481 254H639"/>
+<text class="ts mid" x="560.0" y="248">8. block 10:00 to 12:00</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-state="Ingester’s newest sample: 12:00:00; Blocks in storage: up to 10:00">Every 15 seconds the collector asks the service for its current values. A service that does not answer is itself a signal: up = 0.</li>
+  <li>The answer is a page of names, labels and numbers: counters, gauges and histogram buckets.</li>
+  <li>The collector stamps them with the scrape time and sends them on in a batch.</li>
+  <li data-msg="none">The distributor rejects series over the tenant’s limits, then picks three ingesters for each series by a hash of its labels.</li>
+  <li>Each series goes to the same three ingesters every time, so each holds whole series.</li>
+  <li data-msg="none" data-state="Ingester’s newest sample: 12:00:15; Blocks in storage: up to 10:00">The ingester appends to its write-ahead log for safety, then to the series’ compressed chunk in memory.</li>
+  <li>Once two of the three ingesters have answered, the batch is acknowledged.</li>
+  <li data-state="Ingester’s newest sample: 12:00:15; Blocks in storage: up to 12:00">At 12:00 the two hours before are complete. The ingester writes them as one block of chunks and an index, and later drops them from memory.</li>
+</ol>
+<figcaption>Samples are durable in three write-ahead logs within milliseconds, compressed in memory for two hours, and then moved to object storage in blocks.</figcaption>
+</figure>
+
+<h2 id="storage">Step 6a: Storing a sample in two bytes</h2>
+<p>A sample is a 64-bit time and a 64-bit value: 16 bytes stored plainly, and about 0.9 TB a day at this scale. Consecutive samples of one series are much alike, and the compression introduced by Facebook’s Gorilla exploits that: each time is stored as the change in the gap since the last sample, and each value as the bits that differ from the last value.</p>
+
+<figure class="fig wide" id="fig-gorilla">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 258" role="img" aria-labelledby="f983t f983d">
+<title id="f983t">Compressing five samples of a request counter</title>
+<desc id="f983d">Five samples, 15 seconds apart except one that is 2 milliseconds late. sample 1: 64 bits for the time and 64 for the value; sample 2: 36 bits for the time and 16 for the value; sample 3: 1 bits for the time and 1 for the value; sample 4: 9 bits for the time and 23 for the value; sample 5: 9 bits for the time and 14 for the value. In all 237 bits, about 30 bytes, against 80 bytes stored plainly.</desc>
+<text class="ts tb" x="10" y="22">sample</text>
+<text class="ts tb" x="82" y="22">time</text>
+<text class="ts tb" x="170" y="22">value</text>
+<text class="ts tb" x="236" y="22">how the time is stored</text>
+<text class="ts tb" x="486" y="22">how the value is stored</text>
+<line class="axis" x1="10" y1="30" x2="710" y2="30"/>
+<g data-s="1">
+<text class="ts" x="10" y="52">1</text>
+<text class="ts mono" x="82" y="52">12:00:00</text>
+<text class="ts mono" x="170" y="52">1,000</text>
+<text class="ts" x="236" y="52">in full: 64 bits</text>
+<text class="ts" x="486" y="52">in full: 64 bits</text>
+<rect class="bar" x="10" y="57" width="89.6" height="6" rx="1"/>
+<rect class="bar store" x="99.6" y="57" width="89.6" height="6" rx="1"/>
+</g>
+<g data-s="2">
+<text class="ts" x="10" y="82">2</text>
+<text class="ts mono" x="82" y="82">12:00:15</text>
+<text class="ts mono" x="170" y="82">1,012</text>
+<text class="ts" x="236" y="82">gap 15 s: change from 0, 36 bits</text>
+<text class="ts" x="486" y="82">differs from 1,000: 16 bits</text>
+<rect class="bar" x="10" y="87" width="50.4" height="6" rx="1"/>
+<rect class="bar store" x="60.4" y="87" width="22.4" height="6" rx="1"/>
+</g>
+<g data-s="3">
+<text class="ts" x="10" y="112">3</text>
+<text class="ts mono" x="82" y="112">12:00:30</text>
+<text class="ts mono" x="170" y="112">1,012</text>
+<text class="ts" x="236" y="112">same gap: 1 bit</text>
+<text class="ts" x="486" y="112">unchanged: 1 bit</text>
+<rect class="bar" x="10" y="117" width="1.4" height="6" rx="1"/>
+<rect class="bar store" x="11.4" y="117" width="1.4" height="6" rx="1"/>
+</g>
+<g data-s="4">
+<text class="ts" x="10" y="142">4</text>
+<text class="ts mono" x="82" y="142">12:00:45.002</text>
+<text class="ts mono" x="170" y="142">1,030</text>
+<text class="ts" x="236" y="142">gap 2 ms longer: 9 bits</text>
+<text class="ts" x="486" y="142">differs: 23 bits</text>
+<rect class="bar" x="10" y="147" width="12.6" height="6" rx="1"/>
+<rect class="bar store" x="22.6" y="147" width="32.2" height="6" rx="1"/>
+</g>
+<g data-s="5">
+<text class="ts" x="10" y="172">5</text>
+<text class="ts mono" x="82" y="172">12:01:00</text>
+<text class="ts mono" x="170" y="172">1,031</text>
+<text class="ts" x="236" y="172">gap 4 ms shorter: 9 bits</text>
+<text class="ts" x="486" y="172">differs in a few bits: 14 bits</text>
+<rect class="bar" x="10" y="177" width="12.6" height="6" rx="1"/>
+<rect class="bar store" x="22.6" y="177" width="19.6" height="6" rx="1"/>
+</g>
+<line class="axis" x1="10" y1="200" x2="710" y2="200"/>
+<text class="ts tb" x="10" y="222">Five samples: 237 bits, about 30 bytes. Plainly, each takes 16 bytes: 80 bytes.</text>
+<text class="ts" x="10" y="242">Bars: bits for the time (blue) and for the value (green). The longer a chunk runs, the more samples cost a bit or two.</text>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="none" data-state="Bits so far: 128">The first sample of a chunk is stored in full: a 64-bit time and a 64-bit value, 16 bytes.</li>
+  <li data-msg="none" data-state="Bits so far: 180">The second stores the gap in time as a change from zero, which needs the largest code, and only the bits of the value that differ from 1,000.</li>
+  <li data-msg="none" data-state="Bits so far: 182">The third has the same gap and the same value as the one before: one bit each. Most samples of most series look like this.</li>
+  <li data-msg="none" data-state="Bits so far: 214">A scrape 2 ms late makes the gap change by 2: a short code of 9 bits. The value changed, so its differing bits are stored.</li>
+  <li data-msg="none" data-state="Bits so far: 237">The next gap is back to 15 s, a change of −4 from the last gap: 9 bits again. The value differs from 1,030 in a few low bits.</li>
+</ol>
+<figcaption>Timestamps are stored as the change in the gap between samples, values as the bits that differ from the last value. Regular, slowly changing series cost a bit or two per sample.</figcaption>
+</figure>
+
+<p>The chapter’s code implements the scheme and measured it on two-hour chunks of 480 samples, for five kinds of series. Every chunk decoded to exactly the samples that went in.</p>
+<table>
+<thead><tr><th>Kind of series</th><th>Bytes a sample, scrapes exactly 15 s apart</th><th>With a few ms of jitter</th></tr></thead>
+<tbody>
+<tr><th>Constant (up, limits, versions)</th><td>0.29</td><td>0.74</td></tr>
+<tr><th>Histogram bucket counter</th><td>1.19</td><td>1.59</td></tr>
+<tr><th>Gauge in whole numbers (bytes, connections)</th><td>1.79</td><td>2.23</td></tr>
+<tr><th>Request counter</th><td>2.54</td><td>2.98</td></tr>
+<tr><th>Gauge with fractions (ratios, load)</th><td>7.17</td><td>7.61</td></tr>
+<tr><th>An assumed mix: 40% buckets, 25% counters, 10% constants, 15% and 10% gauges</th><td>2.13</td><td>2.55</td></tr>
+</tbody>
+</table>
+<p>Two lessons sit in the table. Values that are whole numbers or repeat compress well, and arbitrary fractions hardly at all, so a gauge exported as a ratio costs three times what the same quantity costs as two counters. And timestamps that land exactly on the schedule cost one bit, while a few milliseconds of jitter cost nine, so collectors that keep to the schedule save storage. Facebook reported 1.37 bytes a sample on its own data, and the Prometheus documentation says 1 to 2.</p>
+<p>Ingesters keep the open chunk of every series in memory and append each batch to a write-ahead log first (<x-ref to="storage-engines#wal"></x-ref>), so a crashed ingester replays its log and loses nothing it acknowledged. Every two hours they cut a block: the chunks of that period, plus an index from each label value to the sorted ids of the series that have it. A query for <code>service="feed", status="500"</code> intersects two such lists and reads only the chunks of the series in both. Blocks go to object storage, where a compactor later merges small blocks into large ones and writes the downsampled versions.</p>
+
+<h2 id="downsampling">Step 6b: Downsampling, and what survives it</h2>
+<p><dfn>Downsampling</dfn> replaces the samples of a period with a few numbers that summarize it, so that long ranges can be read without reading every sample. A day of one series is 5,760 samples at 15 seconds, 288 five-minute rollups or 24 hourly ones: a query over a year reads hourly rollups, 8,760 rows per series instead of 2.1 million samples. Each rollup stores the minimum, maximum, sum and count, because those combine again exactly: the test checked that hourly rollups built from five-minute rollups equal hourly rollups built from the raw samples. An average alone would not, and a maximum hidden in an average is the spike someone will later look for. The same reasoning as the <x-ref to="hld-ad-click-aggregation#estimates">rollups of ad clicks</x-ref> applies: store what adds up.</p>
+<p>Percentiles do not add up. A dashboard showing hourly latency from per-minute 99th percentiles has to combine them somehow, and every way is wrong.</p>
+
+<figure class="fig wide" id="fig-percentiles">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f984t f984d">
+<title id="f984t">The 99th percentile of each minute, and of the hour</title>
+<desc id="f984d">The 99th percentile latency of each of 60 minutes, 2,000 requests a minute, with five slow minutes from minute 20. The true 99th percentile of the hour is 864 ms. The average of the 60 minute values is 230 ms. The value computed from the 60 minutes’ histograms added together is 877 ms.</desc>
+<text class="tb" x="10" y="18">99th percentile latency of each minute, ms</text>
+<line class="grid" x1="60" y1="220.0" x2="700" y2="220.0"/>
+<text class="ts end" x="52" y="224.0">0</text>
+<line class="grid" x1="60" y1="160.0" x2="700" y2="160.0"/>
+<text class="ts end" x="52" y="164.0">500</text>
+<line class="grid" x1="60" y1="100.0" x2="700" y2="100.0"/>
+<text class="ts end" x="52" y="104.0">1,000</text>
+<line class="grid" x1="60" y1="40.0" x2="700" y2="40.0"/>
+<text class="ts end" x="52" y="44.0">1,500</text>
+<rect class="bar" x="61.0" y="205.3" width="8.7" height="14.7" rx="1"/>
+<rect class="bar" x="71.7" y="205.0" width="8.7" height="15.0" rx="1"/>
+<rect class="bar" x="82.3" y="204.7" width="8.7" height="15.3" rx="1"/>
+<rect class="bar" x="93.0" y="205.6" width="8.7" height="14.4" rx="1"/>
+<rect class="bar" x="103.7" y="206.0" width="8.7" height="14.0" rx="1"/>
+<rect class="bar" x="114.3" y="206.0" width="8.7" height="14.0" rx="1"/>
+<rect class="bar" x="125.0" y="204.3" width="8.7" height="15.7" rx="1"/>
+<rect class="bar" x="135.7" y="204.9" width="8.7" height="15.1" rx="1"/>
+<rect class="bar" x="146.3" y="205.3" width="8.7" height="14.7" rx="1"/>
+<rect class="bar" x="157.0" y="205.6" width="8.7" height="14.4" rx="1"/>
+<rect class="bar" x="167.7" y="204.1" width="8.7" height="15.9" rx="1"/>
+<rect class="bar" x="178.3" y="204.9" width="8.7" height="15.1" rx="1"/>
+<rect class="bar" x="189.0" y="205.4" width="8.7" height="14.6" rx="1"/>
+<rect class="bar" x="199.7" y="205.4" width="8.7" height="14.6" rx="1"/>
+<rect class="bar" x="210.3" y="205.1" width="8.7" height="14.9" rx="1"/>
+<rect class="bar" x="221.0" y="204.2" width="8.7" height="15.8" rx="1"/>
+<rect class="bar" x="231.7" y="204.8" width="8.7" height="15.2" rx="1"/>
+<rect class="bar" x="242.3" y="204.9" width="8.7" height="15.1" rx="1"/>
+<rect class="bar" x="253.0" y="204.6" width="8.7" height="15.4" rx="1"/>
+<rect class="bar" x="263.7" y="204.3" width="8.7" height="15.7" rx="1"/>
+<rect class="bar fault" x="274.3" y="51.1" width="8.7" height="168.9" rx="1"/>
+<rect class="bar fault" x="285.0" y="59.2" width="8.7" height="160.8" rx="1"/>
+<rect class="bar fault" x="295.7" y="57.5" width="8.7" height="162.5" rx="1"/>
+<rect class="bar fault" x="306.3" y="53.2" width="8.7" height="166.8" rx="1"/>
+<rect class="bar fault" x="317.0" y="51.1" width="8.7" height="168.9" rx="1"/>
+<rect class="bar" x="327.7" y="205.0" width="8.7" height="15.0" rx="1"/>
+<rect class="bar" x="338.3" y="205.0" width="8.7" height="15.0" rx="1"/>
+<rect class="bar" x="349.0" y="204.8" width="8.7" height="15.2" rx="1"/>
+<rect class="bar" x="359.7" y="205.2" width="8.7" height="14.8" rx="1"/>
+<rect class="bar" x="370.3" y="204.1" width="8.7" height="15.9" rx="1"/>
+<rect class="bar" x="381.0" y="204.4" width="8.7" height="15.6" rx="1"/>
+<rect class="bar" x="391.7" y="204.6" width="8.7" height="15.4" rx="1"/>
+<rect class="bar" x="402.3" y="205.2" width="8.7" height="14.8" rx="1"/>
+<rect class="bar" x="413.0" y="205.4" width="8.7" height="14.6" rx="1"/>
+<rect class="bar" x="423.7" y="204.7" width="8.7" height="15.3" rx="1"/>
+<rect class="bar" x="434.3" y="204.3" width="8.7" height="15.7" rx="1"/>
+<rect class="bar" x="445.0" y="204.5" width="8.7" height="15.5" rx="1"/>
+<rect class="bar" x="455.7" y="204.6" width="8.7" height="15.4" rx="1"/>
+<rect class="bar" x="466.3" y="204.6" width="8.7" height="15.4" rx="1"/>
+<rect class="bar" x="477.0" y="204.4" width="8.7" height="15.6" rx="1"/>
+<rect class="bar" x="487.7" y="205.2" width="8.7" height="14.8" rx="1"/>
+<rect class="bar" x="498.3" y="203.1" width="8.7" height="16.9" rx="1"/>
+<rect class="bar" x="509.0" y="204.9" width="8.7" height="15.1" rx="1"/>
+<rect class="bar" x="519.7" y="205.7" width="8.7" height="14.3" rx="1"/>
+<rect class="bar" x="530.3" y="204.6" width="8.7" height="15.4" rx="1"/>
+<rect class="bar" x="541.0" y="205.2" width="8.7" height="14.8" rx="1"/>
+<rect class="bar" x="551.7" y="204.7" width="8.7" height="15.3" rx="1"/>
+<rect class="bar" x="562.3" y="206.2" width="8.7" height="13.8" rx="1"/>
+<rect class="bar" x="573.0" y="205.1" width="8.7" height="14.9" rx="1"/>
+<rect class="bar" x="583.7" y="203.9" width="8.7" height="16.1" rx="1"/>
+<rect class="bar" x="594.3" y="205.4" width="8.7" height="14.6" rx="1"/>
+<rect class="bar" x="605.0" y="204.1" width="8.7" height="15.9" rx="1"/>
+<rect class="bar" x="615.7" y="204.7" width="8.7" height="15.3" rx="1"/>
+<rect class="bar" x="626.3" y="204.7" width="8.7" height="15.3" rx="1"/>
+<rect class="bar" x="637.0" y="205.7" width="8.7" height="14.3" rx="1"/>
+<rect class="bar" x="647.7" y="204.0" width="8.7" height="16.0" rx="1"/>
+<rect class="bar" x="658.3" y="205.4" width="8.7" height="14.6" rx="1"/>
+<rect class="bar" x="669.0" y="204.7" width="8.7" height="15.3" rx="1"/>
+<rect class="bar" x="679.7" y="205.8" width="8.7" height="14.2" rx="1"/>
+<rect class="bar" x="690.3" y="204.5" width="8.7" height="15.5" rx="1"/>
+<path class="e none dash store" d="M60 116.3H700"/>
+<text class="ts tb end" x="696" y="110.3258910260928">true hourly 99th percentile: 864 ms (from histograms: 877)</text>
+<path class="e none dash fault" d="M60 192.3H700"/>
+<text class="ts tb end" x="696" y="186.34046369285343">average of the minute values: 230 ms</text>
+<text class="ts mid" x="65.3" y="236">0</text>
+<text class="ts mid" x="172.0" y="236">10</text>
+<text class="ts mid" x="278.7" y="236">20</text>
+<text class="ts mid" x="385.3" y="236">30</text>
+<text class="ts mid" x="492.0" y="236">40</text>
+<text class="ts mid" x="598.7" y="236">50</text>
+<text class="ts mid" x="694.7" y="236">59</text>
+<text class="ts mid" x="380.0" y="254">minute of the hour; red: five minutes in which 30% of requests waited on a slow dependency</text>
+<rect class="hit" x="60" y="40" width="10.6667" height="180" data-tip="Minute 0|99th percentile 122 ms"/>
+<rect class="hit" x="70.6667" y="40" width="10.6667" height="180" data-tip="Minute 1|99th percentile 125 ms"/>
+<rect class="hit" x="81.3333" y="40" width="10.6667" height="180" data-tip="Minute 2|99th percentile 128 ms"/>
+<rect class="hit" x="92" y="40" width="10.6667" height="180" data-tip="Minute 3|99th percentile 120 ms"/>
+<rect class="hit" x="102.667" y="40" width="10.6667" height="180" data-tip="Minute 4|99th percentile 117 ms"/>
+<rect class="hit" x="113.333" y="40" width="10.6667" height="180" data-tip="Minute 5|99th percentile 117 ms"/>
+<rect class="hit" x="124" y="40" width="10.6667" height="180" data-tip="Minute 6|99th percentile 130 ms"/>
+<rect class="hit" x="134.667" y="40" width="10.6667" height="180" data-tip="Minute 7|99th percentile 126 ms"/>
+<rect class="hit" x="145.333" y="40" width="10.6667" height="180" data-tip="Minute 8|99th percentile 123 ms"/>
+<rect class="hit" x="156" y="40" width="10.6667" height="180" data-tip="Minute 9|99th percentile 120 ms"/>
+<rect class="hit" x="166.667" y="40" width="10.6667" height="180" data-tip="Minute 10|99th percentile 133 ms"/>
+<rect class="hit" x="177.333" y="40" width="10.6667" height="180" data-tip="Minute 11|99th percentile 126 ms"/>
+<rect class="hit" x="188" y="40" width="10.6667" height="180" data-tip="Minute 12|99th percentile 122 ms"/>
+<rect class="hit" x="198.667" y="40" width="10.6667" height="180" data-tip="Minute 13|99th percentile 122 ms"/>
+<rect class="hit" x="209.333" y="40" width="10.6667" height="180" data-tip="Minute 14|99th percentile 124 ms"/>
+<rect class="hit" x="220" y="40" width="10.6667" height="180" data-tip="Minute 15|99th percentile 132 ms"/>
+<rect class="hit" x="230.667" y="40" width="10.6667" height="180" data-tip="Minute 16|99th percentile 127 ms"/>
+<rect class="hit" x="241.333" y="40" width="10.6667" height="180" data-tip="Minute 17|99th percentile 126 ms"/>
+<rect class="hit" x="252" y="40" width="10.6667" height="180" data-tip="Minute 18|99th percentile 128 ms"/>
+<rect class="hit" x="262.667" y="40" width="10.6667" height="180" data-tip="Minute 19|99th percentile 131 ms"/>
+<rect class="hit" x="273.333" y="40" width="10.6667" height="180" data-tip="Minute 20|99th percentile 1408 ms"/>
+<rect class="hit" x="284" y="40" width="10.6667" height="180" data-tip="Minute 21|99th percentile 1340 ms"/>
+<rect class="hit" x="294.667" y="40" width="10.6667" height="180" data-tip="Minute 22|99th percentile 1354 ms"/>
+<rect class="hit" x="305.333" y="40" width="10.6667" height="180" data-tip="Minute 23|99th percentile 1390 ms"/>
+<rect class="hit" x="316" y="40" width="10.6667" height="180" data-tip="Minute 24|99th percentile 1408 ms"/>
+<rect class="hit" x="326.667" y="40" width="10.6667" height="180" data-tip="Minute 25|99th percentile 125 ms"/>
+<rect class="hit" x="337.333" y="40" width="10.6667" height="180" data-tip="Minute 26|99th percentile 125 ms"/>
+<rect class="hit" x="348" y="40" width="10.6667" height="180" data-tip="Minute 27|99th percentile 127 ms"/>
+<rect class="hit" x="358.667" y="40" width="10.6667" height="180" data-tip="Minute 28|99th percentile 123 ms"/>
+<rect class="hit" x="369.333" y="40" width="10.6667" height="180" data-tip="Minute 29|99th percentile 133 ms"/>
+<rect class="hit" x="380" y="40" width="10.6667" height="180" data-tip="Minute 30|99th percentile 130 ms"/>
+<rect class="hit" x="390.667" y="40" width="10.6667" height="180" data-tip="Minute 31|99th percentile 128 ms"/>
+<rect class="hit" x="401.333" y="40" width="10.6667" height="180" data-tip="Minute 32|99th percentile 123 ms"/>
+<rect class="hit" x="412" y="40" width="10.6667" height="180" data-tip="Minute 33|99th percentile 121 ms"/>
+<rect class="hit" x="422.667" y="40" width="10.6667" height="180" data-tip="Minute 34|99th percentile 127 ms"/>
+<rect class="hit" x="433.333" y="40" width="10.6667" height="180" data-tip="Minute 35|99th percentile 131 ms"/>
+<rect class="hit" x="444" y="40" width="10.6667" height="180" data-tip="Minute 36|99th percentile 129 ms"/>
+<rect class="hit" x="454.667" y="40" width="10.6667" height="180" data-tip="Minute 37|99th percentile 128 ms"/>
+<rect class="hit" x="465.333" y="40" width="10.6667" height="180" data-tip="Minute 38|99th percentile 128 ms"/>
+<rect class="hit" x="476" y="40" width="10.6667" height="180" data-tip="Minute 39|99th percentile 130 ms"/>
+<rect class="hit" x="486.667" y="40" width="10.6667" height="180" data-tip="Minute 40|99th percentile 123 ms"/>
+<rect class="hit" x="497.333" y="40" width="10.6667" height="180" data-tip="Minute 41|99th percentile 141 ms"/>
+<rect class="hit" x="508" y="40" width="10.6667" height="180" data-tip="Minute 42|99th percentile 126 ms"/>
+<rect class="hit" x="518.667" y="40" width="10.6667" height="180" data-tip="Minute 43|99th percentile 119 ms"/>
+<rect class="hit" x="529.333" y="40" width="10.6667" height="180" data-tip="Minute 44|99th percentile 128 ms"/>
+<rect class="hit" x="540" y="40" width="10.6667" height="180" data-tip="Minute 45|99th percentile 123 ms"/>
+<rect class="hit" x="550.667" y="40" width="10.6667" height="180" data-tip="Minute 46|99th percentile 128 ms"/>
+<rect class="hit" x="561.333" y="40" width="10.6667" height="180" data-tip="Minute 47|99th percentile 115 ms"/>
+<rect class="hit" x="572" y="40" width="10.6667" height="180" data-tip="Minute 48|99th percentile 124 ms"/>
+<rect class="hit" x="582.667" y="40" width="10.6667" height="180" data-tip="Minute 49|99th percentile 134 ms"/>
+<rect class="hit" x="593.333" y="40" width="10.6667" height="180" data-tip="Minute 50|99th percentile 122 ms"/>
+<rect class="hit" x="604" y="40" width="10.6667" height="180" data-tip="Minute 51|99th percentile 133 ms"/>
+<rect class="hit" x="614.667" y="40" width="10.6667" height="180" data-tip="Minute 52|99th percentile 127 ms"/>
+<rect class="hit" x="625.333" y="40" width="10.6667" height="180" data-tip="Minute 53|99th percentile 128 ms"/>
+<rect class="hit" x="636" y="40" width="10.6667" height="180" data-tip="Minute 54|99th percentile 119 ms"/>
+<rect class="hit" x="646.667" y="40" width="10.6667" height="180" data-tip="Minute 55|99th percentile 134 ms"/>
+<rect class="hit" x="657.333" y="40" width="10.6667" height="180" data-tip="Minute 56|99th percentile 122 ms"/>
+<rect class="hit" x="668" y="40" width="10.6667" height="180" data-tip="Minute 57|99th percentile 128 ms"/>
+<rect class="hit" x="678.667" y="40" width="10.6667" height="180" data-tip="Minute 58|99th percentile 119 ms"/>
+<rect class="hit" x="689.333" y="40" width="10.6667" height="180" data-tip="Minute 59|99th percentile 129 ms"/>
+</svg>
+</div>
+<figcaption>Measured: averaging percentiles gives a number that describes nothing, here a quarter of the truth. Histogram buckets add up across minutes and servers, so rollups keep buckets, not percentiles.</figcaption>
+</figure>
+
+<p>In the simulated hour, 120,000 requests with five slow minutes, the true 99th percentile was 864 ms. The average of the 60 per-minute percentiles was 230 ms, a quarter of the truth; the largest was 1,408 ms. Adding the 60 minutes’ histograms bucket by bucket and reading the percentile from the total gave 877 ms, off only by the width of the bucket it fell in (<x-ref to="observability#histograms"></x-ref>). So rollups of latency keep histogram buckets, and percentiles are computed at query time from whatever range the query covers.</p>
+<p>Queriers split a range by age: the last two hours from the ingesters, older data from blocks in object storage, at the coarsest resolution that still gives the dashboard enough points. Results for completed intervals never change, so they are cached by query and interval, and a dashboard refreshed every minute recomputes only the newest step.</p>
+
+<h2 id="alerting">Step 6c: Alerts that page for the right reasons</h2>
+<p>A rule evaluator runs each rule’s query every 15 seconds. When the condition holds, an alert is pending; if the rule has a “for” duration, it fires only once the condition has held that long without a break. The rule language makes it easy to write rules that page too often, or never. The simulation built a day of a service’s 99th-percentile latency: about 120 ms, with brief spikes above 300 ms a few dozen times a day, and one real incident from 14:00 to 14:20 at about 450 ms, during which one sample in ten dipped below 300.</p>
+
+<figure class="fig wide" id="fig-alerts">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 352" role="img" aria-labelledby="f985t f985d">
+<title id="f985t">Four alert rules on the same noisy day</title>
+<desc id="f985d">The highest 99th percentile latency in each minute of a day: about 120 ms with short spikes above 300 ms, and a real incident from 14:00 to 14:20 at about 450 ms with brief dips. Alerting on every sample above 300 ms notified 33 times; requiring 1 minute above, 5 times, all during the incident; requiring 5 minutes above, never; alerting when the 5-minute average is above 300 ms, once, during the incident.</desc>
+<text class="tb" x="10" y="18">Highest 99th percentile latency in each minute, ms</text>
+<rect class="n fault" x="433.3" y="30" width="8.9" height="160" rx="0" style="opacity:.35"/>
+<line class="grid" x1="60" y1="190.0" x2="700" y2="190.0"/>
+<text class="ts end" x="52" y="194.0">0</text>
+<line class="grid" x1="60" y1="116.2" x2="700" y2="116.2"/>
+<text class="ts end" x="52" y="120.15384615384615">300</text>
+<line class="grid" x1="60" y1="42.3" x2="700" y2="42.3"/>
+<text class="ts end" x="52" y="46.30769230769229">600</text>
+<path class="line" d="M60.0 152.8 L60.4 162.2 L60.9 160.2 L61.3 161.7 L61.8 149.9 L62.2 153.3 L62.7 157.8 L63.1 143.5 L63.6 150.4 L64.0 156.5 L64.4 156.5 L64.9 156.3 L65.3 159.0 L65.8 156.0 L66.2 159.5 L66.7 155.5 L67.1 154.1 L67.6 156.3 L68.0 162.4 L68.4 152.1 L68.9 152.6 L69.3 159.2 L69.8 145.4 L70.2 160.7 L70.7 155.8 L71.1 155.0 L71.6 161.2 L72.0 153.3 L72.4 154.1 L72.9 153.3 L73.3 156.8 L73.8 157.3 L74.2 157.0 L74.7 158.0 L75.1 155.5 L75.6 154.8 L76.0 159.7 L76.4 158.2 L76.9 155.0 L77.3 161.7 L77.8 152.6 L78.2 158.7 L78.7 157.5 L79.1 157.0 L79.6 152.3 L80.0 156.8 L80.4 150.9 L80.9 158.7 L81.3 158.0 L81.8 153.6 L82.2 157.0 L82.7 161.0 L83.1 156.3 L83.6 158.2 L84.0 154.3 L84.4 150.1 L84.9 144.2 L85.3 159.7 L85.8 157.8 L86.2 155.5 L86.7 160.5 L87.1 159.2 L87.6 157.0 L88.0 152.8 L88.4 144.5 L88.9 157.5 L89.3 160.0 L89.8 158.5 L90.2 157.5 L90.7 157.8 L91.1 155.3 L91.6 158.2 L92.0 156.5 L92.4 151.8 L92.9 155.5 L93.3 152.1 L93.8 157.3 L94.2 160.7 L94.7 161.9 L95.1 161.9 L95.6 153.8 L96.0 154.3 L96.4 151.8 L96.9 157.8 L97.3 157.5 L97.8 155.3 L98.2 156.8 L98.7 156.3 L99.1 159.2 L99.6 157.3 L100.0 154.3 L100.4 157.5 L100.9 160.2 L101.3 158.7 L101.8 154.3 L102.2 157.8 L102.7 161.2 L103.1 159.7 L103.6 156.8 L104.0 149.9 L104.4 151.1 L104.9 158.2 L105.3 151.4 L105.8 159.5 L106.2 157.8 L106.7 153.3 L107.1 151.4 L107.6 149.1 L108.0 157.5 L108.4 151.1 L108.9 159.5 L109.3 159.2 L109.8 153.8 L110.2 161.0 L110.7 155.0 L111.1 159.5 L111.6 155.3 L112.0 75.5 L112.4 49.9 L112.9 153.1 L113.3 156.5 L113.8 154.3 L114.2 155.8 L114.7 153.8 L115.1 148.4 L115.6 153.3 L116.0 152.8 L116.4 156.5 L116.9 161.0 L117.3 148.4 L117.8 153.6 L118.2 147.7 L118.7 154.6 L119.1 158.2 L119.6 158.0 L120.0 148.6 L120.4 151.4 L120.9 151.6 L121.3 150.9 L121.8 157.0 L122.2 161.2 L122.7 160.2 L123.1 158.5 L123.6 153.3 L124.0 159.0 L124.4 155.8 L124.9 157.5 L125.3 155.0 L125.8 155.3 L126.2 154.8 L126.7 159.0 L127.1 151.6 L127.6 150.9 L128.0 150.4 L128.4 150.9 L128.9 155.0 L129.3 154.8 L129.8 153.8 L130.2 159.2 L130.7 159.2 L131.1 149.6 L131.6 154.3 L132.0 152.8 L132.4 148.6 L132.9 153.3 L133.3 155.3 L133.8 152.8 L134.2 150.4 L134.7 162.2 L135.1 157.5 L135.6 159.0 L136.0 159.7 L136.4 158.7 L136.9 159.7 L137.3 158.7 L137.8 153.6 L138.2 162.4 L138.7 156.0 L139.1 152.1 L139.6 155.3 L140.0 158.5 L140.4 160.7 L140.9 146.4 L141.3 157.8 L141.8 155.0 L142.2 147.9 L142.7 151.6 L143.1 154.3 L143.6 147.4 L144.0 154.3 L144.4 153.8 L144.9 156.0 L145.3 156.8 L145.8 158.2 L146.2 156.3 L146.7 155.0 L147.1 148.9 L147.6 160.0 L148.0 159.7 L148.4 155.0 L148.9 150.1 L149.3 98.4 L149.8 46.7 L150.2 50.9 L150.7 55.8 L151.1 156.8 L151.6 159.2 L152.0 157.5 L152.4 158.5 L152.9 158.7 L153.3 160.5 L153.8 154.3 L154.2 155.0 L154.7 153.8 L155.1 154.6 L155.6 158.0 L156.0 161.9 L156.4 150.1 L156.9 161.2 L157.3 153.1 L157.8 153.1 L158.2 151.1 L158.7 160.0 L159.1 147.9 L159.6 158.0 L160.0 161.0 L160.4 154.6 L160.9 155.8 L161.3 161.2 L161.8 152.1 L162.2 152.8 L162.7 157.5 L163.1 156.3 L163.6 162.2 L164.0 152.6 L164.4 157.8 L164.9 156.0 L165.3 151.6 L165.8 156.3 L166.2 149.9 L166.7 156.5 L167.1 160.5 L167.6 154.8 L168.0 157.5 L168.4 151.4 L168.9 161.7 L169.3 154.8 L169.8 156.0 L170.2 154.6 L170.7 156.0 L171.1 152.3 L171.6 154.8 L172.0 156.8 L172.4 158.5 L172.9 156.8 L173.3 157.0 L173.8 160.2 L174.2 157.0 L174.7 157.5 L175.1 160.2 L175.6 161.7 L176.0 162.4 L176.4 156.5 L176.9 157.8 L177.3 154.3 L177.8 156.8 L178.2 158.5 L178.7 153.6 L179.1 160.2 L179.6 155.0 L180.0 150.1 L180.4 154.3 L180.9 153.8 L181.3 155.5 L181.8 159.2 L182.2 154.6 L182.7 148.2 L183.1 150.4 L183.6 156.3 L184.0 154.3 L184.4 159.2 L184.9 157.3 L185.3 158.5 L185.8 153.6 L186.2 160.5 L186.7 158.5 L187.1 160.2 L187.6 158.2 L188.0 146.9 L188.4 150.4 L188.9 152.3 L189.3 153.1 L189.8 146.9 L190.2 155.3 L190.7 153.3 L191.1 155.0 L191.6 151.1 L192.0 155.8 L192.4 154.6 L192.9 152.8 L193.3 150.9 L193.8 156.3 L194.2 156.3 L194.7 146.7 L195.1 155.5 L195.6 154.6 L196.0 154.8 L196.4 153.6 L196.9 143.0 L197.3 154.8 L197.8 152.6 L198.2 155.8 L198.7 148.9 L199.1 159.0 L199.6 150.9 L200.0 149.4 L200.4 159.7 L200.9 157.8 L201.3 158.2 L201.8 155.3 L202.2 155.3 L202.7 156.8 L203.1 156.8 L203.6 147.7 L204.0 159.2 L204.4 155.3 L204.9 158.2 L205.3 156.8 L205.8 151.4 L206.2 157.5 L206.7 159.0 L207.1 158.0 L207.6 156.5 L208.0 153.3 L208.4 157.8 L208.9 153.6 L209.3 154.1 L209.8 149.9 L210.2 155.8 L210.7 155.5 L211.1 149.9 L211.6 150.4 L212.0 157.8 L212.4 152.6 L212.9 161.9 L213.3 158.7 L213.8 155.5 L214.2 157.8 L214.7 145.9 L215.1 155.0 L215.6 84.6 L216.0 155.3 L216.4 153.6 L216.9 164.4 L217.3 156.0 L217.8 157.5 L218.2 153.6 L218.7 155.8 L219.1 155.5 L219.6 140.0 L220.0 159.2 L220.4 152.3 L220.9 153.8 L221.3 157.5 L221.8 155.3 L222.2 154.6 L222.7 158.5 L223.1 151.1 L223.6 154.8 L224.0 148.9 L224.4 155.0 L224.9 151.6 L225.3 150.6 L225.8 153.6 L226.2 153.6 L226.7 163.7 L227.1 156.3 L227.6 159.5 L228.0 144.2 L228.4 155.8 L228.9 156.3 L229.3 152.6 L229.8 155.3 L230.2 156.0 L230.7 136.6 L231.1 145.9 L231.6 103.8 L232.0 153.8 L232.4 162.7 L232.9 155.0 L233.3 163.7 L233.8 158.0 L234.2 47.7 L234.7 86.9 L235.1 153.1 L235.6 151.8 L236.0 158.7 L236.4 153.8 L236.9 156.3 L237.3 149.9 L237.8 156.3 L238.2 156.0 L238.7 154.1 L239.1 152.6 L239.6 160.0 L240.0 153.3 L240.4 154.3 L240.9 148.9 L241.3 152.3 L241.8 153.1 L242.2 156.0 L242.7 156.5 L243.1 156.0 L243.6 151.6 L244.0 148.6 L244.4 160.5 L244.9 159.2 L245.3 159.5 L245.8 156.0 L246.2 154.6 L246.7 156.0 L247.1 151.8 L247.6 155.3 L248.0 156.3 L248.4 148.4 L248.9 161.9 L249.3 156.3 L249.8 158.5 L250.2 158.7 L250.7 153.1 L251.1 156.5 L251.6 157.3 L252.0 162.9 L252.4 155.0 L252.9 159.2 L253.3 150.9 L253.8 156.5 L254.2 152.8 L254.7 156.8 L255.1 155.8 L255.6 158.7 L256.0 155.5 L256.4 154.8 L256.9 151.1 L257.3 154.8 L257.8 150.9 L258.2 156.5 L258.7 152.3 L259.1 152.6 L259.6 151.6 L260.0 151.4 L260.4 156.8 L260.9 160.2 L261.3 154.8 L261.8 156.5 L262.2 159.5 L262.7 154.6 L263.1 154.1 L263.6 62.2 L264.0 156.3 L264.4 156.0 L264.9 143.7 L265.3 153.6 L265.8 154.8 L266.2 150.9 L266.7 156.0 L267.1 157.5 L267.6 151.1 L268.0 157.5 L268.4 157.0 L268.9 157.5 L269.3 158.2 L269.8 158.7 L270.2 161.7 L270.7 152.1 L271.1 152.1 L271.6 154.3 L272.0 160.0 L272.4 157.8 L272.9 160.5 L273.3 157.3 L273.8 153.8 L274.2 151.1 L274.7 154.3 L275.1 157.0 L275.6 155.5 L276.0 149.9 L276.4 161.7 L276.9 159.2 L277.3 157.3 L277.8 158.5 L278.2 157.3 L278.7 155.8 L279.1 157.3 L279.6 159.2 L280.0 154.6 L280.4 158.5 L280.9 156.0 L281.3 156.0 L281.8 157.8 L282.2 145.7 L282.7 160.5 L283.1 159.5 L283.6 162.7 L284.0 150.9 L284.4 160.7 L284.9 158.0 L285.3 153.1 L285.8 155.8 L286.2 154.6 L286.7 155.8 L287.1 150.6 L287.6 156.0 L288.0 152.8 L288.4 150.6 L288.9 154.8 L289.3 147.9 L289.8 156.5 L290.2 158.7 L290.7 156.5 L291.1 157.8 L291.6 157.5 L292.0 152.1 L292.4 153.8 L292.9 156.5 L293.3 158.5 L293.8 155.8 L294.2 153.8 L294.7 158.0 L295.1 158.2 L295.6 152.6 L296.0 149.9 L296.4 158.5 L296.9 150.6 L297.3 149.1 L297.8 154.3 L298.2 151.4 L298.7 152.6 L299.1 154.3 L299.6 154.8 L300.0 153.1 L300.4 154.6 L300.9 154.3 L301.3 158.0 L301.8 151.8 L302.2 156.3 L302.7 151.8 L303.1 151.6 L303.6 154.3 L304.0 160.7 L304.4 152.6 L304.9 156.0 L305.3 155.8 L305.8 150.4 L306.2 156.8 L306.7 153.3 L307.1 158.7 L307.6 78.5 L308.0 153.1 L308.4 150.4 L308.9 155.5 L309.3 153.3 L309.8 153.3 L310.2 148.9 L310.7 158.0 L311.1 158.0 L311.6 150.4 L312.0 159.7 L312.4 147.2 L312.9 157.3 L313.3 157.8 L313.8 155.0 L314.2 144.7 L314.7 158.7 L315.1 151.1 L315.6 157.0 L316.0 156.0 L316.4 149.4 L316.9 156.8 L317.3 157.8 L317.8 159.0 L318.2 157.3 L318.7 148.2 L319.1 151.6 L319.6 157.8 L320.0 160.0 L320.4 158.5 L320.9 157.0 L321.3 160.2 L321.8 155.0 L322.2 157.0 L322.7 157.5 L323.1 152.6 L323.6 156.3 L324.0 154.8 L324.4 152.8 L324.9 156.0 L325.3 160.5 L325.8 157.0 L326.2 154.1 L326.7 152.6 L327.1 153.3 L327.6 158.7 L328.0 157.5 L328.4 159.5 L328.9 151.1 L329.3 154.1 L329.8 105.6 L330.2 83.9 L330.7 155.5 L331.1 153.1 L331.6 157.3 L332.0 155.5 L332.4 156.0 L332.9 154.6 L333.3 154.8 L333.8 152.6 L334.2 162.2 L334.7 153.1 L335.1 159.0 L335.6 156.0 L336.0 154.1 L336.4 150.1 L336.9 155.8 L337.3 155.5 L337.8 154.3 L338.2 154.3 L338.7 67.9 L339.1 95.2 L339.6 157.0 L340.0 153.1 L340.4 160.0 L340.9 151.6 L341.3 67.7 L341.8 150.9 L342.2 143.5 L342.7 157.8 L343.1 153.8 L343.6 153.6 L344.0 157.3 L344.4 154.3 L344.9 156.0 L345.3 156.3 L345.8 151.8 L346.2 154.8 L346.7 161.2 L347.1 152.1 L347.6 154.6 L348.0 156.3 L348.4 155.8 L348.9 157.8 L349.3 158.0 L349.8 153.1 L350.2 147.7 L350.7 161.7 L351.1 153.8 L351.6 156.5 L352.0 151.1 L352.4 158.7 L352.9 160.0 L353.3 160.2 L353.8 157.8 L354.2 158.0 L354.7 157.3 L355.1 152.1 L355.6 154.1 L356.0 156.5 L356.4 153.6 L356.9 159.7 L357.3 156.5 L357.8 155.8 L358.2 156.5 L358.7 159.5 L359.1 160.2 L359.6 158.7 L360.0 142.0 L360.4 157.8 L360.9 155.5 L361.3 154.8 L361.8 157.3 L362.2 156.5 L362.7 157.0 L363.1 153.6 L363.6 154.1 L364.0 154.3 L364.4 157.8 L364.9 150.6 L365.3 155.8 L365.8 147.7 L366.2 160.2 L366.7 155.8 L367.1 154.1 L367.6 160.2 L368.0 155.3 L368.4 157.5 L368.9 157.0 L369.3 155.5 L369.8 149.4 L370.2 159.2 L370.7 154.8 L371.1 154.8 L371.6 161.7 L372.0 150.1 L372.4 155.5 L372.9 152.8 L373.3 160.2 L373.8 157.0 L374.2 154.8 L374.7 154.8 L375.1 158.5 L375.6 65.0 L376.0 160.7 L376.4 152.8 L376.9 151.4 L377.3 154.8 L377.8 153.1 L378.2 154.6 L378.7 150.9 L379.1 157.3 L379.6 157.3 L380.0 155.5 L380.4 154.1 L380.9 153.1 L381.3 154.1 L381.8 154.3 L382.2 164.2 L382.7 154.1 L383.1 157.8 L383.6 155.0 L384.0 152.6 L384.4 156.8 L384.9 150.4 L385.3 158.2 L385.8 160.2 L386.2 156.0 L386.7 153.1 L387.1 153.3 L387.6 146.2 L388.0 157.5 L388.4 153.1 L388.9 150.9 L389.3 157.5 L389.8 158.0 L390.2 159.0 L390.7 155.8 L391.1 157.0 L391.6 154.8 L392.0 157.8 L392.4 155.8 L392.9 154.1 L393.3 155.8 L393.8 156.5 L394.2 154.3 L394.7 160.0 L395.1 154.1 L395.6 156.8 L396.0 148.6 L396.4 151.6 L396.9 155.3 L397.3 147.4 L397.8 157.0 L398.2 151.8 L398.7 161.0 L399.1 159.5 L399.6 151.4 L400.0 157.0 L400.4 151.4 L400.9 162.9 L401.3 153.6 L401.8 159.7 L402.2 158.0 L402.7 160.7 L403.1 150.9 L403.6 149.6 L404.0 150.4 L404.4 158.5 L404.9 152.1 L405.3 156.3 L405.8 155.0 L406.2 154.6 L406.7 159.7 L407.1 159.7 L407.6 158.2 L408.0 159.5 L408.4 154.3 L408.9 156.8 L409.3 159.7 L409.8 152.6 L410.2 159.0 L410.7 153.8 L411.1 160.2 L411.6 157.0 L412.0 157.3 L412.4 159.7 L412.9 143.0 L413.3 158.0 L413.8 157.3 L414.2 154.8 L414.7 155.8 L415.1 159.0 L415.6 155.5 L416.0 160.0 L416.4 149.9 L416.9 151.6 L417.3 156.3 L417.8 145.0 L418.2 152.1 L418.7 153.8 L419.1 157.8 L419.6 156.5 L420.0 161.4 L420.4 159.0 L420.9 157.5 L421.3 156.3 L421.8 151.4 L422.2 155.5 L422.7 143.0 L423.1 146.9 L423.6 160.7 L424.0 154.6 L424.4 157.3 L424.9 157.0 L425.3 155.5 L425.8 160.2 L426.2 151.6 L426.7 151.1 L427.1 150.6 L427.6 156.5 L428.0 165.1 L428.4 156.3 L428.9 148.6 L429.3 157.8 L429.8 144.2 L430.2 159.2 L430.7 151.8 L431.1 158.7 L431.6 155.0 L432.0 149.6 L432.4 157.0 L432.9 160.2 L433.3 68.9 L433.8 69.1 L434.2 69.4 L434.7 69.1 L435.1 74.6 L435.6 72.3 L436.0 78.0 L436.4 80.2 L436.9 74.1 L437.3 69.9 L437.8 73.8 L438.2 78.7 L438.7 68.6 L439.1 78.0 L439.6 81.2 L440.0 68.9 L440.4 87.8 L440.9 69.1 L441.3 68.6 L441.8 70.1 L442.2 152.1 L442.7 151.8 L443.1 157.0 L443.6 154.3 L444.0 150.6 L444.4 161.2 L444.9 154.1 L445.3 160.5 L445.8 159.7 L446.2 158.7 L446.7 153.8 L447.1 153.1 L447.6 153.8 L448.0 161.0 L448.4 143.0 L448.9 157.3 L449.3 152.8 L449.8 154.1 L450.2 156.5 L450.7 154.6 L451.1 156.5 L451.6 154.6 L452.0 158.2 L452.4 151.6 L452.9 154.3 L453.3 153.1 L453.8 151.4 L454.2 147.9 L454.7 159.2 L455.1 157.3 L455.6 155.0 L456.0 152.6 L456.4 156.0 L456.9 153.8 L457.3 157.8 L457.8 156.8 L458.2 158.7 L458.7 150.9 L459.1 157.0 L459.6 152.6 L460.0 149.6 L460.4 156.8 L460.9 152.6 L461.3 152.6 L461.8 152.6 L462.2 151.8 L462.7 161.4 L463.1 155.3 L463.6 157.3 L464.0 158.5 L464.4 153.3 L464.9 159.2 L465.3 157.3 L465.8 152.6 L466.2 160.2 L466.7 152.8 L467.1 156.3 L467.6 154.3 L468.0 160.2 L468.4 153.8 L468.9 156.3 L469.3 151.8 L469.8 160.2 L470.2 157.0 L470.7 159.5 L471.1 153.6 L471.6 153.8 L472.0 157.0 L472.4 158.7 L472.9 157.3 L473.3 150.9 L473.8 152.8 L474.2 160.7 L474.7 156.3 L475.1 153.8 L475.6 156.5 L476.0 154.1 L476.4 152.3 L476.9 152.1 L477.3 153.3 L477.8 84.4 L478.2 64.5 L478.7 156.8 L479.1 154.1 L479.6 158.0 L480.0 159.2 L480.4 160.2 L480.9 153.1 L481.3 159.2 L481.8 159.2 L482.2 157.0 L482.7 147.2 L483.1 161.0 L483.6 152.3 L484.0 152.3 L484.4 153.3 L484.9 158.7 L485.3 151.6 L485.8 156.5 L486.2 156.3 L486.7 154.6 L487.1 156.8 L487.6 155.3 L488.0 153.1 L488.4 159.7 L488.9 157.0 L489.3 155.0 L489.8 159.5 L490.2 155.0 L490.7 161.2 L491.1 152.3 L491.6 152.8 L492.0 156.5 L492.4 154.3 L492.9 149.6 L493.3 161.7 L493.8 149.9 L494.2 148.9 L494.7 154.6 L495.1 157.0 L495.6 153.8 L496.0 158.0 L496.4 154.1 L496.9 150.6 L497.3 160.5 L497.8 154.6 L498.2 154.8 L498.7 154.8 L499.1 156.8 L499.6 158.0 L500.0 149.9 L500.4 159.5 L500.9 156.3 L501.3 161.9 L501.8 157.3 L502.2 157.8 L502.7 156.0 L503.1 157.0 L503.6 161.7 L504.0 158.2 L504.4 156.5 L504.9 156.0 L505.3 156.0 L505.8 160.0 L506.2 151.4 L506.7 150.4 L507.1 156.8 L507.6 148.6 L508.0 157.0 L508.4 154.8 L508.9 154.1 L509.3 161.4 L509.8 160.0 L510.2 151.6 L510.7 153.8 L511.1 159.5 L511.6 158.2 L512.0 159.2 L512.4 149.1 L512.9 156.8 L513.3 153.8 L513.8 155.0 L514.2 151.1 L514.7 155.0 L515.1 152.8 L515.6 157.3 L516.0 156.0 L516.4 148.9 L516.9 156.8 L517.3 160.0 L517.8 152.6 L518.2 156.3 L518.7 155.5 L519.1 160.7 L519.6 154.3 L520.0 155.8 L520.4 157.3 L520.9 155.8 L521.3 156.0 L521.8 154.6 L522.2 152.6 L522.7 149.1 L523.1 154.1 L523.6 155.3 L524.0 155.8 L524.4 151.8 L524.9 155.8 L525.3 157.8 L525.8 153.3 L526.2 153.6 L526.7 152.8 L527.1 156.8 L527.6 154.8 L528.0 159.7 L528.4 153.1 L528.9 158.0 L529.3 157.0 L529.8 153.8 L530.2 42.6 L530.7 154.6 L531.1 159.2 L531.6 157.3 L532.0 154.3 L532.4 153.6 L532.9 158.2 L533.3 153.3 L533.8 153.8 L534.2 149.1 L534.7 158.5 L535.1 161.0 L535.6 158.2 L536.0 150.1 L536.4 155.5 L536.9 159.5 L537.3 156.8 L537.8 149.1 L538.2 147.7 L538.7 159.5 L539.1 159.7 L539.6 155.3 L540.0 152.3 L540.4 150.9 L540.9 153.6 L541.3 154.8 L541.8 157.0 L542.2 156.0 L542.7 157.8 L543.1 152.1 L543.6 153.1 L544.0 156.0 L544.4 150.6 L544.9 155.0 L545.3 157.5 L545.8 153.6 L546.2 156.0 L546.7 151.4 L547.1 155.3 L547.6 157.3 L548.0 146.9 L548.4 155.5 L548.9 152.3 L549.3 148.9 L549.8 150.9 L550.2 158.5 L550.7 143.0 L551.1 156.8 L551.6 160.5 L552.0 46.5 L552.4 43.8 L552.9 89.1 L553.3 158.0 L553.8 151.1 L554.2 160.2 L554.7 152.1 L555.1 162.9 L555.6 157.0 L556.0 151.8 L556.4 157.5 L556.9 154.6 L557.3 157.0 L557.8 147.4 L558.2 146.9 L558.7 160.7 L559.1 158.7 L559.6 155.8 L560.0 157.3 L560.4 157.0 L560.9 161.0 L561.3 156.8 L561.8 151.8 L562.2 159.0 L562.7 154.1 L563.1 159.0 L563.6 161.4 L564.0 161.9 L564.4 158.5 L564.9 151.4 L565.3 154.6 L565.8 152.3 L566.2 148.9 L566.7 157.3 L567.1 160.7 L567.6 157.5 L568.0 154.3 L568.4 157.5 L568.9 148.6 L569.3 150.1 L569.8 155.8 L570.2 154.6 L570.7 158.2 L571.1 150.9 L571.6 154.6 L572.0 145.2 L572.4 150.6 L572.9 157.5 L573.3 156.3 L573.8 158.2 L574.2 158.2 L574.7 155.5 L575.1 159.5 L575.6 155.5 L576.0 148.9 L576.4 149.9 L576.9 74.3 L577.3 151.1 L577.8 159.0 L578.2 147.4 L578.7 155.0 L579.1 156.8 L579.6 151.1 L580.0 161.7 L580.4 162.7 L580.9 155.5 L581.3 154.6 L581.8 158.2 L582.2 161.2 L582.7 156.3 L583.1 155.0 L583.6 153.8 L584.0 158.7 L584.4 158.5 L584.9 154.3 L585.3 152.6 L585.8 159.5 L586.2 158.5 L586.7 155.3 L587.1 153.6 L587.6 155.5 L588.0 160.5 L588.4 156.0 L588.9 158.0 L589.3 155.3 L589.8 155.0 L590.2 151.6 L590.7 158.5 L591.1 151.1 L591.6 149.1 L592.0 151.8 L592.4 160.7 L592.9 149.9 L593.3 158.0 L593.8 149.6 L594.2 152.3 L594.7 158.2 L595.1 156.3 L595.6 155.5 L596.0 158.0 L596.4 155.5 L596.9 155.8 L597.3 161.7 L597.8 150.9 L598.2 160.2 L598.7 155.8 L599.1 152.3 L599.6 152.3 L600.0 148.6 L600.4 151.1 L600.9 158.7 L601.3 149.1 L601.8 148.6 L602.2 153.3 L602.7 152.1 L603.1 154.8 L603.6 147.7 L604.0 160.0 L604.4 153.6 L604.9 155.0 L605.3 144.7 L605.8 155.8 L606.2 156.0 L606.7 151.6 L607.1 159.0 L607.6 155.3 L608.0 158.7 L608.4 155.0 L608.9 159.5 L609.3 157.5 L609.8 156.3 L610.2 105.1 L610.7 158.2 L611.1 155.5 L611.6 161.0 L612.0 160.5 L612.4 155.8 L612.9 152.1 L613.3 153.8 L613.8 154.3 L614.2 158.0 L614.7 151.4 L615.1 156.5 L615.6 154.6 L616.0 156.0 L616.4 156.8 L616.9 153.3 L617.3 153.6 L617.8 153.6 L618.2 152.3 L618.7 156.3 L619.1 153.8 L619.6 150.4 L620.0 151.8 L620.4 156.5 L620.9 158.0 L621.3 154.6 L621.8 153.1 L622.2 154.6 L622.7 46.7 L623.1 103.8 L623.6 152.3 L624.0 159.5 L624.4 154.3 L624.9 153.8 L625.3 161.7 L625.8 151.1 L626.2 153.3 L626.7 158.5 L627.1 161.4 L627.6 152.6 L628.0 149.4 L628.4 55.6 L628.9 157.3 L629.3 153.3 L629.8 155.0 L630.2 160.0 L630.7 158.5 L631.1 152.6 L631.6 155.5 L632.0 152.3 L632.4 64.2 L632.9 58.8 L633.3 156.3 L633.8 155.0 L634.2 151.1 L634.7 151.6 L635.1 159.7 L635.6 154.3 L636.0 159.5 L636.4 157.3 L636.9 161.2 L637.3 150.1 L637.8 156.8 L638.2 156.3 L638.7 159.5 L639.1 154.3 L639.6 153.3 L640.0 158.2 L640.4 148.2 L640.9 161.2 L641.3 153.1 L641.8 153.6 L642.2 158.2 L642.7 154.8 L643.1 153.3 L643.6 152.1 L644.0 155.0 L644.4 157.5 L644.9 149.9 L645.3 144.5 L645.8 155.8 L646.2 155.8 L646.7 155.0 L647.1 160.2 L647.6 148.4 L648.0 161.7 L648.4 157.3 L648.9 143.7 L649.3 155.0 L649.8 156.8 L650.2 149.6 L650.7 106.1 L651.1 66.2 L651.6 147.2 L652.0 146.9 L652.4 152.1 L652.9 150.4 L653.3 159.2 L653.8 159.0 L654.2 155.5 L654.7 156.3 L655.1 159.5 L655.6 153.8 L656.0 153.3 L656.4 153.8 L656.9 153.3 L657.3 154.8 L657.8 161.7 L658.2 155.0 L658.7 154.8 L659.1 158.7 L659.6 154.8 L660.0 158.2 L660.4 154.1 L660.9 158.5 L661.3 160.5 L661.8 153.3 L662.2 149.1 L662.7 152.3 L663.1 150.6 L663.6 155.5 L664.0 153.6 L664.4 153.6 L664.9 153.6 L665.3 157.5 L665.8 152.8 L666.2 157.0 L666.7 152.3 L667.1 157.0 L667.6 155.0 L668.0 151.1 L668.4 154.3 L668.9 159.7 L669.3 153.1 L669.8 153.3 L670.2 155.5 L670.7 157.8 L671.1 148.9 L671.6 157.8 L672.0 157.8 L672.4 154.3 L672.9 156.0 L673.3 145.4 L673.8 143.5 L674.2 154.3 L674.7 153.3 L675.1 152.8 L675.6 156.3 L676.0 152.1 L676.4 154.3 L676.9 153.3 L677.3 152.6 L677.8 149.9 L678.2 152.1 L678.7 158.7 L679.1 148.4 L679.6 163.2 L680.0 153.8 L680.4 151.1 L680.9 159.2 L681.3 51.4 L681.8 156.3 L682.2 148.6 L682.7 155.5 L683.1 155.8 L683.6 152.8 L684.0 153.6 L684.4 157.5 L684.9 154.3 L685.3 151.1 L685.8 156.3 L686.2 160.7 L686.7 150.6 L687.1 158.0 L687.6 156.5 L688.0 151.4 L688.4 155.8 L688.9 158.0 L689.3 154.3 L689.8 154.1 L690.2 154.8 L690.7 150.9 L691.1 152.3 L691.6 145.9 L692.0 151.1 L692.4 156.8 L692.9 155.0 L693.3 153.6 L693.8 151.4 L694.2 150.1 L694.7 159.2 L695.1 156.3 L695.6 155.0 L696.0 154.8 L696.4 159.7 L696.9 155.8 L697.3 152.3 L697.8 155.8 L698.2 155.3 L698.7 155.3 L699.1 151.8 L699.6 151.1"/>
+<path class="e none dash fault" d="M60 116.2H700"/>
+<text class="ts" x="64" y="110.15384615384615">threshold 300 ms</text>
+<text class="ts mid" x="60.0" y="210">00:00</text>
+<text class="ts mid" x="220.0" y="210">06:00</text>
+<text class="ts mid" x="380.0" y="210">12:00</text>
+<text class="ts mid" x="540.0" y="210">18:00</text>
+<text class="ts mid" x="700.0" y="210">24:00</text>
+<text class="ts" x="60" y="237">every sample above: 33 notifications</text>
+<line class="axis" x1="60" y1="244" x2="700" y2="244"/>
+<circle class="fill-fault" cx="112.1" cy="244" r="4"/>
+<circle class="fill-fault" cx="149.7" cy="244" r="4"/>
+<circle class="fill-fault" cx="150.6" cy="244" r="4"/>
+<circle class="fill-fault" cx="215.6" cy="244" r="4"/>
+<circle class="fill-fault" cx="231.9" cy="244" r="4"/>
+<circle class="fill-fault" cx="234.3" cy="244" r="4"/>
+<circle class="fill-fault" cx="263.6" cy="244" r="4"/>
+<circle class="fill-fault" cx="307.6" cy="244" r="4"/>
+<circle class="fill-fault" cx="330.0" cy="244" r="4"/>
+<circle class="fill-fault" cx="339.0" cy="244" r="4"/>
+<circle class="fill-fault" cx="341.6" cy="244" r="4"/>
+<circle class="fill-fault" cx="375.6" cy="244" r="4"/>
+<circle class="fill-store" cx="433.3" cy="244" r="4"/>
+<circle class="fill-store" cx="433.6" cy="244" r="4"/>
+<circle class="fill-store" cx="435.3" cy="244" r="4"/>
+<circle class="fill-store" cx="435.7" cy="244" r="4"/>
+<circle class="fill-store" cx="437.6" cy="244" r="4"/>
+<circle class="fill-store" cx="438.6" cy="244" r="4"/>
+<circle class="fill-store" cx="439.1" cy="244" r="4"/>
+<circle class="fill-store" cx="440.7" cy="244" r="4"/>
+<circle class="fill-store" cx="440.9" cy="244" r="4"/>
+<circle class="fill-store" cx="442.0" cy="244" r="4"/>
+<circle class="fill-fault" cx="478.0" cy="244" r="4"/>
+<circle class="fill-fault" cx="530.3" cy="244" r="4"/>
+<circle class="fill-fault" cx="552.2" cy="244" r="4"/>
+<circle class="fill-fault" cx="553.1" cy="244" r="4"/>
+<circle class="fill-fault" cx="577.0" cy="244" r="4"/>
+<circle class="fill-fault" cx="610.4" cy="244" r="4"/>
+<circle class="fill-fault" cx="623.0" cy="244" r="4"/>
+<circle class="fill-fault" cx="628.7" cy="244" r="4"/>
+<circle class="fill-fault" cx="632.7" cy="244" r="4"/>
+<circle class="fill-fault" cx="651.0" cy="244" r="4"/>
+<circle class="fill-fault" cx="681.3" cy="244" r="4"/>
+<text class="ts" x="60" y="263">1 minute above: 5 notifications</text>
+<line class="axis" x1="60" y1="270" x2="700" y2="270"/>
+<circle class="fill-store" cx="434.0" cy="270" r="4"/>
+<circle class="fill-store" cx="436.1" cy="270" r="4"/>
+<circle class="fill-store" cx="438.0" cy="270" r="4"/>
+<circle class="fill-store" cx="439.6" cy="270" r="4"/>
+<circle class="fill-store" cx="441.3" cy="270" r="4"/>
+<text class="ts" x="60" y="289">5 minutes above: 0 notifications</text>
+<line class="axis" x1="60" y1="296" x2="700" y2="296"/>
+<text class="ts" x="60" y="315">5-minute average above: 1 notification</text>
+<line class="axis" x1="60" y1="322" x2="700" y2="322"/>
+<circle class="fill-store" cx="434.6" cy="322" r="4"/>
+<text class="ts" x="10" y="344">Dots: notifications, on the same time axis. Green: during the real incident. Red: false alarms.</text>
+<rect class="hit" x="60" y="30" width="26.6667" height="160" data-tip="00:00 to 01:00|highest sample 189 ms|notifications: 0 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="86.6667" y="30" width="26.6667" height="160" data-tip="01:00 to 02:00|highest sample 569 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="113.333" y="30" width="26.6667" height="160" data-tip="02:00 to 03:00|highest sample 172 ms|notifications: 0 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="140" y="30" width="26.6667" height="160" data-tip="03:00 to 04:00|highest sample 582 ms|notifications: 2 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="166.667" y="30" width="26.6667" height="160" data-tip="04:00 to 05:00|highest sample 175 ms|notifications: 0 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="193.333" y="30" width="26.6667" height="160" data-tip="05:00 to 06:00|highest sample 428 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="220" y="30" width="26.6667" height="160" data-tip="06:00 to 07:00|highest sample 578 ms|notifications: 2 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="246.667" y="30" width="26.6667" height="160" data-tip="07:00 to 08:00|highest sample 519 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="273.333" y="30" width="26.6667" height="160" data-tip="08:00 to 09:00|highest sample 180 ms|notifications: 0 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="300" y="30" width="26.6667" height="160" data-tip="09:00 to 10:00|highest sample 453 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="326.667" y="30" width="26.6667" height="160" data-tip="10:00 to 11:00|highest sample 497 ms|notifications: 3 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="353.333" y="30" width="26.6667" height="160" data-tip="11:00 to 12:00|highest sample 508 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="380" y="30" width="26.6667" height="160" data-tip="12:00 to 13:00|highest sample 178 ms|notifications: 0 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="406.667" y="30" width="26.6667" height="160" data-tip="13:00 to 14:00|highest sample 191 ms|notifications: 0 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="433.333" y="30" width="26.6667" height="160" data-tip="14:00 to 15:00|highest sample 493 ms|notifications: 10 plain, 5 with 1 minute, 0 with 5 minutes, 1 on the average"/>
+<rect class="hit" x="460" y="30" width="26.6667" height="160" data-tip="15:00 to 16:00|highest sample 510 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="486.667" y="30" width="26.6667" height="160" data-tip="16:00 to 17:00|highest sample 168 ms|notifications: 0 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="513.333" y="30" width="26.6667" height="160" data-tip="17:00 to 18:00|highest sample 599 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="540" y="30" width="26.6667" height="160" data-tip="18:00 to 19:00|highest sample 594 ms|notifications: 2 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="566.667" y="30" width="26.6667" height="160" data-tip="19:00 to 20:00|highest sample 470 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="593.333" y="30" width="26.6667" height="160" data-tip="20:00 to 21:00|highest sample 345 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="620" y="30" width="26.6667" height="160" data-tip="21:00 to 22:00|highest sample 582 ms|notifications: 3 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="646.667" y="30" width="26.6667" height="160" data-tip="22:00 to 23:00|highest sample 503 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+<rect class="hit" x="673.333" y="30" width="26.6667" height="160" data-tip="23:00 to 24:00|highest sample 563 ms|notifications: 1 plain, 0 with 1 minute, 0 with 5 minutes, 0 on the average"/>
+</svg>
+</div>
+<figcaption>Measured on a simulated day. A plain threshold pages for every spike; “for 5 minutes” missed the incident, because each brief dip reset it; a condition on the 5-minute average paged once.</figcaption>
+</figure>
+
+<ul>
+  <li><b>Every sample above 300 ms</b> paged 33 times: 23 false alarms from spikes, and 10 pages during the incident itself, because each dip ended the alert and the next sample started a new one. That is <dfn>flapping</dfn>: an alert that fires and resolves repeatedly while the underlying problem continues.</li>
+  <li><b>Above 300 ms for 1 minute</b> removed every false alarm, but still paged 5 times during the incident, first after 90 seconds.</li>
+  <li><b>Above 300 ms for 5 minutes</b> never paged at all. Each dip below the threshold reset the pending timer, and no run of 20 samples above it ever happened. A twenty-minute incident went unreported.</li>
+  <li><b>The 5-minute average above 300 ms</b> paged once, 165 seconds into the incident, and never otherwise.</li>
+</ul>
+<p>The lesson is to put the smoothing in the query, over a window, rather than in a timer that any single sample can reset. Better still is the burn-rate alert of <x-ref to="observability#alerting"></x-ref>, which asks how fast the error budget is being spent over two windows at once. Firing alerts go to an <b>alert manager</b> that groups related alerts into one notification, removes repeats, routes by team and severity, and honors silences during planned work. Two rule evaluators run the same rules for safety, and the alert manager removes the duplicates they send.</p>
+<div class="note production"><p><span class="label">In production.</span> A monitoring system that is down sends no alerts, which looks exactly like a healthy system. Teams therefore run an alert that always fires, sent to an outside service that pages when it stops arriving, and watch the platform from a second, independent one.</p></div>
+
+<h2 id="logs">Step 6d: Logs</h2>
+<p>Logs are the largest data in the system, and the main choice is what to index. A search engine indexes every word (<x-ref to="search-systems#inverted-index"></x-ref>), so any text query is a lookup. The alternative, used by Grafana Loki, indexes only a few labels per stream, such as service and level, keeps the lines in compressed chunks in object storage, and scans the chunks whose labels and time range match. The chapter measured both on 200,000 synthetic JSON log lines, 43.3 MB as written.</p>
+
+<figure class="fig wide" id="fig-logs">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-labelledby="f986t f986d">
+<title id="f986t">What it costs to find a log line</title>
+<desc id="f986d">200,000 log lines, 43.3 MB as written. Stored as compressed chunks, 6.9 MB. An index of every word adds 19.6 MB; an index of labels only, 12.1 KB. Finding one trace id took 0.103 ms with the word index, 13.3 ms by scanning one service’s chunks, and 193.8 ms by scanning every chunk, in one run.</desc>
+<text class="tb" x="10" y="18">Storage, MB</text>
+<text class="tb" x="390" y="18">Time to find one trace id, ms (one run)</text>
+<text class="ts" x="10" y="47">As written</text>
+<rect class="bar mute" x="140" y="34" width="192.6" height="18" rx="2"/>
+<text class="ts tb" x="338.6" y="47">43.3</text>
+<text class="ts" x="10" y="81">Compressed chunks</text>
+<rect class="bar store" x="140" y="68" width="30.5" height="18" rx="2"/>
+<text class="ts tb" x="176.5" y="81">6.9</text>
+<text class="ts" x="10" y="115">Index of every word</text>
+<rect class="bar " x="140" y="102" width="87.1" height="18" rx="2"/>
+<text class="ts tb" x="233.1" y="115">19.6</text>
+<text class="ts" x="10" y="149">Index of labels only</text>
+<rect class="bar store" x="140" y="136" width="1.5" height="18" rx="2"/>
+<text class="ts tb" x="147.5" y="149">12 KB</text>
+<line class="grid" x1="520.0" y1="30" x2="520.0" y2="134"/>
+<text class="ts mid" x="520.0" y="150">0.1</text>
+<line class="grid" x1="565.0" y1="30" x2="565.0" y2="134"/>
+<text class="ts mid" x="565.0" y="150">1</text>
+<line class="grid" x1="610.0" y1="30" x2="610.0" y2="134"/>
+<text class="ts mid" x="610.0" y="150">10</text>
+<line class="grid" x1="655.0" y1="30" x2="655.0" y2="134"/>
+<text class="ts mid" x="655.0" y="150">100</text>
+<line class="grid" x1="700.0" y1="30" x2="700.0" y2="134"/>
+<text class="ts mid" x="700.0" y="150">1,000</text>
+<text class="ts end" x="512" y="47">Word index lookup</text>
+<rect class="bar" x="520" y="34" width="1.5" height="18" rx="2"/>
+<text class="ts tb" x="526.6" y="47">0.103</text>
+<text class="ts end" x="512" y="81">Scan one service</text>
+<rect class="bar" x="520" y="68" width="95.6" height="18" rx="2"/>
+<text class="ts tb" x="621.6" y="81">13.3</text>
+<text class="ts end" x="512" y="115">Scan every chunk</text>
+<rect class="bar" x="520" y="102" width="147.9" height="18" rx="2"/>
+<text class="ts tb" x="673.9" y="115">193.8</text>
+<text class="ts" x="10" y="190">The word index is almost three times the size of the compressed logs, mostly unique trace and user ids.</text>
+<text class="ts" x="10" y="208">Scanning is slower, but it runs over only the chunks whose labels and time range match, and in parallel.</text>
+<rect class="hit" x="10" y="32" width="360" height="24" data-tip="As written|43.328 MB"/>
+<rect class="hit" x="10" y="66" width="360" height="24" data-tip="Compressed chunks|6.871 MB"/>
+<rect class="hit" x="10" y="100" width="360" height="24" data-tip="Index of every word|19.595 MB"/>
+<rect class="hit" x="10" y="134" width="360" height="24" data-tip="Index of labels only|0.012 MB"/>
+<rect class="hit" x="390" y="32" width="330" height="24" data-tip="Word index lookup|0.103 ms, one run"/>
+<rect class="hit" x="390" y="66" width="330" height="24" data-tip="Scan one service|13.3 ms, one run"/>
+<rect class="hit" x="390" y="100" width="330" height="24" data-tip="Scan every chunk|193.8 ms, one run"/>
+</svg>
+</div>
+<figcaption>Measured: indexing every word makes any search instant and costs more storage than the logs themselves. Indexing labels only and scanning compressed chunks is cheap to keep and slower to search.</figcaption>
+</figure>
+
+<p>Compressed in chunks of about 256 KB per stream, the lines took 6.9 MB, 6.3 times smaller. An index of every word took 19.6 MB, almost three times the compressed logs, because most of its 486,891 terms were trace ids and user ids that occur once. The label index took 12.1 KB. In one run, finding one trace id took 0.1 ms with the word index, 13.3 ms by decompressing and scanning one service’s 3.6 MB of chunks, and 194 ms by scanning everything.</p>
+<p>At 2 TB a day the difference is about 27 TB of index for a month, against 9.5 TB for the logs themselves. Scanning is slower, but it parallelizes across chunks, and most searches name a service and a time range, which is what the label index narrows. Logs that need instant search by many fields, such as audit and security logs, justify a full index on a smaller volume. Older logs move to cheaper storage classes (<x-ref to="object-and-file-storage"></x-ref>), and routine lines are sampled or turned into metrics before they are ever stored.</p>
+
+<h2 id="failures">Step 7: Failures and growth</h2>
+<table>
+<thead><tr><th>What fails</th><th>What the user sees</th><th>What the design does</th></tr></thead>
+<tbody>
+<tr><th>An ingester</th><td>Nothing</td><td>Two other copies of each series continue; the replacement replays its write-ahead log</td></tr>
+<tr><th>A team adds a user id as a label</th><td>That team’s pushes are refused</td><td>Per-tenant series limits at the distributors protect everyone else</td></tr>
+<tr><th>A query over every series for a year</th><td>An error saying the query is too large</td><td>Limits on series and samples per query, timeouts, and reading rollups for long ranges</td></tr>
+<tr><th>Object storage is slow</th><td>Old dashboards are slow</td><td>Recent data comes from the ingesters, so alerts keep working</td></tr>
+<tr><th>The whole platform</th><td>No alerts, which looks like calm</td><td>An always-firing alert watched from outside, and a second, independent monitor</td></tr>
+<tr><th>A collector cannot reach targets</th><td>Gaps in graphs</td><td>“Target down” is itself alerted on; collectors run in each zone</td></tr>
+</tbody>
+</table>
+<p><b>At ten times the scale</b>, 100 million series and 6.7 million samples a second, the design is the same with more distributors and ingesters, about 18 TB for 15 days of samples, and collectors in every cluster. The pressure moves to queries: dashboards that once read thousands of series now read millions, so queries are split by time and by series across queriers. <b>At a hundred times</b>, the index of a block and the series held in memory become the limit, and the answer is fewer series rather than more machines: aggregating at the collector, dropping labels nobody queries and sampling logs.</p>
+
+<h2 id="real-world">In the real world</h2>
+<ul>
+  <li>Facebook’s Gorilla (VLDB 2015) introduced the compression used here: about 96% of timestamps stored in a single bit and about 51% of values identical to the previous one, for an average of 1.37 bytes a point against 16, in two-hour blocks.</li>
+  <li>Prometheus’s documentation (checked October 2026) describes two-hour blocks compacted in the background, a write-ahead log in 128 MB segments, a default retention of 15 days, and “an average of only 1-2 bytes per sample”. Its source code gives each target a scrape offset from a hash of the target.</li>
+  <li>In Prometheus, an alert with a <code>for</code> clause is pending until the condition has held for that long; <code>keep_firing_for</code> keeps it firing for a while after the condition clears, against flapping.</li>
+  <li>Grafana Loki indexes only labels, not the contents of log lines, and stores compressed chunks in object storage, which its documentation credits for its lower cost (checked October 2026). Grafana Mimir’s stateless distributors validate samples, enforce limits per tenant and shard series across ingesters.</li>
+  <li>Google’s Monarch (VLDB 2020) is a globally distributed, in-memory time-series database that ingests terabytes of data a second and serves millions of queries a second.</li>
+</ul>
+
+<h2 id="extend">Follow-up questions</h2>
+<table>
+<thead><tr><th>The interviewer adds</th><th>What changes</th><th>What does not</th></tr></thead>
+<tbody>
+<tr><th>Traces as well</th><td>Spans stored by trace id in object storage, sampled, with a small index; found from logs and metrics by id</td><td>The tenants, limits and object storage</td></tr>
+<tr><th>Anomaly detection instead of thresholds</th><td>A job that models each series’ normal range and alerts on deviation, still through the alert manager</td><td>Rules, grouping and paging</td></tr>
+<tr><th>Metrics from a million phones</th><td>Push only, aggregated by the server per version and region before storage</td><td>Bounded labels</td></tr>
+<tr><th>Several regions</th><td>A platform per region; a global query layer that fans out; alerts evaluated in each region</td><td>Each region monitors itself even when cut off</td></tr>
+<tr><th>Exact billing from metrics</th><td>Counters are sampled and may reset; billing needs events counted exactly (<x-ref to="hld-ad-click-aggregation"></x-ref>)</td><td>Metrics for operations</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> Start with the numbers: series, samples a second, and why logs dominate storage. Draw collectors, distributors with limits, replicated ingesters, object storage and queriers. Spend the deep dives on compressing samples, on rollups that keep histograms, and on alert rules that neither flap nor miss; mention the alert that watches the watcher. Close with the choice of log index and its cost.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Unbounded label values</th><td>Millions of series; ingesters run out of memory</td><td>Limits per tenant; ids go in logs and traces</td></tr>
+<tr><th>Scraping every target at the same instant</th><td>Bursts of 15 times the average</td><td>A fixed offset per target from a hash</td></tr>
+<tr><th>Rollups that keep only the average</th><td>Spikes vanish from history</td><td>Minimum, maximum, sum and count</td></tr>
+<tr><th>Averaging percentiles</th><td>230 ms reported for a true 864 ms</td><td>Keep histogram buckets and compute percentiles at query time</td></tr>
+<tr><th>Alerting on every sample</th><td>Pages for spikes, and flapping during incidents</td><td>Conditions over a window, or burn rates</td></tr>
+<tr><th>A long “for” on a noisy signal</th><td>The incident never pages</td><td>Smooth in the query, not with a timer</td></tr>
+<tr><th>Indexing every word of every log</th><td>An index larger than the logs</td><td>Labels for streams; full indexes only where needed</td></tr>
+<tr><th>Monitoring that only watches itself</th><td>Silence during its own outage</td><td>An always-firing alert checked from outside</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="observability"></x-ref>: the signals this platform stores, and how to alert on them.</li>
+  <li><x-ref to="specialized-databases#time-series"></x-ref>: the time-series shape and the cardinality trap.</li>
+  <li><x-ref to="storage-engines#wal"></x-ref>: the write-ahead log behind every ingester.</li>
+  <li><x-ref to="search-systems#inverted-index"></x-ref>: the index of labels, and the index of every word.</li>
+  <li><x-ref to="multi-tenancy#noisy-neighbors"></x-ref>: limits that keep one team from hurting the others.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>The platform is write-heavy: millions of samples a second, sharded by series and replicated three ways.</li>
+  <li>Stored as changes in gaps and differing bits, a sample costs one or two bytes; fractions and jitter cost more.</li>
+  <li>Recent data lives in ingesters’ memory with a write-ahead log; two-hour blocks with a label index go to object storage.</li>
+  <li>Rollups keep minimum, maximum, sum, count and histogram buckets, because those combine; percentiles never do.</li>
+  <li>Smooth alert conditions over a window. A plain threshold flaps, and a long “for” can miss a real incident.</li>
+  <li>Indexing every word of the logs costs more than the logs; indexing labels and scanning chunks is the cheap default.</li>
+  <li>Limits per team, and an outside check that the monitoring itself is alive.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>Why does adding a label for the user id break a metrics system, when the number of samples per second hardly changes?</summary><p>Every distinct combination of label values is a separate series, with its own index entries and its own open chunk in an ingester’s memory. A million users turn one series into a million. Memory and index size grow with series, not samples. Per-tenant series limits refuse such pushes, and user ids belong in logs and traces.</p></details>
+<details><summary>A sample whose timestamp is 2 ms late costs 9 bits instead of 1 for its time. Why?</summary><p>Times are stored as the change in the gap between samples. Exactly on schedule, the gap is unchanged and costs a single zero bit. Two milliseconds late, the gap changed by 2, which needs a short code: a 2-bit prefix and 7 bits of value.</p></details>
+<details><summary>Why do rollups store the minimum, maximum, sum and count rather than the average?</summary><p>Because those four combine exactly into coarser rollups: the minimum of minimums, the maximum of maximums, and added sums and counts, from which the average follows. Averages of averages are wrong when counts differ, and an average hides the spike the maximum keeps.</p></details>
+<details><summary>Per-minute 99th percentiles are stored. How should a dashboard show the hourly 99th percentile?</summary><p>It cannot, correctly: averaging them gave 230 ms for a true 864 ms in the chapter’s test. Store histogram buckets per minute instead, add them for the hour, and read the percentile from the total, which gave 877 ms.</p></details>
+<details><summary>An alert “p99 above 300 ms for 5 minutes” stayed silent through a 20-minute incident. How?</summary><p>The pending timer restarts whenever one evaluation falls below the threshold, and during the incident about one sample in ten dipped to around 280 ms. No unbroken 5-minute run ever happened. A condition on the 5-minute average, or a burn rate, does not have this weakness.</p></details>
+<details><summary>Why is a full-text index of all logs usually the wrong default?</summary><p>Because it can be larger than the logs: in the test, 19.6 MB of index for 6.9 MB of compressed logs, mostly unique ids that each appear once. Most searches name a service and a time range, so a label index plus scanning the matching compressed chunks answers them in milliseconds to seconds at a fraction of the storage.</p></details>
+<details><summary>How do you know the monitoring system is working, given that it cannot alert about its own death?</summary><p>Run an alert that always fires and send it to an independent outside service, which pages when the alert stops arriving. Watch the platform’s own health from a second monitoring system that does not share its failure modes.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Tuomas Pelkonen and others, <a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Gorilla: A Fast, Scalable, In-Memory Time Series Database</a>, Proceedings of the VLDB Endowment 8(12), 2015. The compression of times and values.</li>
+  <li>Prometheus, <a href="https://prometheus.io/docs/prometheus/latest/storage/">Storage</a>, documentation, checked October 2026. Blocks, the write-ahead log, retention and bytes per sample.</li>
+  <li>Prometheus, <a href="https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/">Alerting rules</a>, documentation, checked October 2026. Pending and firing, <code>for</code> and <code>keep_firing_for</code>.</li>
+  <li>Prometheus, <a href="https://github.com/prometheus/prometheus/blob/main/scrape/target.go">scrape/target.go</a>, source code, checked October 2026. The scrape offset from a hash of the target.</li>
+  <li>Grafana Labs, <a href="https://grafana.com/docs/loki/latest/get-started/overview/">Loki overview</a> and <a href="https://grafana.com/docs/mimir/latest/references/architecture/components/distributor/">Mimir distributor</a>, documentation, checked October 2026.</li>
+  <li>Colin Adams and others, <a href="https://research.google/pubs/pub50652/">Monarch: Google’s Planet-Scale In-Memory Time Series Database</a>, Proceedings of the VLDB Endowment 13(12), 2020.</li>
+</ol>
+</section>

@@ -1,0 +1,595 @@
+<!--meta
+{ "description": "Cryptography in practice for system design: hash functions, message authentication codes, authenticated encryption and nonces, public-key cryptography and signatures, key agreement, TLS and certificate lifetimes, layers of encryption at rest, envelope encryption and key management services, key rotation, secrets management and the move to post-quantum algorithms.",
+  "lede": "Cryptography turns a large problem, keeping data secret and unaltered, into a small one, keeping a key secret. The algorithms are the reliable part: a handful of standard ones, in maintained libraries, have held for decades. Systems fail at the edges, in how keys are made, stored, shared, rotated and destroyed. This chapter covers the building blocks an engineer needs to recognize and choose between, and then spends most of its time on keys.",
+  "updated": "2026-10-10" }
+-->
+
+<h2 id="why">What cryptography is for</h2>
+<p>Every use of cryptography in a system serves one of three goals, and it helps to say which before reaching for a tool.</p>
+<table>
+<thead><tr><th>Goal</th><th>Meaning</th><th>Tool</th><th>In the photo app</th></tr></thead>
+<tbody>
+<tr><th>Confidentiality</th><td>Only the intended parties can read it</td><td>Encryption</td><td>A private photo on a disk, a password on the wire</td></tr>
+<tr><th>Integrity</th><td>Any change is detected</td><td>Hashes, authentication codes, signatures</td><td>A backup that restores exactly what was saved</td></tr>
+<tr><th>Authenticity</th><td>It came from who it claims to come from</td><td>Authentication codes, signatures, certificates</td><td>A token that the sign-in service did issue</td></tr>
+</tbody>
+</table>
+<p>Three rules come before any detail.</p>
+<ul>
+  <li><b>Never design an algorithm or a protocol.</b> Use the standard ones through a maintained library. The code in this chapter exists to show what such a library does, and it calls one for every primitive.</li>
+  <li><b>Encryption without integrity is a trap.</b> Data that can be read by nobody but changed by anybody is not protected. The modern primitives provide both together.</li>
+  <li><b>The key is the secret.</b> Algorithms are public. A system is exactly as secure as the handling of its keys, which is why half of this chapter is about that.</li>
+</ul>
+<aside class="sn"><b>Randomness</b>Keys, nonces, salts and tokens must come from a cryptographic random generator: <code>crypto.randomBytes</code> in Node.js, never <code>Math.random</code>, whose output can be predicted from a few samples.</aside>
+
+<h2 id="hashes">Hash functions</h2>
+<p>A <dfn>cryptographic hash function</dfn> turns input of any size into a short fixed-size value, called a digest, in such a way that the input cannot be recovered from the digest and no two different inputs with the same digest can be found. SHA-256 produces 32 bytes whatever it is given.</p>
+<pre data-lang="text" data-title="One character changed, and about half of the 256 bits flip">
+sha256("sunset123") = 6099f9b54e27c593…
+sha256("sunset124") = d4b7efa4949d264a…      117 of 256 bits differ
+</pre>
+<table>
+<thead><tr><th>Use</th><th>How the hash helps</th></tr></thead>
+<tbody>
+<tr><th>Detecting corruption</th><td>Store the digest with a file. A different digest on reading means the bytes changed (<x-ref to="object-and-file-storage#durability"></x-ref>)</td></tr>
+<tr><th>Naming content</th><td>Use the digest as the identifier. Equal content gets the same name, which gives deduplication and safe caching for free</td></tr>
+<tr><th>Fixing a version</th><td>A build that names its dependencies by digest cannot be handed different code under the same name</td></tr>
+<tr><th>Inside other tools</th><td>Signatures, authentication codes and key derivation are all built on hashes</td></tr>
+</tbody>
+</table>
+<p>Use SHA-256, or SHA-3 or BLAKE3 where a library offers them. MD5 and SHA-1 are broken for security purposes: researchers can produce two different files with the same digest, which defeats every use above except detecting accidental corruption. A fast hash is also the wrong tool for passwords, for the reasons in <x-ref to="authentication#passwords"></x-ref>.</p>
+<p>A hash proves integrity only if the digest itself is trustworthy. Anyone who can change a file can recompute its digest. To prove where data came from, a key has to be involved.</p>
+
+<h2 id="macs">Message authentication codes</h2>
+<p>A <dfn>message authentication code</dfn>, or MAC, is a short value computed from a message and a secret key. Anyone holding the same key can recompute it and so confirm two things at once: the message has not changed, and it came from someone who holds the key. The standard construction is HMAC, used here with SHA-256.</p>
+<p>A typical use is a webhook (<x-ref to="realtime-communication#webhooks"></x-ref>): your server receives a request claiming to be from a payment provider, and has to know that it is.</p>
+<pre data-lang="ts" data-title="Signing and verifying a request with a shared key">
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+// The sender signs the time and the body, so an old request cannot be replayed later.
+export function sign(body: string, key: Buffer, at = Math.floor(Date.now() / 1000)): string {
+  const mac = createHmac("sha256", key).update(`${at}.${body}`).digest("hex");
+  return `t=${at},v1=${mac}`;
+}
+
+export function verify(body: string, header: string, key: Buffer, now = Math.floor(Date.now() / 1000)): boolean {
+  const parts = Object.fromEntries(header.split(",").map((p) => p.split("=")));
+  const at = Number(parts.t);
+  if (!Number.isFinite(at) || Math.abs(now - at) > 300) return false; // older than five minutes
+  const expected = createHmac("sha256", key).update(`${at}.${body}`).digest();
+  const given = Buffer.from(String(parts.v1 ?? ""), "hex");
+  return given.length === expected.length && timingSafeEqual(given, expected);
+}
+</pre>
+<p>Tested with one valid request and four bad ones, the verifier accepted the first and refused a changed body, a request older than five minutes, a wrong key and a malformed header. Three details carry the weight.</p>
+<ul>
+  <li><b>Use HMAC, not a hash of the key followed by the message.</b> With SHA-256 that naive form lets an attacker extend a signed message and compute a valid code for the longer one without knowing the key.</li>
+  <li><b>Sign the time.</b> Otherwise a captured request can be sent again next month and will still verify.</li>
+  <li><b>Compare in constant time.</b> A comparison that stops at the first wrong byte tells an attacker, through timing, how many bytes were right.</li>
+</ul>
+<p>The limit of a MAC is that both sides hold the same key. Either could have produced the code, so it cannot prove to a third party which of them did, and every verifier is able to forge. Signatures, below, remove that limit.</p>
+
+<h2 id="symmetric">Symmetric encryption</h2>
+<p>In <dfn>symmetric encryption</dfn> the same key encrypts and decrypts. It is fast, at gigabytes a second on ordinary hardware, and it is what protects nearly all data, both stored and in transit.</p>
+<p>The algorithm is almost always AES with a 256-bit key. What matters is how it is used. A block cipher on its own encrypts one 16-byte block, and the obvious way to extend that to a longer message, encrypting each block separately, turns equal blocks of input into equal blocks of output, so patterns in the data show through. It also does nothing to stop the ciphertext being altered.</p>
+<p><dfn>Authenticated encryption</dfn> is encryption that also produces a tag proving the ciphertext has not been changed, so that tampered data is rejected instead of being decrypted into something wrong. Use it for everything. The two standard choices are AES-256-GCM and ChaCha20-Poly1305.</p>
+
+<figure class="fig wide" id="fig-aead">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-labelledby="f541t f541d">
+<title id="f541t">What goes into authenticated encryption and what comes out</title>
+<desc id="f541d">Four inputs enter an authenticated encryption function: a secret key of 32 bytes, a nonce of 12 bytes that must be different for every message under that key, the plaintext, and associated data that is checked but not hidden, such as the row the value belongs to. Two outputs leave: ciphertext the same length as the plaintext, and a 16-byte tag. Below is the stored value: a version byte, the nonce, the tag and the ciphertext. The key and the associated data are not stored with it.</desc>
+<rect class="n fault" x="10" y="30" width="250" height="40" rx="6"/>
+<text class="tb mid" x="135" y="46">Key</text>
+<text class="ts mid" x="135" y="63">32 bytes, secret</text>
+<path class="e" d="M261 50H318"/>
+<rect class="n" x="10" y="78" width="250" height="40" rx="6"/>
+<text class="tb mid" x="135" y="94">Nonce</text>
+<text class="ts mid" x="135" y="111">12 bytes, new for every message</text>
+<path class="e" d="M261 98H318"/>
+<rect class="n sig" x="10" y="126" width="250" height="40" rx="6"/>
+<text class="tb mid" x="135" y="142">Plaintext</text>
+<text class="ts mid" x="135" y="159">ana@example.com</text>
+<path class="e" d="M261 146H318"/>
+<rect class="n" x="10" y="174" width="250" height="40" rx="6"/>
+<text class="tb mid" x="135" y="190">Associated data</text>
+<text class="ts mid" x="135" y="207">“users/871/email”: checked, not hidden</text>
+<path class="e" d="M261 194H318"/>
+<rect class="n store" x="320" y="34" width="150" height="176" rx="6"/>
+<text class="tb mid" x="395" y="109.5">Authenticated</text>
+<text class="tb mid" x="395" y="126.5">encryption</text>
+<text class="ts mid" x="395" y="143.5">AES-256-GCM</text>
+<path class="e store" d="M471 96H528"/>
+<rect class="n store" x="530" y="76" width="180" height="40" rx="6"/>
+<text class="tb mid" x="620" y="92">Ciphertext</text>
+<text class="ts mid" x="620" y="109">same length as the plaintext</text>
+<path class="e store" d="M471 148H528"/>
+<rect class="n store" x="530" y="128" width="180" height="40" rx="6"/>
+<text class="tb mid" x="620" y="144">Tag</text>
+<text class="ts mid" x="620" y="161">16 bytes: proof of integrity</text>
+<text class="tb" x="320" y="236">What is stored:</text>
+<rect class="n sunk" x="320" y="244" width="64" height="26" rx="0"/>
+<text class="ts mid" x="352" y="261">version</text>
+<rect class="n sunk" x="384" y="244" width="76" height="26" rx="0"/>
+<text class="ts mid" x="422" y="261">nonce</text>
+<rect class="n sunk" x="460" y="244" width="76" height="26" rx="0"/>
+<text class="ts mid" x="498" y="261">tag</text>
+<rect class="n sunk" x="536" y="244" width="174" height="26" rx="0"/>
+<text class="ts mid" x="623" y="261">ciphertext</text>
+<text class="ts" x="10" y="242">The key is kept elsewhere. The associated</text>
+<text class="ts" x="10" y="258">data is supplied again when opening.</text>
+</svg>
+</div>
+<figcaption>Opening the value repeats the calculation and compares tags. If the key, the nonce, the ciphertext or the associated data differs by one bit, nothing is returned.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Sealing and opening a value with AES-256-GCM">
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+
+// A sealed value is: version (1 byte) | nonce (12) | tag (16) | ciphertext.
+// `context` is not secret and not stored. It must be the same again to open the value.
+export function seal(plaintext: string, key: Buffer, context: string): Buffer {
+  const nonce = randomBytes(12); // new for every message: never reuse one with the same key
+  const cipher = createCipheriv("aes-256-gcm", key, nonce);
+  cipher.setAAD(Buffer.from(context));
+  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return Buffer.concat([Buffer.from([1]), nonce, cipher.getAuthTag(), ciphertext]);
+}
+
+export function open(sealed: Buffer, key: Buffer, context: string): string {
+  if (sealed[0] !== 1) throw new Error("unknown format version");
+  const decipher = createDecipheriv("aes-256-gcm", key, sealed.subarray(1, 13));
+  decipher.setAAD(Buffer.from(context));
+  decipher.setAuthTag(sealed.subarray(13, 29));
+  // final() throws if a single bit of the nonce, tag, ciphertext or context is wrong.
+  return Buffer.concat([decipher.update(sealed.subarray(29)), decipher.final()]).toString("utf8");
+}
+</pre>
+<p>Sealing the same email address twice gave two different results, because the nonce differed. Opening was refused in each of three tests: one bit of the stored value changed, the right value presented for a different row, and the wrong key.</p>
+<p>The second of those is the reason for the context. Without it, an attacker who can write to the database but cannot decrypt anything can still copy Ben’s encrypted value into Ana’s row. Binding each value to its place makes that copy fail to open.</p>
+<h3 id="nonces">The one rule: never reuse a nonce</h3>
+<p>A <dfn>nonce</dfn> is a value that must be used only once with a given key. It is not secret and is stored with the ciphertext. With AES-GCM, encrypting two messages under the same key and nonce is catastrophic: it reveals the relationship between the two plaintexts and lets an attacker forge further messages.</p>
+<p>The code above picks 12 random bytes each time. That is safe only while the number of messages under one key stays small enough that a repeat is implausible, and the limit NIST sets for random nonces is 2<sup>32</sup> messages for each key, about 4.3 billion. The calculator starts with a busy service: 1,000 messages a second under a key replaced every 90 days.</p>
+
+<div class="widget" data-widget="noncebudget">
+<h4>Messages under one key</h4>
+<p>How many messages a key encrypts in its lifetime, against the limit for random nonces.</p>
+<div class="controls">
+  <label>Messages encrypted per second<input type="number" name="rate" value="1000" min="0.001" max="1000000000" step="0.001"></label>
+  <label>Key lifetime, in days<input type="number" name="days" value="90" min="1" max="3650" step="1"></label>
+</div>
+<svg class="dg" viewBox="0 0 640 220" role="img" aria-label="Messages encrypted under one key, rising over the life of the key, against a horizontal limit of two to the power 32. A dot marks where the limit is reached, or the total when the key is retired."><line x1="70" x2="620" y1="176" y2="176" class="axis"></line><text x="62" y="180" class="ts end">0</text><text x="70" y="193" class="ts">new key</text><text x="620" y="193" class="ts end">day 90</text><text x="345" y="212" class="ts mid">Messages encrypted under one key since it was created</text><path d="M70 100.1 L620 100.1" class="e none dash"></path><text x="62" y="104.1" class="ts end">4.29 bn</text><text x="78" y="93.1" class="ts">limit for random nonces: 2³² messages</text><path d="M70 176 L620 38.5" class="line" style="stroke:var(--fault)"></path><line x1="373.8" x2="373.8" y1="100.1" y2="176" class="e none dash"></line><circle cx="373.8" cy="100.1" r="5.5" class="dot fill-fault"></circle><text x="383.8" y="120.1" class="tb">limit reached after 49.7 days</text></svg>
+<dl class="results">
+  <div><dt>Messages under one key</dt><dd data-out="total">7.78 billion</dd></div>
+  <div><dt>Limit for random nonces</dt><dd data-out="limit">4.29 billion</dd></div>
+  <div><dt>Limit reached after</dt><dd data-out="reached">49.7 days</dd></div>
+  <div><dt>Share of the limit used</dt><dd data-out="share">181%</dd></div>
+</dl>
+<p class="verdict" data-out="verdict">At 1,000 messages a second, one key encrypts 7.78 billion messages in 90 days. That passes the limit of 2³² after 49.7 days. Replace the key more often than that, give each record its own data key, or use a construction made for more messages per key.</p>
+</div>
+
+<p>A single long-lived key for a whole table is therefore a design smell at scale. The pattern later in this chapter, a fresh data key for each record or each small group of records, makes the question disappear: no key ever sees more than a few messages.</p>
+
+<h2 id="public-key">Public-key cryptography</h2>
+<p>Symmetric encryption leaves one problem unsolved: both sides need the same key, and they may never have met. <dfn>Public-key cryptography</dfn> uses keys that come in pairs, a private key kept by its owner and a public key that can be given to anyone, such that what one does only the other can undo or check. It does three jobs.</p>
+<table>
+<thead><tr><th>Job</th><th>How</th><th>Used for</th><th>Common algorithms</th></tr></thead>
+<tbody>
+<tr><th>Key agreement</th><td>Two parties exchange public values and each derives the same secret</td><td>Starting every TLS connection</td><td>X25519, P-256</td></tr>
+<tr><th>Signatures</th><td>The private key signs, and anyone with the public key verifies</td><td>Certificates, tokens, software releases</td><td>Ed25519, ECDSA, RSA</td></tr>
+<tr><th>Encryption to a recipient</th><td>Anyone encrypts with the public key, and only the private key decrypts</td><td>Sending a key or a small secret to one party</td><td>RSA, and hybrid schemes built on key agreement</td></tr>
+</tbody>
+</table>
+<p>Public-key operations are slow and limited to small inputs, so they are never used on bulk data. They establish a symmetric key, and symmetric encryption does the rest.</p>
+
+<figure class="fig wide" id="fig-hybrid">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 246" role="img" aria-labelledby="f542t f542d">
+<title id="f542t">Two parties agreeing on a secret key in front of an eavesdropper</title>
+<desc id="f542d">A sequence between Ana’s browser and a server, with an eavesdropper on the path between them. The browser makes a one-time key pair and sends the public half, A. The server makes its own and sends its public half, B. The browser combines its private half with B, the server combines its private half with A, and both arrive at the same secret K. Data then travels encrypted under a key derived from K. The eavesdropper has seen A, B and ciphertext, and cannot compute K.</desc>
+<text class="tb mid" x="110" y="20">Ana’s browser</text>
+<line class="axis" x1="110" y1="28" x2="110" y2="218"/>
+<text class="tb mid" x="360" y="20">An eavesdropper</text>
+<line class="axis" x1="360" y1="28" x2="360" y2="218"/>
+<text class="tb mid" x="610" y="20">Server</text>
+<line class="axis" x1="610" y1="28" x2="610" y2="218"/>
+<g data-s="1">
+<path class="e sig" d="M111 54H609"/>
+<text class="ts mid" x="360.0" y="48">1. my public value, A</text>
+</g>
+<g data-s="2">
+<path class="e" d="M609 82H111"/>
+<text class="ts mid" x="360.0" y="76">2. my public value, B</text>
+</g>
+<g data-s="3" data-packet="none">
+<rect class="n store" x="118" y="96" width="219.3" height="22" rx="4"/>
+<text class="ts mid" x="227.65" y="111">3. my private half with B gives K</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n store" x="382.7" y="124" width="219.3" height="22" rx="4"/>
+<text class="ts mid" x="492.35" y="139">4. my private half with A gives K</text>
+</g>
+<g data-s="5">
+<path class="e store" d="M111 166H609"/>
+<text class="ts mid" x="360.0" y="160">5. data, encrypted under K</text>
+</g>
+</svg>
+</div>
+<ol class="steps">
+  <li data-msg="A" data-state="The eavesdropper has seen: A; The secret K is known to: nobody yet">Each side makes a key pair that will be used for this connection only. The browser sends the public half of its pair. Anyone on the path can read it.</li>
+  <li data-msg="B" data-state="The eavesdropper has seen: A and B; The secret K is known to: nobody yet">The server sends the public half of its own pair. A signature and a certificate, not drawn here, prove that B came from the real server.</li>
+  <li data-msg="none" data-state="The eavesdropper has seen: A and B; The secret K is known to: the browser">The browser combines its private half with B. The mathematics is chosen so that this is easy with a private half and infeasible with only A and B.</li>
+  <li data-msg="none" data-state="The eavesdropper has seen: A and B; The secret K is known to: the browser and the server">The server combines its private half with A and arrives at the same value. K was never sent.</li>
+  <li data-msg="ciphertext" data-state="The eavesdropper has seen: A, B and ciphertext; The secret K is known to: the browser and the server">Everything after this is encrypted with fast symmetric encryption under keys derived from K. Both private halves are discarded when the connection ends.</li>
+</ol>
+<figcaption>Public-key cryptography is used once, to agree on a key. The data itself is protected by symmetric encryption, which is thousands of times faster.</figcaption>
+</figure>
+
+<p>The key pairs in that figure are thrown away after one connection. This gives forward secrecy (<x-ref to="http-and-tls#handshake"></x-ref>): someone who records the traffic today and steals the server’s long-term key next year still cannot read it, because the long-term key was only ever used to sign.</p>
+<h3 id="signatures">Signatures</h3>
+<p>A <dfn>digital signature</dfn> is a value computed from a message with a private key, which anyone holding the matching public key can verify, and which nobody without the private key can produce. Unlike a MAC, verifying does not confer the ability to sign.</p>
+<pre data-lang="ts" data-title="Signing a release and verifying it, with Ed25519">
+import { generateKeyPairSync, sign, verify } from "node:crypto";
+
+// The private key stays with the signer. The public key can be given to anyone.
+const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+
+const release = Buffer.from("photos-app 4.2.0 sha256:9f2c…");
+const signature = sign(null, release, privateKey); // 64 bytes
+
+verify(null, release, publicKey, signature); // true
+verify(null, Buffer.from("photos-app 4.2.1 sha256:9f2c…"), publicKey, signature); // false
+</pre>
+<p>This is the mechanism behind the signed tokens of <x-ref to="authentication#tokens"></x-ref>, behind certificates, and behind signed software releases (<x-ref to="threats-and-defenses"></x-ref>). In every case the hard question is not the mathematics. It is how the verifier came to trust that this public key belongs to that signer. A certificate is one answer: a public key and a name, signed by an authority the verifier already trusts.</p>
+
+<h2 id="transit">Encryption in transit</h2>
+<p>For data moving between machines the answer is TLS, and <x-ref to="http-and-tls#tls"></x-ref> describes how it works. From a design point of view four decisions remain.</p>
+<ul>
+  <li><b>Everywhere, not only at the edge.</b> Traffic between your own services crosses networks you do not control as closely as you think. Encrypt internal hops too, with mutual TLS where services must identify each other (<x-ref to="service-communication#mtls"></x-ref>).</li>
+  <li><b>Know where it ends.</b> Wherever TLS is terminated, the data is in the clear in that machine’s memory. Each such point is a place to defend (<x-ref to="http-and-tls#termination"></x-ref>).</li>
+  <li><b>Use current versions.</b> TLS 1.3, with 1.2 allowed for old clients, and nothing older.</li>
+  <li><b>Automate certificates.</b> The permitted lifetime of a public certificate is being cut in steps.</li>
+</ul>
+
+<figure class="fig wide" id="fig-certs">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 214" role="img" aria-labelledby="f543t f543d">
+<title id="f543t">The longest lifetime allowed for a public TLS certificate, by the date the limit took effect</title>
+<desc id="f543d">Horizontal bars. From March 2018 the maximum was 825 days. From September 2020, 398 days. From 15 March 2026, 200 days. From 15 March 2027, 100 days. From 15 March 2029, 47 days.</desc>
+<text class="tb" x="10" y="18">Longest lifetime allowed for a public TLS certificate, in days</text>
+<text class="ts end" x="140" y="51">March 2018</text>
+<rect class="bar mute" x="150" y="34" width="470.0" height="22" rx="3"/>
+<text class="ts tb" x="628.0" y="50">825 days</text>
+<text class="ts end" x="140" y="83">September 2020</text>
+<rect class="bar mute" x="150" y="66" width="226.7" height="22" rx="3"/>
+<text class="ts tb" x="384.7" y="82">398 days</text>
+<text class="ts end" x="140" y="115">15 March 2026</text>
+<rect class="bar" x="150" y="98" width="113.9" height="22" rx="3"/>
+<text class="ts tb" x="271.9" y="114">200 days</text>
+<text class="ts end" x="140" y="147">15 March 2027</text>
+<rect class="bar async" x="150" y="130" width="57.0" height="22" rx="3"/>
+<text class="ts tb" x="215.0" y="146">100 days</text>
+<text class="ts end" x="140" y="179">15 March 2029</text>
+<rect class="bar async" x="150" y="162" width="26.8" height="22" rx="3"/>
+<text class="ts tb" x="184.8" y="178">47 days</text>
+<line class="axis" x1="150" y1="30" x2="150" y2="188"/>
+<text class="ts" x="10" y="204">Gray: superseded. Blue: in force when this chapter was written. Purple: agreed, not yet in force.</text>
+<rect class="hit" x="10" y="30" width="700" height="30" data-tip="From March 2018|at most 825 days|about 27 months|in force until 2020"/>
+<rect class="hit" x="10" y="62" width="700" height="30" data-tip="From September 2020|at most 398 days|about 13 months: renew once a year|in force until March 2026"/>
+<rect class="hit" x="10" y="94" width="700" height="30" data-tip="From 15 March 2026|at most 200 days|renew at least twice a year|the limit today"/>
+<rect class="hit" x="10" y="126" width="700" height="30" data-tip="From 15 March 2027|at most 100 days|renew at least four times a year|scheduled"/>
+<rect class="hit" x="10" y="158" width="700" height="30" data-tip="From 15 March 2029|at most 47 days|renew at least eight times a year|scheduled"/>
+</svg>
+</div>
+<figcaption>A certificate that can live for 47 days cannot be renewed by a person with a calendar reminder. The schedule exists to force automation.</figcaption>
+</figure>
+
+<p>The limits are set by the forum of browser makers and certificate authorities. Let’s Encrypt has gone further by choice and has offered certificates valid for six days since January 2026. Short lifetimes replace revocation, which never worked reliably: a stolen key for a six-day certificate is a six-day problem. The price is that issuing and renewing must be done entirely by software, and an expiring certificate must raise an alert long before it expires (<x-ref to="observability#alerting"></x-ref>).</p>
+
+<h2 id="rest">Encryption at rest</h2>
+<p><dfn>Encryption at rest</dfn> means that stored data is kept encrypted on its medium and decrypted only when read by something holding the key. The phrase covers designs with widely different protection, and the difference is in who holds the key at the moment of reading.</p>
+
+<figure class="fig wide" id="fig-layers">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 232" role="img" aria-labelledby="f544t f544d">
+<title id="f544t">What each layer of encryption at rest stops</title>
+<desc id="f544d">A grid of three layers against four threats. Encrypting the disk, volume or database files stops only a stolen or discarded disk. Encrypting chosen fields in the application also stops someone reading through the database, such as an injected query or an over-privileged account, and limits a server compromise to what that server asks the key service for. Encrypting on the user’s device, end to end, stops all four including the operator of the service, and in exchange the server can no longer search, process or recover the data.</desc>
+<rect class="n sunk" x="10" y="14" width="200" height="28" rx="0"/>
+<text class="ts tb" x="18" y="32">Where the data is encrypted</text>
+<rect class="n sunk" x="210" y="14" width="105" height="28" rx="0"/>
+<text class="ts tb" x="218" y="32">A stolen disk</text>
+<rect class="n sunk" x="315" y="14" width="165" height="28" rx="0"/>
+<text class="ts tb" x="323" y="32">A read through the database</text>
+<rect class="n sunk" x="480" y="14" width="135" height="28" rx="0"/>
+<text class="ts tb" x="488" y="32">A compromised server</text>
+<rect class="n sunk" x="615" y="14" width="95" height="28" rx="0"/>
+<text class="ts tb" x="623" y="32">The operator</text>
+<rect class="n" x="10" y="42" width="200" height="30" rx="0"/>
+<text class="ts tb" x="18" y="61">Disk, volume or database files</text>
+<rect class="n store" x="210" y="42" width="105" height="30" rx="0"/>
+<text class="ts" x="218" y="61">stopped</text>
+<rect class="n fault" x="315" y="42" width="165" height="30" rx="0"/>
+<text class="ts" x="323" y="61">not stopped</text>
+<rect class="n fault" x="480" y="42" width="135" height="30" rx="0"/>
+<text class="ts" x="488" y="61">not stopped</text>
+<rect class="n fault" x="615" y="42" width="95" height="30" rx="0"/>
+<text class="ts" x="623" y="61">not stopped</text>
+<rect class="n" x="10" y="72" width="200" height="30" rx="0"/>
+<text class="ts tb" x="18" y="91">Chosen fields, in the application</text>
+<rect class="n store" x="210" y="72" width="105" height="30" rx="0"/>
+<text class="ts" x="218" y="91">stopped</text>
+<rect class="n store" x="315" y="72" width="165" height="30" rx="0"/>
+<text class="ts" x="323" y="91">stopped</text>
+<rect class="n async" x="480" y="72" width="135" height="30" rx="0"/>
+<text class="ts" x="488" y="91">limited and logged</text>
+<rect class="n fault" x="615" y="72" width="95" height="30" rx="0"/>
+<text class="ts" x="623" y="91">not stopped</text>
+<rect class="n" x="10" y="102" width="200" height="30" rx="0"/>
+<text class="ts tb" x="18" y="121">On the user’s device, end to end</text>
+<rect class="n store" x="210" y="102" width="105" height="30" rx="0"/>
+<text class="ts" x="218" y="121">stopped</text>
+<rect class="n store" x="315" y="102" width="165" height="30" rx="0"/>
+<text class="ts" x="323" y="121">stopped</text>
+<rect class="n store" x="480" y="102" width="135" height="30" rx="0"/>
+<text class="ts" x="488" y="121">stopped</text>
+<rect class="n store" x="615" y="102" width="95" height="30" rx="0"/>
+<text class="ts" x="623" y="121">stopped</text>
+<text class="ts" x="10" y="156">A read through the database means an injected query, a leaked connection string or an account with more access than it needs.</text>
+<text class="ts" x="10" y="172">Each row down protects against more and costs more. Encrypted fields cannot be indexed or searched in the ordinary way. With</text>
+<text class="ts" x="10" y="188">end-to-end encryption the server cannot search, process, moderate or recover the data at all, and a user who loses the key loses the data.</text>
+<text class="ts tb" x="10" y="220">“Encrypted at rest” on a compliance form usually means the first row only.</text>
+</svg>
+</div>
+<figcaption>The question to ask of any encryption at rest is who holds the key at the moment the data is read, because that party can read it.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>Layer</th><th>Who decrypts</th><th>Cost</th><th>Use it</th></tr></thead>
+<tbody>
+<tr><th>Disk, volume or database files</th><td>The operating system or database, for every reader it lets in</td><td>None that you will notice</td><td>Always. It is one setting, and it covers lost hardware and discarded disks</td></tr>
+<tr><th>Chosen fields, in the application</th><td>Your service, one value at a time, through a key service</td><td>Those fields cannot be searched, sorted or joined on in the usual way</td><td>For the columns that would hurt most: identity numbers, access tokens for other systems, health data</td></tr>
+<tr><th><dfn>End-to-end encryption</dfn></th><td>Only the users’ devices. The server stores what it cannot read</td><td>No server-side search, processing or recovery. Key handling moves to the client</td><td>When the promise to users is that you cannot read their content</td></tr>
+</tbody>
+</table>
+<p>Backups, replicas, exports and logs are stored data too. An encrypted primary database beside an unencrypted nightly dump is an unencrypted database (<x-ref to="disaster-recovery"></x-ref>).</p>
+
+<h2 id="kms">Managing keys</h2>
+<p>Encrypting data creates a key that now needs protecting, and encrypting that key creates another. The chain has to end somewhere that is not a file on a disk. It ends in a <dfn>key management service</dfn>, or KMS: a service that holds master keys, never releases them, performs encryption and decryption on request, checks who is asking and records every use. Behind it sits a <dfn>hardware security module</dfn>, a device built so that keys can be used inside it and cannot be read out of it, even by its operators.</p>
+<p>A key service is deliberately a poor place to encrypt data. It is a network call away, it accepts only a few kilobytes at a time, and sending it your data would mean it sees everything. The pattern that resolves this is <dfn>envelope encryption</dfn>: each piece of data is encrypted locally with its own data key, and only that small data key is sent to the key service to be encrypted under a master key. The encrypted data key is stored beside the data.</p>
+
+<figure class="fig wide" id="fig-envelope">
+<div class="frame">
+<svg class="dg" viewBox="0 0 720 388" role="img" aria-labelledby="f545t f545d">
+<title id="f545t">Envelope encryption: writing and reading one photo</title>
+<desc id="f545d">Two sequences between the photos service, a key management service and storage. To write, the service makes a random data key and encrypts the photo with it locally, sends only the data key to the key management service to be wrapped under a master key, and stores the encrypted photo together with the wrapped key. To read, it fetches both, asks the key management service to unwrap the data key, decrypts the photo locally and erases the key.</desc>
+<text class="tb" x="10" y="16">Writing</text>
+<g data-scene="write">
+<text class="tb mid" x="120" y="36">Photos service</text>
+<line class="axis" x1="120" y1="44" x2="120" y2="170"/>
+<text class="tb mid" x="400" y="36">Key management service</text>
+<line class="axis" x1="400" y1="44" x2="400" y2="170"/>
+<text class="tb mid" x="640" y="36">Storage</text>
+<line class="axis" x1="640" y1="44" x2="640" y2="170"/>
+<g data-s="1" data-packet="none">
+<rect class="n sig" x="128" y="58" width="243.7" height="22" rx="4"/>
+<text class="ts mid" x="249.85" y="73">1. make a data key, encrypt the photo</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M121 100H399"/>
+<text class="ts mid" x="260.0" y="94">2. wrap this data key</text>
+</g>
+<g data-s="3">
+<path class="e" d="M399 128H121"/>
+<text class="ts mid" x="260.0" y="122">3. the wrapped data key</text>
+</g>
+<g data-s="4">
+<path class="e store" d="M121 156H639"/>
+<text class="ts mid" x="380.0" y="150">4. encrypted photo and wrapped key</text>
+</g>
+</g>
+<path class="e none dash" d="M10 186H710"/>
+<text class="tb" x="10" y="206">Reading</text>
+<g data-scene="read">
+<text class="tb mid" x="120" y="226">Photos service</text>
+<line class="axis" x1="120" y1="234" x2="120" y2="360"/>
+<text class="tb mid" x="400" y="226">Key management service</text>
+<line class="axis" x1="400" y1="234" x2="400" y2="360"/>
+<text class="tb mid" x="640" y="226">Storage</text>
+<line class="axis" x1="640" y1="234" x2="640" y2="360"/>
+<g data-s="1">
+<path class="e store" d="M639 262H121"/>
+<text class="ts mid" x="380.0" y="256">1. encrypted photo and wrapped key</text>
+</g>
+<g data-s="2">
+<path class="e sig" d="M121 290H399"/>
+<text class="ts mid" x="260.0" y="284">2. unwrap, for photos/871</text>
+</g>
+<g data-s="3">
+<path class="e" d="M399 318H121"/>
+<text class="ts mid" x="260.0" y="312">3. the data key</text>
+</g>
+<g data-s="4" data-packet="none">
+<rect class="n sig" x="128" y="332" width="231.5" height="22" rx="4"/>
+<text class="ts mid" x="243.75" y="347">4. decrypt the photo, erase the key</text>
+</g>
+</g>
+</svg>
+</div>
+<ol class="steps" data-scene="write" data-label="Writing">
+  <li data-msg="none" data-state="Plain data key held by: the photos service; Calls to the key service: 0">The service generates a random data key and encrypts the photo with it, on its own machine. The photo itself is never sent to the key service.</li>
+  <li data-msg="data key, 32 bytes">It sends only the 32-byte data key. The key service encrypts it under a master key that never leaves the key service.</li>
+  <li data-msg="wrapped key" data-state="Plain data key held by: the photos service; Calls to the key service: 1">The wrapped key comes back. It is useless to anyone who cannot ask the key service to unwrap it.</li>
+  <li data-msg="ciphertext, wrapped key" data-state="Plain data key held by: nobody; Calls to the key service: 1">Both are stored side by side, and the service erases the plain data key. Nothing in storage can be read without the key service.</li>
+</ol>
+<ol class="steps" data-scene="read" data-label="Reading">
+  <li data-msg="ciphertext, wrapped key" data-state="Plain data key held by: nobody; Calls to the key service: 0">To read the photo, the service fetches the ciphertext and the wrapped key that was stored with it.</li>
+  <li data-msg="wrapped key">It asks the key service to unwrap the data key. The key service checks that this caller may use this master key, and records the request.</li>
+  <li data-msg="data key" data-state="Plain data key held by: the photos service; Calls to the key service: 1">The plain data key comes back over an encrypted connection.</li>
+  <li data-msg="none" data-state="Plain data key held by: nobody; Calls to the key service: 1">The service decrypts the photo locally and erases the key. Cutting off its permission at the key service would make every stored photo unreadable to it at once.</li>
+</ol>
+<figcaption>A megabyte of photo costs one small request to the key service, and the master key is never anywhere but inside it.</figcaption>
+</figure>
+
+<pre data-lang="ts" data-title="Envelope encryption, and rotating the master key">
+import { randomBytes } from "node:crypto";
+import { open, seal } from "./aead";
+
+// What a key management service offers. The key itself never leaves it.
+interface Kms {
+  wrap(keyId: string, dataKey: Buffer): Buffer;
+  unwrap(keyId: string, wrapped: Buffer): Buffer;
+}
+
+type Stored = { keyId: string; wrappedKey: Buffer; sealed: Buffer };
+
+export function encryptRecord(kms: Kms, keyId: string, plaintext: string, context: string): Stored {
+  const dataKey = randomBytes(32); // a fresh key for this record
+  const sealed = seal(plaintext, dataKey, context); // the data is encrypted locally
+  const wrappedKey = kms.wrap(keyId, dataKey); // only the small key travels to the KMS
+  dataKey.fill(0); // do not keep the plain key around
+  return { keyId, wrappedKey, sealed };
+}
+
+export function decryptRecord(kms: Kms, stored: Stored, context: string): string {
+  const dataKey = kms.unwrap(stored.keyId, stored.wrappedKey); // permission is checked, and the call is logged, here
+  try {
+    return open(stored.sealed, dataKey, context);
+  } finally {
+    dataKey.fill(0);
+  }
+}
+
+// Rotating the master key re-wraps the small data key. The data itself is not touched.
+export function rewrap(kms: Kms, stored: Stored, newKeyId: string): Stored {
+  const dataKey = kms.unwrap(stored.keyId, stored.wrappedKey);
+  const wrappedKey = kms.wrap(newKeyId, dataKey);
+  dataKey.fill(0);
+  return { ...stored, keyId: newKeyId, wrappedKey };
+}
+</pre>
+<p>Run against a stand-in key service, a one-megabyte record needed one call to write and one to read, and the key service handled 32 bytes each time. Three properties follow from the shape.</p>
+<ul>
+  <li><b>Rotation is cheap.</b> <dfn>Key rotation</dfn> is the replacement of a key by a new one on a schedule, so that any single key protects a bounded amount of data for a bounded time. Rotating the master key means re-wrapping small data keys, as <code>rewrap</code> does. In the test the megabyte of ciphertext was not touched, and the record still opened.</li>
+  <li><b>Access is one switch.</b> A service reads data only by asking the key service. Remove its permission and everything it stored is unreadable to it, immediately, wherever the copies are.</li>
+  <li><b>Deletion can be exact.</b> <dfn>Crypto-shredding</dfn> is destroying a key to make everything encrypted under it permanently unreadable, including copies in backups that cannot be edited. In the test, destroying the old master key made the record that still depended on it impossible to open. A key for each tenant turns “delete this customer’s data everywhere” into one operation (<x-ref to="multi-tenancy#lifecycle"></x-ref>).</li>
+</ul>
+<p>The same structure answers a request that enterprise customers make: to hold the master key themselves, in their own key service, and be able to withdraw it. The data keys are wrapped under the customer’s key, and your system must be built to fail cleanly for that tenant when the answer is no.</p>
+<div class="note production"><p><span class="label">In production.</span> Unwrapping a key for every request adds a network call to every read, and key services limit request rates. Cache plain data keys in memory for a short time, minutes not hours, and treat that cache as what it is: the place an attacker with access to the process will look. Also decide what happens when the key service is unreachable. It has become a dependency of every read of encrypted data, and it needs the treatment in <x-ref to="resilience-patterns"></x-ref>.</p></div>
+
+<h2 id="secrets">Secrets</h2>
+<p>A <dfn>secret</dfn>, in operations, is any value that grants access: a database password, an API key for another company’s service, a signing key, a token. Keys protect data. Secrets are what let your software reach the keys and everything else, and they are stolen far more often than cryptography is broken.</p>
+<p>The commonest leak is the plainest. A survey of public commits on GitHub found about 29 million secrets pushed during 2025, and found that 64% of the valid secrets it had detected in 2022 still worked. Private repositories are not safer in kind: one compromised laptop or one mistaken permission exposes everything in them.</p>
+<table>
+<thead><tr><th>Practice</th><th>What it means</th></tr></thead>
+<tbody>
+<tr><th>Out of the code</th><td>No secret in source, in a container image or in a configuration file that is committed. A scanner checks every commit before it is accepted</td></tr>
+<tr><th>In a <dfn>secrets manager</dfn></th><td>A service that stores secrets encrypted, hands them out to identified callers only, and records each access. The application fetches what it needs at start, or receives it from the platform at run time</td></tr>
+<tr><th>Short-lived where possible</th><td>A <dfn>dynamic secret</dfn> is created on request and expires by itself: a database account that exists for one hour for one service. A leaked one is soon worthless</td></tr>
+<tr><th>No secret at all where possible</th><td>Workload identity lets a service prove what it is to the platform and receive temporary credentials, with nothing stored (<x-ref to="oauth-and-sso#workload"></x-ref>)</td></tr>
+<tr><th>Rotated without an outage</th><td>Two versions valid at once: add the new one, move every user of it over, remove the old one. A secret that cannot be rotated without downtime will not be rotated</td></tr>
+<tr><th>Narrow</th><td>One secret for each service and purpose, with the least access that works, so that a leak is small and its source is obvious</td></tr>
+</tbody>
+</table>
+<div class="note pitfall"><p><span class="label">Common mistake.</span> Responding to a leaked secret by deleting the commit. The secret was copied the moment it was pushed, by automated scanners that watch public repositories, and it stays in every clone and in the history. The only fix is to revoke it and issue a new one, immediately. Then find out what it was used for while it was exposed.</p></div>
+
+<h2 id="pq">Preparing for quantum computers</h2>
+<p>A large enough quantum computer would break the public-key algorithms in use today: RSA, and the elliptic-curve algorithms behind key agreement and signatures. No such machine is known to exist. The reason to act anyway is that encrypted traffic can be recorded now and decrypted later, an approach known as <dfn>harvest now, decrypt later</dfn>. Anything that must stay secret for ten or twenty years is already exposed to it.</p>
+<table>
+<thead><tr><th>Kind</th><th>Effect of a quantum computer</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><th>Symmetric encryption and hashes</th><td>Weakened, not broken</td><td>Use 256-bit keys, which you should already</td></tr>
+<tr><th>Key agreement</th><td>Broken, and recorded traffic becomes readable</td><td>Hybrid key agreement: a classical and a post-quantum algorithm together, secure if either holds. Most urgent, because of recording</td></tr>
+<tr><th>Signatures</th><td>Broken, from the day such a machine exists</td><td>Post-quantum signatures. Less urgent: a signature cannot be forged retroactively</td></tr>
+</tbody>
+</table>
+<p>The standards exist. NIST published three in August 2024: one for key agreement and two for signatures. Deployment of the first is well advanced, and it happened mostly without application developers doing anything, through upgrades to browsers, libraries and content delivery networks. In September 2026 Cloudflare reported that about 70% of the browser traffic reaching it used hybrid post-quantum key agreement, against about 15% of the origin servers it connects to. Signatures and certificates are further behind. NIST’s draft timetable would deprecate today’s public-key algorithms after 2030 and disallow them after 2035.</p>
+<p>For a system designer the task is <dfn>crypto agility</dfn>: building so that an algorithm can be replaced without redesigning the system. In practice that means three habits. Record the algorithm and key version with everything you encrypt or sign, as the format byte and key identifier in this chapter’s code do. Keep an inventory of where cryptography is used. And keep libraries and TLS endpoints current, because that is how most of the migration will reach you.</p>
+
+<h2 id="design">Choosing for a real system</h2>
+<table>
+<thead><tr><th>In the photo app</th><th>Choice</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Every connection, outside and inside</th><td>TLS 1.3, certificates issued and renewed automatically, mutual TLS between services</td><td>No hop is trusted to be private</td></tr>
+<tr><th>Disks, databases, object storage, backups</th><td>The platform’s encryption at rest, with keys in its key service</td><td>The baseline, at no real cost</td></tr>
+<tr><th>Tokens for third-party services, stored for each user</th><td>Sealed in the application with a data key for each tenant, bound to the row they belong to</td><td>A dump of the table should not be a set of working credentials</td></tr>
+<tr><th>Photos themselves</th><td>Server-side encryption with envelope keys</td><td>The product needs to make thumbnails and search, so end-to-end encryption is not an option here</td></tr>
+<tr><th>Tokens issued to clients</th><td>Signed with a key pair held in the key service, with the key version in each token</td><td>Services verify without being able to issue, and keys can be rotated</td></tr>
+<tr><th>Incoming webhooks</th><td>HMAC over the time and the body</td><td>Authenticity with a shared key is enough between two parties</td></tr>
+<tr><th>Service credentials</th><td>Workload identity first, a secrets manager for the rest, nothing in the repository</td><td>The fewest long-lived secrets</td></tr>
+</tbody>
+</table>
+<div class="note interview"><p><span class="label">In an interview.</span> “Encrypted in transit and at rest” is where the answer starts. What an interviewer listens for is the next sentence: where the keys live, who can use them, and what a stolen database dump or a compromised service would yield. Mention envelope encryption with a key service, and a key for each tenant if tenants are part of the design.</p></div>
+
+<h2 id="mistakes">Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr></thead>
+<tbody>
+<tr><th>Inventing a scheme, or assembling one from low-level parts</th><td>Subtle flaws that no test reveals</td><td>A maintained library’s authenticated encryption, used as documented</td></tr>
+<tr><th>Encryption with no integrity check</th><td>Ciphertext can be altered to change what it decrypts to</td><td>Authenticated encryption, always</td></tr>
+<tr><th>Reusing a nonce, or one key for billions of messages</th><td>Confidentiality and integrity both fail</td><td>A fresh nonce for every message, and a data key for each record</td></tr>
+<tr><th>MD5 or SHA-1 for anything that matters</th><td>Forged files with matching digests</td><td>SHA-256 or newer</td></tr>
+<tr><th>A hash of key and message as a signature</th><td>Messages can be extended and still verify</td><td>HMAC, with the time included</td></tr>
+<tr><th>The key stored beside the data it protects</th><td>Whoever takes one takes both</td><td>Keys in a key service, data keys wrapped</td></tr>
+<tr><th>Treating disk encryption as protection from a breach</th><td>Every query still returns plaintext</td><td>Field-level encryption for the data that would hurt most</td></tr>
+<tr><th>Secrets in source control or images</th><td>They leak, and stay valid for years</td><td>A secrets manager, scanning, short lifetimes</td></tr>
+<tr><th>Keys and secrets that cannot be rotated without downtime</th><td>They are never rotated</td><td>Versions, two valid at once, and a rehearsed procedure</td></tr>
+<tr><th>Certificates renewed by hand</th><td>Outages on a schedule that gets shorter each year</td><td>Automated issuance, and alerts on expiry</td></tr>
+<tr><th>Algorithms fixed in data formats and code</th><td>No path to replace one that breaks</td><td>A version and key identifier stored with every protected value</td></tr>
+</tbody>
+</table>
+
+<div class="connects">
+<h4>Connects to</h4>
+<ul>
+  <li><x-ref to="http-and-tls"></x-ref>: the TLS handshake, certificates and where encryption ends.</li>
+  <li><x-ref to="authentication"></x-ref>: password hashing and signed tokens, which are applications of this chapter.</li>
+  <li><x-ref to="oauth-and-sso"></x-ref>: workload identity, the alternative to stored secrets.</li>
+  <li><x-ref to="object-and-file-storage"></x-ref>: checksums, content addressing and server-side encryption.</li>
+  <li><x-ref to="multi-tenancy"></x-ref>: a key for each tenant, and keys held by the customer.</li>
+  <li><x-ref to="disaster-recovery"></x-ref>: backups must be encrypted, and their keys must survive the disaster too.</li>
+  <li><x-ref to="threats-and-defenses"></x-ref>: the attacks these tools are meant to stop, and the ones they do not.</li>
+</ul>
+</div>
+
+<section class="takeaways">
+<h2 id="takeaways">Key points</h2>
+<ul>
+  <li>Cryptography reduces protecting data to protecting keys. Use standard algorithms through maintained libraries and spend your effort on the keys.</li>
+  <li>A hash detects change. A message authentication code proves origin between two holders of a key. A signature proves it to anyone, and verifying does not allow forging.</li>
+  <li>Always use authenticated encryption, never reuse a nonce with a key, and bind each encrypted value to its context.</li>
+  <li>Public-key cryptography agrees on keys and signs. Symmetric encryption does the bulk work.</li>
+  <li>Encrypt every hop, and automate certificates: their permitted lifetime falls to 47 days by 2029.</li>
+  <li>“Encrypted at rest” ranges from stopping a stolen disk to stopping the operator. Ask who holds the key when the data is read.</li>
+  <li>Envelope encryption keeps master keys inside a key service and makes rotation, revocation and deletion practical.</li>
+  <li>Keep secrets out of code, short-lived and rotatable, and prefer workload identity to any stored secret.</li>
+  <li>Store an algorithm and key version with everything protected, so that algorithms can be replaced, as they are about to be.</li>
+</ul>
+</section>
+
+<section class="quiz">
+<h2 id="check">Check yourself</h2>
+<details><summary>A download page publishes a file and its SHA-256 digest on the same server. What does checking the digest prove, and what does it not?</summary><p>It proves the file was not corrupted in transit or storage. It does not prove the file is the one the publisher made, because anyone able to replace the file on that server can replace the digest too. Proving origin needs a signature made with a private key that is not on that server, verified with a public key the user obtained some other way.</p></details>
+<details><summary>Why can a webhook be authenticated with an HMAC, while a token verified by forty services should use a signature?</summary><p>An HMAC uses one shared key, and anyone who can verify can also create valid codes. Between two parties that is acceptable. With forty verifying services, every one of them would hold a key able to forge tokens, so compromising any one compromises all. With a signature, services hold only the public key, which verifies and cannot sign.</p></details>
+<details><summary>An application encrypts each user’s stored access token with AES-GCM under one key, with nothing binding the value to its row. An attacker can write to the database and cannot decrypt. What can they still do, and what prevents it?</summary><p>They can copy one user’s encrypted token into another user’s row, and the application will decrypt it and use it as if it belonged there. Supplying the row’s identity as associated data when sealing, and again when opening, makes a value moved to another row fail authentication.</p></details>
+<details><summary>A service encrypts 1,000 messages a second with random 12-byte nonces under a key replaced every 90 days. Is that within the limit for random nonces, and what are the remedies?</summary><p>No. 1,000 a second for 90 days is about 7.8 billion messages, and the limit is 2<sup>32</sup>, about 4.3 billion, which is reached after about 50 days. Replace the key more often, or better, use envelope encryption so that each record or small batch has its own data key and no key encrypts more than a handful of messages.</p></details>
+<details><summary>In envelope encryption, what travels to the key management service, and why does rotating the master key not require re-encrypting the data?</summary><p>Only the data key travels, a few dozen bytes, to be wrapped or unwrapped. The data is encrypted locally under the data key and never sent. Rotating the master key means unwrapping each data key with the old master key and wrapping it with the new one. The data key, and therefore the ciphertext of the data, does not change.</p></details>
+<details><summary>A database runs on encrypted volumes. An attacker exploits an injection flaw in the application and reads the users table. What did the encryption protect?</summary><p>Nothing in this attack. Volume encryption is undone transparently for anything that reads through the running database, and the injected query does exactly that. It protects against the disk or a raw copy of it being taken. Fields encrypted in the application would have come back as ciphertext.</p></details>
+<details><summary>An engineer pushes a cloud access key to a public repository, notices a minute later, and force-pushes to remove the commit. What is the state of the key, and what is the correct response?</summary><p>The key must be considered stolen. Public repositories are scanned continuously, and the key was copied when it was pushed. Removing the commit does not recall it. Revoke the key at once, issue a new one through the secrets manager, and review the logs for what the old key was used for while it was exposed.</p></details>
+<details><summary>Why is post-quantum key agreement more urgent to deploy than post-quantum signatures?</summary><p>Because of recording. Traffic captured today can be stored and decrypted once a capable quantum computer exists, so data that must stay secret for years is already at risk, and only a quantum-resistant key agreement used now prevents that. A signature only needs to resist forgery at the time it is checked, so classical signatures remain safe until such a machine exists.</p></details>
+</section>
+
+<section class="sources">
+<h2 id="sources">Sources and further reading</h2>
+<ol>
+  <li>Jean-Philippe Aumasson, <cite>Serious Cryptography</cite>, 2nd edition, No Starch Press, 2024. The primitives in this chapter, explained for engineers.</li>
+  <li>David Wong, <cite>Real-World Cryptography</cite>, Manning, 2021.</li>
+  <li>Morris Dworkin, <a href="https://csrc.nist.gov/pubs/sp/800/38/d/final">NIST Special Publication 800-38D: Recommendation for Block Cipher Modes of Operation: Galois/Counter Mode (GCM) and GMAC</a>, 2007. The limit on messages for each key with random nonces.</li>
+  <li>Shay Gueron, Adam Langley and Yehuda Lindell, <a href="https://www.rfc-editor.org/rfc/rfc8452">RFC 8452: AES-GCM-SIV: Nonce Misuse-Resistant Authenticated Encryption</a>, 2019. What goes wrong when a nonce repeats.</li>
+  <li>OWASP, <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html">Cryptographic Storage Cheat Sheet</a> and <a href="https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html">Secrets Management Cheat Sheet</a>.</li>
+  <li>DNSimple, <a href="https://support.dnsimple.com/articles/announcement-ssl-certificate-validity-changes/">SSL Certificate Validity Changes (2026 - 2029)</a>. The schedule agreed by the CA/Browser Forum in April 2025.</li>
+  <li>Let’s Encrypt, <a href="https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability">6-day and IP Address Certificates are Generally Available</a>, January 2026.</li>
+  <li>NIST, <a href="https://csrc.nist.gov/pubs/fips/203/final">FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard</a>, August 2024, with FIPS 204 and 205 for signatures.</li>
+  <li>Cloudflare, <a href="https://blog.cloudflare.com/post-quantum-visibility/">Is your domain using post-quantum encryption? Now you can see for yourself</a>, September 2026.</li>
+  <li>GitGuardian, The State of Secrets Sprawl 2026, March 2026, as reported by <a href="https://www.cpomagazine.com/?p=41171">CPO Magazine</a>.</li>
+</ol>
+</section>
